@@ -1,0 +1,113 @@
+# ErnosDecent — Integration Test for node daemon and CLI
+# Component: decent_cli/test_cli.ep
+# Status: Testing — OperationTrojanClaude Phase 14
+
+import "collections"
+import "string"
+import "net"
+import "test"
+import "../decent_id/keys"
+import "../decent_id/did"
+import "../decent_net/dht"
+import "../decent_net/relay"
+import "../decent_consensus/raft"
+import "../decent_consensus/election"
+import "../decent_msg/message"
+import "../decent_money/ledger"
+import "../decent_name/registry"
+import "../storage"
+import "../logging"
+import "../node.ep"
+
+define run_daemon_thread with listen_fd as Int and raft_node as Map and identity as Map and dht_node as Int and relay_node as Int and msg_store as Int and ledger as Map and name_reg as Int:
+    ipc_server_loop(listen_fd and borrow raft_node and borrow identity and dht_node and relay_node and msg_store and ledger and name_reg)
+    return 0
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- CLI Integration Test"
+    display "==================================================="
+    
+    # 0. Initialize storage + logging
+    set store_err to storage_init("./test_cli_data")
+    set log_err to log_init("./test_cli_data/logs" and 1048576 and 2)
+
+    # 1. Initialize Cryptography
+    set crypto_err to init_crypto()
+    assert_true(crypto_err == 0 and "Crypto should initialize")
+    
+    # 2. Identity
+    set identity to create_identity()
+    
+    # 3. DHT Discovery Node
+    set dht_node to create_dht_node("test_node" and "127.0.0.1" and 8001)
+    
+    # 4. Relay Node
+    set relay_node to create_relay_node("test_node")
+
+    # 5. Raft Node
+    set peers to create_list()
+    set raft_node to raft_create_node("test_node" and peers)
+    election_init_node(borrow raft_node and 150)
+
+    # 6. Message Store
+    set did_val to ptr_to_str(map_get_val(identity and "did"))
+    set msg_store to mstore_create(did_val)
+
+    # 7. Ledger
+    set genesis_pub to ptr_to_str(map_get_val(identity and "public_key"))
+    set ledger to ledger_create(genesis_pub)
+
+    # 8. Name Registry
+    set name_reg to registry_create()
+    
+    # 9. Start TCP Socket Listener on 5000
+    set listen_fd to ep_net_listen(5000)
+    assert_true(listen_fd >= 0 and "Listen socket should bind")
+    
+    # 10. Spawn the daemon server loop thread
+    spawn run_daemon_thread(listen_fd and raft_node and identity and dht_node and relay_node and msg_store and ledger and name_reg)
+    
+    # Sleep to let the thread bind and start accepting
+    set ok to ep_sleep_ms(100)
+    
+    # 7. Test IPC Commands
+    # Test STATUS command
+    set fd1 to ep_net_connect("127.0.0.1" and 5000)
+    assert_true(fd1 >= 0 and "Connect should succeed")
+    set ok to ep_net_send(fd1 and "STATUS")
+    set resp1 to ep_net_recv(fd1 and 1024)
+    display concat("[Test] STATUS Response: " and resp1)
+    assert_true(string_contains(resp1 and "status:active") == 1 and "STATUS should respond active")
+    set ok to ep_net_close(fd1)
+    
+    # Test WALLET BALANCE command
+    set fd2 to ep_net_connect("127.0.0.1" and 5000)
+    assert_true(fd2 >= 0 and "Connect should succeed")
+    set ok to ep_net_send(fd2 and "WALLET BALANCE")
+    set resp2 to ep_net_recv(fd2 and 1024)
+    display concat("[Test] WALLET BALANCE Response: " and resp2)
+    assert_true(string_contains(resp2 and "wallet_balance") == 1 and "WALLET BALANCE should respond")
+    set ok to ep_net_close(fd2)
+    
+    # Test POOL STATUS command
+    set fd3 to ep_net_connect("127.0.0.1" and 5000)
+    assert_true(fd3 >= 0 and "Connect should succeed")
+    set ok to ep_net_send(fd3 and "POOL STATUS")
+    set resp3 to ep_net_recv(fd3 and 1024)
+    display concat("[Test] POOL STATUS Response: " and resp3)
+    assert_true(string_contains(resp3 and "pool:active") == 1 and "POOL STATUS should respond")
+    set ok to ep_net_close(fd3)
+
+    display "[+] All CLI integration tests passed successfully!"
+    
+    # Test STOP command (kills daemon thread and exits the test runner)
+    set fd4 to ep_net_connect("127.0.0.1" and 5000)
+    assert_true(fd4 >= 0 and "Connect should succeed")
+    set ok to ep_net_send(fd4 and "STOP")
+    set resp4 to ep_net_recv(fd4 and 1024)
+    display concat("[Test] STOP Response: " and resp4)
+    assert_true(string_contains(resp4 and "stopping") == 1 and "STOP should respond stopping")
+    set ok to ep_net_close(fd4)
+    
+    return 0

@@ -1,0 +1,392 @@
+# decent_store/rag.ep — Retrieval-Augmented Generation in pure ErnosPlain.
+# Replaces the Python rag_manager.py: embeddings via the Ollama HTTP API
+# (nomic-embed-text), text chunking, real-float cosine similarity, and a
+# SQLite-backed rag_chunks store that is now SESSION-SCOPED.
+#
+# Design notes:
+# - ErnosPlain has real floats, so cosine is exact (no fixed-point).
+# - json.ep parses numbers as ints (truncating decimals), so embedding vectors
+#   are stored verbatim as the model's array string and parsed with our own
+#   float tokenizer below.
+# - The rag_chunks table gains a session_id column. Ingestion tags each chunk
+#   with the session that uploaded it; search filters to the current session by
+#   default. Cross-session access is the agent's explicit tool path.
+
+import "string"
+import "collections"
+import "../stdlib/http"
+import "../decent_agent/llm"
+import "json"
+import "sql"
+
+set RAG_EMBED_MODEL to "nomic-embed-text"
+set RAG_OLLAMA_URL to "http://127.0.0.1:11434/api/embeddings"
+
+# --- float helpers (json.ep truncates decimals; embeddings need real floats) ---
+
+define rag_pow10 with n as Int returning Float:
+    set r to 1.0
+    set i to 0
+    repeat while i < n:
+        set r to r * 10.0
+        set i to i + 1
+    return r
+
+# Parse one float token, e.g. "-0.0123" or "1.5e-3", in a single pass.
+define rag_token_to_float with s as Str returning Float:
+    set n to string_length(s)
+    set i to 0
+    set sign to 1.0
+    if n > 0:
+        set c0 to get_character(s and 0)
+        if c0 == 45:
+            set sign to -1.0
+            set i to 1
+        else if c0 == 43:
+            set i to 1
+    set val to 0.0
+    repeat while i < n and also (get_character(s and i) >= 48 and also get_character(s and i) <= 57):
+        set val to val * 10.0 + (get_character(s and i) - 48)
+        set i to i + 1
+    if i < n and also get_character(s and i) == 46:
+        set i to i + 1
+        set scale to 0.1
+        repeat while i < n and also (get_character(s and i) >= 48 and also get_character(s and i) <= 57):
+            set val to val + (get_character(s and i) - 48) * scale
+            set scale to scale / 10.0
+            set i to i + 1
+    set val to val * sign
+    if i < n and also (get_character(s and i) == 101 or else get_character(s and i) == 69):
+        set i to i + 1
+        set esign to 1
+        if i < n and also get_character(s and i) == 45:
+            set esign to -1
+            set i to i + 1
+        else if i < n and also get_character(s and i) == 43:
+            set i to i + 1
+        set exp to 0
+        repeat while i < n and also (get_character(s and i) >= 48 and also get_character(s and i) <= 57):
+            set exp to exp * 10 + (get_character(s and i) - 48)
+            set i to i + 1
+        set p to rag_pow10(exp)
+        if esign < 0:
+            set val to val / p
+        else:
+            set val to val * p
+    return val
+
+# Parse one token directly into fixed-point micro-units (value * 1e6) as an Int,
+# never using a float (Lists bit-mangle floats). Handles sign, fraction (6 digits),
+# and exponent, e.g. "-0.3" -> -300000, "1.5e-3" -> 1500.
+define rag_token_to_fixed with s as Str returning Int:
+    set n to string_length(s)
+    set i to 0
+    set sign to 1
+    if n > 0:
+        set c0 to get_character(s and 0)
+        if c0 == 45:
+            set sign to -1
+            set i to 1
+        else if c0 == 43:
+            set i to 1
+    set intval to 0
+    repeat while i < n and also (get_character(s and i) >= 48 and also get_character(s and i) <= 57):
+        set intval to intval * 10 + (get_character(s and i) - 48)
+        set i to i + 1
+    set micro to intval * 1000000
+    if i < n and also get_character(s and i) == 46:
+        set i to i + 1
+        set place to 100000
+        repeat while i < n and also (get_character(s and i) >= 48 and also get_character(s and i) <= 57):
+            if place >= 1:
+                set micro to micro + (get_character(s and i) - 48) * place
+                set place to place / 10
+            set i to i + 1
+    set micro to micro * sign
+    if i < n and also (get_character(s and i) == 101 or else get_character(s and i) == 69):
+        set i to i + 1
+        set esign to 1
+        if i < n and also get_character(s and i) == 45:
+            set esign to -1
+            set i to i + 1
+        else if i < n and also get_character(s and i) == 43:
+            set i to i + 1
+        set exp to 0
+        repeat while i < n and also (get_character(s and i) >= 48 and also get_character(s and i) <= 57):
+            set exp to exp * 10 + (get_character(s and i) - 48)
+            set i to i + 1
+        set ej to 0
+        repeat while ej < exp:
+            if esign < 0:
+                set micro to micro / 10
+            else:
+                set micro to micro * 10
+            set ej to ej + 1
+    return micro
+
+# Newton's method square root for floats (no float sqrt builtin).
+define rag_float_sqrt with x as Float returning Float:
+    if x <= 0.0:
+        return 0.0
+    set g to x
+    if g > 1.0:
+        set g to x / 2.0
+    else:
+        set g to 1.0
+    set i to 0
+    repeat while i < 40:
+        set g to 0.5 * (g + x / g)
+        set i to i + 1
+    return g
+
+# Parse "[f, f, f, ...]" into a List of FIXED-POINT ints (value * 1e6). ErnosPlain
+# Lists truncate floats to int on a round-trip, so we scale by 1e6 and store the
+# integer — the 1e6 factor cancels in the cosine ratio, leaving the true cosine.
+define rag_parse_embedding with arr_str as Str returning List:
+    set out to create_list()
+    set n to string_length(arr_str)
+    set tok to ""
+    set i to 0
+    repeat while i < n:
+        set c to get_character(arr_str and i)
+        if c == 91 or else c == 93 or else c == 32:
+            set i to i + 1
+        else if c == 44:
+            if string_length(tok) > 0:
+                set ok to append_list(out and rag_token_to_fixed(tok))
+                set tok to ""
+            set i to i + 1
+        else:
+            set tok to concat(tok and substring(arr_str and i and 1))
+            set i to i + 1
+    if string_length(tok) > 0:
+        set ok to append_list(out and rag_token_to_float(tok) * 1000000.0)
+    return out
+
+# Extract the raw "embedding":[ ... ] array (as a string) from an Ollama reply.
+define rag_extract_embedding_str with response as Str returning Str:
+    set key_pos to string_index_of(response and "\"embedding\"")
+    if key_pos < 0:
+        return ""
+    set open_pos to string_index_of(substring(response and key_pos and string_length(response) - key_pos) and "[")
+    if open_pos < 0:
+        return ""
+    set start to key_pos + open_pos
+    set close_rel to string_index_of(substring(response and start and string_length(response) - start) and "]")
+    if close_rel < 0:
+        return ""
+    return substring(response and start and close_rel + 1)
+
+# Call the embedding model; returns the raw array string ("" on failure).
+# Retries a few times because the local HTTP transport can intermittently drop a
+# request (same connect-churn flakiness seen elsewhere on this node).
+define rag_embed with text as Str returning Str:
+    set headers to "Content-Type: application/json"
+    set body to "{\"model\": \""
+    set body to concat(body and RAG_EMBED_MODEL)
+    set body to concat(body and "\", \"prompt\": \"")
+    set body to concat(body and json_escape_string(text))
+    set body to concat(body and "\"}")
+    set attempt to 0
+    set arr to ""
+    repeat while attempt < 6 and also (string_length(arr) == 0):
+        set attempt to attempt + 1
+        if attempt > 1:
+            # let the local HTTP transport recover between attempts (connect-churn)
+            set ok to sleep_ms(150)
+        set response to http_post(RAG_OLLAMA_URL and headers and body)
+        if string_length(response) > 0:
+            set arr to rag_extract_embedding_str(http_dechunk(response))
+    return arr
+
+# Cosine over two fixed-point int vectors (each element = value*1e6). The 1e6^2
+# scale is identical in numerator and denominator, so it cancels — the result is
+# the true cosine. Sums stay well inside int64 and float64's exact-integer range
+# for normalised embeddings.
+define rag_cosine with v1 as List and v2 as List returning Float:
+    set n to length_list(v1)
+    set n2 to length_list(v2)
+    if n2 < n:
+        set n to n2
+    set dot to 0
+    set m1 to 0
+    set m2 to 0
+    set i to 0
+    repeat while i < n:
+        set a to get_list(v1 and i)
+        set b to get_list(v2 and i)
+        set dot to dot + a * b
+        set m1 to m1 + a * a
+        set m2 to m2 + b * b
+        set i to i + 1
+    if m1 <= 0 or else m2 <= 0:
+        return 0.0
+    set denom to rag_float_sqrt(0.0 + m1) * rag_float_sqrt(0.0 + m2)
+    if denom <= 0.0:
+        return 0.0
+    return (0.0 + dot) / denom
+
+# --- base64 decode (no stdlib base64; uploads arrive base64-encoded) ---
+define rag_b64_val with c as Int returning Int:
+    if c >= 65 and also c <= 90:
+        return c - 65
+    if c >= 97 and also c <= 122:
+        return c - 71
+    if c >= 48 and also c <= 57:
+        return c + 4
+    if c == 43:
+        return 62
+    if c == 47:
+        return 63
+    return -1
+
+# Decode a base64 string to its raw bytes as a string (UTF-8 text comes back as
+# text). Non-base64 chars (whitespace, '=') are skipped.
+define rag_base64_decode with b64 as Str returning Str:
+    set bytes to create_list()
+    set n to string_length(b64)
+    set acc to 0
+    set nbits to 0
+    set i to 0
+    repeat while i < n:
+        set v to rag_b64_val(get_character(b64 and i))
+        if v >= 0:
+            set acc to acc * 64 + v
+            set nbits to nbits + 6
+            if nbits >= 8:
+                set nbits to nbits - 8
+                set shift to 1
+                set k to 0
+                repeat while k < nbits:
+                    set shift to shift * 2
+                    set k to k + 1
+                set byte to (acc / shift) modulo 256
+                set ok to append_list(bytes and byte)
+                set acc to acc modulo shift
+        set i to i + 1
+    return string_from_list(bytes)
+
+# Split text into ~chunk_size-char windows with `overlap` chars of overlap.
+define rag_chunk_text with text as Str and chunk_size as Int and overlap as Int returning List:
+    set out to create_list()
+    set n to string_length(text)
+    if n == 0:
+        return out
+    set step to chunk_size - overlap
+    if step < 1:
+        set step to chunk_size
+    set start to 0
+    repeat while start < n:
+        set len to chunk_size
+        if start + len > n:
+            set len to n - start
+        set ok to append_list(out and substring(text and start and len))
+        set start to start + step
+    return out
+
+# Ensure the (session-scoped) schema exists; migrate older session-less tables.
+define rag_ensure_schema with db as Int:
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS rag_chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, document_name TEXT NOT NULL, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, embedding TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '');")
+    # Add session_id to a pre-existing session-less table (errors harmlessly if present).
+    set ok to sql_execute(db and "ALTER TABLE rag_chunks ADD COLUMN session_id TEXT NOT NULL DEFAULT '';")
+    return 0
+
+define rag_sql_escape with s as Str returning Str:
+    return string_replace(s and "'" and "''")
+
+# Index a document's text into rag_chunks, tagged with session_id.
+define rag_index with db as Int and doc_name as Str and text as Str and session_id as Str returning Int:
+    set ok to rag_ensure_schema(db)
+    set edoc to rag_sql_escape(doc_name)
+    set ok to sql_execute(db and concat("DELETE FROM rag_chunks WHERE document_name='" and concat(edoc and "';")))
+    set chunks to rag_chunk_text(text and 1000 and 200)
+    set nc to length_list(chunks)
+    set indexed to 0
+    set esession to rag_sql_escape(session_id)
+    set i to 0
+    repeat while i < nc:
+        set chunk to get_list(chunks and i)
+        set emb to rag_embed(chunk)
+        if string_length(emb) > 0:
+            set econtent to rag_sql_escape(chunk)
+            set eemb to rag_sql_escape(emb)
+            set ins to concat("INSERT INTO rag_chunks (document_name, chunk_index, content, embedding, session_id) VALUES ('" and edoc)
+            set ins to concat(ins and "', ")
+            set ins to concat(ins and int_to_string(i))
+            set ins to concat(ins and ", '")
+            set ins to concat(ins and econtent)
+            set ins to concat(ins and "', '")
+            set ins to concat(ins and eemb)
+            set ins to concat(ins and "', '")
+            set ins to concat(ins and esession)
+            set ins to concat(ins and "');")
+            set ok to sql_execute(db and ins)
+            set indexed to indexed + 1
+        set i to i + 1
+    return indexed
+
+# Search the current session's chunks for the query; returns a JSON string
+# {status, results:[{document,chunk_index,content,score}]}. When session_id is
+# empty, searches all sessions (the explicit cross-session tool path).
+define rag_search with db as Int and query as Str and session_id as Str and k as Int returning Str:
+    set qemb_str to rag_embed(query)
+    if string_length(qemb_str) == 0:
+        return "{\"status\":\"error\",\"message\":\"Failed to embed query.\",\"results\":[]}"
+    set qvec to rag_parse_embedding(qemb_str)
+    set sel to "SELECT document_name, chunk_index, content, embedding FROM rag_chunks"
+    if string_length(session_id) > 0:
+        set sel to concat(sel and concat(" WHERE session_id='" and concat(rag_sql_escape(session_id) and "'")))
+    set sel to concat(sel and ";")
+    set rows to sql_query(db and sel)
+    set nr to length_list(rows)
+    # score every chunk, keep a running top-k by simple insertion
+    set docs to create_list()
+    set idxs to create_list()
+    set conts to create_list()
+    set scores to create_list()
+    set i to 0
+    repeat while i < nr:
+        set row to get_list(rows and i)
+        set dname to ptr_to_str(get_list(row and 0))
+        set cidx to ptr_to_str(get_list(row and 1))
+        set content to ptr_to_str(get_list(row and 2))
+        set emb_str to ptr_to_str(get_list(row and 3))
+        set cvec to rag_parse_embedding(emb_str)
+        set score to rag_cosine(qvec and cvec)
+        set ok to append_list(docs and dname)
+        set ok to append_list(idxs and cidx)
+        set ok to append_list(conts and content)
+        set ok to append_list(scores and score)
+        set i to i + 1
+    # select top-k indices by score (selection, nr is small for a session)
+    set total to length_list(scores)
+    set used to create_map()
+    set out_json to "{\"status\":\"ok\",\"results\":["
+    set picked to 0
+    repeat while picked < k and also picked < total:
+        set best to -1
+        set best_score to -2.0
+        set j to 0
+        repeat while j < total:
+            if map_contains(used and int_to_string(j)) == 0:
+                set sj to get_list(scores and j)
+                if sj > best_score:
+                    set best_score to sj
+                    set best to j
+            set j to j + 1
+        if best < 0:
+            set picked to k
+        else:
+            set ok to map_insert(used and int_to_string(best) and 1)
+            if picked > 0:
+                set out_json to concat(out_json and ",")
+            set out_json to concat(out_json and "{\"document\":\"")
+            set out_json to concat(out_json and json_escape_string(ptr_to_str(get_list(docs and best))))
+            set out_json to concat(out_json and "\",\"chunk_index\":")
+            set out_json to concat(out_json and ptr_to_str(get_list(idxs and best)))
+            set out_json to concat(out_json and ",\"content\":\"")
+            set out_json to concat(out_json and json_escape_string(ptr_to_str(get_list(conts and best))))
+            set out_json to concat(out_json and "\"}")
+            set picked to picked + 1
+    set out_json to concat(out_json and "]}")
+    return out_json

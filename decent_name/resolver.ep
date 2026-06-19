@@ -1,0 +1,75 @@
+# ErnosDecent -- DNS Resolver
+# Component: decent_name/resolver.ep
+# Implements: DNS resolution cache with TTL, DHT fallback lookup,
+#             and persistent storage integration
+# Status: Production -- Phase 2 Networking
+
+import "string"
+import "../storage"
+import "../decent_net/transport"
+
+# ================================================================
+# DNS Resolver Cache Operations
+# ================================================================
+
+define resolver_create:
+    set res to create_map()
+    set cache to create_map()
+    set ok to map_insert(res and "cache" and cache)
+    return res
+
+define resolver_cache_add with res as Int and name as Str and value as Str and ttl as Int:
+    set cache to map_get_val(res and "cache")
+    set record to create_map()
+    set ok to map_insert(record and "value" and value)
+    set ok to map_insert(record and "expires_at" and ep_time_now_sec() + ttl)
+    set ok to map_insert(cache and name and record)
+    return 0
+
+define resolver_lookup with res as Int and name as Str returning Str:
+    set cache to map_get_val(res and "cache")
+    if map_contains(cache and name) == 1:
+        set record to map_get_val(cache and name)
+        set expires_at to map_get_val(record and "expires_at")
+        set now to ep_time_now_sec()
+
+        if now > expires_at:
+            # Cache expired — remove entry
+            set ok to map_delete(cache and name)
+        else:
+            return map_get_val(record and "value")
+
+    # Fallback: check persistent storage
+    set persisted to storage_name_resolve(name)
+    if string_length(persisted) > 0:
+        # Cache the result with 5-minute TTL
+        set ok to resolver_cache_add(res and name and persisted and 300)
+        return persisted
+
+    return ""
+
+define resolver_query_remote with res as Int and address as Str and port as Int and name as Str returning Str:
+    # Query a remote node for name resolution via transport layer
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != 0:
+        return ""
+
+    # Send name resolve request
+    set ok to transport_send(conn and "NAME_RESOLVE" and name)
+
+    # Receive response
+    set response to transport_recv(conn)
+    set recv_err to map_get_val(response and "error")
+    set ok to transport_close(conn)
+
+    if recv_err != 0:
+        return ""
+
+    set result to map_get_val(response and "payload")
+
+    # Cache valid result
+    if string_length(result) > 0:
+        set ok to resolver_cache_add(res and name and result and 300)
+
+    return result

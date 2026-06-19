@@ -1,0 +1,202 @@
+# ErnosDecent -- Integration Test for decent_host & decent_name
+# Component: decent_host/test_host.ep
+# Status: Testing -- OperationTrojanClaude Phase 7
+
+import "net"
+import "string"
+import "test"
+import "./static"
+import "./http"
+import "../decent_name/registry"
+import "../decent_name/resolver"
+
+# Helper to run the HTTP server step in a spawned thread
+define run_server_step with server_fd as Int and mapper as Int:
+    set ok to http_server_step(server_fd and mapper)
+    return ok
+
+# ================================================================
+# Test 1: Registry and Resolver Functionality
+# ================================================================
+
+define test_registry_and_resolver:
+    display "TEST 1: Name Registry and DNS Resolver Cache"
+    
+    # 1. Initialize Registry
+    set reg to registry_create()
+    
+    # 2. Register name to DID
+    set alice_did to "did:key:z6MkpTHR8VNsBxRceSt30uFRQ68asdfasdf"
+    set reg_err to registry_register(reg and "alice.ernos" and alice_did)
+    assert_true(reg_err == REG_ERR_NONE and "registering name should succeed")
+    
+    # 3. Try to register duplicate name
+    set reg_err_dup to registry_register(reg and "alice.ernos" and "did:key:another")
+    assert_true(reg_err_dup == REG_ERR_NAME_TAKEN and "registering duplicate name should fail")
+    
+    # 4. Resolve name to DID
+    set resolved_did to registry_resolve(reg and "alice.ernos")
+    assert_true(resolved_did equals alice_did and "resolved DID should match registered DID")
+    
+    # 5. Resolve unknown name
+    set resolved_unknown to registry_resolve(reg and "unknown.ernos")
+    assert_true(resolved_unknown equals "" and "unknown name should resolve to empty string")
+    
+    # 6. Initialize DNS Resolver Cache
+    set res to resolver_create()
+    
+    # 7. Add record with TTL
+    set endpoint to "127.0.0.1:28080"
+    resolver_cache_add(res and "alice.ernos" and endpoint and 3600)
+    
+    # 8. Retrieve cached record
+    set cached_endpoint to resolver_lookup(res and "alice.ernos")
+    assert_true(cached_endpoint equals endpoint and "cached endpoint should match added endpoint")
+    
+    # 9. Verify TTL eviction (using past TTL)
+    resolver_cache_add(res and "expired.ernos" and "127.0.0.1:18081" and 0 - 5)
+    set cached_expired to resolver_lookup(res and "expired.ernos")
+    assert_true(cached_expired equals "" and "expired cache record should be evicted and return empty")
+    
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 2: Static Route Mapper
+# ================================================================
+
+define test_static_route_mapper:
+    display "TEST 2: Static Route File Mapper"
+    
+    set mapper to static_create_mapper()
+    
+    # Add routes
+    static_add_route(mapper and "/" and "<h1>Home</h1>")
+    static_add_route(mapper and "/index.html" and "<h1>Alice's Decentralised Homepage</h1>")
+    
+    # Get routes
+    set content_root to static_get_content(mapper and "/")
+    assert_true(content_root equals "<h1>Home</h1>" and "root route should match")
+    
+    set content_index to static_get_content(mapper and "/index.html")
+    assert_true(content_index equals "<h1>Alice's Decentralised Homepage</h1>" and "index route should match")
+    
+    # Get missing route
+    set content_missing to static_get_content(mapper and "/404.html")
+    assert_true(content_missing equals "" and "missing route should return empty string")
+    
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 3: HTTP Parsing & Response Builder
+# ================================================================
+
+define test_http_parsing_and_response:
+    display "TEST 3: HTTP Request Parsing and Response Builder"
+    
+    # Parse request paths
+    set req1 to "GET /index.html HTTP/1.1\r\nHost: alice.ernos\r\n\r\n"
+    set path1 to http_parse_request_path(req1)
+    assert_true(path1 equals "/index.html" and "parse request path should extract correct path")
+    
+    set req2 to "POST /api/msg HTTP/1.1\nHost: localhost\n\n"
+    set path2 to http_parse_request_path(req2)
+    assert_true(path2 equals "/api/msg" and "parse request path should handle LF-only endings")
+    
+    # Build response
+    set resp to http_build_response(200 and "text/html" and "hello")
+    assert_true(string_contains(resp and "HTTP/1.1 200 OK") == 1 and "response headers should contain 200 OK")
+    assert_true(string_contains(resp and "Content-Length: 5") == 1 and "response headers should contain content length")
+    assert_true(string_contains(resp and "hello") == 1 and "response should contain the body")
+    
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 4: Integration (Registry -> Resolver -> Server -> Request)
+# ================================================================
+
+define test_integration_flow:
+    display "TEST 4: End-to-End Integration Flow"
+    
+    # 1. Setup Registry
+    set reg to registry_create()
+    set alice_did to "did:key:z6MkpTHR8VNsBxRceSt30uFRQ68asdfasdf"
+    registry_register(reg and "alice.ernos" and alice_did)
+    
+    # 2. Setup Resolver and Cache Endpoint for Alice
+    set res to resolver_create()
+    set server_endpoint to "127.0.0.1:28080"
+    resolver_cache_add(res and "alice.ernos" and server_endpoint and 3600)
+    
+    # 3. Setup Static Route Mapper with Alice's Homepage
+    set mapper to static_create_mapper()
+    static_add_route(mapper and "/index.html" and "<h1>Alice's Decentralised Homepage</h1>")
+    
+    # 4. Start HTTP Server Socket on Port 28080
+    set server_fd to net_listen(28080)
+    assert_true(server_fd > 0 - 1 and "server socket should start listening")
+    
+    # 5. Spawn HTTP Server Step in thread
+    spawn run_server_step(server_fd and mapper)
+    
+    # 6. Sleep to let the server start
+    set ok to ep_sleep_ms(100)
+    
+    # 7. Client resolves domain via local Cache
+    set target to resolver_lookup(res and "alice.ernos")
+    assert_true(target equals "127.0.0.1:28080" and "client should resolve domain")
+    
+    # Split resolved target into IP and Port
+    set host_port to split(target and ":")
+    set host to get_list(host_port and 0)
+    set port_str to get_list(host_port and 1)
+    set port to string_to_int(port_str)
+    free_list(host_port)
+    
+    # 8. Client connects to the resolved endpoint
+    set client_fd to net_connect(host and port)
+    assert_true(client_fd > 0 and "client should connect to resolved endpoint")
+    
+    # 9. Client sends HTTP GET Request
+    set request to "GET /index.html HTTP/1.1\r\nHost: alice.ernos\r\nConnection: close\r\n\r\n"
+    set send_len to net_send(client_fd and request)
+    assert_true(send_len > 0 and "client should successfully send HTTP request")
+    
+    # 10. Client receives Response
+    set response to net_recv(client_fd and 4096)
+    assert_true(string_length(response) > 0 and "client should receive non-empty HTTP response")
+    
+    # Verify response contents
+    assert_true(string_contains(response and "HTTP/1.1 200 OK") == 1 and "response status should be 200 OK")
+    assert_true(string_contains(response and "<h1>Alice's Decentralised Homepage</h1>") == 1 and "response body should contain Alice's homepage")
+    
+    # 11. Clean up
+    net_close(client_fd)
+    net_close(server_fd)
+    
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Main -- Run all tests
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_host & decent_name Test Suite"
+    display "  OperationTrojanClaude Phase 7"
+    display "==================================================="
+    display ""
+    
+    test_registry_and_resolver()
+    test_static_route_mapper()
+    test_http_parsing_and_response()
+    test_integration_flow()
+    
+    display ""
+    display "==================================================="
+    display "  All Phase 7 tests executed."
+    display "==================================================="
+    return 0

@@ -1,0 +1,324 @@
+# ErnosDecent — Byzantine Fault Tolerant Consensus (PBFT-style)
+# Component: decent_consensus/bft.ep
+# Status: Production
+#
+# Real BFT for an open-membership validator set: normal-case 3-phase agreement
+# (PRE-PREPARE → PREPARE → COMMIT) with 2f+1 quorums over a 3f+1 validator set,
+# Ed25519-signed messages (every vote is authenticated), and equivocation-based
+# slashing (a validator that signs two different digests for the same (view,seq,
+# phase) produces cryptographic slashing evidence). This is the safety core that
+# Raft (crash-fault only) could not provide.
+
+import "collections"
+import "string"
+import "fs"
+import "json"
+import "../decent_id/keys"
+
+set BFT_PHASE_PREPREPARE to "PRE-PREPARE"
+set BFT_PHASE_PREPARE to "PREPARE"
+set BFT_PHASE_COMMIT to "COMMIT"
+
+set BFT_OK to 0
+set BFT_ERR_BAD_SIG to 1
+set BFT_ERR_NOT_VALIDATOR to 2
+set BFT_ERR_WRONG_LEADER to 3
+set BFT_PREPARED to 4
+set BFT_COMMITTED to 10
+set BFT_EQUIVOCATION to 11
+
+# ----------------------------------------------------------------
+# Quorum math: n = 3f+1, a quorum is 2f+1 (intersection of any two
+# quorums contains ≥ f+1 nodes → at least one honest node in common,
+# which is what guarantees safety under ≤ f Byzantine validators).
+# ----------------------------------------------------------------
+define bft_quorum with f as Int returning Int:
+    return 2 * f + 1
+
+define bft_leader_for with view as Int and validators as List returning Str:
+    set n to length_list(validators)
+    if n == 0:
+        return ""
+    return ptr_to_str(get_list(validators and view modulo n))
+
+define bft_digest with value as Str returning Str:
+    return ep_sha256(value)
+
+# Canonical signed bytes for a consensus message — phase|view|seq|digest.
+define bft_canon with phase as Str and view as Int and seq as Int and digest as Str returning Str:
+    set s to concat(phase and "|")
+    set s to concat(s and int_to_string(view))
+    set s to concat(s and "|")
+    set s to concat(s and int_to_string(seq))
+    set s to concat(s and "|")
+    set s to concat(s and digest)
+    return s
+
+define bft_create_node with id as Str and validators as List and val_keys as Map and my_sec as Str and f as Int returning Map:
+    set node to create_map()
+    set ok to map_insert(node and "id" and id)
+    set ok to map_insert(node and "validators" and validators)
+    set ok to map_insert(node and "val_keys" and val_keys)
+    set ok to map_insert(node and "my_sec" and my_sec)
+    set ok to map_insert(node and "f" and int_to_string(f))
+    set ok to map_insert(node and "view" and "0")
+    set ok to map_insert(node and "seq" and "0")
+    set log to create_list()
+    set ok to map_insert(node and "log" and log)
+    set ok to map_insert(node and "prepares" and create_map())
+    set ok to map_insert(node and "commits" and create_map())
+    set ok to map_insert(node and "prepared" and create_map())
+    set ok to map_insert(node and "committed_keys" and create_map())
+    set ok to map_insert(node and "preprepare_values" and create_map())
+    set ok to map_insert(node and "seen" and create_map())
+    set slashed to create_list()
+    set ok to map_insert(node and "slashed" and slashed)
+    return node
+
+# Load the genesis validator set from a JSON file shared by all nodes:
+#   [ {"did": "did:key:...", "signing_public_key": "<64-hex>"}, ... ]
+# Returns {validators: List<did>, val_keys: Map<did,pubkey>}. Missing/empty/malformed
+# file → empty set (caller falls back to a single-self validator, f=0). This is the
+# standard genesis-config bootstrap: every validator must ship the same file so each
+# node accepts the others' Ed25519-signed votes (bft_verify checks val_keys).
+define bft_load_genesis_validators with path as Str returning Map:
+    set out to create_map()
+    set validators to create_list()
+    set val_keys to create_map()
+    set ok to map_insert(out and "validators" and validators)
+    set ok to map_insert(out and "val_keys" and val_keys)
+    if file_exists(path) == 0:
+        return out
+    set content to read_file(path)
+    set root to json_parse(content)
+    if root == 0:
+        return out
+    if get_json_type(root) != 3:
+        return out
+    set items to get_json_value(root)
+    set n to length_list(items)
+    set i to 0
+    repeat while i < n:
+        set item to get_list(items and i)
+        set did_node to get_json_object_value(item and "did")
+        set pub_node to get_json_object_value(item and "signing_public_key")
+        if did_node != 0 and also pub_node != 0:
+            set did to get_json_value(did_node)
+            set pub to get_json_value(pub_node)
+            set ok to append_list(validators and did)
+            set ok to map_insert(val_keys and did and pub)
+        set i to i + 1
+    return out
+
+# Wire format for sending a BFT message over the network: phase|view|seq|digest|
+# from|sig|value  (value is last/remainder so it may itself contain '|'; digest/
+# from/sig are hex or ids with no '|').
+define bft_serialize_msg with msg as Map returning Str:
+    set s to concat(ptr_to_str(map_get_val(msg and "phase")) and "|")
+    set s to concat(s and ptr_to_str(map_get_val(msg and "view")))
+    set s to concat(s and "|")
+    set s to concat(s and ptr_to_str(map_get_val(msg and "seq")))
+    set s to concat(s and "|")
+    set s to concat(s and ptr_to_str(map_get_val(msg and "digest")))
+    set s to concat(s and "|")
+    set s to concat(s and ptr_to_str(map_get_val(msg and "from")))
+    set s to concat(s and "|")
+    set s to concat(s and ptr_to_str(map_get_val(msg and "sig")))
+    set s to concat(s and "|")
+    set s to concat(s and ptr_to_str(map_get_val(msg and "value")))
+    return s
+
+define bft_deserialize_msg with wire as Str returning Map:
+    set msg to create_map()
+    set rest to wire
+    set i1 to string_index_of(rest and "|")
+    if i1 < 0:
+        set ok to map_insert(msg and "error" and "1")
+        return msg
+    set ok to map_insert(msg and "phase" and substring(rest and 0 and i1))
+    set rest to substring(rest and i1 + 1 and string_length(rest) - i1 - 1)
+    set i2 to string_index_of(rest and "|")
+    set ok to map_insert(msg and "view" and substring(rest and 0 and i2))
+    set rest to substring(rest and i2 + 1 and string_length(rest) - i2 - 1)
+    set i3 to string_index_of(rest and "|")
+    set ok to map_insert(msg and "seq" and substring(rest and 0 and i3))
+    set rest to substring(rest and i3 + 1 and string_length(rest) - i3 - 1)
+    set i4 to string_index_of(rest and "|")
+    set ok to map_insert(msg and "digest" and substring(rest and 0 and i4))
+    set rest to substring(rest and i4 + 1 and string_length(rest) - i4 - 1)
+    set i5 to string_index_of(rest and "|")
+    set ok to map_insert(msg and "from" and substring(rest and 0 and i5))
+    set rest to substring(rest and i5 + 1 and string_length(rest) - i5 - 1)
+    set i6 to string_index_of(rest and "|")
+    set ok to map_insert(msg and "sig" and substring(rest and 0 and i6))
+    set ok to map_insert(msg and "value" and substring(rest and i6 + 1 and string_length(rest) - i6 - 1))
+    set ok to map_insert(msg and "error" and "0")
+    return msg
+
+# Drive a single value to local finality in its own stack frame (leader proposes,
+# then the 3 phases run). Returns the committed value, or "" if not committed.
+# Keeping this in one function (rather than inlined in the deep IPC dispatch) avoids
+# growing the already-deep handler stack with the sign/verify call frames.
+define bft_run_local with node as Map and value as Str returning Str:
+    set pp to bft_propose(node and value)
+    if map_contains(pp and "phase") == 0:
+        return ""
+    set r1 to bft_handle(node and pp)
+    set r2 to bft_handle(node and map_get_val(r1 and "to_send"))
+    set r3 to bft_handle(node and map_get_val(r2 and "to_send"))
+    if map_get_val(r3 and "result") == BFT_COMMITTED:
+        return ptr_to_str(map_get_val(r3 and "committed_value"))
+    return ""
+
+# Build a signed consensus message.
+define bft_make_msg with node as Map and phase as Str and view as Int and seq as Int and digest as Str and value as Str returning Map:
+    set msg to create_map()
+    set ok to map_insert(msg and "phase" and phase)
+    set ok to map_insert(msg and "view" and int_to_string(view))
+    set ok to map_insert(msg and "seq" and int_to_string(seq))
+    set ok to map_insert(msg and "digest" and digest)
+    set ok to map_insert(msg and "value" and value)
+    set ok to map_insert(msg and "from" and map_get_val(node and "id"))
+    set canon to bft_canon(phase and view and seq and digest)
+    set sig_res to sign_message(canon and ptr_to_str(map_get_val(node and "my_sec")))
+    set ok to map_insert(msg and "sig" and ptr_to_str(map_get_val(sig_res and "signature")))
+    return msg
+
+# Leader proposes a value for the current (view, seq). Returns a signed PRE-PREPARE
+# or 0 (a no-map sentinel) if this node is not the current leader.
+define bft_propose with node as Map and value as Str returning Map:
+    set view to string_to_int(map_get_val(node and "view"))
+    set seq to string_to_int(map_get_val(node and "seq"))
+    set leader to bft_leader_for(view and map_get_val(node and "validators"))
+    if (leader equals ptr_to_str(map_get_val(node and "id"))) == 0:
+        return create_map()
+    set digest to bft_digest(value)
+    return bft_make_msg(node and BFT_PHASE_PREPREPARE and view and seq and digest and value)
+
+# Verify a message: sender must be a known validator and the signature must verify
+# over the canonical bytes by that validator's registered key.
+define bft_verify with node as Map and msg as Map returning Int:
+    set sender to ptr_to_str(map_get_val(msg and "from"))
+    set keys_dir to map_get_val(node and "val_keys")
+    if map_contains(keys_dir and sender) == 0:
+        return BFT_ERR_NOT_VALIDATOR
+    set pub to ptr_to_str(map_get_val(keys_dir and sender))
+    set canon to bft_canon(ptr_to_str(map_get_val(msg and "phase")) and string_to_int(map_get_val(msg and "view")) and string_to_int(map_get_val(msg and "seq")) and ptr_to_str(map_get_val(msg and "digest")))
+    if verify_signature(canon and ptr_to_str(map_get_val(msg and "sig")) and pub) != 0:
+        return BFT_ERR_BAD_SIG
+    return BFT_OK
+
+# Equivocation detector: if `sender` already signed a DIFFERENT digest for the same
+# (phase,view,seq), that is provable double-signing → slash. Returns 1 if slashed.
+define bft_check_equivocation with node as Map and msg as Map returning Int:
+    set sender to ptr_to_str(map_get_val(msg and "from"))
+    set sk to concat(sender and "|")
+    set sk to concat(sk and ptr_to_str(map_get_val(msg and "phase")))
+    set sk to concat(sk and "|")
+    set sk to concat(sk and ptr_to_str(map_get_val(msg and "view")))
+    set sk to concat(sk and "|")
+    set sk to concat(sk and ptr_to_str(map_get_val(msg and "seq")))
+    set seen to map_get_val(node and "seen")
+    set digest to ptr_to_str(map_get_val(msg and "digest"))
+    if map_contains(seen and sk) == 1:
+        set prior to ptr_to_str(map_get_val(seen and sk))
+        if (prior equals digest) == 0:
+            set slashed to map_get_val(node and "slashed")
+            if list_index_of_str(slashed and sender) < 0:
+                set ok to append_list(slashed and sender)
+            return 1
+        return 0
+    set ok to map_insert(seen and sk and digest)
+    return 0
+
+define list_index_of_str with lst as List and val as Str returning Int:
+    set n to length_list(lst)
+    set i to 0
+    repeat while i < n:
+        if ptr_to_str(get_list(lst and i)) equals val:
+            return i
+        set i to i + 1
+    return 0 - 1
+
+# Count distinct validators that voted for (view,seq,digest) in a phase tally map.
+define bft_tally_add with tally as Map and key as Str and sender as Str returning Int:
+    if map_contains(tally and key) == 0:
+        set ok to map_insert(tally and key and create_map())
+    set voters to map_get_val(tally and key)
+    # Box the vote marker as a string: this map hangs off the node which is stored in
+    # the GC-scanned agent_ctx, and a bare int leaf in a deeply-nested map can crash the
+    # collector. Only the key count matters (map_size), so the value is a boxed "1".
+    set ok to map_insert(voters and sender and "1")
+    return map_size(voters)
+
+# Core handler. Verifies + slashes equivocation, then runs the 3-phase tally.
+# Returns {result, to_send (msg or empty map), committed_value}.
+define bft_handle with node as Map and msg as Map returning Map:
+    set out to create_map()
+    set empty to create_map()
+    set ok to map_insert(out and "to_send" and empty)
+    set ok to map_insert(out and "committed_value" and "")
+
+    set verr to bft_verify(node and msg)
+    if verr != BFT_OK:
+        set ok to map_insert(out and "result" and verr)
+        return out
+
+    if bft_check_equivocation(node and msg) == 1:
+        set ok to map_insert(out and "result" and BFT_EQUIVOCATION)
+        return out
+
+    set phase to ptr_to_str(map_get_val(msg and "phase"))
+    set view to string_to_int(map_get_val(msg and "view"))
+    set seq to string_to_int(map_get_val(msg and "seq"))
+    set digest to ptr_to_str(map_get_val(msg and "digest"))
+    set f to string_to_int(map_get_val(node and "f"))
+    set quorum to bft_quorum(f)
+
+    set key to bft_canon("K" and view and seq and digest)
+
+    if phase equals BFT_PHASE_PREPREPARE:
+        # Only the designated leader for this view may pre-prepare.
+        set leader to bft_leader_for(view and map_get_val(node and "validators"))
+        if (leader equals ptr_to_str(map_get_val(msg and "from"))) == 0:
+            set ok to map_insert(out and "result" and BFT_ERR_WRONG_LEADER)
+            return out
+        set pv to map_get_val(node and "preprepare_values")
+        set ok to map_insert(pv and key and ptr_to_str(map_get_val(msg and "value")))
+        # Echo a signed PREPARE for this proposal.
+        set ok to map_insert(out and "to_send" and bft_make_msg(node and BFT_PHASE_PREPARE and view and seq and digest and ""))
+        set ok to map_insert(out and "result" and BFT_OK)
+        return out
+
+    if phase equals BFT_PHASE_PREPARE:
+        set count to bft_tally_add(map_get_val(node and "prepares") and key and ptr_to_str(map_get_val(msg and "from")))
+        set prepared to map_get_val(node and "prepared")
+        if count >= quorum and also map_contains(prepared and key) == 0:
+            set ok to map_insert(prepared and key and "1")
+            # 2f+1 prepares → emit a signed COMMIT.
+            set ok to map_insert(out and "to_send" and bft_make_msg(node and BFT_PHASE_COMMIT and view and seq and digest and ""))
+            set ok to map_insert(out and "result" and BFT_PREPARED)
+            return out
+        set ok to map_insert(out and "result" and BFT_OK)
+        return out
+
+    if phase equals BFT_PHASE_COMMIT:
+        set count to bft_tally_add(map_get_val(node and "commits") and key and ptr_to_str(map_get_val(msg and "from")))
+        set committed to map_get_val(node and "committed_keys")
+        if count >= quorum and also map_contains(committed and key) == 0:
+            set ok to map_insert(committed and key and "1")
+            set pv to map_get_val(node and "preprepare_values")
+            set committed_value to ""
+            if map_contains(pv and key) == 1:
+                set committed_value to ptr_to_str(map_get_val(pv and key))
+            set log to map_get_val(node and "log")
+            set ok to append_list(log and committed_value)
+            set ok to map_insert(node and "seq" and int_to_string(seq + 1))
+            set ok to map_insert(out and "committed_value" and committed_value)
+            set ok to map_insert(out and "result" and BFT_COMMITTED)
+            return out
+        set ok to map_insert(out and "result" and BFT_OK)
+        return out
+
+    set ok to map_insert(out and "result" and BFT_OK)
+    return out

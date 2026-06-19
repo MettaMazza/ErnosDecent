@@ -1,0 +1,237 @@
+# ErnosDecent — Raft Leader Election Loops
+# Component: decent_consensus/election.ep
+# Implements: Election timeout ticking, RequestVote distribution, and AppendEntries heartbeats
+# Status: Production — OperationTrojanClaude Phase 13
+
+import "collections"
+import "math"
+import "string"
+import "./raft"
+
+# ================================================================
+# Election State Initialisation
+# ================================================================
+
+define election_init_node with borrow node as Map and timeout as Int returning Int:
+    set votes to create_map()
+    set ok to map_insert(node and "election_timeout" and timeout)
+    set ok to map_insert(node and "election_elapsed" and 0)
+    set ok to map_insert(node and "heartbeat_timeout" and 50)
+    set ok to map_insert(node and "heartbeat_elapsed" and 0)
+    set ok to map_insert(node and "votes_received" and votes)
+    return 0
+
+# ================================================================
+# Election Tick (Run periodically or on simulated time step)
+# ================================================================
+
+define election_tick with borrow node as Map and elapsed_ms as Int returning List:
+    set requests to create_list()
+    set role to map_get_val(node and "role")
+    
+    if role equals RAFT_ROLE_FOLLOWER || role equals RAFT_ROLE_CANDIDATE:
+        set elapsed to map_get_val(node and "election_elapsed")
+        set timeout to map_get_val(node and "election_timeout")
+        set new_elapsed to elapsed + elapsed_ms
+        set ok to map_insert(node and "election_elapsed" and new_elapsed)
+        
+        if new_elapsed >= timeout:
+            # Trigger election!
+            free_list(requests)
+            set requests to election_start_vote(node)
+            
+    else:
+        if role equals RAFT_ROLE_LEADER:
+            set hb_elapsed to map_get_val(node and "heartbeat_elapsed")
+            set hb_timeout to map_get_val(node and "heartbeat_timeout")
+            set new_hb_elapsed to hb_elapsed + elapsed_ms
+            set ok to map_insert(node and "heartbeat_elapsed" and new_hb_elapsed)
+            
+            if new_hb_elapsed >= hb_timeout:
+                set ok to map_insert(node and "heartbeat_elapsed" and 0)
+                free_list(requests)
+                set requests to election_send_heartbeats(node)
+                
+    return requests
+
+# ================================================================
+# Start Election Vote Requests
+# ================================================================
+
+define election_start_vote with borrow node as Map returning List:
+    set requests to create_list()
+    set id to map_get_val(node and "node_id")
+    
+    # Transition to candidate, increment term, vote for self
+    set ok to map_insert(node and "role" and RAFT_ROLE_CANDIDATE)
+    
+    set term to map_get_val(node and "current_term")
+    set new_term to term + 1
+    set ok to map_insert(node and "current_term" and new_term)
+    set ok to map_insert(node and "voted_for" and id)
+    set ok to map_insert(node and "election_elapsed" and 0)
+    
+    # Reset votes_received and add self vote
+    set votes to create_map()
+    set ok to map_insert(votes and id and 1)
+    set ok to map_insert(node and "votes_received" and votes)
+    
+    # Determine local last log info
+    set log to map_get_val(node and "log")
+    set log_len to length_list(log)
+    set last_term to 0
+    if log_len > 0:
+        set last_entry to get_list(log and log_len - 1)
+        set last_term to map_get_val(last_entry and "term")
+        
+    set peers to map_get_val(node and "peers")
+    set num_peers to length_list(peers)
+
+    # Single-node (or already-majority) fast path: the self-vote alone may already be a
+    # majority. Without this a standalone node stays CANDIDATE forever, because no vote
+    # responses ever arrive to drive election_handle_vote_response's majority check.
+    set total_nodes to num_peers + 1
+    set majority to total_nodes / 2 + 1
+    if 1 >= majority:
+        set ok to map_insert(node and "role" and RAFT_ROLE_LEADER)
+        set match_map to map_get_val(node and "match_index")
+        set next_map to map_get_val(node and "next_index")
+        set next_idx_init to log_len + 1
+        set j to 0
+        repeat while j < num_peers:
+            set pj to ptr_to_str(get_list(peers and j))
+            set ok to map_insert(match_map and pj and 0)
+            set ok to map_insert(next_map and pj and next_idx_init)
+            set j to j + 1
+        return requests
+
+    set i to 0
+    repeat while i < num_peers:
+        set peer_ptr to get_list(peers and i)
+        set peer_id to ptr_to_str(peer_ptr)
+
+        set req to create_map()
+        set ok to map_insert(req and "type" and "RequestVote")
+        set ok to map_insert(req and "term" and new_term)
+        set ok to map_insert(req and "candidate_id" and id)
+        set ok to map_insert(req and "last_log_index" and log_len)
+        set ok to map_insert(req and "last_log_term" and last_term)
+        set ok to map_insert(req and "target" and peer_id)
+        
+        set ok to append_list(requests and req)
+        set i to i + 1
+        
+    # Randomized next election timeout to prevent split votes
+    # Range: [base_timeout, base_timeout * 2] where base_timeout is the configured value
+    set base_timeout to map_get_val(node and "election_timeout")
+    set rand_timeout to ep_random_int(base_timeout and base_timeout * 2)
+    set ok to map_insert(node and "election_timeout" and rand_timeout)
+    
+    return requests
+
+# ================================================================
+# Process RequestVote Response
+# ================================================================
+
+define election_handle_vote_response with borrow node as Map and peer_id as Str and term as Int and vote_granted as Int returning Int:
+    set role to map_get_val(node and "role")
+    if (role equals RAFT_ROLE_CANDIDATE) == 0:
+        return 0
+        
+    set current_term to map_get_val(node and "current_term")
+    
+    if term > current_term:
+        set ok to map_insert(node and "current_term" and term)
+        set ok to map_insert(node and "voted_for" and "")
+        set ok to map_insert(node and "role" and RAFT_ROLE_FOLLOWER)
+        set ok to map_insert(node and "election_elapsed" and 0)
+        return 0
+        
+    if term == current_term && vote_granted == 1:
+        set votes to map_get_val(node and "votes_received")
+        set ok to map_insert(votes and peer_id and 1)
+        
+        # Check if majority achieved
+        set peers to map_get_val(node and "peers")
+        set num_peers to length_list(peers)
+        set total_nodes to num_peers + 1
+        set majority to total_nodes / 2 + 1
+        
+        set num_votes to map_size(votes)
+        if num_votes >= majority:
+            # Transition to leader!
+            set ok to map_insert(node and "role" and RAFT_ROLE_LEADER)
+            
+            # Initialize match_index and next_index maps
+            set match_map to map_get_val(node and "match_index")
+            set next_map to map_get_val(node and "next_index")
+            set log to map_get_val(node and "log")
+            set log_len to length_list(log)
+            set next_idx_init to log_len + 1
+            
+            set i to 0
+            repeat while i < num_peers:
+                set peer_ptr to get_list(peers and i)
+                set peer_p_id to ptr_to_str(peer_ptr)
+                set ok to map_insert(match_map and peer_p_id and 0)
+                set ok to map_insert(next_map and peer_p_id and next_idx_init)
+                set i to i + 1
+                
+            return 1 # Transited to leader
+            
+    return 0
+
+# ================================================================
+# Send Leader Heartbeats
+# ================================================================
+
+define election_send_heartbeats with borrow node as Map returning List:
+    set requests to create_list()
+    set role to map_get_val(node and "role")
+    if (role equals RAFT_ROLE_LEADER) == 0:
+        return requests
+        
+    set id to map_get_val(node and "node_id")
+    set current_term to map_get_val(node and "current_term")
+    set commit_idx to map_get_val(node and "commit_index")
+    set next_map to map_get_val(node and "next_index")
+    set log to map_get_val(node and "log")
+    
+    set peers to map_get_val(node and "peers")
+    set num_peers to length_list(peers)
+    set i to 0
+    repeat while i < num_peers:
+        set peer_ptr to get_list(peers and i)
+        set peer_id to ptr_to_str(peer_ptr)
+        
+        set prev_idx to map_get_val(next_map and peer_id) - 1
+        set prev_term to 0
+        if prev_idx > 0:
+            set prev_entry to get_list(log and prev_idx - 1)
+            set prev_term to map_get_val(prev_entry and "term")
+            
+        # Include pending log entries for this follower
+        set next_idx to map_get_val(next_map and peer_id)
+        set log_len to length_list(log)
+        set entries_to_send to create_list()
+        set j to next_idx - 1
+        repeat while j < log_len:
+            if j >= 0:
+                set entry to get_list(log and j)
+                set ok to append_list(entries_to_send and entry)
+            set j to j + 1
+        
+        set req to create_map()
+        set ok to map_insert(req and "type" and "AppendEntries")
+        set ok to map_insert(req and "term" and current_term)
+        set ok to map_insert(req and "leader_id" and id)
+        set ok to map_insert(req and "prev_log_index" and prev_idx)
+        set ok to map_insert(req and "prev_log_term" and prev_term)
+        set ok to map_insert(req and "entries" and entries_to_send)
+        set ok to map_insert(req and "leader_commit" and commit_idx)
+        set ok to map_insert(req and "target" and peer_id)
+        
+        set ok to append_list(requests and req)
+        set i to i + 1
+        
+    return requests

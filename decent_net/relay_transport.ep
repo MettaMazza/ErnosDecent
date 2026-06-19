@@ -1,0 +1,258 @@
+# ErnosDecent -- Relay-over-Transport Bridge
+# Component: decent_net/relay_transport.ep
+# Wires the existing relay node (in-memory maps) to real TCP
+# Handles serialization and TCP-based relay message exchange
+# Status: Production
+
+import "transport"
+import "relay"
+import "string"
+import "collections"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set RELAY_NET_ERR_NONE to 0
+set RELAY_NET_ERR_SEND_FAILED to 971
+set RELAY_NET_ERR_RECV_FAILED to 972
+set RELAY_NET_ERR_BAD_RESPONSE to 973
+set RELAY_NET_ERR_NOT_REGISTERED to 974
+set RELAY_NET_ERR_CIRCUIT_FAILED to 975
+
+# ================================================================
+# Outbound RPC: Client-side relay operations over TCP
+# ================================================================
+
+define relay_rpc_register with address as Str and port as Int and my_id as Str and my_pub_hex as Str returning Int:
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        return RELAY_NET_ERR_SEND_FAILED
+
+    # Payload: "sender_id,pub_hex,address,port"
+    set payload to concat(my_id and ",")
+    set payload to concat(payload and my_pub_hex)
+    set payload to concat(payload and ",")
+    set payload to concat(payload and address)
+    set payload to concat(payload and ",")
+    set payload to concat(payload and int_to_string(port))
+    set err to transport_send(conn and MSG_TYPE_RELAY_REQUEST and concat("REGISTER," and payload))
+    if err != TRANSPORT_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        return RELAY_NET_ERR_SEND_FAILED
+
+    set resp to transport_recv(conn)
+    set recv_err to map_get_val(resp and "error")
+    set resp_payload to ""
+    if recv_err == TRANSPORT_ERR_NONE:
+        set resp_payload to map_get_val(resp and "payload")
+    free_map(resp)
+    transport_close(conn)
+    free_map(conn)
+
+    if recv_err != TRANSPORT_ERR_NONE:
+        return RELAY_NET_ERR_RECV_FAILED
+
+    if string_contains(resp_payload and "ok") == 1:
+        return RELAY_NET_ERR_NONE
+    return RELAY_NET_ERR_BAD_RESPONSE
+
+define relay_rpc_connect with address as Str and port as Int and my_id as Str and target_id as Str returning Map:
+    set result to create_map()
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        set ok to map_insert(result and "error" and RELAY_NET_ERR_SEND_FAILED)
+        return result
+
+    # Payload: "CONNECT,sender_id,target_id"
+    set payload to concat("CONNECT," and my_id)
+    set payload to concat(payload and ",")
+    set payload to concat(payload and target_id)
+    set err to transport_send(conn and MSG_TYPE_RELAY_REQUEST and payload)
+    if err != TRANSPORT_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        set ok to map_insert(result and "error" and RELAY_NET_ERR_SEND_FAILED)
+        return result
+
+    set resp to transport_recv(conn)
+    set recv_err to map_get_val(resp and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        free_map(resp)
+        transport_close(conn)
+        free_map(conn)
+        set ok to map_insert(result and "error" and RELAY_NET_ERR_RECV_FAILED)
+        return result
+
+    set resp_payload to map_get_val(resp and "payload")
+    free_map(resp)
+    transport_close(conn)
+    free_map(conn)
+
+    # Parse "ok,circuit_id" or "error"
+    if string_contains(resp_payload and "ok,") == 1:
+        set cid_start to 3
+        set cid_len to string_length(resp_payload) - cid_start
+        set circuit_id to substring(resp_payload and cid_start and cid_len)
+        set ok to map_insert(result and "circuit_id" and circuit_id)
+        set ok to map_insert(result and "error" and RELAY_NET_ERR_NONE)
+    else:
+        set ok to map_insert(result and "error" and RELAY_NET_ERR_CIRCUIT_FAILED)
+    return result
+
+define relay_rpc_forward with address as Str and port as Int and circuit_id as Str and encrypted_data as Str returning Int:
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        return RELAY_NET_ERR_SEND_FAILED
+
+    # Payload: "DATA,circuit_id,encrypted_data"
+    set payload to concat("DATA," and circuit_id)
+    set payload to concat(payload and ",")
+    set payload to concat(payload and encrypted_data)
+    set err to transport_send(conn and MSG_TYPE_RELAY_DATA and payload)
+    if err != TRANSPORT_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        return RELAY_NET_ERR_SEND_FAILED
+
+    set resp to transport_recv(conn)
+    set recv_err to map_get_val(resp and "error")
+    free_map(resp)
+    transport_close(conn)
+    free_map(conn)
+
+    if recv_err != TRANSPORT_ERR_NONE:
+        return RELAY_NET_ERR_RECV_FAILED
+    return RELAY_NET_ERR_NONE
+
+define relay_rpc_heartbeat with address as Str and port as Int and my_id as Str returning Int:
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        return RELAY_NET_ERR_SEND_FAILED
+
+    set payload to concat("HEARTBEAT," and my_id)
+    set err to transport_send(conn and MSG_TYPE_RELAY_REQUEST and payload)
+    if err != TRANSPORT_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        return RELAY_NET_ERR_SEND_FAILED
+
+    set resp to transport_recv(conn)
+    set recv_err to map_get_val(resp and "error")
+    free_map(resp)
+    transport_close(conn)
+    free_map(conn)
+
+    if recv_err != TRANSPORT_ERR_NONE:
+        return RELAY_NET_ERR_RECV_FAILED
+    return RELAY_NET_ERR_NONE
+
+# ================================================================
+# Inbound: Handle incoming relay messages from TCP
+# ================================================================
+
+define relay_handle_transport_message with relay as Int and conn as Map returning Int:
+    set frame to transport_recv(conn)
+    set recv_err to map_get_val(frame and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        free_map(frame)
+        return RELAY_NET_ERR_RECV_FAILED
+
+    set msg_type to map_get_val(frame and "msg_type")
+    set payload to map_get_val(frame and "payload")
+    free_map(frame)
+
+    # Parse command from payload: "COMMAND,arg1,arg2,..."
+    set parts to string_split(payload and ",")
+    set part_count to length_list(parts)
+    set command to ""
+    if part_count > 0:
+        set command to get_list(parts and 0)
+
+    if command equals "REGISTER":
+        if part_count >= 3:
+            set sender_id to get_list(parts and 1)
+            set pub_hex to get_list(parts and 2)
+            set reg_addr to "127.0.0.1"
+            set reg_port to 9100
+            if part_count >= 4:
+                set reg_addr to get_list(parts and 3)
+            if part_count >= 5:
+                set reg_port to string_to_int(get_list(parts and 4))
+            set reg_err to relay_register(relay and sender_id and pub_hex and reg_addr and reg_port)
+            free_list(parts)
+            if reg_err == RELAY_ERR_NONE:
+                return transport_send(conn and MSG_TYPE_RELAY_REQUEST and "ok")
+            else:
+                return transport_send(conn and MSG_TYPE_RELAY_REQUEST and "error:register_failed")
+        free_list(parts)
+        return transport_send(conn and MSG_TYPE_RELAY_REQUEST and "error:bad_register")
+
+    if command equals "CONNECT":
+        if part_count >= 3:
+            set sender_id to get_list(parts and 1)
+            set target_id to get_list(parts and 2)
+            set circuit_result to relay_create_circuit(relay and sender_id and target_id)
+            set circuit_err to map_get_val(circuit_result and "error")
+            if circuit_err == RELAY_ERR_NONE:
+                set circuit_id to map_get_val(circuit_result and "circuit_id")
+                set resp to concat("ok," and circuit_id)
+                free_map(circuit_result)
+                free_list(parts)
+                return transport_send(conn and MSG_TYPE_RELAY_REQUEST and resp)
+            free_map(circuit_result)
+        free_list(parts)
+        return transport_send(conn and MSG_TYPE_RELAY_REQUEST and "error:connect_failed")
+
+    if command equals "DATA":
+        if part_count >= 3:
+            set circuit_id to get_list(parts and 1)
+            set data to get_list(parts and 2)
+            set fwd to relay_forward_data(relay and circuit_id and data)
+            set fwd_err to map_get_val(fwd and "error")
+            if fwd_err == RELAY_ERR_NONE:
+                # Actually forward the data to the target over TCP
+                set target_id to ptr_to_str(map_get_val(fwd and "target"))
+                set target_info to relay_get_target_address(relay and target_id)
+                set target_err to map_get_val(target_info and "error")
+                if target_err == 0:
+                    set target_addr to ptr_to_str(map_get_val(target_info and "address"))
+                    set target_port to map_get_val(target_info and "port")
+                    set fwd_conn to transport_connect(target_addr and target_port)
+                    set fwd_conn_err to map_get_val(fwd_conn and "error")
+                    if fwd_conn_err == 0:
+                        set fwd_data to ptr_to_str(map_get_val(fwd and "data"))
+                        set send_err to transport_send(fwd_conn and MSG_TYPE_RELAY_DATA and fwd_data)
+                        set ok to transport_close(fwd_conn)
+                    free_map(fwd_conn)
+                free_map(target_info)
+            free_map(fwd)
+            free_list(parts)
+            if fwd_err == RELAY_ERR_NONE:
+                return transport_send(conn and MSG_TYPE_RELAY_DATA and "ok")
+            else:
+                return transport_send(conn and MSG_TYPE_RELAY_DATA and "error:forward_failed")
+        free_list(parts)
+        return transport_send(conn and MSG_TYPE_RELAY_DATA and "error:bad_data")
+
+    if command equals "HEARTBEAT":
+        if part_count >= 2:
+            set sender_id to get_list(parts and 1)
+            set registrations to map_get_val(relay and "registrations")
+            set reg to map_get_val(registrations and sender_id)
+            if reg != 0:
+                set ok to refresh_registration(reg)
+        free_list(parts)
+        return transport_send(conn and MSG_TYPE_RELAY_REQUEST and "ok")
+
+    free_list(parts)
+    return transport_send(conn and MSG_TYPE_RELAY_REQUEST and "error:unknown_command")

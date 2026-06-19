@@ -1,0 +1,344 @@
+# Contributing to ErnosDecent
+
+Thank you for your interest in ErnosDecent. This document covers everything you need to know to contribute.
+
+---
+
+## Table of Contents
+
+- [Before You Start](#before-you-start)
+- [Development Setup](#development-setup)
+- [The Ernos Language](#the-ernos-language)
+- [Project Structure](#project-structure)
+- [Coding Standards](#coding-standards)
+- [The Eleven Laws](#the-eleven-laws)
+- [Writing Tests](#writing-tests)
+- [Submitting Changes](#submitting-changes)
+- [Reporting Issues](#reporting-issues)
+
+---
+
+## Before You Start
+
+ErnosDecent is written entirely in **Ernos** (`.ep` files). Ernos is a compiled, statically-typed language with plain English syntax. Before contributing code, you need to be comfortable reading and writing Ernos. The full language reference is at [ERNOS_REFERENCE.md](ERNOS_REFERENCE.md).
+
+**This project has strict quality standards.** Every function must be complete and operational. Every claim must be verified. Every test must test something that could actually fail. Read [The Eleven Laws](#the-eleven-laws) before writing any code.
+
+---
+
+## Development Setup
+
+### 1. Install Prerequisites
+
+**Ernos Compiler:**
+```bash
+git clone https://github.com/MettaMazza/Ernos-Programming-Language.git
+cd Ernos-Programming-Language
+cargo build --release
+# The compiler binary is at target/release/ernos
+# Add it to your PATH
+```
+
+**System Dependencies:**
+```bash
+# macOS
+brew install libsodium
+xcode-select --install    # For Clang
+
+# Linux (Debian/Ubuntu)
+sudo apt install clang libsodium-dev
+```
+
+### 2. Clone ErnosDecent
+
+```bash
+git clone https://github.com/MettaMazza/ErnosDecent.git
+cd ErnosDecent
+```
+
+### 3. Set Up the Standard Library Symlink
+
+The Ernos standard library must be accessible from the project root:
+
+```bash
+ln -s /path/to/Ernos-Programming-Language/stdlib ./stdlib
+```
+
+### 4. Verify Your Setup
+
+```bash
+# Compile and run the identity test suite
+ernos decent_id/test_keys.ep && ./decent_id/test_keys
+```
+
+If you see `16/16 PASS` (or similar), your environment is correctly configured.
+
+---
+
+## The Ernos Language
+
+A brief primer for contributors coming from other languages:
+
+```ernos
+# Variables
+set x to 42
+set name to "ErnosDecent"
+
+# Functions
+define add with a as Int and b as Int returning Int:
+    return a + b
+
+# Structs
+define structure Peer:
+    field id as Str
+    field address as Str
+    field port as Int
+
+# Control flow
+if count > 0:
+    display f"Found {count} peers"
+else:
+    display "No peers found"
+
+repeat while i < 100:
+    set i to i + 1
+
+# String comparison uses 'equals', not '=='
+if name equals "ErnosDecent":
+    display "Match"
+
+# Integer comparison uses '=='
+if x == 42:
+    display "Match"
+```
+
+Key things to know:
+- **`==`** is for integer comparison. **`equals`** is for string comparison. They are not interchangeable.
+- **Lists** store `long long` (8 bytes per element). For byte buffers, use `alloc_bytes()`.
+- **Maps** require `import "collections"`.
+- **FFI** uses `ep_dlopen`/`ep_dlsym`/`ep_dlcall0..10` for C library access.
+- **Concurrency** uses `spawn`, `create_channel`, `send X to CH`, `receive from CH`.
+
+Full specification: [ERNOS_REFERENCE.md](ERNOS_REFERENCE.md)
+
+---
+
+## Project Structure
+
+```
+ErnosDecent/
+├── decent_id/           # Cryptographic identity (keys, DIDs, auth)
+├── decent_net/          # P2P networking (Noise, DHT, relays)
+├── decent_store/        # Storage (content-addressed, CRDTs)
+├── decent_msg/          # Messaging (E2E encrypted, group channels)
+├── decent_social/       # Social (Nostr, ActivityPub, feeds)
+├── decent_name/         # Naming (DNS resolver, .ernos registry)
+├── decent_host/         # Hosting (HTTP server, static serving)
+├── decent_money/        # Finance (wallets, ledger, DEX, contracts)
+├── decent_ai/           # AI (GGUF inference, embeddings, speech)
+├── decent_media/        # Media (WebRTC, streaming, codecs, CDN)
+├── decent_anon/         # Privacy (onion routing, mixnets)
+├── decent_search/       # Search (crawler, ranking engine, query)
+├── decent_pool/         # Resource pooling (bandwidth, compute, mesh)
+├── decent_consensus/    # Raft consensus (election loops, log replication)
+├── decent_cli/          # Daemon CLI (control CLI tool, CLI integration tests)
+├── decent_web/          # Web UI App (glassmorphic dashboard, backend server)
+├── docs/                # Project documentation (AGENT.md, ERNOS_REFERENCE.md, CHANGELOG.md, CONTRIBUTING.md, etc.)
+├── node.ep              # Sovereign Node Daemon (coordinates all subsystems)
+├── README.md            # Project overview & roadmap
+└── LICENSE              # AGPL-3.0
+```
+
+Each `decent_*/` directory contains:
+- **Source modules** (`name.ep`) — the implementation
+- **Test suite** (`test_name.ep`) — integration tests
+- **Compiled artifacts** (binaries, `.c` intermediates, `.dSYM` debug symbols) — generated by the compiler
+
+---
+
+## Coding Standards
+
+### File naming
+- Source files: `lowercase_descriptive_name.ep`
+- Test files: `test_module_name.ep` (one per subsystem)
+- All files in the appropriate `decent_*/` directory
+
+### Indentation
+- **4 spaces.** No tabs.
+
+### Functions
+- Explicit type annotations on all parameters and return values
+- Error paths handled in every function — no operation that can fail goes unchecked
+- No empty function bodies, no stub returns
+
+```ernos
+# Correct
+define hash_content with data as Str returning Str:
+    if string_length(data) == 0:
+        return "error:empty_input"
+    set digest to ep_sha256(data)
+    return digest
+
+# Incorrect — missing type annotations, no error handling
+define hash_content with data:
+    return ep_sha256(data)
+```
+
+### Memory management
+- Strings are immutable pointers — safe to copy freely
+- Lists and maps follow ownership/move semantics — document transfers clearly
+- Byte buffers (`alloc_bytes`) must be manually freed with `free_bytes`
+- FFI calls must pair every allocation with a deallocation
+
+### Naming conventions
+- Functions: `verb_noun` pattern — `create_wallet`, `verify_signature`, `hash_content`
+- Structs: `PascalCase` — `PeerInfo`, `SessionToken`, `MerkleNode`
+- Variables: `snake_case` — `peer_count`, `block_hash`, `session_token`
+- Constants: Defined as `set CONSTANT_NAME to value` at module top
+
+### Comments
+- Explain *why*, not *what*
+- No `TODO`, `FIXME`, `HACK`, or `placeholder` comments in submitted code
+- Document non-obvious decisions, protocol specifics, and edge case handling
+
+---
+
+## The Eleven Laws
+
+Every contribution to ErnosDecent is held to these standards. They are defined in full in [AGENT.md](AGENT.md). The summary:
+
+| # | Law | What it means |
+|---|-----|---------------|
+| 1 | No Stubs | Every function must be complete and operational |
+| 2 | No Minimal Implementations | Every component must be production-grade on first write |
+| 3 | No Hallucinated Success | Never claim something works unless you have verified it works |
+| 4 | No Reward Hacking | Optimise for actual progress, not the appearance of progress |
+| 5 | No Soft-Cover Hedges | State what code does and does not do — no vague disclaimers |
+| 6 | No Justification Clauses | Do not pre-justify future failure |
+| 7 | No Architecture Astronautics | Engineer exactly what is needed — no more, no less |
+| 8 | No Silent Failures | Every error must be reported and visible |
+| 9 | No Unverified Claims | Verify facts about external systems before stating them |
+| 10 | No Scope Creep Without Declaration | Do not silently change what you are building |
+| 11 | Every Line Must Compile and Run | No code is submitted that has not been verified to compile |
+
+**The standard:** Every line of code in ErnosDecent must be code that Maria Smith would sign her name to.
+
+---
+
+## Writing Tests
+
+Every subsystem has a test suite in `test_*.ep`. Tests use the Ernos `test` standard library:
+
+```ernos
+import "test"
+
+define test_my_feature returning Int:
+    # Test valid input
+    set result to my_function("valid_input")
+    assert_true(string_length(result) > 0, "my_function should return non-empty result")
+
+    # Test boundary conditions
+    set empty_result to my_function("")
+    assert_true(empty_result equals "error:empty_input", "my_function should handle empty input")
+
+    # Test error paths
+    set bad_result to my_function("malformed\x00data")
+    assert_true(string_contains(bad_result, "error:") == 1, "my_function should reject malformed input")
+
+    display "  my_feature: PASS"
+    return 0
+```
+
+### Test requirements
+- Every test must test something that could actually fail
+- Include: valid input, invalid input, boundary values, error recovery
+- Tests must be deterministic — no randomness unless testing random behaviour
+- Name tests clearly: `test_feature_being_tested`
+
+### Running tests
+
+```bash
+# Compile and run
+ernos decent_id/test_keys.ep && ./decent_id/test_keys
+
+# Type-check only (faster feedback loop)
+ernos check decent_id/keys.ep
+```
+
+---
+
+## Submitting Changes
+
+### 1. Fork and branch
+
+```bash
+git checkout -b feature/your-feature-name
+```
+
+### 2. Write your code
+
+Follow the coding standards above. Compile and run tests before committing.
+
+### 3. Verify
+
+```bash
+# Your module compiles
+ernos check your_module.ep
+
+# Your module's tests pass
+ernos your_test.ep && ./your_test
+
+# Existing tests still pass
+for test in decent_*/test_*.ep; do
+    ernos "$test" && "./${test%.ep}" || echo "FAIL: $test"
+done
+```
+
+### 4. Commit
+
+Write clear, descriptive commit messages:
+
+```
+decent_net: implement QUIC handshake with 0-RTT resumption
+
+- Implements Initial, Handshake, and 1-RTT packet types
+- TLS 1.3 integration via libssl FFI
+- Connection migration via connection IDs
+- 0-RTT data for repeat connections
+
+Tests: 12/12 passing
+```
+
+### 5. Open a pull request
+
+- Title: `module: short description`
+- Body: what was implemented, what was tested, test output
+- Include the actual test output in your PR description
+
+---
+
+## Reporting Issues
+
+### Bug reports
+
+Include:
+- **Module**: which `decent_*/` subsystem
+- **Steps to reproduce**: exact commands to trigger the issue
+- **Expected behaviour**: what should happen
+- **Actual behaviour**: what actually happens
+- **Compiler output**: full error output from `ernos` or `clang`
+- **Platform**: OS, architecture, Clang version, libsodium version
+
+### Feature requests
+
+ErnosDecent has a defined architecture. Feature requests should align with the existing subsystem structure. If your request involves a new subsystem, open a discussion first.
+
+---
+
+## Code of Conduct
+
+Be direct. Be honest. Write code you would sign your name to. The rest follows.
+
+---
+
+*Maria Smith. Scotland. 2026.*

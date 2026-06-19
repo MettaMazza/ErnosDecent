@@ -1,0 +1,459 @@
+# ErnosPlain Shared LLM Interface Module
+# Component: decent_agent/llm.ep
+# Provides query_local_llm, try_chat_completion, json_escape_string, http_dechunk, agent_list_models
+# Shared by react_loop.ep and observer.ep to avoid circular imports.
+
+import "collections"
+import "string"
+import "json"
+import "../stdlib/http"
+
+external define ep_net_connect with host and port
+external define ep_net_close with fd
+
+define is_port_open with host as Str and port as Int returning Int:
+    set fd to ep_net_connect(host and port)
+    if fd > 0:
+        set ok to ep_net_close(fd)
+        return 1
+    return 0
+
+define json_escape_string with s as Str returning Str:
+    set len to string_length(s)
+    set result_list to create_list()
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(s and i)
+        if ch == 34: # "
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 34)
+        else if ch == 92: # \
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 92)
+        else if ch == 10: # \n
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 110)
+        else if ch == 13: # \r
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 114)
+        else if ch == 9: # \t
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 116)
+        else if ch >= 32:
+            set ok to append_list(result_list and ch)
+        set i to i + 1
+    set escaped to string_from_list(result_list)
+    free_list(result_list)
+    return escaped
+define http_dechunk with body as Str returning Str:
+    set len to string_length(body)
+    if len < 5:
+        return body
+    set pos to 0
+    set has_crlf to 0
+    set limit to 8
+    if limit > len:
+        set limit to len
+    repeat while pos < limit and has_crlf == 0:
+        set ch to get_character(body and pos)
+        if ch == 13:
+            set next_ch to get_character(body and pos + 1)
+            if next_ch == 10:
+                set has_crlf to 1
+            else:
+                set pos to pos + 1
+        else:
+            set pos to pos + 1
+    if has_crlf == 0:
+        return body
+    set hex_str to substring(body and 0 and pos)
+    set is_hex to 1
+    set hi to 0
+    set hex_len to string_length(hex_str)
+    if hex_len == 0:
+        set is_hex to 0
+    repeat while hi < hex_len:
+        set hc to get_character(hex_str and hi)
+        if (hc >= 48 and hc <= 57) or else (hc >= 97 and hc <= 102) or else (hc >= 65 and hc <= 70):
+            set ok to 1
+        else:
+            set is_hex to 0
+        set hi to hi + 1
+    if is_hex == 0:
+        return body
+    set result_list to create_list()
+    set curr_pos to 0
+    set outer_loop to 1
+    repeat while curr_pos < len and outer_loop == 1:
+        set chunk_pos to curr_pos
+        set found_crlf to 0
+        set sub_limit to curr_pos + 8
+        if sub_limit > len:
+            set sub_limit to len
+        repeat while chunk_pos < sub_limit and found_crlf == 0:
+            set ch to get_character(body and chunk_pos)
+            if ch == 13:
+                if chunk_pos + 1 < len:
+                    set next_ch to get_character(body and chunk_pos + 1)
+                    if next_ch == 10:
+                        set found_crlf to 1
+                    else:
+                        set chunk_pos to chunk_pos + 1
+                else:
+                    set chunk_pos to chunk_pos + 1
+            else:
+                set chunk_pos to chunk_pos + 1
+        if found_crlf == 0:
+            set outer_loop to 0
+        else:
+            set size_hex to substring(body and curr_pos and chunk_pos - curr_pos)
+            set chunk_size to 0
+            set hex_idx to 0
+            set size_hex_len to string_length(size_hex)
+            repeat while hex_idx < size_hex_len:
+                set hc to get_character(size_hex and hex_idx)
+                set val to 0
+                if hc >= 48 and hc <= 57:
+                    set val to hc - 48
+                else if hc >= 97 and hc <= 102:
+                    set val to hc - 87
+                else if hc >= 65 and hc <= 70:
+                    set val to hc - 55
+                set chunk_size to chunk_size * 16 + val
+                set hex_idx to hex_idx + 1
+            if chunk_size == 0:
+                set outer_loop to 0
+            else:
+                set data_start to chunk_pos + 2
+                if data_start + chunk_size <= len:
+                    set di to 0
+                    repeat while di < chunk_size:
+                        set dc to get_character(body and data_start + di)
+                        set ok to append_list(result_list and dc)
+                        set di to di + 1
+                    set curr_pos to data_start + chunk_size + 2
+                else:
+                    set outer_loop to 0
+    set decompressed to string_from_list(result_list)
+    free_list(result_list)
+    return decompressed
+
+define get_system_ram_gb returning Int:
+    set ram_gb to 16
+    set sys_res to run_command("sysctl -n hw.memsize 2>/dev/null")
+    if string_length(sys_res) > 0:
+        set bytes to string_to_int(sys_res)
+        if bytes > 0:
+            return bytes / 1073741824
+    set mem_res to run_command("grep MemTotal /proc/meminfo 2>/dev/null")
+    if string_length(mem_res) > 0:
+        set clean_digits to ""
+        set len to string_length(mem_res)
+        set i to 0
+        repeat while i < len:
+            set ch to get_character(mem_res and i)
+            if ch >= 48 and ch <= 57:
+                set clean_digits to concat(clean_digits and substring(mem_res and i and 1))
+            set i to i + 1
+        if string_length(clean_digits) > 0:
+            set kb to string_to_int(clean_digits)
+            if kb > 0:
+                return kb / 1048576
+    return ram_gb
+
+define get_model_context_limit with model_name as Str returning Int:
+    set model_max to 8192
+    if string_contains(model_name and "gemma4") == 1:
+        set model_max to 200000
+    else if string_contains(model_name and "llama3.1") == 1:
+        set model_max to 131072
+    else if string_contains(model_name and "llama3.2") == 1:
+        set model_max to 131072
+    else if string_contains(model_name and "mistral-nemo") == 1:
+        set model_max to 128000
+    else if string_contains(model_name and "command-r") == 1:
+        set model_max to 128000
+    else if string_contains(model_name and "phi3") == 1:
+        set model_max to 128000
+    else if string_contains(model_name and "llama3") == 1:
+        set model_max to 8192
+    else if string_contains(model_name and "gemma2") == 1:
+        set model_max to 8192
+    set ram_gb to get_system_ram_gb()
+    set limit to 8192
+    if ram_gb >= 128:
+        set limit to model_max
+    else if ram_gb >= 64:
+        if model_max > 65536:
+            set limit to 65536
+        else:
+            set limit to model_max
+    else if ram_gb >= 32:
+        if model_max > 32768:
+            set limit to 32768
+        else:
+            set limit to model_max
+    else if ram_gb >= 16:
+        if model_max > 16384:
+            set limit to 16384
+        else:
+            set limit to model_max
+    else:
+        if model_max > 8192:
+            set limit to 8192
+        else:
+            set limit to model_max
+    return limit
+
+define try_chat_completion with url as Str and model_name as Str and prompt as Str returning Str:
+    set headers to "Content-Type: application/json"
+    set escaped_prompt to json_escape_string(prompt)
+    
+    set body to "{\"model\": \""
+    set body to concat(body and model_name)
+    set body to concat(body and "\", \"messages\": [{\"role\": \"user\", \"content\": \"")
+    set body to concat(body and escaped_prompt)
+    if string_contains(url and "11434") == 1:
+        set num_ctx to get_model_context_limit(model_name)
+        set num_ctx_str to int_to_string(num_ctx)
+        set body to concat(body and "\"}], \"options\": {\"num_ctx\": ")
+        set body to concat(body and num_ctx_str)
+        set body to concat(body and "}}")
+    else:
+        set body to concat(body and "\"}]}")
+    
+    display f"[LLM DEBUG] POST {url} model={model_name} body_len={string_length(body)}"
+    set response to http_post(url and headers and body)
+    display f"[LLM DEBUG] Raw response length: {string_length(response)}"
+    
+    if string_length(response) == 0:
+        display "[LLM DEBUG] FAIL: http_post returned empty string"
+        return ""
+    
+    if string_length(response) < 200:
+        display f"[LLM DEBUG] Short response: {response}"
+        
+    if response equals "Error: connection failed":
+        display "[LLM DEBUG] FAIL: connection failed"
+        return ""
+        
+    set response to http_dechunk(response)
+    display f"[LLM DEBUG] After dechunk length: {string_length(response)}"
+        
+    if string_contains(response and "\"error\":") == 1:
+        display f"[LLM DEBUG] FAIL: response contains error JSON key"
+        return ""
+        
+    set root_node to json_parse(response)
+    if root_node == 0:
+        display "[LLM DEBUG] FAIL: json_parse returned 0"
+        return ""
+        
+    set choices_node to get_json_object_value(root_node and "choices")
+    if choices_node == 0:
+        display "[LLM DEBUG] FAIL: no 'choices' in JSON"
+        return ""
+        
+    set choices_list to get_json_value(choices_node)
+    if length_list(choices_list) == 0:
+        display "[LLM DEBUG] FAIL: choices list empty"
+        return ""
+        
+    set first_choice to get_list(choices_list and 0)
+    if first_choice == 0:
+        display "[LLM DEBUG] FAIL: first choice is null"
+        return ""
+        
+    set message_node to get_json_object_value(first_choice and "message")
+    if message_node == 0:
+        display "[LLM DEBUG] FAIL: no 'message' in choice"
+        return ""
+        
+    set content_node to get_json_object_value(message_node and "content")
+    if content_node == 0:
+        display "[LLM DEBUG] FAIL: no 'content' in message"
+        return ""
+        
+    set content_str to get_json_value(content_node)
+    display f"[LLM DEBUG] SUCCESS: got content length={string_length(content_str)}"
+    return content_str
+
+define agent_list_models returning Str:
+    set models_list to create_list()
+    set headers to "Accept: application/json"
+    
+    # 1. Query Ollama
+    set ollama_resp to ""
+    if is_port_open("127.0.0.1" and 11434) == 1:
+        set ollama_resp to http_get("http://127.0.0.1:11434/api/tags" and headers)
+        set ollama_resp to http_dechunk(ollama_resp)
+    if string_length(ollama_resp) > 0:
+        if ollama_resp equals "Error: connection failed":
+            set ok to 0
+        else:
+            set root to json_parse(ollama_resp)
+            if root != 0:
+                set models_node to get_json_object_value(root and "models")
+                if models_node != 0:
+                    set m_list to get_json_value(models_node)
+                    set m_len to length_list(m_list)
+                    set i to 0
+                    repeat while i < m_len:
+                        set item to get_list(m_list and i)
+                        set name_node to get_json_object_value(item and "name")
+                        if name_node != 0:
+                            set name_str to get_json_value(name_node)
+                            # Check duplicates
+                            set dup to 0
+                            set j to 0
+                            set cur_len to length_list(models_list)
+                            repeat while j < cur_len:
+                                  set existing to get_list(models_list and j)
+                                  if existing equals name_str:
+                                      set dup to 1
+                                  set j to j + 1
+                            if dup == 0:
+                                set ok to append_list(models_list and name_str)
+                        set i to i + 1
+
+    # 2. Query LM Studio
+    set lm_resp to ""
+    if is_port_open("127.0.0.1" and 1234) == 1:
+        set lm_resp to http_get("http://127.0.0.1:1234/v1/models" and headers)
+        set lm_resp to http_dechunk(lm_resp)
+    if string_length(lm_resp) > 0:
+        if lm_resp equals "Error: connection failed":
+            set ok to 0
+        else:
+            set root2 to json_parse(lm_resp)
+            if root2 != 0:
+                set data_node to get_json_object_value(root2 and "data")
+                if data_node != 0:
+                    set d_list to get_json_value(data_node)
+                    set d_len to length_list(d_list)
+                    set i to 0
+                    repeat while i < d_len:
+                        set item to get_list(d_list and i)
+                        set id_node to get_json_object_value(item and "id")
+                        if id_node != 0:
+                            set id_str to get_json_value(id_node)
+                            # Check duplicates
+                            set dup to 0
+                            set j to 0
+                            set cur_len to length_list(models_list)
+                            repeat while j < cur_len:
+                                  set existing to get_list(models_list and j)
+                                  if existing equals id_str:
+                                      set dup to 1
+                                  set j to j + 1
+                            if dup == 0:
+                                set ok to append_list(models_list and id_str)
+                        set i to i + 1
+
+
+
+    # 3. Query llama.cpp servers (8080, 8081) — OpenAI-compatible /v1/models, same
+    #    shape as LM Studio (.data[].id). Probe both ports the user may run llama.cpp on.
+    set llama_ports to create_list()
+    set ok to append_list(llama_ports and 8080)
+    set ok to append_list(llama_ports and 8081)
+    set lp to 0
+    repeat while lp < length_list(llama_ports):
+        set lc_port to get_list(llama_ports and lp)
+        set lc_resp to ""
+        if is_port_open("127.0.0.1" and lc_port) == 1:
+            set lc_resp to http_get(concat(concat("http://127.0.0.1:" and int_to_string(lc_port)) and "/v1/models") and headers)
+            set lc_resp to http_dechunk(lc_resp)
+        if string_length(lc_resp) > 0:
+            if (lc_resp equals "Error: connection failed") == 0:
+                set lroot to json_parse(lc_resp)
+                if lroot != 0:
+                    set ldata to get_json_object_value(lroot and "data")
+                    if ldata != 0:
+                        set ld_list to get_json_value(ldata)
+                        set li to 0
+                        repeat while li < length_list(ld_list):
+                            set litem to get_list(ld_list and li)
+                            set lid_node to get_json_object_value(litem and "id")
+                            if lid_node != 0:
+                                set lid_str to get_json_value(lid_node)
+                                set ldup to 0
+                                set lj to 0
+                                repeat while lj < length_list(models_list):
+                                    if get_list(models_list and lj) equals lid_str:
+                                        set ldup to 1
+                                    set lj to lj + 1
+                                if ldup == 0:
+                                    set ok to append_list(models_list and lid_str)
+                            set li to li + 1
+        set lp to lp + 1
+
+    # Format list to JSON string
+    set out_json to "["
+    set list_len to length_list(models_list)
+    set idx to 0
+    repeat while idx < list_len:
+        set model_val to get_list(models_list and idx)
+        set out_json to concat(out_json and "\"")
+        set out_json to concat(out_json and model_val)
+        set out_json to concat(out_json and "\"")
+        if idx < list_len - 1:
+            set out_json to concat(out_json and ",")
+        set idx to idx + 1
+    set out_json to concat(out_json and "]")
+    
+    free_list(models_list)
+    return out_json
+
+define query_local_llm with prompt as Str and selected_model as Str returning Str:
+    if string_length(selected_model) > 0:
+        # 1. Try selected_model on LM Studio (1234)
+        if is_port_open("127.0.0.1" and 1234) == 1:
+            display f"[LLM] Trying selected model '{selected_model}' on LM Studio (1234)..."
+            set res to try_chat_completion("http://127.0.0.1:1234/v1/chat/completions" and selected_model and prompt)
+            if string_length(res) > 0:
+                return res
+            
+        # 2. Try selected_model on Ollama (11434)
+        if is_port_open("127.0.0.1" and 11434) == 1:
+            display f"[LLM] Trying selected model '{selected_model}' on Ollama (11434)..."
+            set res to try_chat_completion("http://127.0.0.1:11434/v1/chat/completions" and selected_model and prompt)
+            if string_length(res) > 0:
+                return res
+
+        # 3. Try selected_model on llama.cpp servers (8080 / 8081). llama.cpp serves the
+        #    loaded model via the OpenAI-compatible endpoint and ignores the model field.
+        if is_port_open("127.0.0.1" and 8080) == 1:
+            display f"[LLM] Trying selected model '{selected_model}' on llama.cpp (8080)..."
+            set res to try_chat_completion("http://127.0.0.1:8080/v1/chat/completions" and selected_model and prompt)
+            if string_length(res) > 0:
+                return res
+        if is_port_open("127.0.0.1" and 8081) == 1:
+            display f"[LLM] Trying selected model '{selected_model}' on llama.cpp (8081)..."
+            set res to try_chat_completion("http://127.0.0.1:8081/v1/chat/completions" and selected_model and prompt)
+            if string_length(res) > 0:
+                return res
+
+        display f"[LLM] Selected model '{selected_model}' failed or offline. Falling through to cascade."
+
+    # Default cascade. llama.cpp (8080/8081) first — it serves whatever model is loaded.
+    if is_port_open("127.0.0.1" and 8080) == 1:
+        set res to try_chat_completion("http://127.0.0.1:8080/v1/chat/completions" and selected_model and prompt)
+        if string_length(res) > 0:
+            return res
+    if is_port_open("127.0.0.1" and 8081) == 1:
+        set res to try_chat_completion("http://127.0.0.1:8081/v1/chat/completions" and selected_model and prompt)
+        if string_length(res) > 0:
+            return res
+
+    # Then gemma4:26b on Ollama / LM Studio.
+    if is_port_open("127.0.0.1" and 11434) == 1:
+        set res to try_chat_completion("http://127.0.0.1:11434/v1/chat/completions" and "gemma4:26b" and prompt)
+        if string_length(res) > 0:
+            return res
+    if is_port_open("127.0.0.1" and 1234) == 1:
+        set res to try_chat_completion("http://127.0.0.1:1234/v1/chat/completions" and "gemma4:26b" and prompt)
+        if string_length(res) > 0:
+            return res
+
+    return ""

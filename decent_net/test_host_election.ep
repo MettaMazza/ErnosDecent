@@ -1,0 +1,107 @@
+# Test suite for host election and fallback routing
+import "string"
+import "collections"
+import "json"
+import "dht"
+import "host_election"
+
+# Mock bootstrap_to_seed to satisfy compiler links in standalone test mode
+define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node as Int and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int returning Map:
+    display f"  [MOCK] Bootstrapped to {seed_addr}:{int_to_string(seed_port)}"
+    set res to create_map()
+    set ok to map_insert(res and "connected" and 1)
+    return res
+
+define main:
+    display "==================================================="
+    display "  ErnOS GitDec Host Election Test Suite"
+    display "==================================================="
+
+    # Test 1: Serialization and Deserialization
+    display "TEST 1: Serialize and Deserialize Host List"
+    set list to create_list()
+    
+    set host1 to create_map()
+    set ok to map_insert(host1 and "node_id" and "peer_a")
+    set ok to map_insert(host1 and "address" and "1.1.1.1")
+    set ok to map_insert(host1 and "port" and 9100)
+    set ok to map_insert(host1 and "connections" and 5)
+    set ok to map_insert(host1 and "last_seen" and 1000)
+    set ok to map_insert(host1 and "is_static" and 0)
+    set ok to append_list(list and host1)
+
+    set host2 to create_map()
+    set ok to map_insert(host2 and "node_id" and "peer_b")
+    set ok to map_insert(host2 and "address" and "2.2.2.2")
+    set ok to map_insert(host2 and "port" and 9100)
+    set ok to map_insert(host2 and "connections" and 10)
+    set ok to map_insert(host2 and "last_seen" and 1000)
+    set ok to map_insert(host2 and "is_static" and 0)
+    set ok to append_list(list and host2)
+
+    set json_str to host_list_serialize(list)
+    display f"  Serialized JSON: {json_str}"
+    
+    set root_node to json_parse(json_str)
+    if root_node == 0:
+        display "  FAIL: json_parse failed"
+        return 1
+        
+    set parsed_list_map to host_json_to_map(root_node)
+    set parsed_list to host_cast_map_to_list(parsed_list_map)
+    if length_list(parsed_list) != 2:
+        display f"  FAIL: Expected 2 items, got {int_to_string(length_list(parsed_list))}"
+        return 1
+        
+    set item1 to get_list(parsed_list and 0)
+    set item2 to get_list(parsed_list and 1)
+    if (map_get_val(item1 and "node_id") equals "peer_a") == 0:
+        display "  FAIL: node_id mismatch for item 1"
+        return 1
+    display "  PASS: Serialization and deserialization verified."
+
+    # Test 2: Sorting and election ranking
+    display "TEST 2: Host Node Election Sorting (Preferred/Static Node)"
+    
+    # Let's add a static/preferred host node
+    set host3 to create_map()
+    set ok to map_insert(host3 and "node_id" and "peer_static")
+    set ok to map_insert(host3 and "address" and "3.3.3.3")
+    set ok to map_insert(host3 and "port" and 9100)
+    set ok to map_insert(host3 and "connections" and 2)
+    set ok to map_insert(host3 and "last_seen" and 1000)
+    set ok to map_insert(host3 and "is_static" and 1)
+    set ok to append_list(list and host3)
+    
+    # Currently:
+    # host1: peer_a, connections=5, static=0
+    # host2: peer_b, connections=10, static=0
+    # host3: peer_static, connections=2, static=1
+    
+    set ok to sort_hosts_descending(list)
+    
+    # Expected order after sort:
+    # 0: peer_static (because static gets +10000 score)
+    # 1: peer_b (connections=10)
+    # 2: peer_a (connections=5)
+    
+    set first_host to get_list(list and 0)
+    set second_host to get_list(list and 1)
+    set third_host to get_list(list and 2)
+    
+    set first_id to map_get_val(first_host and "node_id")
+    if (first_id equals "peer_static") == 0:
+        display f"  FAIL: Expected peer_static first, got '{first_id}'"
+        return 1
+    set second_id to map_get_val(second_host and "node_id")
+    if (second_id equals "peer_b") == 0:
+        display f"  FAIL: Expected peer_b second, got '{second_id}'"
+        return 1
+    set third_id to map_get_val(third_host and "node_id")
+    if (third_id equals "peer_a") == 0:
+        display f"  FAIL: Expected peer_a third, got '{third_id}'"
+        return 1
+        
+    display "  PASS: Host sorting and preferred prioritization verified."
+    display "ALL TESTS PASSED!"
+    return 0

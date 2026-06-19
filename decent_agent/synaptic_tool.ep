@@ -1,0 +1,262 @@
+# ErnosPlain Rebuild of ErnOS Agent Synaptic Graph Tool
+# Component: decent_agent/synaptic_tool.ep
+
+import "collections"
+import "string"
+import "memory"
+
+define operate_synaptic_graph with memory_mgr as Map and action_name as Str and args_list as List returning Str:
+    set action to string_lower(string_trim(action_name))
+    set syn_nodes to map_get_val(memory_mgr and "synaptic_nodes")
+    set syn_edges to map_get_val(memory_mgr and "synaptic_edges")
+    set syn_layers to map_get_val(memory_mgr and "synaptic_layers")
+    
+    if action equals "store":
+        if length_list(args_list) < 2:
+            return "Error: store action requires concept and data arguments."
+            
+        set concept to get_list(args_list and 0)
+        set data_val to get_list(args_list and 1)
+        set layer_val to "concepts"
+        if length_list(args_list) >= 3:
+            set layer_val to get_list(args_list and 2)
+            
+        set key to string_lower(string_trim(concept))
+        
+        # Check if concept already exists
+        set node_map to 0
+        if map_contains(syn_nodes and key) == 1:
+            set node_map to map_get_val(syn_nodes and key)
+        else:
+            set node_map to create_map()
+            set ok to map_insert(node_map and "concept" and concept)
+            set ok to map_insert(node_map and "layer" and layer_val)
+            set node_data to create_list()
+            set ok to map_insert(node_map and "data" and node_data)
+            set ok to map_insert(syn_nodes and key and node_map)
+            
+        set d_list to map_get_val(node_map and "data")
+        set already to 0
+        set d_len to length_list(d_list)
+        set idx to 0
+        repeat while idx < d_len:
+            set item to get_list(d_list and idx)
+            if item equals data_val:
+                set already to 1
+            set idx to idx + 1
+            
+        if already == 0:
+            set ok to append_list(d_list and data_val)
+            
+        # Auto-serialize memory
+        set ser_err to memory_serialize(memory_mgr and "config/agent_memory.json")
+        return f"Stored: '{concept}' -> '{data_val}'"
+        
+    if action equals "search":
+        if length_list(args_list) < 1:
+            return "Error: search action requires concept argument."
+        set concept to get_list(args_list and 0)
+        set query to string_lower(string_trim(concept))
+        
+        # Exact match check
+        if map_contains(syn_nodes and query) == 1:
+            set node_map to map_get_val(syn_nodes and query)
+            set concept_name to map_get_val(node_map and "concept")
+            set d_list to map_get_val(node_map and "data")
+            set d_len to length_list(d_list)
+            set res to f"Found exact match for '{concept_name}':\n"
+            set idx to 0
+            repeat while idx < d_len:
+                set item to get_list(d_list and idx)
+                set res to concat(res and f"  - {item}\n")
+                set idx to idx + 1
+            return res
+            
+        # Substring/prefix search fallback
+        set res to ""
+        set n_keys to map_keys(syn_nodes)
+        set n_len to length_list(n_keys)
+        set match_count to 0
+        set idx to 0
+        repeat while idx < n_len:
+            set k to get_list(n_keys and idx)
+            if string_contains(k and query) == 1 or else string_contains(query and k) == 1:
+                set node_map to map_get_val(syn_nodes and k)
+                set concept_name to map_get_val(node_map and "concept")
+                set d_list to map_get_val(node_map and "data")
+                set d_len to length_list(d_list)
+                set res to concat(res and f"[{concept_name}]:\n")
+                set j to 0
+                repeat while j < d_len:
+                    set item to get_list(d_list and j)
+                    set res to concat(res and f"  - {item}\n")
+                    set j to j + 1
+                set match_count to match_count + 1
+            set idx to idx + 1
+        free_list(n_keys)
+        
+        if match_count == 0:
+            return f"No knowledge found for concept '{concept}'."
+            
+        return f"Found {int_to_string(match_count)} partial matches:\n{res}"
+        
+    if action equals "beliefs":
+        set limit to 10
+        if length_list(args_list) >= 1:
+            set limit_arg to get_list(args_list and 0)
+            set limit to limit_arg
+            
+        set n_keys to map_keys(syn_nodes)
+        set n_len to length_list(n_keys)
+        
+        # Sort concepts by data list length (simple bubble sort)
+        set sorted_keys to create_list()
+        set i to 0
+        repeat while i < n_len:
+            set ok to append_list(sorted_keys and get_list(n_keys and i))
+            set i to i + 1
+        free_list(n_keys)
+        
+        set i to 0
+        repeat while i < n_len:
+            set j to i + 1
+            repeat while j < n_len:
+                set k1 to get_list(sorted_keys and i)
+                set k2 to get_list(sorted_keys and j)
+                set n1_map to map_get_val(syn_nodes and k1)
+                set n2_map to map_get_val(syn_nodes and k2)
+                set len1 to length_list(map_get_val(n1_map and "data"))
+                set len2 to length_list(map_get_val(n2_map and "data"))
+                if len2 > len1:
+                    # Swap
+                    set ok to set_list(sorted_keys and i and k2)
+                    set ok to set_list(sorted_keys and j and k1)
+                set j to j + 1
+            set i to i + 1
+            
+        set res to "Core Beliefs:\n"
+        set count to limit
+        if n_len < count:
+            set count to n_len
+            
+        set i to 0
+        repeat while i < count:
+            set k to get_list(sorted_keys and i)
+            set node_map to map_get_val(syn_nodes and k)
+            set concept_name to map_get_val(node_map and "concept")
+            set d_list to map_get_val(node_map and "data")
+            set d_len to length_list(d_list)
+            
+            # Summarize data
+            set summary to ""
+            set j to 0
+            set summary_limit to 3
+            if d_len < summary_limit:
+                set summary_limit to d_len
+            repeat while j < summary_limit:
+                set item to get_list(d_list and j)
+                if j > 0:
+                    set summary to concat(summary and "; ")
+                set summary to concat(summary and item)
+                set j to j + 1
+            if d_len > 3:
+                set summary to concat(summary and f" (+{int_to_string(d_len - 3)} more)")
+                
+            set res to concat(res and f"{int_to_string(i + 1)}. {concept_name}: {summary}\n")
+            set i to i + 1
+            
+        free_list(sorted_keys)
+        return res
+        
+    if action equals "relate":
+        if length_list(args_list) < 3:
+            return "Error: relate action requires from, relation, and to arguments."
+        set from_node to get_list(args_list and 0)
+        set relation to get_list(args_list and 1)
+        set to_node to get_list(args_list and 2)
+        
+        # Contradiction check: scan existing edges
+        set from_lower to string_lower(from_node)
+        set relation_lower to string_lower(relation)
+        set to_lower to string_lower(to_node)
+        
+        set contradiction_found to 0
+        set contradicting_target to ""
+        
+        set e_len to length_list(syn_edges)
+        set idx to 0
+        repeat while idx < e_len:
+            set edge to get_list(syn_edges and idx)
+            set e_from to string_lower(map_get_val(edge and "from"))
+            set e_relation to string_lower(map_get_val(edge and "relation"))
+            set e_to to string_lower(map_get_val(edge and "to"))
+            
+            if e_from equals from_lower and also e_relation equals relation_lower and also (e_to equals to_lower == 0):
+                set contradiction_found to 1
+                set contradicting_target to map_get_val(edge and "to")
+            set idx to idx + 1
+            
+        if contradiction_found == 1:
+            return f"Warning: Contradiction detected. '{from_node}' is already '{relation}' '{contradicting_target}', but you're asserting '{to_node}'."
+            
+        # Add new edge map
+        set edge_map to create_map()
+        set ok to map_insert(edge_map and "from" and from_node)
+        set ok to map_insert(edge_map and "relation" and relation)
+        set ok to map_insert(edge_map and "to" and to_node)
+        set ok to map_insert(edge_map and "weight" and 500000)
+        set ok to map_insert(edge_map and "activation_count" and 1)
+        set ok to map_insert(edge_map and "permanent" and 0)
+        set ok to append_list(syn_edges and edge_map)
+        
+        # Auto-serialize memory
+        set ser_err to memory_serialize(memory_mgr and "config/agent_memory.json")
+        return f"Relationship stored: '{from_node}' --[{relation}]--> '{to_node}'"
+        
+    if action equals "stats":
+        set n_keys to map_keys(syn_nodes)
+        set num_nodes to length_list(n_keys)
+        free_list(n_keys)
+        set num_edges to length_list(syn_edges)
+        set num_layers to length_list(syn_layers)
+        return f"Synaptic Graph Stats:\n  Nodes: {int_to_string(num_nodes)}\n  Edges: {int_to_string(num_edges)}\n  Layers: {int_to_string(num_layers)}"
+        
+    if action equals "layers":
+        set res to f"KG Layers ({int_to_string(length_list(syn_layers))}):\n"
+        set l_len to length_list(syn_layers)
+        set idx to 0
+        repeat while idx < l_len:
+            set layer_map to get_list(syn_layers and idx)
+            set name_val to map_get_val(layer_map and "name")
+            set desc_val to map_get_val(layer_map and "description")
+            set root_val to map_get_val(layer_map and "root_node")
+            set res to concat(res and f"  * {name_val} - {desc_val} (root: {root_val})\n")
+            set idx to idx + 1
+        return res
+        
+    if action equals "link_memory":
+        if length_list(args_list) < 2:
+            return "Error: link_memory action requires concept and target arguments."
+        set concept to get_list(args_list and 0)
+        set target to get_list(args_list and 1)
+        set memory_type to "timeline"
+        if length_list(args_list) >= 3:
+            set memory_type to get_list(args_list and 2)
+            
+        set rel_type to concat("linked_to_" and memory_type)
+        
+        # Store typed relationship
+        set edge_map to create_map()
+        set ok to map_insert(edge_map and "from" and concept)
+        set ok to map_insert(edge_map and "relation" and rel_type)
+        set ok to map_insert(edge_map and "to" and target)
+        set ok to map_insert(edge_map and "weight" and 500000)
+        set ok to map_insert(edge_map and "activation_count" and 1)
+        set ok to map_insert(edge_map and "permanent" and 0)
+        set ok to append_list(syn_edges and edge_map)
+        
+        # Auto-serialize memory
+        set ser_err to memory_serialize(memory_mgr and "config/agent_memory.json")
+        return f"Linked concept '{concept}' to {memory_type} entry: '{target}'"
+        
+    return f"Unknown action: '{action_name}'. Available: store, search, beliefs, relate, stats, layers, link_memory"

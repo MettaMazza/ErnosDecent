@@ -1,0 +1,622 @@
+# ErnosDecent -- Test Suite for decent_net/dht.ep
+# Tests: XOR distance, routing table, k-bucket, value store, RPC
+# Note: Tests are inline in main to avoid exceeding global string
+#       constant initialization limits with many function definitions.
+#       Each importing this module brings 150+ functions already.
+# Status: Production -- OperationTrojanClaude Phase 3
+
+import "dht"
+import "../decent_id/keys"
+import "string"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_net/dht.ep Test Suite"
+    display "  OperationTrojanClaude Phase 3"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # ===========================================================
+    # TEST 1: XOR distance basic properties
+    # ===========================================================
+    display "TEST 1: XOR distance basic properties"
+    set t1_ok to 1
+    set id_a to "0000000000000000000000000000000000000000000000000000000000000001"
+    set dist_self to xor_distance(id_a and id_a)
+    set expected_zero to "0000000000000000000000000000000000000000000000000000000000000000"
+    if dist_self equals expected_zero:
+        set ok to 1
+    else:
+        display "  FAIL: self-distance not zero"
+        set t1_ok to 0
+
+    set id_b to "00000000000000000000000000000000000000000000000000000000000000ff"
+    set dist_ab to xor_distance(id_a and id_b)
+    set dist_ba to xor_distance(id_b and id_a)
+    if dist_ab equals dist_ba:
+        set ok to 1
+    else:
+        display "  FAIL: not symmetric"
+        set t1_ok to 0
+
+    set expected_fe to "00000000000000000000000000000000000000000000000000000000000000fe"
+    if dist_ab equals expected_fe:
+        set ok to 1
+    else:
+        display "  FAIL: 0x01 XOR 0xFF should be 0xFE"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: Leading zeros count
+    # ===========================================================
+    display "TEST 2: Leading zeros count"
+    set t2_ok to 1
+
+    set lz_zero to distance_leading_zeros(expected_zero)
+    if lz_zero != 256:
+        display f"  FAIL: all zeros = {lz_zero}, expected 256"
+        set t2_ok to 0
+
+    set high to "8000000000000000000000000000000000000000000000000000000000000000"
+    set lz_high to distance_leading_zeros(high)
+    if lz_high != 0:
+        display f"  FAIL: 0x8 = {lz_high}, expected 0"
+        set t2_ok to 0
+
+    set trailing1 to "0000000000000000000000000000000000000000000000000000000000000001"
+    set lz_trail to distance_leading_zeros(trailing1)
+    if lz_trail != 255:
+        display f"  FAIL: trailing 1 = {lz_trail}, expected 255"
+        set t2_ok to 0
+
+    set nibble_1 to "0100000000000000000000000000000000000000000000000000000000000000"
+    set lz_n1 to distance_leading_zeros(nibble_1)
+    if lz_n1 != 7:
+        display f"  FAIL: 0x01 = {lz_n1}, expected 7"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: Distance comparison
+    # ===========================================================
+    display "TEST 3: Distance comparison"
+    set t3_ok to 1
+    set small to "0000000000000000000000000000000000000000000000000000000000000001"
+    set large to "ff00000000000000000000000000000000000000000000000000000000000000"
+
+    if is_distance_less(small and large) != 1:
+        display "  FAIL: small < large"
+        set t3_ok to 0
+    if is_distance_less(large and small) != 0:
+        display "  FAIL: large !< small"
+        set t3_ok to 0
+    if is_distance_less(small and small) != 0:
+        display "  FAIL: equal not less"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: Routing table insert and lookup
+    # ===========================================================
+    display "TEST 4: Routing table insert and lookup"
+    set t4_ok to 1
+    set local_id to "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    set rt to create_routing_table(local_id)
+    set peer_id to "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    set peer to create_node(peer_id and "127.0.0.1" and 8000)
+    set add_r to routing_table_add(rt and peer)
+    if add_r != 0:
+        display "  FAIL: first add"
+        set t4_ok to 0
+    if routing_table_node_count(rt) != 1:
+        display "  FAIL: count != 1"
+        set t4_ok to 0
+    if routing_table_contains(rt and peer_id) != 1:
+        display "  FAIL: not found"
+        set t4_ok to 0
+    set random_id to "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    if routing_table_contains(rt and random_id) != 0:
+        display "  FAIL: false positive"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: Cannot add self
+    # ===========================================================
+    display "TEST 5: Cannot add self"
+    set t5_ok to 1
+    set rt5 to create_routing_table(local_id)
+    set self_node to create_node(local_id and "127.0.0.1" and 8000)
+    set self_r to routing_table_add(rt5 and self_node)
+    if self_r != DHT_ERR_SELF_INSERT:
+        display "  FAIL: self insert not rejected"
+        set t5_ok to 0
+    if routing_table_node_count(rt5) != 0:
+        display "  FAIL: count not 0"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Duplicate insert updates
+    # ===========================================================
+    display "TEST 6: Duplicate insert updates"
+    set t6_ok to 1
+    set rt6 to create_routing_table(local_id)
+    set ok to routing_table_add(rt6 and create_node(peer_id and "x" and 1))
+    if routing_table_node_count(rt6) != 1:
+        set t6_ok to 0
+    set peer2 to create_node(peer_id and "y" and 2)
+    set dup_r to routing_table_add(rt6 and peer2)
+    if dup_r != 1:
+        display "  FAIL: dup should return 1"
+        set t6_ok to 0
+    if routing_table_node_count(rt6) != 1:
+        display "  FAIL: count changed"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: Find closest nodes
+    # ===========================================================
+    display "TEST 7: Find closest nodes"
+    set t7_ok to 1
+    set local_z to "0000000000000000000000000000000000000000000000000000000000000000"
+    set rt7 to create_routing_table(local_z)
+    set id_close to "0000000000000000000000000000000000000000000000000000000000000001"
+    set id_mid to "000000000000000000000000000000000000000000000000000000000000ff00"
+    set id_far to "ff00000000000000000000000000000000000000000000000000000000000000"
+    set ok to routing_table_add(rt7 and create_node(id_close and "a" and 1))
+    set ok to routing_table_add(rt7 and create_node(id_mid and "b" and 2))
+    set ok to routing_table_add(rt7 and create_node(id_far and "c" and 3))
+
+    set closest7 to routing_table_find_closest(rt7 and local_z and 2)
+    set cc7 to length_list(closest7)
+    if cc7 != 2:
+        display f"  FAIL: expected 2, got {cc7}"
+        set t7_ok to 0
+
+    if cc7 >= 1:
+        set first7 to get_list(closest7 and 0)
+        set fid7 to map_get_val(first7 and "id")
+        if fid7 equals id_close:
+            set ok to 1
+        else:
+            display "  FAIL: first not closest"
+            set t7_ok to 0
+
+    if cc7 >= 2:
+        set second7 to get_list(closest7 and 1)
+        set sid7 to map_get_val(second7 and "id")
+        if sid7 equals id_mid:
+            set ok to 1
+        else:
+            display "  FAIL: second not mid"
+            set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: Node removal
+    # ===========================================================
+    display "TEST 8: Node removal"
+    set t8_ok to 1
+    set rt8 to create_routing_table(local_id)
+    set ok to routing_table_add(rt8 and create_node(peer_id and "x" and 1))
+    set removed to routing_table_remove(rt8 and peer_id)
+    if removed != 1:
+        display "  FAIL: removal failed"
+        set t8_ok to 0
+    if routing_table_node_count(rt8) != 0:
+        display "  FAIL: count not 0"
+        set t8_ok to 0
+    if routing_table_contains(rt8 and peer_id) != 0:
+        display "  FAIL: still found"
+        set t8_ok to 0
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9: Value store put and get
+    # ===========================================================
+    display "TEST 9: Value store put and get"
+    set t9_ok to 1
+    set store9 to create_value_store()
+    set vkey to "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+    set vval to "Hello, DHT world!"
+    set vpub to "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    set ok to value_store_put(store9 and vkey and vval and vpub)
+
+    set get9 to value_store_get(store9 and vkey)
+    if map_get_val(get9 and "error") != DHT_ERR_NONE:
+        display "  FAIL: get failed"
+        set t9_ok to 0
+
+    set got9 to map_get_val(get9 and "value")
+    if got9 equals vval:
+        set ok to 1
+    else:
+        display "  FAIL: value mismatch"
+        set t9_ok to 0
+
+    if t9_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9b: TOFU -- ownership keys (repo:/name:) reject hijack overwrites
+    # ===========================================================
+    display "TEST 9b: DHT ownership keys are first-writer-wins (anti-hijack)"
+    set t9b_ok to 1
+    set store9b to create_value_store()
+    set owner_a to "did:key:zOwnerAAAA"
+    set owner_b to "did:key:zAttackerBBBB"
+
+    set r1 to value_store_put(store9b and "repo:demoproject" and owner_a and "pubA")
+    if r1 != DHT_ERR_NONE:
+        display "  FAIL: initial repo owner store rejected"
+        set t9b_ok to 0
+
+    set r2 to value_store_put(store9b and "repo:demoproject" and owner_b and "pubAttacker")
+    if r2 != DHT_ERR_NONE:
+        set ok to 1
+    else:
+        display "  FAIL: repo owner was hijacked (overwrite accepted)"
+        set t9b_ok to 0
+
+    set who to value_store_get(store9b and "repo:demoproject")
+    if map_get_val(who and "value") equals owner_a:
+        set ok to 1
+    else:
+        display "  FAIL: stored owner changed after hijack attempt"
+        set t9b_ok to 0
+
+    set r3 to value_store_put(store9b and "repo:demoproject" and owner_a and "pubA")
+    if r3 == DHT_ERR_NONE:
+        set ok to 1
+    else:
+        display "  FAIL: legitimate re-publish of same owner rejected"
+        set t9b_ok to 0
+
+    set h1 to value_store_put(store9b and "network:host_nodes" and "hostlist_v1" and "pubX")
+    set h2 to value_store_put(store9b and "network:host_nodes" and "hostlist_v2" and "pubX")
+    if h2 == DHT_ERR_NONE:
+        set ok to 1
+    else:
+        display "  FAIL: non-ownership key overwrite wrongly rejected"
+        set t9b_ok to 0
+
+    if t9b_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 10: Value store not found
+    # ===========================================================
+    display "TEST 10: Value store not found"
+    set t10_ok to 1
+    set store10 to create_value_store()
+    set miss to value_store_get(store10 and "missing_key")
+    if map_get_val(miss and "error") != DHT_ERR_NOT_FOUND:
+        display "  FAIL: should be not found"
+        set t10_ok to 0
+
+    if t10_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 11: DHT node high-level
+    # ===========================================================
+    display "TEST 11: DHT node high-level"
+    set t11_ok to 1
+    set my_id to generate_random_node_id()
+    set dht11 to create_dht_node(my_id and "0.0.0.0" and 4001)
+    set p11a to generate_random_node_id()
+    set p11b to generate_random_node_id()
+    set ok to dht_node_add_peer(dht11 and p11a and "h1" and 1)
+    set ok to dht_node_add_peer(dht11 and p11b and "h2" and 2)
+    if dht_node_peer_count(dht11) != 2:
+        display "  FAIL: peer count"
+        set t11_ok to 0
+
+    set ok to dht_node_store_value(dht11 and "tkey" and "tval")
+    set get11 to dht_node_get_value(dht11 and "tkey")
+    if map_get_val(get11 and "error") != DHT_ERR_NONE:
+        display "  FAIL: get"
+        set t11_ok to 0
+
+    set got11 to map_get_val(get11 and "value")
+    if got11 equals "tval":
+        set ok to 1
+    else:
+        display "  FAIL: value mismatch"
+        set t11_ok to 0
+
+    if t11_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 12: RPC PING/PONG
+    # ===========================================================
+    display "TEST 12: RPC PING/PONG"
+    set t12_ok to 1
+    set dht12 to create_dht_node(generate_random_node_id() and "0.0.0.0" and 4001)
+    set sid12 to generate_random_node_id()
+    set ping12 to create_ping_message(sid12)
+    set resp12 to dht_handle_message(dht12 and ping12)
+    if map_get_val(resp12 and "error") != DHT_ERR_NONE:
+        display "  FAIL: ping error"
+        set t12_ok to 0
+    set reply12 to map_get_val(resp12 and "reply")
+    if map_get_val(reply12 and "type") != DHT_MSG_PONG:
+        display "  FAIL: not pong"
+        set t12_ok to 0
+    if dht_node_peer_count(dht12) != 1:
+        display "  FAIL: sender not added"
+        set t12_ok to 0
+
+    if t12_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 13: RPC FIND_NODE
+    # ===========================================================
+    display "TEST 13: RPC FIND_NODE"
+    set t13_ok to 1
+    set myid13 to generate_random_node_id()
+    set dht13 to create_dht_node(myid13 and "0.0.0.0" and 4001)
+    set ok to dht_node_add_peer(dht13 and generate_random_node_id() and "a" and 1)
+    set ok to dht_node_add_peer(dht13 and generate_random_node_id() and "b" and 2)
+    set ok to dht_node_add_peer(dht13 and generate_random_node_id() and "c" and 3)
+
+    set target13 to generate_random_node_id()
+    set sender13 to generate_random_node_id()
+    set find13 to create_find_node_message(sender13 and target13)
+    set resp13 to dht_handle_message(dht13 and find13)
+    if map_get_val(resp13 and "error") != DHT_ERR_NONE:
+        display "  FAIL: find_node error"
+        set t13_ok to 0
+    set reply13 to map_get_val(resp13 and "reply")
+    if map_get_val(reply13 and "type") != DHT_MSG_FIND_NODE_REPLY:
+        display "  FAIL: not find_node_reply"
+        set t13_ok to 0
+    set nodes13 to map_get_val(reply13 and "nodes")
+    set n13 to length_list(nodes13)
+    if n13 < 3:
+        display f"  FAIL: returned {n13} nodes, expected >= 3"
+        set t13_ok to 0
+
+    if t13_ok == 1:
+        display f"  Returned {n13} closest nodes"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 14: RPC STORE + FIND_VALUE
+    # ===========================================================
+    display "TEST 14: RPC STORE + FIND_VALUE"
+    set t14_ok to 1
+    set myid14 to generate_random_node_id()
+    set dht14 to create_dht_node(myid14 and "0.0.0.0" and 4001)
+    set sender14 to generate_random_node_id()
+    set key14 to "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+    set store14 to create_store_message(sender14 and key14 and "stored_by_peer")
+    set sr14 to dht_handle_message(dht14 and store14)
+    if map_get_val(sr14 and "error") != DHT_ERR_NONE:
+        display "  FAIL: store error"
+        set t14_ok to 0
+
+    set fv14 to create_find_value_message(sender14 and key14)
+    set fr14 to dht_handle_message(dht14 and fv14)
+    set freply14 to map_get_val(fr14 and "reply")
+    if map_get_val(freply14 and "type") != DHT_MSG_FIND_VALUE_REPLY:
+        display "  FAIL: not find_value_reply"
+        set t14_ok to 0
+    if map_get_val(freply14 and "found") != 1:
+        display "  FAIL: not found"
+        set t14_ok to 0
+    set fval14 to map_get_val(freply14 and "value")
+    if fval14 equals "stored_by_peer":
+        set ok to 1
+    else:
+        display "  FAIL: value mismatch"
+        set t14_ok to 0
+
+    if t14_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 15: Node ID from key is deterministic
+    # ===========================================================
+    display "TEST 15: Node ID deterministic"
+    set t15_ok to 1
+    set pub15 to "aabbccdd00112233445566778899aabbccddeeff0011223344556677aabbccdd"
+    set nid15a to generate_node_id_from_key(pub15)
+    set nid15b to generate_node_id_from_key(pub15)
+    if string_length(nid15a) != 64:
+        display "  FAIL: wrong length"
+        set t15_ok to 0
+    if nid15a equals nid15b:
+        set ok to 1
+    else:
+        display "  FAIL: not deterministic"
+        set t15_ok to 0
+
+    if t15_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 16: Many nodes + ordering verification
+    # ===========================================================
+    display "TEST 16: Many nodes + ordering"
+    set t16_ok to 1
+    set lid16 to generate_random_node_id()
+    set rt16 to create_routing_table(lid16)
+    set added16 to 0
+    set i16 to 0
+    repeat while i16 < 50:
+        set pid16 to generate_random_node_id()
+        set pn16 to create_node(pid16 and "h" and i16)
+        set ar16 to routing_table_add(rt16 and pn16)
+        if ar16 == 0:
+            set added16 to added16 + 1
+        set i16 to i16 + 1
+
+    if routing_table_node_count(rt16) != added16:
+        display "  FAIL: count mismatch"
+        set t16_ok to 0
+
+    set tgt16 to generate_random_node_id()
+    set cl16 to routing_table_find_closest(rt16 and tgt16 and 10)
+    set clc16 to length_list(cl16)
+    set exp16 to 10
+    if added16 < 10:
+        set exp16 to added16
+    if clc16 != exp16:
+        display f"  FAIL: expected {exp16}, got {clc16}"
+        set t16_ok to 0
+
+    # Verify ordering
+    set oi16 to 0
+    repeat while oi16 < clc16 - 1:
+        set na16 to get_list(cl16 and oi16)
+        set nb16 to get_list(cl16 and oi16 + 1)
+        set da16 to xor_distance(tgt16 and map_get_val(na16 and "id"))
+        set db16 to xor_distance(tgt16 and map_get_val(nb16 and "id"))
+        if is_distance_less(db16 and da16) == 1:
+            display f"  FAIL: ordering at {oi16}"
+            set t16_ok to 0
+        set oi16 to oi16 + 1
+
+    if t16_ok == 1:
+        display f"  Added {added16}/50, ordering verified"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 17: Simulated 3-node lookup
+    # ===========================================================
+    display "TEST 17: Simulated 3-node lookup"
+    set t17_ok to 1
+    set nid1 to "1000000000000000000000000000000000000000000000000000000000000000"
+    set nid2 to "2000000000000000000000000000000000000000000000000000000000000000"
+    set nid3 to "3000000000000000000000000000000000000000000000000000000000000000"
+
+    set node1 to create_dht_node(nid1 and "n1" and 1)
+    set node2 to create_dht_node(nid2 and "n2" and 2)
+    set node3 to create_dht_node(nid3 and "n3" and 3)
+
+    set ok to dht_node_add_peer(node1 and nid2 and "n2" and 2)
+    set ok to dht_node_add_peer(node1 and nid3 and "n3" and 3)
+    set ok to dht_node_add_peer(node2 and nid1 and "n1" and 1)
+    set ok to dht_node_add_peer(node2 and nid3 and "n3" and 3)
+    set ok to dht_node_add_peer(node3 and nid1 and "n1" and 1)
+    set ok to dht_node_add_peer(node3 and nid2 and "n2" and 2)
+
+    set key17 to "2100000000000000000000000000000000000000000000000000000000000000"
+    set ok to dht_node_store_value(node2 and key17 and "secret_data")
+
+    set fmsg17 to create_find_value_message(nid1 and key17)
+    set fresp17 to dht_handle_message(node2 and fmsg17)
+    set freply17 to map_get_val(fresp17 and "reply")
+    if map_get_val(freply17 and "found") != 1:
+        display "  FAIL: value not found on node2"
+        set t17_ok to 0
+
+    set fval17 to map_get_val(freply17 and "value")
+    if fval17 equals "secret_data":
+        set ok to 1
+    else:
+        display "  FAIL: value mismatch"
+        set t17_ok to 0
+
+    # Node3 doesn't have it -> should return closest nodes
+    set fmsg17b to create_find_value_message(nid1 and key17)
+    set fresp17b to dht_handle_message(node3 and fmsg17b)
+    set freply17b to map_get_val(fresp17b and "reply")
+    if map_get_val(freply17b and "type") != DHT_MSG_FIND_NODE_REPLY:
+        display "  FAIL: should return nodes"
+        set t17_ok to 0
+
+    if t17_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    display "==================================================="
+    return 0

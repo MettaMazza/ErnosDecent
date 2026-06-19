@@ -1,0 +1,406 @@
+# ErnosDecent -- Test Suite for decent_id/did.ep
+# Tests: DID creation, resolution, roundtrip, base58, auth challenge
+# Status: Production -- OperationTrojanClaude Phase 2
+
+import "did"
+import "keys"
+import "string"
+import "test"
+
+# ================================================================
+# Test 1: Base58btc encode/decode roundtrip
+# ================================================================
+
+define test_base58_roundtrip:
+    display "TEST 1: Base58btc encode/decode roundtrip"
+    # Known test vector: 0x0000 prefix + random bytes
+    set hex_input to "ed01aabbccdd00112233445566778899aabbccdd00112233445566778899aabb"
+    set encoded to base58_encode(hex_input)
+    assert_true(string_length(encoded) > 0 and "base58 encode should produce output")
+
+    set decoded to base58_decode(encoded)
+    if decoded equals hex_input:
+        display "  PASS"
+    else:
+        display "  FAIL: roundtrip mismatch"
+        display f"    input:   {hex_input}"
+        display f"    encoded: {encoded}"
+        display f"    decoded: {decoded}"
+        return 1
+    return 0
+
+# ================================================================
+# Test 2: DID:key from Ed25519 public key
+# ================================================================
+
+define test_did_key_ed25519:
+    display "TEST 2: DID:key from Ed25519 public key"
+    set kp to generate_signing_keypair()
+    set pub_key to map_get_val(kp and "public_key")
+
+    set did to create_did_key_from_ed25519(pub_key)
+    assert_true(string_length(did) > 0 and "DID should be non-empty")
+
+    # DID must start with "did:key:z"
+    set prefix to substring(did and 0 and 9)
+    if prefix equals "did:key:z":
+        set ok to 1
+    else:
+        display "  FAIL: DID does not start with did:key:z"
+        display f"    got: {prefix}"
+        return 1
+
+    display f"  DID: {did}"
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 3: DID:key from X25519 public key
+# ================================================================
+
+define test_did_key_x25519:
+    display "TEST 3: DID:key from X25519 public key"
+    set kp to generate_encryption_keypair()
+    set pub_key to map_get_val(kp and "public_key")
+
+    set did to create_did_key_from_x25519(pub_key)
+    assert_true(string_length(did) > 0 and "DID should be non-empty")
+
+    set prefix to substring(did and 0 and 9)
+    if prefix equals "did:key:z":
+        set ok to 1
+    else:
+        display "  FAIL: DID does not start with did:key:z"
+        return 1
+
+    display f"  DID: {did}"
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 4: DID:key resolve roundtrip (Ed25519)
+# ================================================================
+
+define test_did_key_resolve_ed25519:
+    display "TEST 4: DID:key resolve roundtrip (Ed25519)"
+    set kp to generate_signing_keypair()
+    set pub_key to map_get_val(kp and "public_key")
+
+    set did to create_did_key_from_ed25519(pub_key)
+    set resolved to resolve_did_key(did)
+    assert_true(map_get_val(resolved and "error") == DID_ERR_NONE and "resolve should succeed")
+
+    set resolved_key to map_get_val(resolved and "public_key_hex")
+    if resolved_key equals pub_key:
+        set ok to 1
+    else:
+        display "  FAIL: resolved public key does not match original"
+        display f"    original: {pub_key}"
+        display f"    resolved: {resolved_key}"
+        return 1
+
+    set key_type to map_get_val(resolved and "key_type")
+    if key_type equals DID_KEY_TYPE_ED25519:
+        set ok to 1
+    else:
+        display "  FAIL: key type mismatch"
+        return 1
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 5: DID:key resolve roundtrip (X25519)
+# ================================================================
+
+define test_did_key_resolve_x25519:
+    display "TEST 5: DID:key resolve roundtrip (X25519)"
+    set kp to generate_encryption_keypair()
+    set pub_key to map_get_val(kp and "public_key")
+
+    set did to create_did_key_from_x25519(pub_key)
+    set resolved to resolve_did_key(did)
+    assert_true(map_get_val(resolved and "error") == DID_ERR_NONE and "resolve should succeed")
+
+    set resolved_key to map_get_val(resolved and "public_key_hex")
+    if resolved_key equals pub_key:
+        set ok to 1
+    else:
+        display "  FAIL: resolved public key does not match original"
+        return 1
+
+    set key_type to map_get_val(resolved and "key_type")
+    if key_type equals DID_KEY_TYPE_X25519:
+        set ok to 1
+    else:
+        display "  FAIL: key type mismatch"
+        return 1
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 6: Two DIDs from different keys must differ
+# ================================================================
+
+define test_did_uniqueness:
+    display "TEST 6: Two DIDs from different keys must differ"
+    set kp1 to generate_signing_keypair()
+    set kp2 to generate_signing_keypair()
+
+    set did1 to create_did_key_from_ed25519(map_get_val(kp1 and "public_key"))
+    set did2 to create_did_key_from_ed25519(map_get_val(kp2 and "public_key"))
+
+    if did1 equals did2:
+        display "  FAIL: two different keys produced the same DID"
+        return 1
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 7: Same key always produces the same DID (deterministic)
+# ================================================================
+
+define test_did_deterministic:
+    display "TEST 7: Same key always produces same DID (deterministic)"
+    set kp to generate_signing_keypair()
+    set pub_key to map_get_val(kp and "public_key")
+
+    set did1 to create_did_key_from_ed25519(pub_key)
+    set did2 to create_did_key_from_ed25519(pub_key)
+
+    if did1 equals did2:
+        display "  PASS"
+    else:
+        display "  FAIL: same key produced different DIDs"
+        return 1
+    return 0
+
+# ================================================================
+# Test 8: Invalid DID resolution must fail
+# ================================================================
+
+define test_invalid_did:
+    display "TEST 8: Invalid DID resolution must fail"
+
+    # Empty DID
+    set r1 to resolve_did_key("")
+    assert_true(map_get_val(r1 and "error") != DID_ERR_NONE and "empty DID should fail")
+
+    # Wrong method
+    set r2 to resolve_did_key("did:web:example.com")
+    assert_true(map_get_val(r2 and "error") != DID_ERR_NONE and "wrong method should fail")
+
+    # Truncated DID
+    set r3 to resolve_did_key("did:key:z")
+    assert_true(map_get_val(r3 and "error") != DID_ERR_NONE and "truncated DID should fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 9: DID Document creation
+# ================================================================
+
+define test_did_document:
+    display "TEST 9: DID Document creation"
+    set kp_sign to generate_signing_keypair()
+    set kp_enc to generate_encryption_keypair()
+    set sign_pub to map_get_val(kp_sign and "public_key")
+    set enc_pub to map_get_val(kp_enc and "public_key")
+
+    set doc_result to create_did_document(sign_pub and enc_pub)
+    assert_true(map_get_val(doc_result and "error") == DID_ERR_NONE and "doc creation should succeed")
+
+    set did to map_get_val(doc_result and "did")
+    assert_true(string_length(did) > 0 and "DID should be non-empty")
+
+    set document to map_get_val(doc_result and "document")
+    assert_true(string_length(document) > 100 and "document should be substantial")
+    assert_true(string_contains(document and "verificationMethod") == 1 and "document should contain verificationMethod")
+    assert_true(string_contains(document and "authentication") == 1 and "document should contain authentication")
+    assert_true(string_contains(document and "keyAgreement") == 1 and "document should contain keyAgreement")
+    assert_true(string_contains(document and sign_pub) == 1 and "document should contain signing public key")
+    assert_true(string_contains(document and enc_pub) == 1 and "document should contain encryption public key")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 10: Challenge-response authentication
+# ================================================================
+
+define test_auth_challenge:
+    display "TEST 10: Challenge-response authentication"
+    set kp to generate_signing_keypair()
+    set pub_key to map_get_val(kp and "public_key")
+    set sec_key to map_get_val(kp and "secret_key")
+
+    # Create challenge
+    set challenge to create_auth_challenge()
+    assert_true(string_length(challenge) == 64 and "challenge should be 64 hex chars (32 bytes)")
+
+    # Respond to challenge
+    set response to respond_to_challenge(challenge and sec_key)
+    assert_true(map_get_val(response and "error") == DID_ERR_NONE and "response should succeed")
+
+    set sig to map_get_val(response and "response")
+    assert_true(string_length(sig) == 128 and "response should be 128 hex chars (Ed25519 sig)")
+
+    # Verify
+    set verify_result to verify_challenge_response(challenge and sig and pub_key)
+    assert_true(verify_result == DID_ERR_NONE and "verification should succeed")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 11: Challenge-response with wrong key must fail
+# ================================================================
+
+define test_auth_wrong_key:
+    display "TEST 11: Challenge-response with wrong key must fail"
+    set kp1 to generate_signing_keypair()
+    set kp2 to generate_signing_keypair()
+
+    set challenge to create_auth_challenge()
+    set response to respond_to_challenge(challenge and map_get_val(kp1 and "secret_key"))
+    set sig to map_get_val(response and "response")
+
+    # Verify with wrong key
+    set verify_result to verify_challenge_response(challenge and sig and map_get_val(kp2 and "public_key"))
+    assert_true(verify_result == DID_ERR_VERIFICATION_FAILED and "wrong key should fail verification")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 12: Full identity creation
+# ================================================================
+
+define test_create_identity:
+    display "TEST 12: Full identity creation"
+    set id to create_identity()
+    assert_true(map_get_val(id and "error") == DID_ERR_NONE and "identity creation should succeed")
+
+    set did to map_get_val(id and "did")
+    assert_true(string_length(did) > 0 and "DID should be non-empty")
+
+    set document to map_get_val(id and "document")
+    assert_true(string_length(document) > 100 and "document should be substantial")
+
+    set sign_pub to map_get_val(id and "signing_public_key")
+    set sign_sec to map_get_val(id and "signing_secret_key")
+    set enc_pub to map_get_val(id and "encryption_public_key")
+    set enc_sec to map_get_val(id and "encryption_secret_key")
+    set id_hash to map_get_val(id and "identity_hash")
+
+    assert_true(string_length(sign_pub) == 64 and "signing public key should be 64 hex chars")
+    assert_true(string_length(sign_sec) == 128 and "signing secret key should be 128 hex chars")
+    assert_true(string_length(enc_pub) == 64 and "encryption public key should be 64 hex chars")
+    assert_true(string_length(enc_sec) == 64 and "encryption secret key should be 64 hex chars")
+    assert_true(string_length(id_hash) == 64 and "identity hash should be 64 hex chars")
+
+    # DID should resolve back to the signing public key
+    set resolved to resolve_did_key(did)
+    assert_true(map_get_val(resolved and "error") == DID_ERR_NONE and "DID should resolve")
+    set resolved_key to map_get_val(resolved and "public_key_hex")
+    if resolved_key equals sign_pub:
+        set ok to 1
+    else:
+        display "  FAIL: resolved key mismatch"
+        return 1
+
+    display f"  DID: {did}"
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 13: DID:peer creation and resolution
+# ================================================================
+
+define test_did_peer:
+    display "TEST 13: DID:peer creation and resolution"
+    set kp to generate_signing_keypair()
+    set pub_key to map_get_val(kp and "public_key")
+
+    set peer_did to create_did_peer(pub_key)
+    assert_true(string_length(peer_did) > 0 and "peer DID should be non-empty")
+
+    set prefix to substring(peer_did and 0 and 11)
+    if prefix equals "did:peer:0z":
+        set ok to 1
+    else:
+        display "  FAIL: peer DID does not start with did:peer:0z"
+        return 1
+
+    # Resolve back
+    set resolved to resolve_did_peer(peer_did)
+    assert_true(map_get_val(resolved and "error") == DID_ERR_NONE and "peer DID should resolve")
+
+    set resolved_key to map_get_val(resolved and "public_key_hex")
+    if resolved_key equals pub_key:
+        set ok to 1
+    else:
+        display "  FAIL: resolved key mismatch"
+        return 1
+
+    display f"  Peer DID: {peer_did}"
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 14: Wrong key length must be rejected
+# ================================================================
+
+define test_invalid_key_length:
+    display "TEST 14: Wrong key length must be rejected"
+
+    # Too short
+    set short_did to create_did_key_from_ed25519("aabb")
+    assert_true(string_length(short_did) == 0 and "short key should produce empty DID")
+
+    # Too long
+    set long_key to "aabbccdd00112233445566778899aabbccdd00112233445566778899aabbccddee"
+    set long_did to create_did_key_from_ed25519(long_key)
+    assert_true(string_length(long_did) == 0 and "long key should produce empty DID")
+
+    # Document with wrong key
+    set doc_result to create_did_document("short" and "alsoshort")
+    assert_true(map_get_val(doc_result and "error") == DID_ERR_KEY_LENGTH and "short keys should fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Main -- Run all tests
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_id/did.ep Test Suite"
+    display "  OperationTrojanClaude Phase 2"
+    display "==================================================="
+    display ""
+
+    set ok to test_base58_roundtrip()
+    set ok to test_did_key_ed25519()
+    set ok to test_did_key_x25519()
+    set ok to test_did_key_resolve_ed25519()
+    set ok to test_did_key_resolve_x25519()
+    set ok to test_did_uniqueness()
+    set ok to test_did_deterministic()
+    set ok to test_invalid_did()
+    set ok to test_did_document()
+    set ok to test_auth_challenge()
+    set ok to test_auth_wrong_key()
+    set ok to test_create_identity()
+    set ok to test_did_peer()
+    set ok to test_invalid_key_length()
+
+    display ""
+    display "==================================================="
+    display "  14 tests executed."
+    display "==================================================="
+    return 0

@@ -1,0 +1,563 @@
+# ErnosDecent — Raft Consensus & Host Integration Test Suite
+# Component: decent_consensus/test_consensus.ep
+# Status: Testing — OperationTrojanClaude Phase 13
+
+import "collections"
+import "string"
+import "test"
+import "../decent_id/keys"
+import "../decent_id/did"
+import "../decent_host/email"
+import "../decent_host/git"
+import "./raft"
+import "./state"
+import "./election"
+
+# ================================================================
+# Simulation Helper Functions
+# ================================================================
+
+define merge_and_free with list1 as List and list2 as List returning List:
+    set len to length_list(list2)
+    set j to 0
+    repeat while j < len:
+        set item to get_list(list2 and j)
+        set ok to append_list(list1 and item)
+        set j to j + 1
+    free_list(list2)
+    return list1
+
+define leader_send_append_entries with borrow leader as Map and peer_id as Str returning Map:
+    set id to map_get_val(leader and "node_id")
+    set current_term to map_get_val(leader and "current_term")
+    set commit_idx to map_get_val(leader and "commit_index")
+    set next_map to map_get_val(leader and "next_index")
+    set log to map_get_val(leader and "log")
+    
+    set next_idx to map_get_val(next_map and peer_id)
+    set prev_idx to next_idx - 1
+    set prev_term to 0
+    if prev_idx > 0:
+        set prev_entry to get_list(log and prev_idx - 1)
+        set prev_term to map_get_val(prev_entry and "term")
+        
+    set entries to create_list()
+    set log_len to length_list(log)
+    set j to next_idx - 1
+    repeat while j < log_len:
+        set ok to append_list(entries and get_list(log and j))
+        set j to j + 1
+        
+    set req to create_map()
+    set ok to map_insert(req and "type" and "AppendEntries")
+    set ok to map_insert(req and "term" and current_term)
+    set ok to map_insert(req and "leader_id" and id)
+    set ok to map_insert(req and "prev_log_index" and prev_idx)
+    set ok to map_insert(req and "prev_log_term" and prev_term)
+    set ok to map_insert(req and "entries" and entries)
+    set ok to map_insert(req and "leader_commit" and commit_idx)
+    set ok to map_insert(req and "target" and peer_id)
+    
+    return req
+
+define trigger_replication with borrow cluster as Map and leader_id as Str and partitioned_node as Str returning Int:
+    set leader to map_get_val(cluster and leader_id)
+    set peers to map_get_val(leader and "peers")
+    set num_peers to length_list(peers)
+    
+    set queue to create_list()
+    set i to 0
+    repeat while i < num_peers:
+        set peer_ptr to get_list(peers and i)
+        set peer_id to ptr_to_str(peer_ptr)
+        set req to leader_send_append_entries(leader and peer_id)
+        set ok to append_list(queue and req)
+        set i to i + 1
+        
+    repeat while length_list(queue) > 0:
+        set next_queue to dispatch_messages(cluster and queue and partitioned_node)
+        free_list(queue)
+        set queue to next_queue
+        
+    free_list(queue)
+    return 0
+
+define leader_propose_command with borrow leader as Map and command as Str returning Int:
+    set log to map_get_val(leader and "log")
+    set log_len to length_list(log)
+    set new_idx to log_len + 1
+    set term to map_get_val(leader and "current_term")
+    
+    set entry to create_map()
+    set ok to map_insert(entry and "term" and term)
+    set ok to map_insert(entry and "index" and new_idx)
+    set ok to map_insert(entry and "command" and command)
+    
+    set ok to append_list(log and entry)
+    return new_idx
+
+define dispatch_messages with borrow cluster as Map and msgs as List and partitioned_node as Str returning List:
+    set outgoing to create_list()
+    set num_msgs to length_list(msgs)
+    set i to 0
+    repeat while i < num_msgs:
+        set msg to get_list(msgs and i)
+        set target to map_get_val(msg and "target")
+        set sender to map_get_val(msg and "candidate_id")
+        if sender == 0:
+            set sender to map_get_val(msg and "leader_id")
+        if sender == 0:
+            set sender to map_get_val(msg and "sender")
+            
+        set drop to 0
+        if string_length(partitioned_node) > 0:
+            if target equals partitioned_node || sender equals partitioned_node:
+                set drop to 1
+                
+        if drop == 0:
+            set target_node to map_get_val(cluster and target)
+            set type to map_get_val(msg and "type")
+            
+            if type equals "RequestVote":
+                set term to map_get_val(msg and "term")
+                set candidate_id to map_get_val(msg and "candidate_id")
+                set last_idx to map_get_val(msg and "last_log_index")
+                set last_term to map_get_val(msg and "last_log_term")
+                
+                set resp to raft_handle_request_vote(target_node and term and candidate_id and last_idx and last_term)
+                
+                set reply to create_map()
+                set ok to map_insert(reply and "type" and "RequestVoteResponse")
+                set ok to map_insert(reply and "term" and map_get_val(resp and "term"))
+                set ok to map_insert(reply and "vote_granted" and map_get_val(resp and "vote_granted"))
+                set ok to map_insert(reply and "sender" and target)
+                set ok to map_insert(reply and "target" and candidate_id)
+                set ok to append_list(outgoing and reply)
+                
+            if type equals "RequestVoteResponse":
+                set term to map_get_val(msg and "term")
+                set vote_granted to map_get_val(msg and "vote_granted")
+                
+                set leader_ok to election_handle_vote_response(target_node and sender and term and vote_granted)
+                
+            if type equals "AppendEntries":
+                set term to map_get_val(msg and "term")
+                set leader_id to map_get_val(msg and "leader_id")
+                set prev_idx to map_get_val(msg and "prev_log_index")
+                set prev_term to map_get_val(msg and "prev_log_term")
+                set entries to map_get_val(msg and "entries")
+                set leader_commit to map_get_val(msg and "leader_commit")
+                
+                set resp to raft_handle_append_entries(target_node and term and leader_id and prev_idx and prev_term and entries and leader_commit)
+                
+                set success to map_get_val(resp and "success")
+                if success == 1:
+                    set log to map_get_val(target_node and "log")
+                    set commit_index to map_get_val(target_node and "commit_index")
+                    set last_applied to map_get_val(target_node and "last_applied")
+                    
+                    repeat while last_applied < commit_index:
+                        set entry to get_list(log and last_applied)
+                        set err to state_apply_log(target_node and entry)
+                        set last_applied to last_applied + 1
+                        
+                set reply to create_map()
+                set ok to map_insert(reply and "type" and "AppendEntriesResponse")
+                set ok to map_insert(reply and "term" and map_get_val(resp and "term"))
+                set ok to map_insert(reply and "success" and success)
+                set ok to map_insert(reply and "sender" and target)
+                set ok to map_insert(reply and "target" and leader_id)
+                set ok to map_insert(reply and "match_index" and length_list(map_get_val(target_node and "log")))
+                set ok to append_list(outgoing and reply)
+                
+            if type equals "AppendEntriesResponse":
+                set term to map_get_val(msg and "term")
+                set success to map_get_val(msg and "success")
+                set match_idx to map_get_val(msg and "match_index")
+                
+                set current_term to map_get_val(target_node and "current_term")
+                if term == current_term && (map_get_val(target_node and "role") equals RAFT_ROLE_LEADER) == 1:
+                    set match_map to map_get_val(target_node and "match_index")
+                    set next_map to map_get_val(target_node and "next_index")
+                    
+                    if success == 1:
+                        set ok to map_insert(match_map and sender and match_idx)
+                        set ok to map_insert(next_map and sender and match_idx + 1)
+                        
+                        set log to map_get_val(target_node and "log")
+                        set log_len to length_list(log)
+                        set commit_index to map_get_val(target_node and "commit_index")
+                        
+                        set n to log_len
+                        repeat while n > commit_index:
+                            set count to 1
+                            set peers to map_get_val(target_node and "peers")
+                            set num_peers to length_list(peers)
+                            set p to 0
+                            repeat while p < num_peers:
+                                set p_id to ptr_to_str(get_list(peers and p))
+                                if map_get_val(match_map and p_id) >= n:
+                                    set count to count + 1
+                                set p to p + 1
+                                
+                            if count >= 2:
+                                set entry_at_n to get_list(log and n - 1)
+                                if map_get_val(entry_at_n and "term") == current_term:
+                                    set ok to map_insert(target_node and "commit_index" and n)
+                                    set n to commit_index
+                            set n to n - 1
+                            
+                        set commit_index to map_get_val(target_node and "commit_index")
+                        set last_applied to map_get_val(target_node and "last_applied")
+                        repeat while last_applied < commit_index:
+                            set entry to get_list(log and last_applied)
+                            set err to state_apply_log(target_node and entry)
+                            set last_applied to last_applied + 1
+                    else:
+                        set next_idx to map_get_val(next_map and sender)
+                        if next_idx > 1:
+                            set ok to map_insert(next_map and sender and next_idx - 1)
+                            
+        set i to i + 1
+        
+    return outgoing
+
+define run_simulation_ticks with borrow cluster as Map and ticks as Int and partitioned_node as Str returning Int:
+    set queue to create_list()
+    
+    set i to 0
+    repeat while i < ticks:
+        set n1 to map_get_val(cluster and "node1")
+        set n2 to map_get_val(cluster and "node2")
+        set n3 to map_get_val(cluster and "node3")
+        set p1 to election_tick(n1 and 10)
+        set p2 to election_tick(n2 and 10)
+        set p3 to election_tick(n3 and 10)
+        
+        set queue to merge_and_free(queue and p1)
+        set queue to merge_and_free(queue and p2)
+        set queue to merge_and_free(queue and p3)
+        
+        repeat while length_list(queue) > 0:
+            set next_queue to dispatch_messages(cluster and queue and partitioned_node)
+            free_list(queue)
+            set queue to next_queue
+            
+        set i to i + 1
+        
+    free_list(queue)
+    return 0
+
+# ================================================================
+# Test 1: Leader election on randomized election timeout
+# ================================================================
+
+define test_leader_election returning Str:
+    display "TEST 1: Raft Cluster Leader Election"
+    
+    set cluster to create_map()
+    
+    set peers1 to create_list()
+    set ok to append_list(peers1 and str_to_ptr("node2"))
+    set ok to append_list(peers1 and str_to_ptr("node3"))
+    set node1 to raft_create_node("node1" and peers1)
+    
+    set peers2 to create_list()
+    set ok to append_list(peers2 and str_to_ptr("node1"))
+    set ok to append_list(peers2 and str_to_ptr("node3"))
+    set node2 to raft_create_node("node2" and peers2)
+    
+    set peers3 to create_list()
+    set ok to append_list(peers3 and str_to_ptr("node1"))
+    set ok to append_list(peers3 and str_to_ptr("node2"))
+    set node3 to raft_create_node("node3" and peers3)
+    
+    set ok to map_insert(cluster and "node1" and node1)
+    set ok to map_insert(cluster and "node2" and node2)
+    set ok to map_insert(cluster and "node3" and node3)
+    
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+    
+    # Initialize timeouts: node1 has the shortest timeout (150ms)
+    election_init_node(n1 and 150)
+    election_init_node(n2 and 300)
+    election_init_node(n3 and 300)
+    
+    # Run simulation for 20 ticks (200ms)
+    # node1 should timeout, candidate, request votes, get them, and transition to leader
+    run_simulation_ticks(cluster and 20 and "")
+    
+    set role1 to map_get_val(n1 and "role")
+    set role2 to map_get_val(n2 and "role")
+    set role3 to map_get_val(n3 and "role")
+    
+    assert_true(role1 equals RAFT_ROLE_LEADER and "node1 should have become leader")
+    assert_true(role2 equals RAFT_ROLE_FOLLOWER and "node2 should be follower")
+    assert_true(role3 equals RAFT_ROLE_FOLLOWER and "node3 should be follower")
+    
+    display "  PASS"
+    return "node1"
+
+# ================================================================
+# Test 2: Log replication from leader to followers
+# ================================================================
+
+define test_log_replication with leader_id as Str:
+    display "TEST 2: Raft Consensus Log Replication"
+    
+    set cluster to create_map()
+    
+    set peers1 to create_list()
+    set ok to append_list(peers1 and str_to_ptr("node2"))
+    set ok to append_list(peers1 and str_to_ptr("node3"))
+    set node1 to raft_create_node("node1" and peers1)
+    
+    set peers2 to create_list()
+    set ok to append_list(peers2 and str_to_ptr("node1"))
+    set ok to append_list(peers2 and str_to_ptr("node3"))
+    set node2 to raft_create_node("node2" and peers2)
+    
+    set peers3 to create_list()
+    set ok to append_list(peers3 and str_to_ptr("node1"))
+    set ok to append_list(peers3 and str_to_ptr("node2"))
+    set node3 to raft_create_node("node3" and peers3)
+    
+    set ok to map_insert(cluster and "node1" and node1)
+    set ok to map_insert(cluster and "node2" and node2)
+    set ok to map_insert(cluster and "node3" and node3)
+    
+    set n1_init to map_get_val(cluster and "node1")
+    set n2_init to map_get_val(cluster and "node2")
+    set n3_init to map_get_val(cluster and "node3")
+    
+    election_init_node(n1_init and 150)
+    election_init_node(n2_init and 300)
+    election_init_node(n3_init and 300)
+    
+    # Establish node1 as leader
+    run_simulation_ticks(cluster and 20 and "")
+    
+    # Leader proposes commands
+    set leader to map_get_val(cluster and leader_id)
+    set idx1 to leader_propose_command(leader and "SET x=42")
+    set idx2 to leader_propose_command(leader and "SET y=100")
+    
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+    
+    # Replicate state to cluster
+    trigger_replication(cluster and leader_id and "")
+    trigger_replication(cluster and leader_id and "")
+    
+    # Verify commit_index across all nodes is updated to 2
+    set commit1 to map_get_val(n1 and "commit_index")
+    set commit2 to map_get_val(n2 and "commit_index")
+    set commit3 to map_get_val(n3 and "commit_index")
+    
+    assert_true(commit1 == 2 and "leader commit_index should be 2")
+    assert_true(commit2 == 2 and "node2 commit_index should be 2")
+    assert_true(commit3 == 2 and "node3 commit_index should be 2")
+    
+    # Verify state machine values applied
+    set sm1 to map_get_val(n1 and "state_machine")
+    set sm2 to map_get_val(n2 and "state_machine")
+    set sm3 to map_get_val(n3 and "state_machine")
+        
+    set x1 to map_get_val(sm1 and "x")
+    set y2 to map_get_val(sm2 and "y")
+    set x3 to map_get_val(sm3 and "x")
+    
+    assert_true(x1 equals "42" and "node1: x should be 42")
+    assert_true(y2 equals "100" and "node2: y should be 100")
+    assert_true(x3 equals "42" and "node3: x should be 42")
+    
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 3: Partition recovery
+# ================================================================
+
+define test_partition_recovery with leader_id as Str:
+    display "TEST 3: Network Partition & Recovery Reconciliation"
+    
+    set cluster to create_map()
+    
+    set peers1 to create_list()
+    set ok to append_list(peers1 and str_to_ptr("node2"))
+    set ok to append_list(peers1 and str_to_ptr("node3"))
+    set node1 to raft_create_node("node1" and peers1)
+    
+    set peers2 to create_list()
+    set ok to append_list(peers2 and str_to_ptr("node1"))
+    set ok to append_list(peers2 and str_to_ptr("node3"))
+    set node2 to raft_create_node("node2" and peers2)
+    
+    set peers3 to create_list()
+    set ok to append_list(peers3 and str_to_ptr("node1"))
+    set ok to append_list(peers3 and str_to_ptr("node2"))
+    set node3 to raft_create_node("node3" and peers3)
+    
+    set ok to map_insert(cluster and "node1" and node1)
+    set ok to map_insert(cluster and "node2" and node2)
+    set ok to map_insert(cluster and "node3" and node3)
+    
+    set n1_init3 to map_get_val(cluster and "node1")
+    set n2_init3 to map_get_val(cluster and "node2")
+    set n3_init3 to map_get_val(cluster and "node3")
+    
+    election_init_node(n1_init3 and 150)
+    election_init_node(n2_init3 and 300)
+    election_init_node(n3_init3 and 300)
+    
+    # Establish node1 as leader
+    run_simulation_ticks(cluster and 20 and "")
+    
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+    
+    set leader to map_get_val(cluster and leader_id)
+    
+    # Replicate first command to everyone
+    leader_propose_command(leader and "SET z=77")
+    trigger_replication(cluster and leader_id and "")
+    trigger_replication(cluster and leader_id and "")
+    
+    # Now partition node3 (cannot talk to leader or other node)
+    # Propose new commands while node3 is partitioned
+    leader_propose_command(leader and "SET z=99")
+    
+    # Trigger replication with node3 partitioned
+    trigger_replication(cluster and leader_id and "node3")
+    trigger_replication(cluster and leader_id and "node3")
+    
+    # Verify commit_index: Leader & node2 committed it (majority 2/3), node3 is stale
+    set commit1 to map_get_val(n1 and "commit_index")
+    set commit2 to map_get_val(n2 and "commit_index")
+    set commit3 to map_get_val(n3 and "commit_index")
+    
+    assert_true(commit1 == 2 and "leader commit_index should be 2")
+    assert_true(commit2 == 2 and "node2 commit_index should be 2")
+    assert_true(commit3 == 1 and "partitioned node3 commit_index should remain 1")
+    
+    set sm3_before to map_get_val(n3 and "state_machine")
+    set z3_before to map_get_val(sm3_before and "z")
+    assert_true(z3_before equals "77" and "node3 state should be stale")
+    
+    # Heal partition and replicate again
+    trigger_replication(cluster and leader_id and "")
+    trigger_replication(cluster and leader_id and "")
+    
+    # Verify node3 has caught up
+    set commit3_after to map_get_val(n3 and "commit_index")
+    assert_true(commit3_after == 2 and "healed node3 should catch up to commit_index 2")
+    
+    set sm3_after to map_get_val(n3 and "state_machine")
+    set z3_after to map_get_val(sm3_after and "z")
+    assert_true(z3_after equals "99" and "healed node3 state should reconcile to 99")
+    
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 4: SMTP routing and Git push signature verification
+# ================================================================
+
+define test_smtp_and_git:
+    display "TEST 4: SMTP Routing & Git Push Verification via DIDs"
+    
+    # 1. Setup Identities
+    set alice_id to create_identity()
+    set alice_did to map_get_val(alice_id and "did")
+    set alice_pub to map_get_val(alice_id and "signing_public_key")
+    set alice_sec to map_get_val(alice_id and "signing_secret_key")
+    
+    set bob_id to create_identity()
+    set bob_did to map_get_val(bob_id and "did")
+    set bob_pub to map_get_val(bob_id and "signing_public_key")
+    set bob_sec to map_get_val(bob_id and "signing_secret_key")
+    
+    # 2. SMTP Verification
+    set smtp_server to smtp_create_server(25)
+    
+    set bob_account to create_map()
+    set inbox to create_list()
+    set ok to map_insert(bob_account and "email_address" and "bob@ernos")
+    set ok to map_insert(bob_account and "owner_did" and bob_did)
+    set ok to map_insert(bob_account and "inbox_list" and inbox)
+    set ok to map_insert(bob_account and "authenticated_session" and 0)
+    
+    set server_accounts to map_get_val(smtp_server and "accounts")
+    set ok to map_insert(server_accounts and "bob@ernos" and bob_account)
+    
+    # Alice signs message body
+    set body to "Hello Bob, this is Alice, did signatures are secure."
+    set sig_res to sign_message(body and alice_sec)
+    set signature_hex to map_get_val(sig_res and "signature")
+    
+    # Route signed inbound SMTP email
+    set raw_msg to f"From: {alice_did}\nTo: bob@ernos\nSignature: {signature_hex}\nBody: {body}"
+    set smtp_err to smtp_route_inbound(smtp_server and raw_msg)
+    assert_true(smtp_err == EMAIL_ERR_NONE and "routing signed SMTP mail should succeed")
+    
+    set inbox_len to length_list(inbox)
+    assert_true(inbox_len == 1 and "Bob should have received 1 email in his inbox")
+    
+    set rec_msg to get_list(inbox and 0)
+    assert_true(map_get_val(rec_msg and "body") equals body and "inbox email content should match")
+    
+    # 3. Git Push Verification
+    set repo to git_create_repo("decent_core" and alice_did)
+    
+    # Add Bob as collaborator
+    set col_err to git_add_collaborator(repo and alice_did and bob_did and "write")
+    assert_true(col_err == GIT_ERR_NONE and "adding collaborator should succeed")
+    
+    # Bob pushes signed commit
+    set commit_payload to "commit: add raft consensus module\nparent: 00000000\nauthor: Bob"
+    set commit_hash to ep_sha256(commit_payload)
+    set bob_sig_res to sign_message(commit_payload and bob_sec)
+    set bob_signature to map_get_val(bob_sig_res and "signature")
+    
+    set push_err to git_push_commit(repo and bob_did and "main" and commit_hash and commit_payload and bob_signature)
+    assert_true(push_err == GIT_ERR_NONE and "git push with valid collaborator signature should succeed")
+    
+    # Pull ref and check payload
+    set pulled_hash to git_pull_ref(repo and "main")
+    assert_true(pulled_hash equals commit_hash and "pulled ref head commit hash should match")
+    
+    set pulled_payload to git_get_object(repo and commit_hash)
+    assert_true(pulled_payload equals commit_payload and "pulled commit payload should match")
+    
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Main Entry Point
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- Consensus & Host Test Suite"
+    display "  OperationTrojanClaude Phase 13"
+    display "==================================================="
+    display ""
+    
+    # Initialize keys cryptography
+    set crypto_err to init_crypto()
+    assert_true(crypto_err == ERR_NONE and "libsodium initialization should succeed")
+    
+    set leader_id to test_leader_election()
+    test_log_replication(leader_id)
+    test_partition_recovery(leader_id)
+    test_smtp_and_git()
+    
+    display ""
+    display "==================================================="
+    display "  All Phase 13 tests passed successfully!"
+    display "==================================================="
+    return 0

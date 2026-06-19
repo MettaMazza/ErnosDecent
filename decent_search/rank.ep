@@ -1,0 +1,219 @@
+# ErnosDecent — BM25 & PageRank Ranking Engine
+# Component: decent_search/rank.ep
+# Implements: Fixed-point ln(x) approximation, BM25 scoring, and PageRank power iteration
+# Status: Production — OperationTrojanClaude Phase 11
+
+import "collections"
+import "string"
+import "math"
+
+# ================================================================
+# Fixed-Point Natural Logarithm ln(x)
+# Inputs and Outputs are scaled by 1,000,000 (6 decimal places)
+# ================================================================
+
+define rank_ln with x as Int returning Int:
+    if x <= 0:
+        return 0
+    set scale to 1000000
+    set ln2 to 693147
+
+    set k to 0
+    set temp to x
+
+    # Reduce to [0.707106, 1.414213]
+    repeat while temp > 1414213:
+        set temp to temp / 2
+        set k to k + 1
+
+    repeat while temp < 707106:
+        set temp to temp * 2
+        set k to k - 1
+
+    # Taylor series for ln(1 + z) where z = temp - 1.0
+    set z to temp - scale
+    set z2 to (z * z) / scale
+    set z3 to (z2 * z) / scale
+    set z4 to (z3 * z) / scale
+    set z5 to (z4 * z) / scale
+    set z6 to (z5 * z) / scale
+
+    set ln_y to z - (z2 / 2) + (z3 / 3) - (z4 / 4) + (z5 / 5) - (z6 / 6)
+    return ln_y + k * ln2
+
+# ================================================================
+# BM25 Relevance Scoring
+# ================================================================
+
+define rank_bm25_score with index as Map and url as Str and query_terms as List returning Int:
+    set pages to map_get_val(index and "pages")
+    set page_meta to map_get_val(pages and url)
+    if page_meta == 0:
+        return 0
+
+    set body to map_get_val(page_meta and "body")
+    # Document length (word count)
+    set words to string_split(body and " ")
+    set doc_len to length_list(words)
+    if doc_len == 0:
+        set doc_len to 1
+
+    # Compute average doc length across index
+    set total_words to 0
+    set page_keys to map_keys(pages)
+    set num_pages to length_list(page_keys)
+    if num_pages == 0:
+        return 0
+
+    set i to 0
+    repeat while i < num_pages:
+        set pk_ptr to get_list(page_keys and i)
+        set pk_str to ptr_to_str(pk_ptr)
+        set pm to map_get_val(pages and pk_str)
+        set p_body to map_get_val(pm and "body")
+        set p_words to string_split(p_body and " ")
+        set total_words to total_words + length_list(p_words)
+        set i to i + 1
+
+    set avg_doc_len to total_words / num_pages
+    if avg_doc_len == 0:
+        set avg_doc_len to 1
+
+    # BM25 parameters
+    set scale to 1000000
+    set k1 to 1200000 # 1.2
+    set b to 750000   # 0.75
+
+    set score to 0
+    set num_query_terms to length_list(query_terms)
+    set inverted to map_get_val(index and "inverted_index")
+
+    set j to 0
+    repeat while j < num_query_terms:
+        set term_ptr to get_list(query_terms and j)
+        set term to ptr_to_str(term_ptr)
+
+        set word_map to map_get_val(inverted and term)
+        if word_map != 0:
+            # Term frequency in this document
+            set tf to map_get_val(word_map and url)
+            if tf > 0:
+                # n(q) = number of docs containing term
+                set n_term to map_size(word_map)
+                if n_term == 0:
+                    set n_term to 1
+
+                # IDF = ln( (N - n(q) + 0.5) / (n(q) + 0.5) + 1 )
+                set num to (2 * num_pages - 2 * n_term + 1) * scale
+                set den to 2 * n_term + 1
+                set idf_ratio to num / den
+                set idf to rank_ln(idf_ratio + scale)
+
+                # K = k1 * (1 - b + b * (doc_len / avg_doc_len))
+                set doc_ratio to (doc_len * scale) / avg_doc_len
+                set b_term to (b * doc_ratio) / scale
+                set inner to scale - b + b_term
+                set K to (k1 * inner) / scale
+
+                # term_score = idf * (tf * (k1 + 1)) / (tf + K)
+                set t_num to tf * (k1 + scale)
+                set t_den to tf * scale + K
+                set term_score to (idf * t_num) / t_den
+                set score to score + term_score
+
+        set j to j + 1
+
+    return score
+
+# ================================================================
+# PageRank Power Iteration
+# Updates page metadata ranks directly in the index Map
+# ================================================================
+
+define rank_compute_pagerank with index as Map and iterations as Int returning Int:
+    set pages to map_get_val(index and "pages")
+    set page_keys to map_keys(pages)
+    set N to length_list(page_keys)
+    if N == 0:
+        return 0
+
+    set scale to 1000000
+    set d to 850000 # damping factor = 0.85
+
+    # 1. Initialize incoming links mapping
+    set incoming_map to create_map()
+    set i to 0
+    repeat while i < N:
+        set p_ptr to get_list(page_keys and i)
+        set p_str to ptr_to_str(p_ptr)
+        set pm to map_get_val(pages and p_str)
+        set links to map_get_val(pm and "links")
+        set num_links to length_list(links)
+
+        set j to 0
+        repeat while j < num_links:
+            set dst_ptr to get_list(links and j)
+            set dst_str to ptr_to_str(dst_ptr)
+
+            set inc_list to map_get_val(incoming_map and dst_str)
+            if inc_list == 0:
+                set inc_list to create_list()
+                set ok to map_insert(incoming_map and dst_str and inc_list)
+
+            set ok to append_list(inc_list and p_ptr)
+            set j to j + 1
+
+        set i to i + 1
+
+    # 2. Iteration Loop
+    set iter to 0
+    repeat while iter < iterations:
+        set new_ranks to create_map()
+
+        set i to 0
+        repeat while i < N:
+            set p_ptr to get_list(page_keys and i)
+            set p_str to ptr_to_str(p_ptr)
+
+            set sum_share to 0
+            set inc_list to map_get_val(incoming_map and p_str)
+            if inc_list != 0:
+                set num_inc to length_list(inc_list)
+                set j to 0
+                repeat while j < num_inc:
+                    set inc_ptr to get_list(inc_list and j)
+                    set inc_str to ptr_to_str(inc_ptr)
+
+                    set inc_meta to map_get_val(pages and inc_str)
+                    set inc_pr to map_get_val(inc_meta and "pagerank")
+                    set inc_links to map_get_val(inc_meta and "links")
+                    set outdegree to length_list(inc_links)
+                    if outdegree == 0:
+                        set outdegree to 1
+
+                    set share to inc_pr / outdegree
+                    set sum_share to sum_share + share
+                    set j to j + 1
+
+            # PR(p) = (1 - d)/N + d * sum_share
+            # (1 - d) = 0.15 = 150000
+            set base_rank to 150000 / N
+            set share_rank to (d * sum_share) / scale
+            set new_pr to base_rank + share_rank
+
+            set ok to map_insert(new_ranks and p_str and new_pr)
+            set i to i + 1
+
+        # Copy new ranks back
+        set i to 0
+        repeat while i < N:
+            set p_ptr to get_list(page_keys and i)
+            set p_str to ptr_to_str(p_ptr)
+            set pm to map_get_val(pages and p_str)
+            set new_pr to map_get_val(new_ranks and p_str)
+            set ok to map_insert(pm and "pagerank" and new_pr)
+            set i to i + 1
+
+        set iter to iter + 1
+
+    return 0

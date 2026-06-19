@@ -1,0 +1,88 @@
+# G3 negative-control: email never forges a sender DID; git_serve handles signed
+# GIT_PUSH (auth + signature), rejecting unsigned/unauthorized/malformed pushes.
+
+import "string"
+import "collections"
+import "../decent_id/keys"
+import "../decent_id/did"
+import "email"
+import "git"
+
+define check_int with label as Str and got as Int and want as Int returning Int:
+    if got == want:
+        display concat("PASS: " and label)
+        return 1
+    display concat(concat(concat("FAIL: " and label) and " got=") and int_to_string(got))
+    return 0
+
+define check_str with label as Str and got as Str and want as Str returning Int:
+    if got equals want:
+        display concat("PASS: " and label)
+        return 1
+    display concat(concat(concat("FAIL: " and label) and " got=[") and concat(got and "]"))
+    return 0
+
+define main:
+    set ok to init_crypto()
+    set passes to 0
+
+    # ---- Email: non-DID sender with no registry must be REJECTED, never forged ----
+    set srv to smtp_create_server(2525)
+    set accounts to map_get_val(srv and "accounts")
+    set acc to create_map()
+    set inbox to create_list()
+    set ok to map_insert(acc and "inbox_list" and inbox)
+    set ok to map_insert(accounts and "bob@ernos" and acc)
+
+    set raw to "From: alice@evil\nTo: bob@ernos\nSignature: deadbeef\nBody: hi"
+    set er to smtp_route_inbound(srv and raw)
+    set passes to passes + check_int("email_forged_sender_rejected" and er and EMAIL_ERR_VERIFICATION_FAILED)
+
+    # ---- Git: real signed push by the owner is accepted ----
+    set kp to generate_signing_keypair()
+    set pub to ptr_to_str(map_get_val(kp and "public_key"))
+    set sec to ptr_to_str(map_get_val(kp and "secret_key"))
+    set owner_did to create_did_key_from_ed25519(pub)
+    set repo to git_create_repo("r" and owner_did)
+
+    set payload to "tree 1\nauthor commit body"
+    set sigr to sign_message(payload and sec)
+    set sig to ptr_to_str(map_get_val(sigr and "signature"))
+
+    set wire to concat(owner_did and "|main|hashAAA|")
+    set wire to concat(wire and sig)
+    set wire to concat(wire and "|")
+    set wire to concat(wire and payload)
+    set passes to passes + check_str("git_push_signed_ok" and git_apply_push(repo and wire) and "ok")
+
+    # ---- Git: tampered signature is rejected ----
+    set wire_bad to concat(owner_did and "|main|hashAAA|deadbeefdeadbeef|")
+    set wire_bad to concat(wire_bad and payload)
+    set resp_bad to git_apply_push(repo and wire_bad)
+    set tampered_rejected to 0
+    if (resp_bad equals "ok") == 0:
+        set tampered_rejected to 1
+    set passes to passes + check_int("git_push_bad_sig_rejected" and tampered_rejected and 1)
+
+    # ---- Git: unauthorized pusher is rejected ----
+    set kp2 to generate_signing_keypair()
+    set pub2 to ptr_to_str(map_get_val(kp2 and "public_key"))
+    set sec2 to ptr_to_str(map_get_val(kp2 and "secret_key"))
+    set stranger_did to create_did_key_from_ed25519(pub2)
+    set sigr2 to sign_message(payload and sec2)
+    set sig2 to ptr_to_str(map_get_val(sigr2 and "signature"))
+    set wire_unauth to concat(stranger_did and "|main|hashBBB|")
+    set wire_unauth to concat(wire_unauth and sig2)
+    set wire_unauth to concat(wire_unauth and "|")
+    set wire_unauth to concat(wire_unauth and payload)
+    set resp_unauth to git_apply_push(repo and wire_unauth)
+    set unauth_rejected to 0
+    if (resp_unauth equals "ok") == 0:
+        set unauth_rejected to 1
+    set passes to passes + check_int("git_push_unauthorized_rejected" and unauth_rejected and 1)
+
+    # ---- Git: malformed wire is rejected ----
+    set passes to passes + check_str("git_push_malformed" and git_apply_push(repo and "no-delimiters-here") and "error:malformed")
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/5 passed"))
+    return 0

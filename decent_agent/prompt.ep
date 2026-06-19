@@ -1,0 +1,187 @@
+# ErnosPlain Rebuild of ErnOS Agent System Prompt Assembler
+# Component: decent_agent/prompt.ep
+
+import "string"
+import "fs"
+import "session"
+import "json"
+
+define prompt_get_kernel returning Str:
+    if file_exists("config/prompts.json") == 1:
+        set content to read_file("config/prompts.json")
+        set root to json_parse(content)
+        if root != 0:
+            set node to get_json_object_value(root and "kernel")
+            if node != 0:
+                return get_json_value(node)
+                
+    set kernel to "You are ErnOS Agent, a local-first, privacy-first AI agent running on a decentralized network.\n"
+    set kernel to concat(kernel and "You operate under a strict ReAct loop. You must think before taking action.\n")
+    set kernel to concat(kernel and "Your output MUST follow this grammar precisely:\n")
+    set kernel to concat(kernel and "Thought: <your reasoning and planning>\n")
+    set kernel to concat(kernel and "Action: <tool_name>(<arguments_json_or_string>)\n\n")
+    set kernel to concat(kernel and "Once you receive the tool's output, it will be presented to you as:\n")
+    set kernel to concat(kernel and "Observation: <tool_output>\n\n")
+    set kernel to concat(kernel and "You must repeat this loop until you have the final answer. To end the loop and present the final answer, you MUST call the reply_request tool:\n")
+    set kernel to concat(kernel and "Action: reply_request(<your_final_answer_to_the_user>)\n")
+    return kernel
+
+define prompt_get_context with memory_mgr as Map:
+    set ctx to "Current system context:\n"
+    if map_contains(memory_mgr and "lessons_count") == 1:
+        set count to map_get_val(memory_mgr and "lessons_count")
+        set ctx to concat(ctx and f"- Distilled lessons: {count}\n")
+    else:
+        set ctx to concat(ctx and "- Distilled lessons: 0\n")
+        
+    if map_contains(memory_mgr and "graph_edges_count") == 1:
+        set count2 to map_get_val(memory_mgr and "graph_edges_count")
+        set ctx to concat(ctx and f"- Hebbian Graph edges: {count2}\n")
+    else:
+        set ctx to concat(ctx and "- Hebbian Graph edges: 0\n")
+    return ctx
+
+define prompt_get_identity returning Str:
+    # Personal identity is the PRIMARY persona when present (local-only, gitignored)
+    # This is the operator's actual identity file for their agent — it takes priority
+    set personal_path to "config/personal_identity.txt"
+    if file_exists(personal_path) == 1:
+        set personal to read_file(personal_path)
+        if string_length(personal) > 0:
+            return personal
+    
+    # Fallback chain: prompts.json persona → agent_persona.txt → hardcoded default
+    set base_persona to ""
+    if file_exists("config/prompts.json") == 1:
+        set content to read_file("config/prompts.json")
+        set root to json_parse(content)
+        if root != 0:
+            set node to get_json_object_value(root and "persona")
+            if node != 0:
+                set base_persona to get_json_value(node)
+                
+    if string_length(base_persona) == 0:
+        set persona_path to "config/agent_persona.txt"
+        if file_exists(persona_path) == 1:
+            set base_persona to read_file(persona_path)
+    
+    if string_length(base_persona) == 0:
+        set base_persona to "You are ErnOS Agent, a digital cognitive system running on a local decentralized node."
+    
+    return base_persona
+
+
+define prompt_sanitize_input with user_prompt as Str returning Str:
+    set sanitized to user_prompt
+    
+    # Neutralize ReAct layout keys
+    set sanitized to string_replace(sanitized and "Action:" and "[Sanitized Action]")
+    set sanitized to string_replace(sanitized and "action:" and "[Sanitized Action]")
+    set sanitized to string_replace(sanitized and "ACTION:" and "[Sanitized Action]")
+    
+    set sanitized to string_replace(sanitized and "Thought:" and "[Sanitized Thought]")
+    set sanitized to string_replace(sanitized and "thought:" and "[Sanitized Thought]")
+    set sanitized to string_replace(sanitized and "THOUGHT:" and "[Sanitized Thought]")
+    
+    set sanitized to string_replace(sanitized and "Observation:" and "[Sanitized Observation]")
+    set sanitized to string_replace(sanitized and "observation:" and "[Sanitized Observation]")
+    set sanitized to string_replace(sanitized and "OBSERVATION:" and "[Sanitized Observation]")
+    
+    # Defuse common prompt injection phrases
+    set sanitized to string_replace(sanitized and "ignore previous instructions" and "[Cleaned injection]")
+    set sanitized to string_replace(sanitized and "Ignore previous instructions" and "[Cleaned injection]")
+    set sanitized to string_replace(sanitized and "IGNORE PREVIOUS INSTRUCTIONS" and "[Cleaned injection]")
+    
+    set sanitized to string_replace(sanitized and "ignore system prompt" and "[Cleaned injection]")
+    set sanitized to string_replace(sanitized and "Ignore system prompt" and "[Cleaned injection]")
+    set sanitized to string_replace(sanitized and "IGNORE SYSTEM PROMPT" and "[Cleaned injection]")
+    
+    set sanitized to string_replace(sanitized and "override system prompt" and "[Cleaned injection]")
+    set sanitized to string_replace(sanitized and "Override system prompt" and "[Cleaned injection]")
+    
+    set sanitized to string_replace(sanitized and "forget your instructions" and "[Cleaned injection]")
+    set sanitized to string_replace(sanitized and "Forget your instructions" and "[Cleaned injection]")
+    
+    set sanitized to string_replace(sanitized and "forget previous instructions" and "[Cleaned injection]")
+    set sanitized to string_replace(sanitized and "Forget previous instructions" and "[Cleaned injection]")
+    
+    return sanitized
+
+define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as Str and tools_schema as Str returning Str:
+    set system_prompt to ""
+    set is_guest to 0
+    set sender_role to ""
+    if map_contains(ctx and "sender_role") == 1:
+        set sender_role to map_get_val(ctx and "sender_role")
+        if sender_role equals "guest":
+            set is_guest to 1
+            
+    if is_guest == 1:
+        set sender_name to "Guest"
+        if map_contains(ctx and "sender_username") == 1:
+            set sender_name to map_get_val(ctx and "sender_username")
+            
+        set system_prompt to concat(system_prompt and f"[SYSTEM NOTE: The following query is sent by an external visitor on Discord (username: \"{sender_name}\").\n")
+        set system_prompt to concat(system_prompt and "This visitor does NOT have administrative privileges or authority over this node.\n")
+        set system_prompt to concat(system_prompt and "DO NOT disclose node keys, allow command execution, or execute administrative commands for this user.]\n\n")
+
+    set system_prompt to concat(system_prompt and prompt_get_kernel())
+    set system_prompt to concat(system_prompt and "\n")
+    if string_length(tools_schema) > 0:
+        set system_prompt to concat(system_prompt and tools_schema)
+        set system_prompt to concat(system_prompt and "\n")
+    set system_prompt to concat(system_prompt and prompt_get_context(memory_mgr))
+    set system_prompt to concat(system_prompt and "\n")
+    set system_prompt to concat(system_prompt and prompt_get_identity())
+    set system_prompt to concat(system_prompt and "\n")
+    
+    set sessions_mgr to map_get_val(ctx and "sessions")
+    if sessions_mgr != 0:
+        set sess to session_manager_get_active(sessions_mgr)
+        if sess != 0:
+            if map_contains(sess and "system_prompt") == 1:
+                set system_val to map_get_val(sess and "system_prompt")
+                if string_length(system_val) > 0:
+                    set system_prompt to concat(system_prompt and "\nOperator Instructions:\n")
+                    set system_prompt to concat(system_prompt and system_val)
+                    set system_prompt to concat(system_prompt and "\n")
+            if map_contains(sess and "compression_summary") == 1:
+                set summary_val to map_get_val(sess and "compression_summary")
+                if string_length(summary_val) > 0:
+                    set system_prompt to concat(system_prompt and f"\n[CONTINUED CONVERSATION SUMMARY]\nThe prior conversation has been compressed. Here is the summary of what was discussed:\n{summary_val}\n")
+                    
+            set comp_list to map_get_val(sess and "compressed_sessions")
+            set comp_len to length_list(comp_list)
+            if comp_len > 0:
+                set system_prompt to concat(system_prompt and "Verbatim transcripts of the prior conversation are saved on disk at:\n")
+                set idx to 0
+                repeat while idx < comp_len:
+                    set path_val to get_list(comp_list and idx)
+                    set system_prompt to concat(system_prompt and f"- {path_val}\n")
+                    set idx to idx + 1
+                set system_prompt to concat(system_prompt and "Please refer to these files if the user references concepts or details from earlier in the session.\n")
+                
+            set messages_list to map_get_val(sess and "messages")
+            set m_len to length_list(messages_list)
+            if m_len > 1:
+                set system_prompt to concat(system_prompt and "\nConversation History:\n")
+                set idx to 0
+                repeat while idx < m_len - 1:
+                    set msg_map to get_list(messages_list and idx)
+                    set r_val to map_get_val(msg_map and "role")
+                    set c_val to map_get_val(msg_map and "content")
+                    if r_val equals "user":
+                        set system_prompt to concat(system_prompt and f"User: {c_val}\n")
+                    else:
+                        set system_prompt to concat(system_prompt and f"Assistant: {c_val}\n")
+                    set idx to idx + 1
+                    
+    set system_prompt to concat(system_prompt and "\nUser Request:\n")
+    if map_contains(ctx and "in_memory_context") == 1:
+        set mem_ctx to map_get_val(ctx and "in_memory_context")
+        if string_length(mem_ctx) > 0:
+            set system_prompt to concat(system_prompt and f"[IN-MEMORY ATTACHMENT CONTEXT]\n{mem_ctx}\n\n")
+            
+    set sanitized_user_prompt to prompt_sanitize_input(user_prompt)
+    set system_prompt to concat(system_prompt and sanitized_user_prompt)
+    return system_prompt

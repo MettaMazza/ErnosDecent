@@ -1,0 +1,106 @@
+# ErnosDecent -- Name Registry
+# Component: decent_name/registry.ep
+# Implements: .decent TLD name registration and resolution
+#             DHT-backed distributed storage + SQLite persistence
+# Status: Production -- Phase 2 Networking
+
+import "string"
+import "../storage"
+import "../decent_net/dht_transport"
+import "../decent_net/transport"
+import "../decent_id/keys"
+import "../decent_id/did"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set REG_ERR_NONE to 0
+set REG_ERR_NAME_TAKEN to 971
+set REG_ERR_NOT_FOUND to 972
+
+# ================================================================
+# Registry Operations — in-memory + persistent
+# ================================================================
+
+define registry_create:
+    set reg to create_map()
+    set names to create_map()
+    set ok to map_insert(reg and "names" and names)
+    return reg
+
+define registry_register with reg as Int and name as Str and owner_did as Str and dht as Int and seed_addr as Str and seed_port as Int and signing_pub_hex as Str and signing_sec_hex as Str returning Int:
+    set names to map_get_val(reg and "names")
+
+    # Check in-memory first
+    if map_contains(names and name) == 1:
+        set existing_did to map_get_val(names and name)
+        if existing_did equals owner_did:
+            # Re-affirming a name this DID already owns: bump registered_at so it
+            # becomes the node's current display name. The reverse DID->name
+            # lookup (storage_name_get_by_did) returns the most recently
+            # registered name, so without this bump a freshly re-registered name
+            # would stay behind an older one and never show in the UI.
+            set ok to storage_name_register(name and owner_did)
+            return REG_ERR_NONE
+        return REG_ERR_NAME_TAKEN
+
+    # Check persistent storage
+    set persisted to storage_name_resolve(name)
+    if string_length(persisted) > 0:
+        # Already registered in storage — cache in memory
+        set ok to map_insert(names and name and persisted)
+        if persisted equals owner_did:
+            # Owned by this DID: bump registered_at so it becomes the current name.
+            set ok to storage_name_register(name and owner_did)
+            return REG_ERR_NONE
+        return REG_ERR_NAME_TAKEN
+
+    # Register in memory and persist
+    set ok to map_insert(names and name and owner_did)
+    set persist_ok to storage_name_register(name and owner_did)
+
+    # Publish to DHT for distributed resolution
+    set dht_key to concat("name:" and name)
+    if string_length(seed_addr) > 0:
+        set dht_err to dht_rpc_store_signed(dht and seed_addr and seed_port and dht_key and owner_did and signing_pub_hex and signing_sec_hex)
+
+    return REG_ERR_NONE
+
+define registry_resolve with reg as Int and name as Str and dht as Int and seed_addr as Str and seed_port as Int returning Str:
+    set names to map_get_val(reg and "names")
+
+    # Check in-memory cache
+    if map_contains(names and name) == 1:
+        return map_get_val(names and name)
+
+    # Fallback to persistent storage
+    set persisted to storage_name_resolve(name)
+    if string_length(persisted) > 0:
+        # Cache in memory for next lookup
+        set ok to map_insert(names and name and persisted)
+        return persisted
+
+    # DHT fallback
+    if string_length(seed_addr) > 0:
+        set dht_key to concat("name:" and name)
+        set dht_result to dht_rpc_find_value(dht and seed_addr and seed_port and dht_key)
+        set found to map_get_val(dht_result and "found")
+        if found == 1:
+            set dht_val to ptr_to_str(map_get_val(dht_result and "value"))
+            # C7: cryptographically verify the signed bundle "owner_did|pubkey|sig"
+            # before caching/returning — a malicious resolver cannot substitute a
+            # different DID because the signature is over (name-key || owner_did) and
+            # owner_did must equal the DID derived from the signing pubkey.
+            set bparts to string_split(dht_val and "|")
+            if length_list(bparts) >= 3:
+                set r_did to ptr_to_str(get_list(bparts and 0))
+                set r_pub to ptr_to_str(get_list(bparts and 1))
+                set r_sig to ptr_to_str(get_list(bparts and 2))
+                if verify_signature(concat(dht_key and r_did) and r_sig and r_pub) == 0:
+                    if r_did equals create_did_key_from_ed25519(r_pub):
+                        set names to map_get_val(reg and "names")
+                        set ok to map_insert(names and name and r_did)
+                        return r_did
+
+    return ""

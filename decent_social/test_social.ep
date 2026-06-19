@@ -1,0 +1,389 @@
+# ErnosDecent -- Test Suite for decent_social Component
+# Tests: Nostr events, ActivityPub actors, unified feeds, publication, sorting, follow broadcasts
+# Status: Production -- OperationTrojanClaude Phase 6
+
+import "publish"
+import "../decent_id/keys"
+import "string"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_social/test_social.ep Suite"
+    display "  OperationTrojanClaude Phase 6"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # Init crypto
+    set err to init_crypto()
+
+    # Generate keypairs for Alice and Bob
+    set alice_keys to generate_signing_keypair()
+    set alice_pk to map_get_val(alice_keys and "public_key")
+    set alice_sk to map_get_val(alice_keys and "secret_key")
+    set alice_id to ep_sha256(alice_pk)
+
+    set bob_keys to generate_signing_keypair()
+    set bob_pk to map_get_val(bob_keys and "public_key")
+    set bob_sk to map_get_val(bob_keys and "secret_key")
+    set bob_id to ep_sha256(bob_pk)
+
+    # ===========================================================
+    # TEST 1: Nostr event creation and hashing consistency
+    # ===========================================================
+    display "TEST 1: Nostr event creation and hashing consistency"
+    set t1_ok to 1
+
+    set tags to create_list()
+    set inner_tag to create_list()
+    set ok to append_list(inner_tag and "p")
+    set ok to append_list(inner_tag and bob_pk)
+    set ok to append_list(tags and inner_tag)
+
+    set event to nostr_create_event(alice_pk and 1 and tags and "Hello Nostr")
+    
+    set ev_id to map_get_val(event and "id")
+    set ev_pub to map_get_val(event and "pubkey")
+    set ev_kind to map_get_val(event and "kind")
+    set ev_content to map_get_val(event and "content")
+    set ev_ts to map_get_val(event and "created_at")
+    set ev_tags to map_get_val(event and "tags")
+
+    if ev_pub equals alice_pk:
+        set ok to 1
+    else:
+        display "  FAIL: public key mismatch"
+        set t1_ok to 0
+
+    if ev_kind == 1:
+        set ok to 1
+    else:
+        display "  FAIL: kind mismatch"
+        set t1_ok to 0
+
+    if ev_content equals "Hello Nostr":
+        set ok to 1
+    else:
+        display "  FAIL: content mismatch"
+        set t1_ok to 0
+
+    # Verify deterministic hash
+    set calculated_hash to nostr_hash_event(ev_pub and ev_ts and ev_kind and ev_tags and ev_content)
+    if ev_id equals calculated_hash:
+        set ok to 1
+    else:
+        display "  FAIL: calculated hash mismatch"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: Nostr event signing and verification
+    # ===========================================================
+    display "TEST 2: Nostr event signing and verification"
+    set t2_ok to 1
+
+    set sign_err to nostr_sign_event(event and alice_sk)
+    if sign_err != NOSTR_ERR_NONE:
+        display "  FAIL: signing event failed"
+        set t2_ok to 0
+
+    set verified to nostr_verify_event(event)
+    if verified == 1:
+        set ok to 1
+    else:
+        display "  FAIL: verification should pass"
+        set t2_ok to 0
+
+    # Verify failure with wrong signature (simulate by changing pubkey)
+    set bad_event to create_map()
+    set ok to map_insert(bad_event and "id" and ev_id)
+    set ok to map_insert(bad_event and "pubkey" and bob_pk)  # Bob's PK instead of Alice
+    set ok to map_insert(bad_event and "sig" and map_get_val(event and "sig"))
+    
+    set bad_verified to nostr_verify_event(bad_event)
+    if bad_verified == 0:
+        set ok to 1
+    else:
+        display "  FAIL: verification should fail with wrong public key"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: Nostr subscription filter matching
+    # ===========================================================
+    display "TEST 3: Nostr subscription filter matching"
+    set t3_ok to 1
+
+    set filter1 to create_map()
+    set authors_list to create_list()
+    set ok to append_list(authors_list and alice_pk)
+    set ok to map_insert(filter1 and "authors" and authors_list)
+
+    if nostr_match_filter(event and filter1) == 1:
+        set ok to 1
+    else:
+        display "  FAIL: filter should match author"
+        set t3_ok to 0
+
+    # Match tag
+    set filter2 to create_map()
+    set ok to map_insert(filter2 and "tag_name" and "p")
+    set ok to map_insert(filter2 and "tag_value" and bob_pk)
+    if nostr_match_filter(event and filter2) == 1:
+        set ok to 1
+    else:
+        display "  FAIL: filter should match tag p with bob_pk"
+        set t3_ok to 0
+
+    # Mismatching author filter
+    set filter3 to create_map()
+    set bad_authors to create_list()
+    set ok to append_list(bad_authors and bob_pk)
+    set ok to map_insert(filter3 and "authors" and bad_authors)
+    if nostr_match_filter(event and filter3) == 0:
+        set ok to 1
+    else:
+        display "  FAIL: filter should reject wrong author"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: ActivityPub actor and activity creation
+    # ===========================================================
+    display "TEST 4: ActivityPub actor and activity creation"
+    set t4_ok to 1
+
+    set actor to ap_create_actor(alice_id and "Alice")
+    if map_get_val(actor and "id") equals alice_id:
+        set ok to 1
+    else:
+        display "  FAIL: actor ID mismatch"
+        set t4_ok to 0
+
+    if map_get_val(actor and "name") equals "Alice":
+        set ok to 1
+    else:
+        display "  FAIL: actor name mismatch"
+        set t4_ok to 0
+
+    set note_obj to create_map()
+    set ok to map_insert(note_obj and "content" and "Hello AP note")
+    
+    set activity to ap_create_activity(alice_id and "Create" and note_obj)
+    if map_get_val(activity and "actor") equals alice_id:
+        set ok to 1
+    else:
+        display "  FAIL: activity actor mismatch"
+        set t4_ok to 0
+
+    if map_get_val(activity and "type") equals "Create":
+        set ok to 1
+    else:
+        display "  FAIL: activity type mismatch"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: Delivery of ActivityPub activities
+    # ===========================================================
+    display "TEST 5: Delivery of ActivityPub activities"
+    set t5_ok to 1
+
+    set recipient to ap_create_actor(bob_id and "Bob")
+    set del_err to ap_deliver_activity(activity and recipient)
+    if del_err != AP_ERR_NONE:
+        display "  FAIL: activity delivery failed"
+        set t5_ok to 0
+
+    set inbox to map_get_val(recipient and "inbox")
+    if length_list(inbox) == 1:
+        set ok to 1
+    else:
+        display "  FAIL: recipient inbox should have 1 activity"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Normalizing and aggregating both feeds
+    # ===========================================================
+    display "TEST 6: Normalizing and aggregating both feeds"
+    set t6_ok to 1
+
+    set feed to feed_create()
+    set ok to feed_add_nostr_event(feed and event)
+    set ok to feed_add_ap_activity(feed and activity)
+
+    set items to map_get_val(feed and "items")
+    if length_list(items) == 2:
+        set ok to 1
+    else:
+        display "  FAIL: feed should contain exactly 2 items"
+        set t6_ok to 0
+
+    set item_nostr to get_list(items and 0)
+    if map_get_val(item_nostr and "source") equals "nostr":
+        set ok to 1
+    else:
+        display "  FAIL: item 0 source should be nostr"
+        set t6_ok to 0
+
+    set item_ap to get_list(items and 1)
+    if map_get_val(item_ap and "source") equals "activitypub":
+        set ok to 1
+    else:
+        display "  FAIL: item 1 source should be activitypub"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: Chronological sorting validation of the unified feed
+    # ===========================================================
+    display "TEST 7: Chronological sorting validation of the unified feed"
+    set t7_ok to 1
+
+    # Create dummy feed with out-of-order items
+    set test_feed to feed_create()
+    
+    set item_old to create_map()
+    set ok to map_insert(item_old and "timestamp" and 1000)
+    set ok to map_insert(item_old and "content" and "Old post")
+    set ok to append_list(map_get_val(test_feed and "items") and item_old)
+
+    set item_new to create_map()
+    set ok to map_insert(item_new and "timestamp" and 3000)
+    set ok to map_insert(item_new and "content" and "New post")
+    set ok to append_list(map_get_val(test_feed and "items") and item_new)
+
+    set item_mid to create_map()
+    set ok to map_insert(item_mid and "timestamp" and 2000)
+    set ok to map_insert(item_mid and "content" and "Middle post")
+    set ok to append_list(map_get_val(test_feed and "items") and item_mid)
+
+    set sorted to feed_get_sorted(test_feed)
+    if length_list(sorted) == 3:
+        set ok to 1
+    else:
+        display "  FAIL: sorted list length mismatch"
+        set t7_ok to 0
+
+    set first_item to get_list(sorted and 0)
+    set second_item to get_list(sorted and 1)
+    set third_item to get_list(sorted and 2)
+
+    if map_get_val(first_item and "content") equals "New post":
+        set ok to 1
+    else:
+        display "  FAIL: first sorted item should be 'New post'"
+        set t7_ok to 0
+
+    if map_get_val(second_item and "content") equals "Middle post":
+        set ok to 1
+    else:
+        display "  FAIL: second sorted item should be 'Middle post'"
+        set t7_ok to 0
+
+    if map_get_val(third_item and "content") equals "Old post":
+        set ok to 1
+    else:
+        display "  FAIL: third sorted item should be 'Old post'"
+        set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: Follow flow and note broadcasting integration test
+    # ===========================================================
+    display "TEST 8: Follow flow and note broadcasting integration test"
+    set t8_ok to 1
+
+    # Create Alice publisher
+    set alice_pub to pub_create_publisher(alice_pk)
+    
+    # Bob follows Alice
+    set follow_err to pub_follow(alice_pub and bob_pk)
+    if pub_is_follower(alice_pub and bob_pk) == 1:
+        set ok to 1
+    else:
+        display "  FAIL: Bob should be registered as Alice's follower"
+        set t8_ok to 0
+
+    # Bob's feed
+    set bob_feed to feed_create()
+    set target_feeds to create_list()
+    set ok to append_list(target_feeds and bob_feed)
+
+    # Alice publishes note
+    set pub_err to pub_publish_note(alice_pub and "Broadcasting notes to followers!" and alice_sk and target_feeds)
+    if pub_err != 0:
+        display "  FAIL: Alice publish failed"
+        set t8_ok to 0
+
+    # Verify Bob's feed has Alice's broadcasted event & activity
+    set bob_sorted_feed to feed_get_sorted(bob_feed)
+    if length_list(bob_sorted_feed) == 2:
+        set ok to 1
+    else:
+        display f"  FAIL: Bob's feed should contain 2 items, got {length_list(bob_sorted_feed)}"
+        set t8_ok to 0
+
+    set first_feed_item to get_list(bob_sorted_feed and 0)
+    set feed_content to map_get_val(first_feed_item and "content")
+    if feed_content equals "Broadcasting notes to followers!":
+        set ok to 1
+    else:
+        display "  FAIL: Bob's feed item content mismatch"
+        set t8_ok to 0
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    display "==================================================="
+    return 0

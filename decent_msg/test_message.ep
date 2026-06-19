@@ -1,0 +1,408 @@
+# ErnosDecent -- Test Suite for decent_msg/message.ep
+# Tests: Message creation, signing, encryption, conversations, store
+# Status: Production -- OperationTrojanClaude Phase 5
+
+import "message"
+import "../decent_id/keys"
+import "string"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_msg/message.ep Test Suite"
+    display "  OperationTrojanClaude Phase 5"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # Init crypto
+    set err to init_crypto()
+
+    # Generate keypairs for tests
+    set alice_keys to generate_signing_keypair()
+    set alice_pk to map_get_val(alice_keys and "public_key")
+    set alice_sk to map_get_val(alice_keys and "secret_key")
+    set alice_id to ep_sha256(alice_pk)
+
+    set bob_keys to generate_signing_keypair()
+    set bob_pk to map_get_val(bob_keys and "public_key")
+    set bob_sk to map_get_val(bob_keys and "secret_key")
+    set bob_id to ep_sha256(bob_pk)
+
+    # ===========================================================
+    # TEST 1: Text message creation
+    # ===========================================================
+    display "TEST 1: Text message creation"
+    set t1_ok to 1
+    set msg1 to msg_create_text(alice_id and bob_id and "Hello Bob!")
+    set m1_sender to map_get_val(msg1 and "sender")
+    if m1_sender equals alice_id:
+        set ok to 1
+    else:
+        display "  FAIL: sender mismatch"
+        set t1_ok to 0
+    set m1_body to map_get_val(msg1 and "body")
+    if m1_body equals "Hello Bob!":
+        set ok to 1
+    else:
+        display "  FAIL: body mismatch"
+        set t1_ok to 0
+    if map_get_val(msg1 and "type") != MSG_TYPE_TEXT:
+        display "  FAIL: type should be TEXT"
+        set t1_ok to 0
+    if map_get_val(msg1 and "state") != MSG_STATE_DRAFT:
+        display "  FAIL: initial state should be DRAFT"
+        set t1_ok to 0
+    set m1_id to map_get_val(msg1 and "id")
+    if string_length(m1_id) != 64:
+        display "  FAIL: message ID should be 64 hex chars"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: Message signing and verification
+    # ===========================================================
+    display "TEST 2: Message signing and verification"
+    set t2_ok to 1
+    set msg2 to msg_create_text(alice_id and bob_id and "Signed message")
+    set sign_err to msg_sign(msg2 and alice_sk)
+    if sign_err != MSG_ERR_NONE:
+        display f"  FAIL: signing should succeed, got {sign_err}"
+        set t2_ok to 0
+    if map_get_val(msg2 and "state") != MSG_STATE_SENT:
+        display "  FAIL: state should be SENT after signing"
+        set t2_ok to 0
+    set sig_len to string_length(map_get_val(msg2 and "signature"))
+    if sig_len == 0:
+        display "  FAIL: signature should not be empty"
+        set t2_ok to 0
+
+    # Verify with correct key
+    set verified to msg_verify(msg2 and alice_pk)
+    if verified != 1:
+        display "  FAIL: verification should pass with correct key"
+        set t2_ok to 0
+
+    # Verify with wrong key should fail
+    set wrong_verified to msg_verify(msg2 and bob_pk)
+    if wrong_verified == 1:
+        display "  FAIL: verification should fail with wrong key"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: Message encryption and decryption
+    # ===========================================================
+    display "TEST 3: Message encryption and decryption"
+    set t3_ok to 1
+    set session_key to map_get_val(generate_symmetric_key() and "key")
+    set plain to "This is a secret message for encryption test"
+    set enc_result to msg_encrypt_body(plain and session_key)
+    if map_get_val(enc_result and "error") != MSG_ERR_NONE:
+        display "  FAIL: encryption should succeed"
+        set t3_ok to 0
+
+    set ct to map_get_val(enc_result and "ciphertext")
+    set nonce to map_get_val(enc_result and "nonce")
+    if string_length(ct) == 0:
+        display "  FAIL: ciphertext should not be empty"
+        set t3_ok to 0
+
+    # Decrypt
+    set dec_result to msg_decrypt_body(ct and nonce and session_key)
+    if map_get_val(dec_result and "error") != MSG_ERR_NONE:
+        display "  FAIL: decryption should succeed"
+        set t3_ok to 0
+    set recovered to map_get_val(dec_result and "plaintext")
+    if recovered equals plain:
+        set ok to 1
+    else:
+        display "  FAIL: decrypted text should match original"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: Wrong key decryption fails
+    # ===========================================================
+    display "TEST 4: Wrong key decryption fails"
+    set t4_ok to 1
+    set wrong_key to map_get_val(generate_symmetric_key() and "key")
+    set bad_dec to msg_decrypt_body(ct and nonce and wrong_key)
+    if map_get_val(bad_dec and "error") != MSG_ERR_DECRYPTION_FAILED:
+        display "  FAIL: wrong key should fail decryption"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: File and reaction messages
+    # ===========================================================
+    display "TEST 5: File and reaction messages"
+    set t5_ok to 1
+    set file_msg to msg_create_file(alice_id and bob_id and "abcdef0123456789" and "document.pdf")
+    if map_get_val(file_msg and "type") != MSG_TYPE_FILE:
+        display "  FAIL: should be FILE type"
+        set t5_ok to 0
+    set file_body to map_get_val(file_msg and "body")
+    if string_length(file_body) > 0:
+        set ok to 1
+    else:
+        display "  FAIL: file body empty"
+        set t5_ok to 0
+
+    set react_msg to msg_create_reaction(alice_id and bob_id and m1_id and "thumbsup")
+    if map_get_val(react_msg and "type") != MSG_TYPE_REACTION:
+        display "  FAIL: should be REACTION type"
+        set t5_ok to 0
+    set reply_to to map_get_val(react_msg and "reply_to")
+    if reply_to equals m1_id:
+        set ok to 1
+    else:
+        display "  FAIL: reply_to should be original message ID"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Conversation creation and message adding
+    # ===========================================================
+    display "TEST 6: Conversation basics"
+    set t6_ok to 1
+    set conv to conv_create(alice_id and bob_id)
+    if map_get_val(conv and "state") != CONV_STATE_ACTIVE:
+        display "  FAIL: should be ACTIVE"
+        set t6_ok to 0
+    if map_get_val(conv and "message_count") != 0:
+        display "  FAIL: should start empty"
+        set t6_ok to 0
+
+    # Add outgoing message
+    set out_msg to msg_create_text(alice_id and bob_id and "First message")
+    set add_err to conv_add_message(conv and out_msg)
+    if add_err != MSG_ERR_NONE:
+        display "  FAIL: add should succeed"
+        set t6_ok to 0
+    if map_get_val(conv and "message_count") != 1:
+        display "  FAIL: count should be 1"
+        set t6_ok to 0
+    if map_get_val(conv and "unread_count") != 0:
+        display "  FAIL: outgoing should not increment unread"
+        set t6_ok to 0
+
+    # Add incoming message
+    set in_msg to msg_create_text(bob_id and alice_id and "Reply from Bob")
+    set add2_err to conv_add_message(conv and in_msg)
+    if map_get_val(conv and "message_count") != 2:
+        display "  FAIL: count should be 2"
+        set t6_ok to 0
+    if map_get_val(conv and "unread_count") != 1:
+        display "  FAIL: incoming should increment unread"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: Mark read
+    # ===========================================================
+    display "TEST 7: Mark read"
+    set t7_ok to 1
+    set ok to conv_mark_read(conv)
+    if map_get_val(conv and "unread_count") != 0:
+        display "  FAIL: unread should be 0 after mark_read"
+        set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: Conversation pagination
+    # ===========================================================
+    display "TEST 8: Conversation pagination"
+    set t8_ok to 1
+    set conv8 to conv_create(alice_id and bob_id)
+    set i8 to 0
+    repeat while i8 < 5:
+        set m8 to msg_create_text(alice_id and bob_id and concat("msg_" and int_to_string(i8)))
+        set ok to conv_add_message(conv8 and m8)
+        set i8 to i8 + 1
+
+    # Get messages 1-3 (offset 1, limit 3)
+    set page to conv_get_messages(conv8 and 1 and 3)
+    if length_list(page) != 3:
+        display f"  FAIL: expected 3, got {length_list(page)}"
+        set t8_ok to 0
+
+    # Get latest 2
+    set latest to conv_get_latest(conv8 and 2)
+    if length_list(latest) != 2:
+        display f"  FAIL: expected 2 latest, got {length_list(latest)}"
+        set t8_ok to 0
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9: Closed conversation rejects messages
+    # ===========================================================
+    display "TEST 9: Closed conversation rejects messages"
+    set t9_ok to 1
+    set ok to conv_close(conv8)
+    if map_get_val(conv8 and "state") != CONV_STATE_CLOSED:
+        display "  FAIL: state should be CLOSED"
+        set t9_ok to 0
+    set reject_msg to msg_create_text(alice_id and bob_id and "should fail")
+    set reject_err to conv_add_message(conv8 and reject_msg)
+    if reject_err != MSG_ERR_CONVERSATION_CLOSED:
+        display "  FAIL: should reject message on closed conv"
+        set t9_ok to 0
+
+    if t9_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 10: Message store send and receive
+    # ===========================================================
+    display "TEST 10: Message store send and receive"
+    set t10_ok to 1
+    set store_a to mstore_create(alice_id)
+    set store_b to mstore_create(bob_id)
+
+    # Alice sends to Bob
+    set send_result to mstore_send(store_a and bob_id and "Hello from store!")
+    if map_get_val(send_result and "error") != MSG_ERR_NONE:
+        display "  FAIL: send should succeed"
+        set t10_ok to 0
+    if mstore_conv_count(store_a) != 1:
+        display "  FAIL: alice should have 1 conversation"
+        set t10_ok to 0
+
+    # Bob receives
+    set sent_msg to map_get_val(send_result and "message")
+    set recv_result to mstore_receive(store_b and sent_msg)
+    if map_get_val(recv_result and "error") != MSG_ERR_NONE:
+        display "  FAIL: receive should succeed"
+        set t10_ok to 0
+    if mstore_conv_count(store_b) != 1:
+        display "  FAIL: bob should have 1 conversation"
+        set t10_ok to 0
+    if mstore_total_unread(store_b) != 1:
+        display "  FAIL: bob should have 1 unread"
+        set t10_ok to 0
+
+    if t10_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 11: Multiple conversations
+    # ===========================================================
+    display "TEST 11: Multiple conversations"
+    set t11_ok to 1
+    set charlie_id to msg_generate_id()
+    set ok to mstore_send(store_a and charlie_id and "Hello Charlie!")
+    if mstore_conv_count(store_a) != 2:
+        display "  FAIL: alice should have 2 conversations"
+        set t11_ok to 0
+
+    # Send again to same person - should not create new conversation
+    set ok to mstore_send(store_a and bob_id and "Hello again Bob!")
+    if mstore_conv_count(store_a) != 2:
+        display "  FAIL: should still have 2 conversations"
+        set t11_ok to 0
+
+    if t11_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 12: Empty body rejected
+    # ===========================================================
+    display "TEST 12: Empty body rejected"
+    set t12_ok to 1
+    set empty_send to mstore_send(store_a and bob_id and "")
+    if map_get_val(empty_send and "error") != MSG_ERR_EMPTY_BODY:
+        display "  FAIL: empty body should be rejected"
+        set t12_ok to 0
+    set empty_enc to msg_encrypt_body("" and session_key)
+    if map_get_val(empty_enc and "error") != MSG_ERR_EMPTY_BODY:
+        display "  FAIL: empty encryption should be rejected"
+        set t12_ok to 0
+
+    if t12_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 13: Read receipt and delete messages
+    # ===========================================================
+    display "TEST 13: Read receipt and delete messages"
+    set t13_ok to 1
+    set receipt to msg_create_read_receipt(bob_id and alice_id and m1_id)
+    if map_get_val(receipt and "type") != MSG_TYPE_READ_RECEIPT:
+        display "  FAIL: should be READ_RECEIPT type"
+        set t13_ok to 0
+    set del_msg to msg_create_delete(alice_id and bob_id and m1_id)
+    if map_get_val(del_msg and "type") != MSG_TYPE_DELETE:
+        display "  FAIL: should be DELETE type"
+        set t13_ok to 0
+
+    if t13_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    display "==================================================="
+    return 0

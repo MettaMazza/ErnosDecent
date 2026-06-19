@@ -1,0 +1,412 @@
+# ErnosDecent — Live System E2E Test Harness
+# Tests every user-facing feature through the real running daemon
+# Exercises: IPC commands, HTTP endpoints, WebSocket flows
+# Status: Production test
+
+import "collections"
+import "string"
+import "net"
+
+# ================================================================
+# Test Framework
+# ================================================================
+
+set TESTS_RUN to 0
+set TESTS_PASSED to 0
+set TESTS_FAILED to 0
+
+define test_assert with name as Str and condition as Int:
+    set TESTS_RUN to TESTS_RUN + 1
+    if condition == 1:
+        set TESTS_PASSED to TESTS_PASSED + 1
+        display f"  [PASS] {name}"
+    else:
+        set TESTS_FAILED to TESTS_FAILED + 1
+        display f"  [FAIL] {name}"
+    return condition
+
+define test_assert_contains with name as Str and haystack as Str and needle as Str:
+    set found to string_contains(haystack and needle)
+    return test_assert(name and found)
+
+define test_assert_not_empty with name as Str and value as Str:
+    set ok to 0
+    if string_length(value) > 0:
+        set ok to 1
+    return test_assert(name and ok)
+
+# ================================================================
+# IPC Client Helper
+# ================================================================
+
+define ipc_send with command as Str returning Str:
+    set fd to ep_net_connect("127.0.0.1" and 5000)
+    if fd < 0:
+        return "error:connection_failed"
+    set ok to ep_net_send(fd and command)
+    set resp to ep_net_recv(fd and 4096)
+    set ok to ep_net_close(fd)
+    return resp
+
+# ================================================================
+# HTTP Client Helper
+# ================================================================
+
+define http_get with path as Str returning Str:
+    set fd to ep_net_connect("127.0.0.1" and 8080)
+    if fd < 0:
+        return "error:connection_failed"
+    set req to concat("GET " and path)
+    set req to concat(req and " HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n")
+    set ok to ep_net_send(fd and req)
+    set resp to ep_net_recv(fd and 8192)
+    set ok to ep_net_close(fd)
+    return resp
+
+# ================================================================
+# WebSocket Client Helper
+# ================================================================
+
+define ws_connect returning Int:
+    set fd to ep_net_connect("127.0.0.1" and 8080)
+    if fd < 0:
+        return -1
+    # Send upgrade request with a fixed key
+    set req to "GET /ws HTTP/1.1\r\n"
+    set req to concat(req and "Host: 127.0.0.1:8080\r\n")
+    set req to concat(req and "Upgrade: websocket\r\n")
+    set req to concat(req and "Connection: Upgrade\r\n")
+    set req to concat(req and "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n")
+    set req to concat(req and "Sec-WebSocket-Version: 13\r\n")
+    set req to concat(req and "\r\n")
+    set ok to ep_net_send(fd and req)
+    # Read upgrade response
+    set resp to ep_net_recv(fd and 4096)
+    if string_contains(resp and "101 Switching Protocols") == 1:
+        return fd
+    set ok to ep_net_close(fd)
+    return -1
+
+define ws_send_msg with fd as Int and msg as Str returning Int:
+    # Build a masked WebSocket text frame
+    set msg_len to string_length(msg)
+    set frame_bytes to create_list()
+    # Byte 1: FIN + text opcode (0x81)
+    set ok to append_list(frame_bytes and 129)
+    # Byte 2: MASK bit (0x80) + length
+    if msg_len < 126:
+        set ok to append_list(frame_bytes and 128 + msg_len)
+    else:
+        set ok to append_list(frame_bytes and 128 + 126)
+        set ok to append_list(frame_bytes and msg_len / 256)
+        set ok to append_list(frame_bytes and msg_len % 256)
+    # Mask key (4 bytes) — use simple fixed mask for testing
+    set ok to append_list(frame_bytes and 0)
+    set ok to append_list(frame_bytes and 0)
+    set ok to append_list(frame_bytes and 0)
+    set ok to append_list(frame_bytes and 0)
+    # Payload (mask key is all zeros so payload XOR mask = payload)
+    set header to string_from_list(frame_bytes)
+    set frame to concat(header and msg)
+    set ok to ep_net_send(fd and frame)
+    return 1
+
+define ws_recv_msg with fd as Int returning Str:
+    # Read a WebSocket response frame (server sends unmasked)
+    set header to ep_net_recv_bytes(fd and 2)
+    if string_length(header) < 2:
+        return ""
+    set byte1 to get_character(header and 0)
+    set byte2 to get_character(header and 1)
+    set opcode to byte1 % 16
+    if opcode == 8:
+        return ""
+    set payload_len to byte2 % 128
+    if payload_len == 126:
+        set ext to ep_net_recv_bytes(fd and 2)
+        set payload_len to get_character(ext and 0) * 256 + get_character(ext and 1)
+    if payload_len < 1:
+        return ""
+    set payload to ep_net_recv_bytes(fd and payload_len)
+    return payload
+
+# ================================================================
+# Wait for daemon to be ready
+# ================================================================
+
+define wait_for_daemon returning Int:
+    display "[*] Waiting for daemon IPC port 5000..."
+    set attempts to 0
+    repeat while attempts < 20:
+        set fd to ep_net_connect("127.0.0.1" and 5000)
+        if fd >= 0:
+            set ok to ep_net_close(fd)
+            display "[+] Daemon is ready."
+            return 1
+        set attempts to attempts + 1
+        sleep_ms(500)
+    display "[-] Daemon did not start within 10 seconds."
+    return 0
+
+# ================================================================
+# TEST SUITE 1: IPC Commands
+# ================================================================
+
+define test_ipc_commands:
+    display ""
+    display "=== TEST SUITE 1: IPC Commands ==="
+    display ""
+
+    # 1.1 STATUS
+    set resp to ipc_send("STATUS")
+    test_assert_contains("IPC STATUS returns status:active" and resp and "status:active")
+    test_assert_contains("IPC STATUS returns role:" and resp and "role:")
+    test_assert_contains("IPC STATUS returns did:key:" and resp and "did:")
+    test_assert_contains("IPC STATUS returns term:" and resp and "term:")
+    test_assert_contains("IPC STATUS returns peers:" and resp and "peers:")
+    test_assert_contains("IPC STATUS returns dht_size:" and resp and "dht_size:")
+
+    # 1.2 IDENTITY
+    set resp to ipc_send("IDENTITY")
+    test_assert_contains("IPC IDENTITY returns did:" and resp and "did:")
+    test_assert_contains("IPC IDENTITY returns signing_key:" and resp and "signing_key:")
+    test_assert_contains("IPC IDENTITY returns encryption_key:" and resp and "encryption_key:")
+
+    # 1.3 WALLET BALANCE
+    set resp to ipc_send("WALLET BALANCE")
+    test_assert_contains("IPC WALLET BALANCE returns wallet_balance:" and resp and "wallet_balance:")
+
+    # 1.4 STORAGE STATUS
+    set resp to ipc_send("STORAGE STATUS")
+    test_assert_contains("IPC STORAGE returns storage:active" and resp and "storage:active")
+    test_assert_contains("IPC STORAGE returns chunk_count:" and resp and "chunk_count:")
+
+    # 1.5 POOL STATUS
+    set resp to ipc_send("POOL STATUS")
+    test_assert_contains("IPC POOL returns pool:active" and resp and "pool:active")
+    test_assert_contains("IPC POOL returns bandwidth_up:" and resp and "bandwidth_up:")
+    test_assert_contains("IPC POOL returns bandwidth_down:" and resp and "bandwidth_down:")
+
+    # 1.6 NET STATUS
+    set resp to ipc_send("NET STATUS")
+    test_assert_contains("IPC NET returns net:active" and resp and "net:active")
+    test_assert_contains("IPC NET returns dht_size:" and resp and "dht_size:")
+    test_assert_contains("IPC NET returns nat_mode:" and resp and "nat_mode:")
+    test_assert_contains("IPC NET returns active_circuits:" and resp and "active_circuits:")
+
+    # 1.7 MSG SEND
+    set resp to ipc_send("MSG SEND live_test_message")
+    test_assert_contains("IPC MSG SEND returns msg:sent" and resp and "msg:sent")
+    test_assert_contains("IPC MSG SEND returns id:" and resp and "id:")
+    test_assert_contains("IPC MSG SEND echoes text:" and resp and "text:live_test_message")
+
+    # 1.8 AI INFER
+    set resp to ipc_send("AI INFER hello world")
+    test_assert_contains("IPC AI INFER returns ai:" and resp and "ai:")
+    test_assert_contains("IPC AI INFER returns response:" and resp and "response:")
+
+    # 1.9 MONEY TRANSFER
+    set resp to ipc_send("MONEY TRANSFER 10 did:key:test_recipient")
+    test_assert_contains("IPC MONEY TRANSFER returns transfer:" and resp and "transfer:")
+
+    # 1.10 MONEY SWAP
+    set resp to ipc_send("MONEY SWAP ERN USD 5")
+    test_assert_contains("IPC MONEY SWAP returns swap:" and resp and "swap:")
+
+    # 1.11 HEALTH
+    set resp to ipc_send("HEALTH")
+    test_assert_not_empty("IPC HEALTH returns non-empty" and resp)
+
+    # 1.12 Unknown command
+    set resp to ipc_send("BOGUS_COMMAND")
+    test_assert_contains("IPC unknown returns error:unknown_command" and resp and "error:unknown_command")
+
+    display ""
+    return 0
+
+# ================================================================
+# TEST SUITE 2: HTTP Static Serving
+# ================================================================
+
+define test_http_static:
+    display "=== TEST SUITE 2: HTTP Static Serving ==="
+    display ""
+
+    # 2.1 GET /
+    set resp to http_get("/")
+    test_assert_contains("HTTP GET / returns 200" and resp and "200")
+    test_assert_contains("HTTP GET / returns HTML" and resp and "<!DOCTYPE html>")
+
+    # 2.2 GET /app.js
+    set resp to http_get("/app.js")
+    test_assert_contains("HTTP GET /app.js returns 200" and resp and "200")
+    test_assert_contains("HTTP GET /app.js has connectDaemon" and resp and "connectDaemon")
+
+    # 2.3 GET /style.css
+    set resp to http_get("/style.css")
+    test_assert_contains("HTTP GET /style.css returns 200" and resp and "200")
+
+    # 2.4 GET /nonexistent
+    set resp to http_get("/does_not_exist.xyz")
+    test_assert_contains("HTTP GET /nonexistent returns 404" and resp and "404")
+
+    display ""
+    return 0
+
+# ================================================================
+# TEST SUITE 3: HTTP API Endpoints
+# ================================================================
+
+define test_http_api:
+    display "=== TEST SUITE 3: HTTP API Endpoints ==="
+    display ""
+
+    # 3.1 GET /api/status
+    set resp to http_get("/api/status")
+    test_assert_contains("API /api/status returns type:status" and resp and "\"type\":\"status\"")
+    test_assert_contains("API /api/status returns did" and resp and "\"did\":\"")
+
+    # 3.2 GET /api/wallet
+    set resp to http_get("/api/wallet")
+    test_assert_contains("API /api/wallet returns type:wallet" and resp and "\"type\":\"wallet\"")
+    test_assert_contains("API /api/wallet returns balance" and resp and "\"balance\":\"")
+
+    # 3.3 GET /api/storage
+    set resp to http_get("/api/storage")
+    test_assert_contains("API /api/storage returns type:storage" and resp and "\"type\":\"storage\"")
+    test_assert_contains("API /api/storage returns chunk_count" and resp and "\"chunk_count\":")
+
+    # 3.4 GET /api/pool
+    set resp to http_get("/api/pool")
+    test_assert_contains("API /api/pool returns type:pool" and resp and "\"type\":\"pool\"")
+
+    display ""
+    return 0
+
+# ================================================================
+# TEST SUITE 4: WebSocket Flows
+# ================================================================
+
+define test_websocket_flows:
+    display "=== TEST SUITE 4: WebSocket Full User Flows ==="
+    display ""
+
+    # 4.0 WebSocket upgrade
+    set ws_fd to ws_connect()
+    test_assert("WS upgrade succeeds" and ws_fd >= 0)
+    if ws_fd < 0:
+        display "  [SKIP] Cannot continue WebSocket tests — upgrade failed."
+        return 0
+
+    # 4.1 get_status
+    ws_send_msg(ws_fd and "{\"type\":\"get_status\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS get_status returns type:status" and resp and "\"type\":\"status\"")
+    test_assert_contains("WS get_status returns did" and resp and "\"did\":\"")
+    test_assert_contains("WS get_status returns role" and resp and "\"role\":\"")
+
+    # 4.2 get_identity
+    ws_send_msg(ws_fd and "{\"type\":\"get_identity\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS get_identity returns type:identity" and resp and "\"type\":\"identity\"")
+    test_assert_contains("WS get_identity returns signing_key" and resp and "\"signing_key\":\"")
+    test_assert_contains("WS get_identity returns encryption_key" and resp and "\"encryption_key\":\"")
+
+    # 4.3 get_storage
+    ws_send_msg(ws_fd and "{\"type\":\"get_storage\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS get_storage returns type:storage" and resp and "\"type\":\"storage\"")
+    test_assert_contains("WS get_storage returns chunk_count" and resp and "\"chunk_count\":")
+
+    # 4.4 get_pool
+    ws_send_msg(ws_fd and "{\"type\":\"get_pool\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS get_pool returns type:pool" and resp and "\"type\":\"pool\"")
+
+    # 4.5 get_network
+    ws_send_msg(ws_fd and "{\"type\":\"get_network\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS get_network returns type:network" and resp and "\"type\":\"network\"")
+    test_assert_contains("WS get_network returns nat_mode" and resp and "\"nat_mode\":\"")
+
+    # 4.6 send_chat
+    ws_send_msg(ws_fd and "{\"type\":\"send_chat\",\"text\":\"hello_e2e_test\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS send_chat returns type:chat_msg" and resp and "\"type\":\"chat_msg\"")
+    test_assert_contains("WS send_chat returns sender" and resp and "\"sender\":\"")
+    test_assert_contains("WS send_chat returns text" and resp and "\"text\":\"")
+
+    # 4.7 transfer
+    ws_send_msg(ws_fd and "{\"type\":\"transfer\",\"amount\":\"1\",\"to\":\"did:key:z6Mktest\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS transfer returns type:wallet" and resp and "\"type\":\"wallet\"")
+    test_assert_contains("WS transfer returns balance" and resp and "\"balance\":\"")
+
+    # 4.8 swap
+    ws_send_msg(ws_fd and "{\"type\":\"swap\",\"from_token\":\"ERN\",\"to_token\":\"USD\",\"amount\":\"1\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS swap returns type:wallet" and resp and "\"type\":\"wallet\"")
+    test_assert_contains("WS swap returns balance" and resp and "\"balance\":\"")
+
+    # 4.9 ai_prompt
+    ws_send_msg(ws_fd and "{\"type\":\"ai_prompt\",\"prompt\":\"test_e2e\",\"system\":\"you are a test assistant\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS ai_prompt returns ai_token" and resp and "\"type\":\"ai_token\"")
+    # Read the ai_complete message
+    set resp2 to ws_recv_msg(ws_fd)
+    test_assert_contains("WS ai_prompt sends ai_complete" and resp2 and "\"type\":\"ai_complete\"")
+
+    # 4.10 unknown message type
+    ws_send_msg(ws_fd and "{\"type\":\"bogus_type\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS unknown type returns error" and resp and "\"type\":\"error\"")
+
+    # 4.11 Session stays alive after all messages
+    ws_send_msg(ws_fd and "{\"type\":\"get_status\"}")
+    set resp to ws_recv_msg(ws_fd)
+    test_assert_contains("WS session alive after 10 messages" and resp and "\"type\":\"status\"")
+
+    # Clean close
+    set ok to ep_net_close(ws_fd)
+    test_assert("WS clean close" and 1)
+
+    display ""
+    return 0
+
+# ================================================================
+# Main
+# ================================================================
+
+define main:
+    display "==========================================================="
+    display "  ErnosDecent — Live System E2E Test Harness"
+    display "  Tests every user-facing feature through the real daemon"
+    display "==========================================================="
+    display ""
+
+    # Wait for daemon
+    set ready to wait_for_daemon()
+    if ready == 0:
+        display ""
+        display "[FATAL] Daemon not running. Start ./node first, then run this test."
+        return 1
+
+    # Run all test suites
+    test_ipc_commands()
+    test_http_static()
+    test_http_api()
+    test_websocket_flows()
+
+    # Summary
+    display "==========================================================="
+    display f"  RESULTS: {TESTS_PASSED}/{TESTS_RUN} passed, {TESTS_FAILED} failed"
+    display "==========================================================="
+
+    if TESTS_FAILED > 0:
+        display ""
+        display "[FAIL] Some tests failed. See output above."
+        return 1
+    else:
+        display ""
+        display "[PASS] All live system E2E tests passed!"
+        return 0

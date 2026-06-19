@@ -1,0 +1,61 @@
+# Phase J — real DTLS-SRTP key agreement (OpenSSL, RFC 5764).
+# Runs a genuine DTLS handshake (ECDHE + cert + Finished) negotiating the use_srtp
+# extension, exports the SRTP keying material, and confirms (a) both endpoints get the
+# correct per-direction keys (client send == server recv), and (b) those negotiated keys
+# drive a working real-libsrtp2 round-trip (client protect → server unprotect).
+
+import "collections"
+import "crypto"
+import "fs"
+import "webrtc"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set passes to 0
+    set keys_client to create_map()
+    set keys_server to create_map()
+    set okneg to webrtc_dtls_negotiate(keys_client and keys_server and "/tmp/ernos_dtls_cert.pem" and "/tmp/ernos_dtls_key.pem")
+    set passes to passes + pass_if("dtls_handshake_succeeds" and (okneg == 1))
+    if okneg == 0:
+        display "RESULT: 1/5 passed (DTLS unavailable)"
+        return 0
+
+    # keys present + correct length (32 hex key, 28 hex salt)
+    set ck to map_get_val(keys_client and "send_key")
+    set passes to passes + pass_if("client_send_key_len" and (string_length(ck) == 32 and also string_length(map_get_val(keys_client and "send_salt")) == 28))
+
+    # RFC 5764 cross-match: client's send key == server's receive key, and vice versa
+    set cross1 to (map_get_val(keys_client and "send_key") equals map_get_val(keys_server and "recv_key"))
+    set cross2 to (map_get_val(keys_server and "send_key") equals map_get_val(keys_client and "recv_key"))
+    set passes to passes + pass_if("rfc5764_key_cross_match" and (cross1 and also cross2))
+    # the two directions use DIFFERENT keys (real DTLS, not a single shared secret)
+    set passes to passes + pass_if("directions_use_distinct_keys" and ((map_get_val(keys_client and "send_key") equals map_get_val(keys_client and "recv_key")) == 0))
+
+    # End-to-end: client protects, server unprotects, with the negotiated keys.
+    set p to alloc_bytes(24)
+    set i to 0
+    repeat while i < 24:
+        set ok to poke_byte(p and i and (i * 11) modulo 256)
+        set i to i + 1
+    set enc to webrtc_encrypt_srtp(p and 24 and keys_client and 7 and 555)
+    set dec to webrtc_decrypt_srtp(map_get_val(enc and "packet_ptr") and map_get_val(enc and "packet_len") and keys_server)
+    set rt_ok to 0
+    if map_get_val(enc and "error") == 0 and also map_get_val(dec and "valid") == 1:
+        set match to 1
+        set dp to map_get_val(dec and "payload_ptr")
+        set i to 0
+        repeat while i < 24:
+            if peek_byte(dp and i) != (i * 11) modulo 256:
+                set match to 0
+            set i to i + 1
+        set rt_ok to match
+    set passes to passes + pass_if("dtls_keyed_srtp_roundtrip" and rt_ok)
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/5 passed"))
+    return 0

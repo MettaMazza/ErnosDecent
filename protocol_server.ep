@@ -1,0 +1,619 @@
+# ErnosDecent -- Protocol Server
+# Component: protocol_server.ep
+# Listens for incoming P2P connections, performs Noise handshake,
+# dispatches authenticated messages to DHT/Relay/Consensus handlers
+# Status: Production
+
+import "collections"
+import "string"
+import "./logging"
+import "net"
+import "./decent_net/transport"
+import "./decent_net/noise_transport"
+import "./decent_net/dht_transport"
+import "./decent_net/relay_transport"
+import "./decent_net/noise"
+import "./decent_net/dht"
+import "./decent_net/relay"
+import "./decent_net/security"
+import "./decent_id/keys"
+import "./decent_msg/message"
+import "./decent_consensus/raft"
+import "./decent_consensus/bft"
+import "./decent_anon/circuit"
+import "./decent_money/ledger"
+import "./decent_search/query"
+import "fs"
+import "json"
+import "./decent_id/did"
+
+# Runtime no-op cast (build.sh injects the C body). Lets us pass the ledger as an
+# Int handle through the per-connection spawn (avoiding move-in-loop) and recover a
+# Map view of it inside the handler for ledger_receive_block.
+external define cast_borrow_to_map with b returning Map
+
+# ================================================================
+# Constants
+# ================================================================
+
+set PROTO_ERR_NONE to 0
+set PROTO_ERR_LISTEN_FAILED to 981
+set PROTO_ERR_ACCEPT_FAILED to 982
+set PROTO_ERR_HANDSHAKE_FAILED to 983
+
+set PROTO_PORT_P2P to 9100
+set PROTO_PORT_DHT to 9101
+set PROTO_PORT_RELAY to 9102
+
+# ================================================================
+# DHT Server Thread — handles DHT-only connections (no encryption)
+# ================================================================
+
+define dht_server_thread with dht as Int and port as Int:
+    display f"[P2P] DHT server listening on port {port}"
+    set listen_fd to ep_net_listen(port)
+    if listen_fd < 0:
+        display f"[P2P] ERROR: DHT server failed to bind port {port}"
+        return PROTO_ERR_LISTEN_FAILED
+
+    set rl_dht to security_create_rate_limiter()
+    repeat while 1 == 1:
+        set client_fd to ep_net_accept(listen_fd)
+        if client_fd >= 0:
+            if security_check_rate_limit(rl_dht and net_peer_ip(client_fd)) <= 0:
+                set ok to ep_net_close(client_fd)
+            else:
+                set conn to create_map()
+                set ok to map_insert(conn and "fd" and client_fd)
+                set ok to map_insert(conn and "connected" and 1)
+                set ok to dht_handle_transport_message(dht and conn)
+                transport_close(conn)
+                free_map(conn)
+
+    return PROTO_ERR_NONE
+
+# ================================================================
+# Relay Server Thread — handles relay protocol connections
+# ================================================================
+
+define relay_server_thread with relay as Int and port as Int:
+    display f"[P2P] Relay server listening on port {port}"
+    set listen_fd to ep_net_listen(port)
+    if listen_fd < 0:
+        display f"[P2P] ERROR: Relay server failed to bind port {port}"
+        return PROTO_ERR_LISTEN_FAILED
+
+    set rl_relay to security_create_rate_limiter()
+    repeat while 1 == 1:
+        set client_fd to ep_net_accept(listen_fd)
+        if client_fd >= 0:
+            if security_check_rate_limit(rl_relay and net_peer_ip(client_fd)) <= 0:
+                set ok to ep_net_close(client_fd)
+            else:
+                set conn to create_map()
+                set ok to map_insert(conn and "fd" and client_fd)
+                set ok to map_insert(conn and "connected" and 1)
+                set ok to relay_handle_transport_message(relay and conn)
+                transport_close(conn)
+                free_map(conn)
+
+    return PROTO_ERR_NONE
+
+# ================================================================
+# Encrypted P2P Server — Noise handshake then dispatches
+# ================================================================
+
+# Explicit opt-in to open-peer mode. When config/allowed_peers.json is absent or
+# unusable, peers are rejected (fail-closed) UNLESS the operator has created this
+# marker file, deliberately choosing to accept all authenticated peers.
+define peers_open_mode_enabled returning Int:
+    if file_exists("config/allow_all_peers") == 1:
+        return 1
+    return 0
+
+# Decide what to do when no usable whitelist exists: open mode only if explicitly
+# opted in, otherwise reject. Centralises the fail-closed default.
+define peers_default_decision with reason as Str returning Int:
+    if peers_open_mode_enabled() == 1:
+        display concat("[P2P] open-peer mode (config/allow_all_peers): " and reason)
+        return 1
+    display concat("[P2P] SECURITY: rejecting peer (fail-closed) — " and reason)
+    return 0
+
+define is_peer_allowed with remote_static as Str returning Int:
+    set whitelist_path to "config/allowed_peers.json"
+    if file_exists(whitelist_path) == 0:
+        return peers_default_decision("config/allowed_peers.json does not exist")
+
+    set content to read_file(whitelist_path)
+    if string_length(content) == 0:
+        return peers_default_decision("config/allowed_peers.json is empty")
+
+    set root_node to json_parse(content)
+    if root_node == 0:
+        return peers_default_decision("config/allowed_peers.json is not valid JSON")
+
+    set type to get_json_type(root_node)
+    if type != 3: # 3 is list
+        return peers_default_decision("config/allowed_peers.json root is not an array")
+
+    set list_items to get_json_value(root_node)
+    set list_len to length_list(list_items)
+    if list_len == 0:
+        return peers_default_decision("config/allowed_peers.json whitelist is empty")
+
+    # Convert remote X25519 static key to did:key:z
+    set remote_did to create_did_key_from_x25519(remote_static)
+    if string_length(remote_did) == 0:
+        return 0
+
+    set allowed to 0
+    set idx to 0
+    repeat while idx < list_len:
+        set item_node to get_list(list_items and idx)
+        if get_json_type(item_node) == 2: # string
+            set allowed_did to get_json_value(item_node)
+            if remote_did equals allowed_did:
+                set allowed to 1
+                set idx to list_len
+        set idx to idx + 1
+
+    return allowed
+
+define p2p_handle_connection with conn as Map and static_secret as Int and static_public as Int and dht as Int and msg_store as Int and identity as Int and ledger as Int and search_index as Int and bft as Int:
+    # Perform Noise handshake as responder
+    set hs_result to noise_net_handshake_respond(conn and static_secret and static_public)
+    set hs_err to map_get_val(hs_result and "error")
+    if hs_err != NOISE_NET_ERR_NONE:
+        display "[P2P] Handshake failed with remote peer"
+        return PROTO_ERR_HANDSHAKE_FAILED
+
+    set session to map_get_val(hs_result and "session")
+    set remote_static to map_get_val(hs_result and "remote_static")
+
+    # Whitelist check
+    set allowed to is_peer_allowed(remote_static)
+    if allowed == 0:
+        display f"[P2P] Connection rejected: peer static key {remote_static} (DID: {create_did_key_from_x25519(remote_static)}) not in whitelist."
+        noise_net_close(session)
+        free_map(hs_result)
+        return PROTO_ERR_HANDSHAKE_FAILED
+
+    display f"[P2P] Authenticated peer: {remote_static}"
+
+    # Message loop: receive encrypted messages and dispatch
+    set running to 1
+    repeat while running == 1:
+        set recv_result to noise_net_recv(session)
+        set recv_err to map_get_val(recv_result and "error")
+        if recv_err != NOISE_NET_ERR_NONE:
+            set running to 0
+        else:
+            set msg_type to map_get_val(recv_result and "msg_type")
+            set plaintext to map_get_val(recv_result and "plaintext")
+
+            # Dispatch based on message type
+            if msg_type equals "DHT_PING":
+                set my_id to map_get_val(dht and "id")
+                set ok to noise_net_send(session and "DHT_PONG" and my_id)
+            else:
+                if msg_type equals "CONSENSUS":
+                    # Honest response (F1): Raft consensus does NOT run over this Noise
+                    # control channel. The live consensus engine listens on its own
+                    # dedicated transport (raft_port) where raft_server_handle_connection
+                    # parses and dispatches RequestVote/AppendEntries to raft_handle_*.
+                    # This branch previously faked a "CONSENSUS_ACK" without doing any
+                    # consensus work; reply truthfully that this is the wrong channel
+                    # instead of fabricating an acknowledgement.
+                    set ok to noise_net_send(session and "CONSENSUS_WRONG_CHANNEL" and "consensus runs on dedicated raft_port")
+                else:
+                    if msg_type equals "MSG_DELIVER":
+                        # C5: verify-then-decrypt then actually store (no more discard +
+                        # fake "delivered"). The sender's X25519 enc pubkey is derived from
+                        # the Ed25519 signing key in their DID; the local enc sec from ours.
+                        set incoming_msg to msg_deserialize(plaintext)
+                        if map_get_val(incoming_msg and "error") != 0:
+                            set ok to noise_net_send(session and "MSG_NACK" and "bad_format")
+                        else:
+                            set sender_did to ptr_to_str(map_get_val(incoming_msg and "sender"))
+                            set sres to did_resolve(sender_did)
+                            if map_get_val(sres and "error") != 0:
+                                set ok to noise_net_send(session and "MSG_NACK" and "unknown_sender")
+                            else:
+                                set vmeth to map_get_val(sres and "verification_method")
+                                set sender_sign_pub to ptr_to_str(map_get_val(vmeth and "public_key_hex"))
+                                set sender_enc_pub to ed25519_pub_to_x25519(sender_sign_pub)
+                                set my_sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                set my_enc_sec to ed25519_sec_to_x25519(my_sign_sec)
+                                set vderr to msg_verify_and_decrypt(incoming_msg and sender_sign_pub and sender_enc_pub and my_enc_sec)
+                                if vderr != 0:
+                                    set ok to noise_net_send(session and "MSG_NACK" and "verify_or_decrypt_failed")
+                                else:
+                                    set rcv to mstore_receive(msg_store and incoming_msg)
+                                    set ok to noise_net_send(session and "MSG_ACK" and "delivered")
+                    else:
+                        if msg_type equals "RTC_SIGNAL":
+                            set ok to rtc_queue_incoming_signal(plaintext)
+                            set ok to noise_net_send(session and "RTC_ACK" and "queued")
+                        else:
+                            if msg_type equals "BLOCK_PROPAGATE":
+                                # F2: actually apply the propagated block (linkage check,
+                                # first-seen fork-choice, equivocation detection) instead
+                                # of faking a "received" ack. Recover a Map view of the
+                                # ledger from the Int handle threaded through the spawn.
+                                set ledger_map to cast_borrow_to_map(ledger)
+                                set blk_err to ledger_receive_block(ledger_map and plaintext)
+                                if blk_err == LEDGER_ERR_NONE:
+                                    set ok to noise_net_send(session and "BLOCK_ACK" and "applied")
+                                else:
+                                    if blk_err == LEDGER_BLOCK_DUPLICATE:
+                                        set ok to noise_net_send(session and "BLOCK_ACK" and "duplicate")
+                                    else:
+                                        set ok to noise_net_send(session and "BLOCK_NACK" and int_to_string(blk_err))
+                            else:
+                                if msg_type equals "SEARCH_QUERY":
+                                    # G5: answer a federated search from our local index.
+                                    set sidx_map to cast_borrow_to_map(search_index)
+                                    set local_hits to query_search(sidx_map and plaintext)
+                                    set wire to query_serialize_results(local_hits)
+                                    set ok to noise_net_send(session and "SEARCH_RESULTS" and wire)
+                                else:
+                                    if msg_type equals "BFT":
+                                        # Phase K (multi-node): a peer validator's signed BFT
+                                        # vote. Verify + tally via the real engine; if it
+                                        # produces an echo (PREPARE/COMMIT) gossip it onward so
+                                        # the 3-phase protocol cascades to quorum across the
+                                        # validator set. bft_handle is idempotent (seen/prepared/
+                                        # committed_keys guards) so re-received votes don't loop.
+                                        set bnode to cast_borrow_to_map(bft)
+                                        set bmsg to bft_deserialize_msg(plaintext)
+                                        if ptr_to_str(map_get_val(bmsg and "error")) equals "0":
+                                            set br to bft_handle(bnode and bmsg)
+                                            set bts to map_get_val(br and "to_send")
+                                            if map_contains(bts and "phase") == 1:
+                                                spawn broadcast_bft_to_peers(bft_serialize_msg(bts) and dht and static_secret and static_public)
+                                            set ok to noise_net_send(session and "BFT_ACK" and int_to_string(map_get_val(br and "result")))
+                                        else:
+                                            set ok to noise_net_send(session and "BFT_NACK" and "bad_format")
+                                    else:
+                                        if msg_type equals "ONION_DATA":
+                                            # Onion relay hop: peel exactly one layer with our own
+                                            # encryption secret (we learn only the prev TCP peer +
+                                            # the next address). Relay → forward the inner packet to
+                                            # the next hop; exit → deliver the cleartext SEARCH_QUERY
+                                            # to the destination. Either way we block on the
+                                            # downstream reply and hand it back up the circuit, so
+                                            # the results return to the origin without any relay
+                                            # learning who the origin is.
+                                            set oid_map to cast_borrow_to_map(identity)
+                                            set my_enc_sec to ptr_to_str(map_get_val(oid_map and "encryption_secret_key"))
+                                            set hop to onion_process_hop(my_enc_sec and plaintext)
+                                            if map_get_val(hop and "error") != 0:
+                                                set ok to noise_net_send(session and "ONION_NACK" and "bad_layer")
+                                            else:
+                                                if map_get_val(hop and "is_exit") == 1:
+                                                    # Exit relay: answer the (now-cleartext) query from
+                                                    # our own search index. We never learn the origin.
+                                                    set osidx to cast_borrow_to_map(search_index)
+                                                    set ohits to query_search(osidx and ptr_to_str(map_get_val(hop and "payload")))
+                                                    set oreply to query_serialize_results(ohits)
+                                                    # Explicit marker: an empty serialization is "" which
+                                                    # is indistinguishable from a transport failure. Send a
+                                                    # sentinel so the origin can tell "circuit completed, no
+                                                    # hits" from "no circuit / failed".
+                                                    if string_length(oreply) == 0:
+                                                        set oreply to "ONION_EMPTY"
+                                                else:
+                                                    set onext_addr to ptr_to_str(map_get_val(hop and "next_addr"))
+                                                    set onext_port to map_get_val(hop and "next_port")
+                                                    set oreply to onion_relay_request(onext_addr and onext_port and "ONION_DATA" and ptr_to_str(map_get_val(hop and "fwd_wire")) and static_secret and static_public)
+                                                set ok to noise_net_send(session and "ONION_REPLY" and oreply)
+                                        else:
+                                            set ok to noise_net_send(session and "ERROR" and "unknown_msg_type")
+        free_map(recv_result)
+
+    noise_net_close(session)
+    return PROTO_ERR_NONE
+
+define p2p_server_thread with port as Int and static_secret as Int and static_public as Int and dht as Int and msg_store as Int and identity as Int and ledger as Int and search_index as Int and bft as Int:
+    display f"[P2P] Encrypted P2P server listening on port {port}"
+    set listen_fd to ep_net_listen(port)
+    if listen_fd < 0:
+        display f"[P2P] ERROR: P2P server failed to bind port {port}"
+        return PROTO_ERR_LISTEN_FAILED
+
+    set rl_p2p to security_create_rate_limiter()
+    repeat while 1 == 1:
+        set client_fd to ep_net_accept(listen_fd)
+        if client_fd >= 0:
+            if security_check_rate_limit(rl_p2p and net_peer_ip(client_fd)) <= 0:
+                set ok to ep_net_close(client_fd)
+            else:
+                set conn to create_map()
+                set ok to map_insert(conn and "fd" and client_fd)
+                set ok to map_insert(conn and "connected" and 1)
+                # Each connection handled in its own spawn
+                spawn p2p_handle_connection(conn and static_secret and static_public and dht and msg_store and identity and ledger and search_index and bft)
+
+    return PROTO_ERR_NONE
+
+# C5 send side: deliver a real E2E direct message over the SAME Noise channel the
+# receiver listens on. Resolves the recipient's signing key from their DID, derives
+# the X25519 enc keys (both sides derive from signing keys), encrypt-then-signs, then
+# Noise-handshakes to the peer and sends MSG_DELIVER. Returns 0 on success, else a code.
+define msg_send_p2p with recipient_did as Str and address as Str and port as Int and body as Str and my_did as Str and my_sign_sec as Str and static_secret as Int and static_public as Int returning Int:
+    set sres to did_resolve(recipient_did)
+    if map_get_val(sres and "error") != 0:
+        return 1
+    set vmeth to map_get_val(sres and "verification_method")
+    set rcpt_sign_pub to ptr_to_str(map_get_val(vmeth and "public_key_hex"))
+    set rcpt_enc_pub to ed25519_pub_to_x25519(rcpt_sign_pub)
+    set my_enc_sec to ed25519_sec_to_x25519(my_sign_sec)
+    if string_length(rcpt_enc_pub) == 0 or else string_length(my_enc_sec) == 0:
+        return 2
+    set msg to msg_create_text(my_did and recipient_did and body)
+    set eerr to msg_encrypt_and_sign(msg and rcpt_enc_pub and my_enc_sec and my_sign_sec)
+    if eerr != 0:
+        return 3
+    set wire to msg_serialize(msg)
+    set conn to transport_connect(address and port)
+    if map_get_val(conn and "error") != 0:
+        set ok to free_map(conn)
+        return 4
+    set hs to noise_net_handshake_initiate(conn and static_secret and static_public)
+    if map_get_val(hs and "error") != NOISE_NET_ERR_NONE:
+        set ok to free_map(hs)
+        return 5
+    set session to map_get_val(hs and "session")
+    set serr to noise_net_send(session and "MSG_DELIVER" and wire)
+    set ack to noise_net_recv(session)
+    set ok to noise_net_close(session)
+    if serr != 0:
+        return 6
+    return 0
+
+# ================================================================
+# F2: Block propagation (broadcast side, Noise client)
+# Sends a serialized block to a peer over the same authenticated/encrypted
+# Noise channel the BLOCK_PROPAGATE receiver listens on (the P2P server). The
+# Noise XX handshake learns the peer's static key in-band, so no pre-shared key
+# is required (mirrors msg_send_p2p).
+# ================================================================
+
+define block_broadcast_p2p with block_wire as Str and address as Str and port as Int and static_secret as Int and static_public as Int returning Int:
+    set conn to transport_connect(address and port)
+    if map_get_val(conn and "error") != 0:
+        set ok to free_map(conn)
+        return 4
+    set hs to noise_net_handshake_initiate(conn and static_secret and static_public)
+    if map_get_val(hs and "error") != NOISE_NET_ERR_NONE:
+        set ok to free_map(hs)
+        return 5
+    set session to map_get_val(hs and "session")
+    set serr to noise_net_send(session and "BLOCK_PROPAGATE" and block_wire)
+    set ack to noise_net_recv(session)
+    set ok to noise_net_close(session)
+    if serr != 0:
+        return 6
+    return 0
+
+# Serialize the current tip and gossip it to every known peer. Peers are stored in
+# the DHT routing table with their DHT port; the P2P (Noise) port is one below it
+# (CLI/config convention: p2p = base, dht = base+1). Returns the number of peers
+# that acknowledged.
+define broadcast_block_to_peers with ledger as Int and dht as Int and static_secret as Int and static_public as Int returning Int:
+    set lmap to cast_borrow_to_map(ledger)
+    set blocks to map_get_val(lmap and "blocks")
+    set tip to get_list(blocks and length_list(blocks) - 1)
+    set block_wire to ledger_serialize_block(tip)
+
+    set count to dht_node_peer_count(dht)
+    if count <= 0:
+        return 0
+    set rt to map_get_val(dht and "routing_table")
+    set my_id to ptr_to_str(map_get_val(rt and "local_id"))
+    set peers to routing_table_find_closest(rt and my_id and count)
+    set n to length_list(peers)
+    set sent to 0
+    set i to 0
+    repeat while i < n:
+        set peer to get_list(peers and i)
+        set addr to ptr_to_str(map_get_val(peer and "address"))
+        set dht_peer_port to map_get_val(peer and "port")
+        set p2p_peer_port to dht_peer_port - 1
+        set r to block_broadcast_p2p(block_wire and addr and p2p_peer_port and static_secret and static_public)
+        if r == 0:
+            set sent to sent + 1
+        set i to i + 1
+    return sent
+
+# ================================================================
+# G5: Federated search (client side, Noise)
+# Sends a query to one peer over the authenticated Noise channel and returns its
+# serialized SEARCH_RESULTS string ("" on failure). Mirrors block_broadcast_p2p.
+# ================================================================
+
+define search_query_p2p with query as Str and address as Str and port as Int and static_secret as Int and static_public as Int returning Str:
+    set conn to transport_connect(address and port)
+    if map_get_val(conn and "error") != 0:
+        set ok to free_map(conn)
+        return ""
+    set hs to noise_net_handshake_initiate(conn and static_secret and static_public)
+    if map_get_val(hs and "error") != NOISE_NET_ERR_NONE:
+        set ok to free_map(hs)
+        return ""
+    set session to map_get_val(hs and "session")
+    set serr to noise_net_send(session and "SEARCH_QUERY" and query)
+    if serr != 0:
+        set ok to noise_net_close(session)
+        return ""
+    set resp to noise_net_recv(session)
+    set wire to ""
+    if map_get_val(resp and "error") == NOISE_NET_ERR_NONE:
+        if ptr_to_str(map_get_val(resp and "msg_type")) equals "SEARCH_RESULTS":
+            set wire to ptr_to_str(map_get_val(resp and "plaintext"))
+    set ok to noise_net_close(session)
+    return wire
+
+# Query every known peer and return the merged remote result list (deduped/ranked by
+# query_merge_results). Peer P2P port = DHT port − 1 (CLI/config convention).
+define search_federate_to_peers with dht as Int and static_secret as Int and static_public as Int and query as Str returning List:
+    set accumulated to create_list()
+    set count to dht_node_peer_count(dht)
+    if count <= 0:
+        return accumulated
+    set rt to map_get_val(dht and "routing_table")
+    set my_id to ptr_to_str(map_get_val(rt and "local_id"))
+    set peers to routing_table_find_closest(rt and my_id and count)
+    set n to length_list(peers)
+    set i to 0
+    repeat while i < n:
+        set peer to get_list(peers and i)
+        set addr to ptr_to_str(map_get_val(peer and "address"))
+        set p2p_peer_port to map_get_val(peer and "port") - 1
+        set wire to search_query_p2p(query and addr and p2p_peer_port and static_secret and static_public)
+        if string_length(wire) > 0:
+            set remote to query_deserialize_results(wire)
+            set accumulated to query_merge_results(accumulated and remote)
+        set i to i + 1
+    return accumulated
+
+# ================================================================
+# Onion routing: one synchronous Noise request used both by the origin (send the
+# outer onion packet to the entry relay) and by each relay (forward the peeled
+# inner packet to the next hop, or deliver the cleartext query to the destination).
+# Returns the reply plaintext (the serialized SEARCH_RESULTS travelling back up the
+# circuit), or "" on failure. The reply path is the circuit in reverse: each relay
+# blocks its handler thread waiting for the downstream reply, then returns it to its
+# predecessor — so no relay (past the entry) ever learns the origin.
+# ================================================================
+define onion_relay_request with address as Str and port as Int and msg_type as Str and payload as Str and static_secret as Int and static_public as Int returning Str:
+    set conn to transport_connect(address and port)
+    if map_get_val(conn and "error") != 0:
+        set ok to free_map(conn)
+        return ""
+    set hs to noise_net_handshake_initiate(conn and static_secret and static_public)
+    if map_get_val(hs and "error") != NOISE_NET_ERR_NONE:
+        set ok to free_map(hs)
+        return ""
+    set session to map_get_val(hs and "session")
+    set serr to noise_net_send(session and msg_type and payload)
+    if serr != 0:
+        set ok to noise_net_close(session)
+        return ""
+    set resp to noise_net_recv(session)
+    set reply to ""
+    if map_get_val(resp and "error") == NOISE_NET_ERR_NONE:
+        set reply to ptr_to_str(map_get_val(resp and "plaintext"))
+    set ok to noise_net_close(session)
+    return reply
+
+# ================================================================
+# Gather up to `count` onion relay descriptors from known DHT peers (each peer
+# publishes its descriptor under onion:relay:<id>; we fetch it from that peer).
+# ================================================================
+define onion_gather_relays with dht as Int and count as Int returning List:
+    set relays to create_list()
+    set pc to dht_node_peer_count(dht)
+    if pc <= 0:
+        return relays
+    set rt to map_get_val(dht and "routing_table")
+    set my_id to ptr_to_str(map_get_val(rt and "local_id"))
+    set peers to routing_table_find_closest(rt and my_id and pc)
+    set n to length_list(peers)
+    set got to 0
+    set i to 0
+    repeat while i < n and also got < count:
+        set peer to get_list(peers and i)
+        set paddr to ptr_to_str(map_get_val(peer and "address"))
+        set pdht to map_get_val(peer and "port")
+        set pid to ptr_to_str(map_get_val(peer and "id"))
+        set fv to dht_rpc_find_value(dht and paddr and pdht and onion_relay_dht_key(pid))
+        if map_get_val(fv and "found") == 1:
+            set desc to onion_parse_descriptor(ptr_to_str(map_get_val(fv and "value")))
+            if map_get_val(desc and "error") == 0:
+                set ok to append_list(relays and desc)
+                set got to got + 1
+        set i to i + 1
+    return relays
+
+# Origin side: anonymously query the network by routing a SEARCH through an onion
+# circuit (the exit relay answers from its index and the results return up the
+# circuit). Returns serialized SEARCH_RESULTS, or "" if no relays / failure (caller
+# falls back to the direct federated path). num_hops is the desired circuit length.
+define onion_search_anonymous with dht as Int and query as Str and static_secret as Int and static_public as Int and num_hops as Int returning Str:
+    # Retry the whole build+route a few times: a fresh circuit is built each attempt
+    # (re-gathering relays), so a transiently-failed hop or directory lookup recovers
+    # on the next try. After the attempts are exhausted we return "" and the caller
+    # falls back to the direct federated path (still correct, just not origin-anonymous).
+    set attempt to 0
+    set result to ""
+    repeat while attempt < 3 and also (string_length(result) == 0):
+        set attempt to attempt + 1
+        set relays to onion_gather_relays(dht and num_hops)
+        set nr to length_list(relays)
+        # Require at least 2 hops: with a single relay the exit's TCP peer IS the
+        # origin, so there is no anonymity.
+        if nr >= 2:
+            # final_destination is informational — the exit answers from its own index.
+            set exitd to get_list(relays and nr - 1)
+            set dest_addr to ptr_to_str(map_get_val(exitd and "address"))
+            set dest_port to map_get_val(exitd and "port")
+            set built to onion_build_query(relays and dest_addr and dest_port and query)
+            if map_get_val(built and "error") == 0:
+                set result to onion_relay_request(ptr_to_str(map_get_val(built and "first_addr")) and map_get_val(built and "first_port") and "ONION_DATA" and ptr_to_str(map_get_val(built and "wire")) and static_secret and static_public)
+    return result
+
+# ================================================================
+# Phase K: gossip a signed BFT vote to peer validators (Noise). Mirrors
+# block_broadcast_p2p — one-shot send of a serialized BFT message + ACK read.
+# ================================================================
+define bft_send_p2p with msg_wire as Str and address as Str and port as Int and static_secret as Int and static_public as Int returning Int:
+    set conn to transport_connect(address and port)
+    if map_get_val(conn and "error") != 0:
+        set ok to free_map(conn)
+        return 4
+    set hs to noise_net_handshake_initiate(conn and static_secret and static_public)
+    if map_get_val(hs and "error") != NOISE_NET_ERR_NONE:
+        set ok to free_map(hs)
+        return 5
+    set session to map_get_val(hs and "session")
+    set serr to noise_net_send(session and "BFT" and msg_wire)
+    set ack to noise_net_recv(session)
+    set ok to noise_net_close(session)
+    if serr != 0:
+        return 6
+    return 0
+
+# Gossip a serialized BFT message to every known peer (peer P2P port = DHT port − 1).
+# Returns the number of peers that accepted the send.
+define broadcast_bft_to_peers with msg_wire as Str and dht as Int and static_secret as Int and static_public as Int returning Int:
+    set count to dht_node_peer_count(dht)
+    if count <= 0:
+        return 0
+    set rt to map_get_val(dht and "routing_table")
+    set my_id to ptr_to_str(map_get_val(rt and "local_id"))
+    set peers to routing_table_find_closest(rt and my_id and count)
+    set n to length_list(peers)
+    set sent to 0
+    set i to 0
+    repeat while i < n:
+        set peer to get_list(peers and i)
+        set addr to ptr_to_str(map_get_val(peer and "address"))
+        set p2p_peer_port to map_get_val(peer and "port") - 1
+        set r to bft_send_p2p(msg_wire and addr and p2p_peer_port and static_secret and static_public)
+        if r == 0:
+            set sent to sent + 1
+        set i to i + 1
+    return sent
+
+# ================================================================
+# Start all protocol servers
+# ================================================================
+
+define start_protocol_servers with static_secret as Int and static_public as Int and dht as Int and relay as Int and p2p_port as Int and dht_port as Int and relay_port as Int and msg_store as Int and identity as Int and ledger as Int and search_index as Int and bft as Int:
+    spawn dht_server_thread(dht and dht_port)
+    spawn relay_server_thread(relay and relay_port)
+    spawn p2p_server_thread(p2p_port and static_secret and static_public and dht and msg_store and identity and ledger and search_index and bft)
+    display "[P2P] All protocol servers started."
+    return PROTO_ERR_NONE

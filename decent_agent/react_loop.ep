@@ -1,0 +1,541 @@
+# ErnosPlain Rebuild of ErnOS Agent ReAct Loop Coordinator
+# Component: decent_agent/react_loop.ep
+
+import "collections"
+import "string"
+import "json"
+import "llm"
+
+import "prompt"
+import "tools"
+import "memory"
+import "observer"
+import "session"
+
+define react_parse_action with raw as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "found" and 0)
+    
+    set raw_lower to string_lower(raw)
+    set pos to string_index_of(raw_lower and "action:")
+    if pos < 0:
+        return result
+        
+    set raw_len to string_length(raw)
+    set tool_name_start to pos + 7
+    set skip_done to 0
+    repeat while tool_name_start < raw_len and skip_done == 0:
+        set ch to get_character(raw and tool_name_start)
+        if ch == 32 or else ch == 9:
+            set tool_name_start to tool_name_start + 1
+        else:
+            set skip_done to 1
+            
+    if tool_name_start >= raw_len:
+        return result
+        
+    set start_args to -1
+    set search_idx to tool_name_start
+    set args_found to 0
+    repeat while search_idx < raw_len and args_found == 0:
+        set ch to get_character(raw and search_idx)
+        if ch == 40: # '('
+            set start_args to search_idx
+            set args_found to 1
+        else:
+            set search_idx to search_idx + 1
+            
+    if start_args < 0:
+        return result
+        
+    set tool_name to substring(raw and tool_name_start and start_args - tool_name_start)
+    set tool_name_trimmed to string_trim(tool_name)
+    
+    set end_args to -1
+    set in_string to 0
+    set escaped to 0
+    set depth to 1
+    set scan_idx to start_args + 1
+    set scan_done to 0
+    repeat while scan_idx < raw_len and scan_done == 0:
+        set ch to get_character(raw and scan_idx)
+        if escaped == 1:
+            set escaped to 0
+        else if ch == 92: # backslash '\'
+            set escaped to 1
+        else if ch == 34: # double quote '"'
+            if in_string == 0:
+                set in_string to 1
+            else:
+                set in_string to 0
+        else if in_string == 0:
+            if ch == 40: # '('
+                set depth to depth + 1
+            else if ch == 41: # ')'
+                set depth to depth - 1
+                if depth == 0:
+                    set end_args to scan_idx
+                    set scan_done to 1
+        set scan_idx to scan_idx + 1
+
+    if end_args < start_args:
+        return result
+        
+    set args_str to substring(raw and start_args + 1 and end_args - start_args - 1)
+    
+    set ok to map_insert(result and "found" and 1)
+    set ok to map_insert(result and "tool_name" and tool_name_trimmed)
+    set ok to map_insert(result and "args_str" and args_str)
+    
+    set values_list to create_list()
+    set ok to map_insert(result and "values_list" and values_list)
+    set ok to append_list(values_list and tool_name_trimmed)
+    set ok to append_list(values_list and args_str)
+    return result
+
+
+define react_hebbian_trigger with memory_mgr as Map and text as Str returning Int:
+    set concepts to create_list()
+    set ok to append_list(concepts and "wallet")
+    set ok to append_list(concepts and "ledger")
+    set ok to append_list(concepts and "dht")
+    set ok to append_list(concepts and "consensus")
+    set ok to append_list(concepts and "identity")
+    set ok to append_list(concepts and "speech")
+    set ok to append_list(concepts and "turing")
+    set ok to append_list(concepts and "name")
+    
+    set text_upper to string_upper(text)
+    set len to length_list(concepts)
+    
+    set i to 0
+    repeat while i < len:
+        set c1 to get_list(concepts and i)
+        set c1_upper to string_upper(c1)
+        if string_contains(text_upper and c1_upper) == 1:
+            set j to i + 1
+            repeat while j < len:
+                set c2 to get_list(concepts and j)
+                set c2_upper to string_upper(c2)
+                if string_contains(text_upper and c2_upper) == 1:
+                    set ok to memory_strengthen_synapse(memory_mgr and c1 and c2)
+                set j to j + 1
+        set i to i + 1
+        
+    free_list(concepts)
+    return 0
+
+
+define react_simulate_inference with prompt as Str and loop_idx as Int returning Str:
+    set prompt_upper to string_upper(prompt)
+    
+    if string_contains(prompt_upper and "AUTO_APPROVE_TEST") == 1:
+        if loop_idx == 0:
+            return "Thought: I will call money_transfer.\nAction: money_transfer([50, \"did:key:recipient\"])"
+        else if loop_idx == 1:
+            return "Thought: I will call dht_store.\nAction: dht_store([\"test_key\", \"test_val\"])"
+        else:
+            return "Thought: I will now reply correctly.\nAction: reply_request([\"ai:agent_rebuild,response:Success\"])"
+
+    if string_contains(prompt_upper and "CONVERGENCE_TEST") == 1:
+        if loop_idx == 0:
+            return "Thought: I will output a message without a properly formatted Action statement to test loop convergence recovery."
+        else:
+            return "Thought: I will now reply correctly.\nAction: reply_request([\"ai:agent_rebuild,response:Success\"])"
+
+    set req_pos to string_last_index_of(prompt_upper and "USER REQUEST:")
+    set obs_pos to string_last_index_of(prompt_upper and "\nOBSERVATION:")
+    if obs_pos > req_pos:
+        set observation_text to substring(prompt and obs_pos + 13 and string_length(prompt) - obs_pos - 13)
+        return f"Thought: I have received the observation. I will now reply to the user.\nAction: reply_request([\"ai:agent_rebuild,response:Success. Result is: {string_trim(observation_text)}\"])"
+        
+    if string_contains(prompt_upper and "TURING_GRID_OP") == 1:
+        set op_start to string_index_of(prompt and "turing_grid_op(")
+        if op_start > 0:
+            set op_end to string_index_of(prompt and ")")
+            if op_end > op_start:
+                set op_args to substring(prompt and op_start + 15 and op_end - op_start - 15)
+                return f"Thought: Running Turing Grid operation.\nAction: turing_grid_op({op_args})"
+        
+    if string_contains(prompt_upper and "RESOLVE NAME ") == 1:
+        set name_pos to string_index_of(prompt_upper and "RESOLVE NAME ")
+        set name_arg to substring(prompt and name_pos + 13 and string_length(prompt) - name_pos - 13)
+        set name_trimmed to string_trim(name_arg)
+        return f"Thought: The user wants me to resolve a name. I will call name_resolve.\nAction: name_resolve([\"{name_trimmed}\"])"
+        
+    if string_contains(prompt_upper and "CHECK BALANCE") == 1 or else string_contains(prompt_upper and "WALLET BALANCE") == 1:
+        return "Thought: I need to check the wallet balance. I will call wallet_balance.\nAction: wallet_balance([])"
+        
+    if string_contains(prompt_upper and "TRANSFER ") == 1:
+        return "Thought: I will call money_transfer.\nAction: money_transfer([50, \"did:key:recipient\"])"
+        
+    return "Thought: I will answer the user request directly.\nAction: reply_request([\"ai:agent_rebuild,response:Hello! I am the ErnOS Agent rebuilt in ErnosPlain. How can I help you today?\"])"
+
+
+define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and current_prompt as Str and start_loop_idx as Int and values_list as List returning Str:
+    set loop_idx to start_loop_idx
+    set final_answer to ""
+    set finished to 0
+    
+    # Check if we are running under automated test suite
+    set is_test to 0
+    if map_contains(ctx and "is_test") == 1:
+        set is_test to map_get_val(ctx and "is_test")
+    
+    # Check if a model is loaded. If model has no vocab (empty map), run simulation mode.
+    set use_simulation to 1
+    if map_contains(model and "vocab") == 1:
+        set vocab_node to map_get_val(model and "vocab")
+        if length_list(vocab_node) > 0:
+            set use_simulation to 0
+            
+    repeat while finished == 0 and also loop_idx < 24:
+        display f"--- ReAct Loop Turn {loop_idx + 1} ---"
+        display f"Prompt character length: {string_length(current_prompt)}"
+        
+        set raw_output to ""
+        if is_test == 0:
+            set selected_model to ""
+            if map_contains(ctx and "selected_model") == 1:
+                set selected_model to map_get_val(ctx and "selected_model")
+            set raw_output to query_local_llm(current_prompt and selected_model)
+            
+        if string_length(raw_output) == 0:
+            if is_test == 1:
+                set raw_output to react_simulate_inference(current_prompt and loop_idx)
+            else if use_simulation == 0:
+                set raw_output to inference_run(model and current_prompt and 0 and 200)
+            else:
+                # No LLM available — tell user instead of faking it with hardcoded heuristics
+                display "[ReAct] No LLM response and no local model loaded. Returning error."
+                set final_answer to "Error: No LLM model responded. Please check that your selected model is running in Ollama or LM Studio."
+                set finished to 1
+            
+        display f"LLM raw response:\n{raw_output}\n----------------"
+        set ok to append_list(values_list and raw_output)
+        
+        # Strengthen synapses based on generated thought
+        set ok to react_hebbian_trigger(memory_mgr and raw_output)
+        
+        set action_map to react_parse_action(raw_output)
+        set found_action to map_get_val(action_map and "found")
+        
+        if found_action == 1:
+            set tool_name to map_get_val(action_map and "tool_name")
+            set args_str to map_get_val(action_map and "args_str")
+            display f"Parsed action: '{tool_name}' with args: '{args_str}'"
+            set ok to append_list(values_list and action_map)
+            
+            # Parse arguments as JSON array or fallback to raw string
+            set args_list to create_list()
+            set json_node to json_parse(args_str)
+            if json_node != 0:
+                set j_type to get_json_type(json_node)
+                if j_type == 3: # List
+                    set parsed_items to get_json_value(json_node)
+                    set items_len to length_list(parsed_items)
+                    set item_i to 0
+                    repeat while item_i < items_len:
+                        set json_item to get_list(parsed_items and item_i)
+                        set val to get_json_value(json_item)
+                        set ok to append_list(args_list and val)
+                        set item_i to item_i + 1
+                else:
+                    set ok to append_list(args_list and get_json_value(json_node))
+            else:
+                set ok to append_list(args_list and args_str)
+                
+            set action_allowed to 1
+            set action_reason to ""
+            
+            # --- Tool Approval Gate ---
+            set needs_approval to tools_requires_approval(tool_name and args_list)
+            if needs_approval == 1:
+                set has_approval to 0
+                if map_contains(ctx and "tool_approved") == 1:
+                    set has_approval to map_get_val(ctx and "tool_approved")
+                
+                # Check request-scoped auto_approve
+                set auto_approve_val to 0
+                if map_contains(ctx and "auto_approve") == 1:
+                    set auto_approve_val to map_get_val(ctx and "auto_approve")
+                if auto_approve_val == 1:
+                    set has_approval to 1
+                
+                if has_approval == 0:
+                    set denials to 0
+                    if map_contains(ctx and "consecutive_denials") == 1:
+                        set denials to map_get_val(ctx and "consecutive_denials")
+                    
+                    if denials >= 2:
+                        display f"Auto-denying tool '{tool_name}' because consecutive denials >= 2"
+                        set action_allowed to 0
+                        set action_reason to "Tool execution blocked because user has denied tool execution twice in a row."
+                    else:
+                        # Build a summary of what the tool wants to do
+                        set approval_summary to concat(tool_name and "(")
+                        set approval_summary to concat(approval_summary and args_str)
+                        set approval_summary to concat(approval_summary and ")")
+                        
+                        display f"Tool '{tool_name}' requires user approval. Pausing for confirmation."
+                        
+                        # Store pending action state in context for the IPC layer to pick up
+                        set pending to create_map()
+                        set ok to map_insert(pending and "tool_name" and tool_name)
+                        set ok to map_insert(pending and "args_str" and args_str)
+                        set ok to map_insert(pending and "summary" and approval_summary)
+                        set ok to map_insert(pending and "prompt_state" and current_prompt)
+                        set ok to map_insert(pending and "raw_output" and raw_output)
+                        set ok to map_insert(pending and "loop_idx" and loop_idx)
+                        set ok to map_insert(ctx and "pending_action" and pending)
+                        
+                        # Store the parsed args list for later execution
+                        set pending_args to create_list()
+                        set pa_idx to 0
+                        set a_len to length_list(args_list)
+                        repeat while pa_idx < a_len:
+                            set pa_val to get_list(args_list and pa_idx)
+                            set ok to append_list(pending_args and pa_val)
+                            set pa_idx to pa_idx + 1
+                        set ok to map_insert(pending and "args_list" and pending_args)
+                        
+                        free_list(args_list)
+                        free_list(values_list)
+                        return "PENDING_APPROVAL"
+                else:
+                    # Approval was granted — clear the flag and proceed
+                    set ok to map_insert(ctx and "tool_approved" and 0)
+            
+            # --- Observer Security Audit (for dangerous commands) ---
+            # E4: turing_grid_op(execute) runs a grid cell as a shell command — treat it
+            # as a shell-exec sink and audit it like run_command (it's also admin-only
+            # via tools_is_action_allowed).
+            set is_grid_exec to 0
+            if tool_name equals "turing_grid_op":
+                if length_list(args_list) >= 1:
+                    if get_list(args_list and 0) equals "execute":
+                        set is_grid_exec to 1
+            if tool_name equals "run_command" or else tool_name equals "codebase_write" or else is_grid_exec == 1:
+                set audit_payload to ""
+                if tool_name equals "run_command":
+                    if length_list(args_list) >= 1:
+                        set cmd_arg to get_list(args_list and 0)
+                        set audit_payload to concat("run_command: " and cmd_arg)
+                else if is_grid_exec == 1:
+                    set audit_payload to "turing_grid_op execute: runs a Turing-grid cell as a shell command"
+                else:
+                    if length_list(args_list) >= 1:
+                        set path_arg to get_list(args_list and 0)
+                        set audit_payload to concat("codebase_write: " and path_arg)
+                
+                if string_length(audit_payload) > 0:
+                    set audit_map to observer_audit(ctx and current_prompt and audit_payload)
+                    set verdict to map_get_val(audit_map and "verdict")
+                    if verdict equals "BLOCKED":
+                        set action_allowed to 0
+                        set action_reason to map_get_val(audit_map and "reason")
+                    free_map(audit_map)
+                    
+            set tool_result to ""
+            if action_allowed == 0:
+                display f"Observer action audit: BLOCKED. Reason: {action_reason}"
+                set tool_result to concat("BLOCKED by Observer: " and action_reason)
+            else:
+                display f"Executing tool: {tool_name}..."
+                set tool_result to tools_execute(tools_mgr and ctx and tool_name and args_list)
+                display f"Tool result: {tool_result}"
+                
+            set ok to append_list(values_list and tool_result)
+            free_list(args_list)
+            
+            # Store event in Tier 3 Timeline
+            set ok to memory_store(memory_mgr and 3 and f"Action: {tool_name}" and f"Result: {tool_result}")
+            
+            if tool_name equals "reply_request":
+                # Single inference-only audit — no static checks, all LLM
+                set audit_map to observer_audit(ctx and current_prompt and tool_result)
+                set verdict to map_get_val(audit_map and "verdict")
+                set audit_reason to map_get_val(audit_map and "reason")
+                free_map(audit_map)
+                
+                if verdict equals "ALLOWED":
+                    display "Observer reply audit: ALLOWED. Final response ready."
+                    set final_answer to tool_result
+                    set finished to 1
+                else:
+                    display f"Observer reply audit: BLOCKED. Reason: {audit_reason}. Re-prompting..."
+                    # Blocked! Re-prompt agent with audit warning using [SELF-CHECK FAIL: INVISIBLE TO USER]
+                    set current_prompt to concat(current_prompt and "\n")
+                    set current_prompt to concat(current_prompt and raw_output)
+                    set current_prompt to concat(current_prompt and "\n[SELF-CHECK FAIL: INVISIBLE TO USER] Your response was BLOCKED by the Observer. Reason: ")
+                    set current_prompt to concat(current_prompt and audit_reason)
+                    set current_prompt to concat(current_prompt and ". Please correct the response and try again.\n")
+            else:
+                # Standard tool observation back to prompt
+                set current_prompt to concat(current_prompt and "\n")
+                set current_prompt to concat(current_prompt and raw_output)
+                set current_prompt to concat(current_prompt and "\nObservation: ")
+                set current_prompt to concat(current_prompt and tool_result)
+                set current_prompt to concat(current_prompt and "\n")
+                
+                set denials to 0
+                if map_contains(ctx and "consecutive_denials") == 1:
+                    set denials to map_get_val(ctx and "consecutive_denials")
+                if denials >= 2:
+                    set current_prompt to concat(current_prompt and "\n[SYSTEM: The user has denied tool execution twice in a row. You must call reply_request now to return your final answer based on the information you have. Do not use any other tool.]\n")
+        else:
+            display "No valid action parsed. Re-prompting for correct Action grammar..."
+            # Enforce Turn Boundary Rejection!
+            set current_prompt to concat(current_prompt and "\n")
+            set current_prompt to concat(current_prompt and raw_output)
+            set current_prompt to concat(current_prompt and "\n[SELF-CHECK FAIL: INVISIBLE TO USER] You did NOT call the reply_request tool or any other tool. To reply to the user, you must use the grammar: Action: reply_request([\"your response\"])\n")
+            
+        set loop_idx to loop_idx + 1
+
+    # E3: if the loop exited on the iteration cap (not a natural reply_request), abort
+    # instead of spinning — a model that never replies would otherwise run forever with
+    # an ever-growing prompt (cost/compute DoS).
+    if finished == 0:
+        display "[ReAct] Iteration cap (24) reached — aborting."
+        set final_answer to "I could not complete this request within the allowed number of steps."
+    free_list(values_list)
+    return final_answer
+
+
+define react_resume_approved with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and approved as Int returning Str:
+    # Resume execution after a tool approval/denial decision
+    set pending to map_get_val(ctx and "pending_action")
+    if pending == 0:
+        return "Error: No pending action to resume."
+    
+    set tool_name to map_get_val(pending and "tool_name")
+    set args_list to map_get_val(pending and "args_list")
+    set current_prompt to map_get_val(pending and "prompt_state")
+    set raw_output to map_get_val(pending and "raw_output")
+    
+    set loop_idx to 0
+    if map_contains(pending and "loop_idx") == 1:
+        set loop_idx to map_get_val(pending and "loop_idx")
+    
+    # Clear the pending action
+    set ok to map_delete(ctx and "pending_action")
+    
+    set denials to 0
+    if map_contains(ctx and "consecutive_denials") == 1:
+        set denials to map_get_val(ctx and "consecutive_denials")
+
+    if approved == 1:
+        set denials to 0
+    else:
+        set denials to denials + 1
+    set ok to map_insert(ctx and "consecutive_denials" and denials)
+
+    set tool_result to ""
+    if approved == 1:
+        display f"User APPROVED tool: {tool_name}. Executing..."
+        
+        # Run observer security audit for dangerous commands before executing
+        set action_allowed to 1
+        if tool_name equals "run_command" or else tool_name equals "codebase_write":
+            set audit_payload to ""
+            if tool_name equals "run_command":
+                if length_list(args_list) >= 1:
+                    set cmd_arg to get_list(args_list and 0)
+                    set audit_payload to concat("run_command: " and cmd_arg)
+            else:
+                if length_list(args_list) >= 1:
+                    set path_arg to get_list(args_list and 0)
+                    set audit_payload to concat("codebase_write: " and path_arg)
+            
+            if string_length(audit_payload) > 0:
+                set audit_map to observer_audit(ctx and current_prompt and audit_payload)
+                set verdict to map_get_val(audit_map and "verdict")
+                if verdict equals "BLOCKED":
+                    set action_allowed to 0
+                    set tool_result to concat("BLOCKED by Observer: " and map_get_val(audit_map and "reason"))
+                free_map(audit_map)
+        
+        if action_allowed == 1:
+            set tool_result to tools_execute(tools_mgr and ctx and tool_name and args_list)
+            display f"Tool result: {tool_result}"
+    else:
+        display f"User DENIED tool: {tool_name}. Skipping."
+        set tool_result to f"DENIED by user: Tool '{tool_name}' was not approved for execution."
+    
+    # Store event in Tier 3 Timeline
+    set ok to memory_store(memory_mgr and 3 and f"Action: {tool_name}" and f"Result: {tool_result}")
+    
+    if tool_name equals "reply_request" and approved == 1:
+        # reply_request was approved — run observer audit on the reply content
+        set audit_map to observer_audit(ctx and current_prompt and tool_result)
+        set verdict to map_get_val(audit_map and "verdict")
+        set audit_reason to map_get_val(audit_map and "reason")
+        free_map(audit_map)
+        if verdict equals "ALLOWED":
+            return tool_result
+    
+    # Inject the result as an Observation and re-enter the main loop
+    set current_prompt to concat(current_prompt and "\n")
+    set current_prompt to concat(current_prompt and raw_output)
+    set current_prompt to concat(current_prompt and "\nObservation: ")
+    set current_prompt to concat(current_prompt and tool_result)
+    set current_prompt to concat(current_prompt and "\n")
+    
+    if denials >= 2:
+        set current_prompt to concat(current_prompt and "\n[SYSTEM: The user has denied tool execution twice in a row. You must call reply_request now to return your final answer based on the information you have. Do not use any other tool.]\n")
+
+    # Set approval flag so the loop can continue without re-gating
+    set ok to map_insert(ctx and "tool_approved" and 0)
+    
+    set values_list to create_list()
+    set ok to append_list(values_list and current_prompt)
+    
+    return react_run_loop(model and memory_mgr and tools_mgr and ctx and current_prompt and loop_idx + 1 and values_list)
+
+
+define react_run with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and user_prompt as Str returning Str:
+    set active_runs to 0
+    if map_contains(ctx and "active_runs") == 1:
+        set active_runs to map_get_val(ctx and "active_runs")
+    
+    set max_runs to 4
+    if map_contains(ctx and "resource_profile") == 1:
+        set profile to map_get_val(ctx and "resource_profile")
+        if profile equals "low":
+            set max_runs to 1
+        else if profile equals "standard":
+            set max_runs to 2
+            
+    if active_runs >= max_runs:
+        return "Error: System is at capacity (concurrency limit reached). Please try again later."
+        
+    set ok to map_insert(ctx and "active_runs" and active_runs + 1)
+
+    set ok to map_insert(ctx and "auto_approve" and 0)
+    set sanitized_user_prompt to prompt_sanitize_input(user_prompt)
+    # Trigger Hebbian learning on prompt concepts
+    set ok to react_hebbian_trigger(memory_mgr and sanitized_user_prompt)
+    
+    # Context window compression check
+    set sessions_mgr to map_get_val(ctx and "sessions")
+    if sessions_mgr != 0:
+        set sess to session_manager_get_active(sessions_mgr)
+        if sess != 0:
+            set selected_model to map_get_val(ctx and "selected_model")
+            set ok to session_compress_active(sessions_mgr and sess and selected_model)
+
+    set history to create_list()
+    set values_list to create_list()
+    set ok to append_list(values_list and history)
+    
+    set tools_schema to map_get_val(tools_mgr and "schemas")
+    set assembled_prompt to prompt_assemble(memory_mgr and ctx and sanitized_user_prompt and tools_schema)
+    set ok to append_list(values_list and assembled_prompt)
+    
+    set res to react_run_loop(model and memory_mgr and tools_mgr and ctx and assembled_prompt and 0 and values_list)
+    
+    set active_runs to map_get_val(ctx and "active_runs")
+    if active_runs > 0:
+        set ok to map_insert(ctx and "active_runs" and active_runs - 1)
+        
+    return res

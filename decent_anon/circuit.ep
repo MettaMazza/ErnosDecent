@@ -1,0 +1,179 @@
+# ErnosDecent — Onion circuit construction + DHT relay directory
+# Component: decent_anon/circuit.ep
+# Status: Production
+#
+# Turns the layered-crypto primitives in onion.ep into a usable anonymizing
+# transport: relays advertise an onion descriptor in the DHT, an origin builds a
+# multi-hop circuit from real directory entries using a FRESH ephemeral X25519 key
+# (so the entry guard cannot link the circuit to the origin's long-term identity),
+# and each relay derives its own layer key by ECDH against that ephemeral key.
+#
+# Wire format on the network: "<eph_pub_hex>|<ciphertext_hex>|<nonce_hex>".
+# eph_pub is constant for the whole circuit; ciphertext/nonce are hex (no '|'),
+# so a single '|' split is unambiguous.
+
+import "collections"
+import "string"
+import "../decent_id/keys"
+import "../decent_net/dht"
+import "onion"
+
+set ONION_CIRCUIT_OK to 0
+set ONION_CIRCUIT_ERR_NO_RELAYS to 1
+set ONION_CIRCUIT_ERR_CRYPTO to 2
+set ONION_CIRCUIT_ERR_MALFORMED to 3
+
+# --- DHT relay directory ----------------------------------------------------
+
+define onion_relay_dht_key with node_id as Str returning Str:
+    return concat("onion:relay:" and node_id)
+
+# Publish this node's onion descriptor so others can route through it.
+# value = "address:port:enc_pub" (enc_pub = this node's X25519 encryption pubkey).
+define onion_publish_self with dht as Int and node_id as Str and p2p_addr as Str and p2p_port as Int and enc_pub as Str returning Int:
+    set val to concat(p2p_addr and ":")
+    set val to concat(val and int_to_string(p2p_port))
+    set val to concat(val and ":")
+    set val to concat(val and enc_pub)
+    return dht_node_store_value(dht and onion_relay_dht_key(node_id) and val)
+
+# Parse "address:port:enc_pub". address holds no ':' (IPv4/host), port is decimal,
+# enc_pub is 64 hex chars — so split on the first two ':' and take the remainder.
+define onion_parse_descriptor with raw as Str returning Map:
+    set out to create_map()
+    set c1 to string_index_of(raw and ":")
+    if c1 < 0:
+        set ok to map_insert(out and "error" and 1)
+        return out
+    set addr to substring(raw and 0 and c1)
+    set rest to substring(raw and c1 + 1 and string_length(raw) - c1 - 1)
+    set c2 to string_index_of(rest and ":")
+    if c2 < 0:
+        set ok to map_insert(out and "error" and 1)
+        return out
+    set port to string_to_int(substring(rest and 0 and c2))
+    set pub to substring(rest and c2 + 1 and string_length(rest) - c2 - 1)
+    set ok to map_insert(out and "address" and addr)
+    set ok to map_insert(out and "port" and port)
+    set ok to map_insert(out and "enc_pub" and pub)
+    set ok to map_insert(out and "error" and 0)
+    return out
+
+# --- circuit construction (origin side) -------------------------------------
+
+# relays: List of descriptor maps {address, port, enc_pub} in entry→…→exit order.
+# dest_addr:dest_port is where the EXIT delivers the cleartext query. Returns
+# {error, first_addr, first_port, wire, eph_pub}. The origin sends `wire` to the
+# first relay; the exit recovers `query` addressed to dest.
+define onion_build_query with relays as List and dest_addr as Str and dest_port as Int and query as Str returning Map:
+    set out to create_map()
+    set n to length_list(relays)
+    if n == 0:
+        set ok to map_insert(out and "error" and ONION_CIRCUIT_ERR_NO_RELAYS)
+        return out
+    set eph to generate_encryption_keypair()
+    if map_get_val(eph and "error") != 0:
+        set ok to map_insert(out and "error" and ONION_CIRCUIT_ERR_CRYPTO)
+        return out
+    set eph_sec to ptr_to_str(map_get_val(eph and "secret_key"))
+    set eph_pub to ptr_to_str(map_get_val(eph and "public_key"))
+    set circuit_keys to create_list()
+    set hops to create_list()
+    set i to 0
+    repeat while i < n:
+        set d to get_list(relays and i)
+        set rpub to ptr_to_str(map_get_val(d and "enc_pub"))
+        set k to onion_derive_shared_secret(eph_sec and rpub)
+        if string_length(k) == 0:
+            set ok to map_insert(out and "error" and ONION_CIRCUIT_ERR_CRYPTO)
+            return out
+        set ok to append_list(circuit_keys and str_to_ptr(k))
+        set hopaddr to concat(ptr_to_str(map_get_val(d and "address")) and ":")
+        set hopaddr to concat(hopaddr and int_to_string(map_get_val(d and "port")))
+        set ok to append_list(hops and str_to_ptr(hopaddr))
+        set i to i + 1
+    set dest to concat(dest_addr and ":")
+    set dest to concat(dest and int_to_string(dest_port))
+    set pkt to onion_create_packet(circuit_keys and hops and dest and query)
+    if map_get_val(pkt and "error") != 0:
+        set ok to map_insert(out and "error" and ONION_CIRCUIT_ERR_CRYPTO)
+        return out
+    set wire to concat(eph_pub and "|")
+    set wire to concat(wire and ptr_to_str(map_get_val(pkt and "ciphertext")))
+    set wire to concat(wire and "|")
+    set wire to concat(wire and ptr_to_str(map_get_val(pkt and "nonce")))
+    set d0 to get_list(relays and 0)
+    set ok to map_insert(out and "first_addr" and ptr_to_str(map_get_val(d0 and "address")))
+    set ok to map_insert(out and "first_port" and map_get_val(d0 and "port"))
+    set ok to map_insert(out and "wire" and wire)
+    set ok to map_insert(out and "eph_pub" and eph_pub)
+    set ok to map_insert(out and "error" and ONION_CIRCUIT_OK)
+    return out
+
+# --- relay side -------------------------------------------------------------
+
+# Split "<eph_pub>|<ciphertext>|<nonce>".
+define onion_parse_wire with wire as Str returning Map:
+    set out to create_map()
+    set p1 to string_index_of(wire and "|")
+    if p1 < 0:
+        set ok to map_insert(out and "error" and 1)
+        return out
+    set eph_pub to substring(wire and 0 and p1)
+    set rest to substring(wire and p1 + 1 and string_length(wire) - p1 - 1)
+    set p2 to string_index_of(rest and "|")
+    if p2 < 0:
+        set ok to map_insert(out and "error" and 1)
+        return out
+    set ct to substring(rest and 0 and p2)
+    set nc to substring(rest and p2 + 1 and string_length(rest) - p2 - 1)
+    set ok to map_insert(out and "eph_pub" and eph_pub)
+    set ok to map_insert(out and "ciphertext" and ct)
+    set ok to map_insert(out and "nonce" and nc)
+    set ok to map_insert(out and "error" and 0)
+    return out
+
+# Process one hop with this relay's encryption secret key. Returns
+# {error, is_exit, next_addr, next_port, payload (exit) | fwd_wire (relay)}.
+# The relay learns ONLY the immediate predecessor (the TCP peer it received from)
+# and the immediate successor (next_addr) — never the origin or, unless it is the
+# exit, the destination/query.
+define onion_process_hop with my_enc_sec as Str and wire as Str returning Map:
+    set out to create_map()
+    set pw to onion_parse_wire(wire)
+    if map_get_val(pw and "error") != 0:
+        set ok to map_insert(out and "error" and ONION_CIRCUIT_ERR_MALFORMED)
+        return out
+    set eph_pub to ptr_to_str(map_get_val(pw and "eph_pub"))
+    set my_key to onion_derive_shared_secret(my_enc_sec and eph_pub)
+    if string_length(my_key) == 0:
+        set ok to map_insert(out and "error" and ONION_CIRCUIT_ERR_CRYPTO)
+        return out
+    set pm to create_map()
+    set ok to map_insert(pm and "ciphertext" and map_get_val(pw and "ciphertext"))
+    set ok to map_insert(pm and "nonce" and map_get_val(pw and "nonce"))
+    set step to onion_decrypt_step(pm and my_key)
+    if map_get_val(step and "error") != 0:
+        set ok to map_insert(out and "error" and ONION_CIRCUIT_ERR_CRYPTO)
+        return out
+    set is_exit to map_get_val(step and "is_exit")
+    set next to ptr_to_str(map_get_val(step and "next"))
+    set c to string_last_index_of(next and ":")
+    set naddr to next
+    set nport to 0
+    if c > 0:
+        set naddr to substring(next and 0 and c)
+        set nport to string_to_int(substring(next and c + 1 and string_length(next) - c - 1))
+    set ok to map_insert(out and "is_exit" and is_exit)
+    set ok to map_insert(out and "next_addr" and naddr)
+    set ok to map_insert(out and "next_port" and nport)
+    if is_exit == 1:
+        set ok to map_insert(out and "payload" and ptr_to_str(map_get_val(step and "payload")))
+    else:
+        set fwd to concat(eph_pub and "|")
+        set fwd to concat(fwd and ptr_to_str(map_get_val(step and "ciphertext")))
+        set fwd to concat(fwd and "|")
+        set fwd to concat(fwd and ptr_to_str(map_get_val(step and "nonce")))
+        set ok to map_insert(out and "fwd_wire" and fwd)
+    set ok to map_insert(out and "error" and ONION_CIRCUIT_OK)
+    return out

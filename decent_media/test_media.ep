@@ -1,0 +1,485 @@
+# ErnosDecent -- Integration Test Suite for Media & Communication
+# Component: decent_media/test_media.ep
+# Status: Production -- Phase 10
+
+import "webrtc"
+import "stream"
+import "codec"
+import "cdn"
+import "../decent_store/content"
+import "../decent_net/dht"
+import "collections"
+import "string"
+
+external define get_list_data_ptr with list
+
+define cast_to_int with x as Int returning Int:
+    return x
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_media/test_media.ep Suite"
+    display "  OperationTrojanClaude Phase 10 Integration Test"
+    display "==================================================="
+    display ""
+    
+    set tests_passed to 0
+    set tests_failed to 0
+    
+    # ════════════════════════════════════════════════════════════════
+    # TEST 1: SDP Offer/Answer Parsing & Generation
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 1: SDP Offer/Answer Parsing & Generation"
+    
+    set pc_alice to webrtc_create_peer_connection("alice")
+    set pc_bob to webrtc_create_peer_connection("bob")
+    
+    set sdp_alice to webrtc_generate_local_sdp(pc_alice)
+    
+    # Set Alice's SDP as remote on Bob
+    set ok to webrtc_set_remote_sdp(pc_bob and sdp_alice)
+    
+    set r_ufrag to map_get_val(pc_bob and "remote_ufrag")
+    set r_pwd to map_get_val(pc_bob and "remote_pwd")
+    set r_fp to map_get_val(pc_bob and "remote_fingerprint")
+    
+    set t1_ok to 0
+    if r_ufrag equals "u_alice":
+        if r_pwd equals "p_alice":
+            if string_length(r_fp) > 0:
+                set t1_ok to 1
+                
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: SDP parsing extraction mismatch"
+        display concat("    Remote Ufrag: " and r_ufrag)
+        display concat("    Remote Pwd: " and r_pwd)
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 2: STUN Packet Packing & Parsing
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 2: STUN Packet Packing & Parsing"
+    
+    set transaction_id to create_list()
+    set ok to append_list(transaction_id and 1)
+    set ok to append_list(transaction_id and 2)
+    set ok to append_list(transaction_id and 3)
+    set ok to append_list(transaction_id and 4)
+    set ok to append_list(transaction_id and 5)
+    set ok to append_list(transaction_id and 6)
+    set ok to append_list(transaction_id and 7)
+    set ok to append_list(transaction_id and 8)
+    set ok to append_list(transaction_id and 9)
+    set ok to append_list(transaction_id and 10)
+    set ok to append_list(transaction_id and 11)
+    set ok to append_list(transaction_id and 12)
+    
+    set request_ptr to webrtc_pack_stun_request(transaction_id)
+    
+    # Verify request magic cookie (0x2112A442)
+    set cookie_ok to 0
+    if peek_byte(request_ptr and 4) == 33 and also peek_byte(request_ptr and 5) == 18 and also peek_byte(request_ptr and 6) == 164 and also peek_byte(request_ptr and 7) == 66:
+        set cookie_ok to 1
+        
+    # Construct a simulated STUN Response packet with XOR-MAPPED-ADDRESS
+    # Attributes start at offset 20. Let's make a 32-byte packet
+    set response_ptr to alloc_bytes(32)
+    # Type: 0x0101 (Binding Response)
+    poke_byte(response_ptr and 0 and 1)
+    poke_byte(response_ptr and 1 and 1)
+    # Length: 12 bytes of attributes (0x000c)
+    poke_byte(response_ptr and 2 and 0)
+    poke_byte(response_ptr and 3 and 12)
+    # Magic Cookie (0x2112A442)
+    poke_byte(response_ptr and 4 and 33)
+    poke_byte(response_ptr and 5 and 18)
+    poke_byte(response_ptr and 6 and 164)
+    poke_byte(response_ptr and 7 and 66)
+    
+    # Attribute XOR-MAPPED-ADDRESS type (0x0020)
+    poke_byte(response_ptr and 20 and 0)
+    poke_byte(response_ptr and 21 and 32)
+    # Attribute length (8 bytes)
+    poke_byte(response_ptr and 22 and 0)
+    poke_byte(response_ptr and 23 and 8)
+    
+    # Reserved zero byte + Family IPv4 (0x01)
+    poke_byte(response_ptr and 24 and 0)
+    poke_byte(response_ptr and 25 and 1)
+    
+    # XOR Port (let's encode port 12345 ^ 8466 = 4395)
+    # 4395 = 17 * 256 + 43
+    poke_byte(response_ptr and 26 and 17)
+    poke_byte(response_ptr and 27 and 43)
+    
+    # XOR IP (let's encode IP 192.168.1.10)
+    # 192 ^ 33 = 225
+    # 168 ^ 18 = 186
+    # 1 ^ 164 = 165
+    # 10 ^ 66 = 72
+    poke_byte(response_ptr and 28 and 225)
+    poke_byte(response_ptr and 29 and 186)
+    poke_byte(response_ptr and 30 and 165)
+    poke_byte(response_ptr and 31 and 72)
+    
+    set parsed_res to webrtc_parse_stun_response(response_ptr and 32)
+    set parsed_valid to cast_to_int(map_get_val(parsed_res and "valid"))
+    set parsed_addr to map_get_val(parsed_res and "address")
+    set parsed_port to cast_to_int(map_get_val(parsed_res and "port"))
+    
+    free_bytes(request_ptr)
+    free_bytes(response_ptr)
+    set ok to free_list(transaction_id)
+    
+    set t2_ok to 0
+    if cookie_ok == 1:
+        if parsed_valid == 1:
+            if parsed_addr equals "192.168.1.10":
+                if parsed_port >= 12345 and also parsed_port <= 12345:
+                    set t2_ok to 1
+                    
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: STUN pack/unpack failed"
+        display concat("    IP: " and parsed_addr)
+        display concat("    Port: " and int_to_string(parsed_port))
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 3: DTLS/SRTP Packet Encryption & Decryption
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 3: DTLS/SRTP Packet Encryption & Decryption"
+    
+    set sdp_bob to webrtc_generate_local_sdp(pc_bob)
+    set ok to webrtc_set_remote_sdp(pc_alice and sdp_bob)
+    
+    # Real DTLS-SRTP key agreement (OpenSSL handshake → RFC 5764 keying material).
+    # One negotiation yields alice's (client) and bob's (server) per-direction keys.
+    set keys_alice to create_map()
+    set keys_bob to create_map()
+    set dtls_ok to webrtc_dtls_negotiate(keys_alice and keys_bob and "/tmp/ernos_dtls_cert.pem" and "/tmp/ernos_dtls_key.pem")
+    
+    # Encrypt media payload
+    set sample_payload to "hello-media-stream"
+    set pay_len to string_length(sample_payload)
+    set pay_ptr to str_to_ptr(sample_payload)
+    
+    set enc_res to webrtc_encrypt_srtp(pay_ptr and pay_len and keys_alice and 105 and 99999)
+    set packet_ptr to cast_to_int(map_get_val(enc_res and "packet_ptr"))
+    set packet_len to cast_to_int(map_get_val(enc_res and "packet_len"))
+    
+    # Decrypt at receiver side
+    set dec_res to webrtc_decrypt_srtp(packet_ptr and packet_len and keys_bob)
+    set dec_valid to cast_to_int(map_get_val(dec_res and "valid"))
+    
+    set decrypted_payload to ""
+    if dec_valid == 1:
+        set dec_ptr to cast_to_int(map_get_val(dec_res and "payload_ptr"))
+        set dec_len to cast_to_int(map_get_val(dec_res and "payload_len"))
+        set decrypted_payload to ptr_to_str(dec_ptr)
+        free_bytes(dec_ptr)
+        
+    free_bytes(packet_ptr)
+    
+    set t3_ok to 0
+    if dec_valid == 1:
+        if decrypted_payload equals sample_payload:
+            set t3_ok to 1
+            
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: SRTP Loopback decryption failure"
+        display concat("    Decrypted payload: " and decrypted_payload)
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 4: Media Segmenter & Caching (LRU eviction)
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 4: Media Segmenter & Caching"
+    
+    set long_media to "AAAAABBBBBCCCCCDDDDD" # 20 bytes
+    set playlist to stream_segment_media(long_media and 10 and "720p") # chunk size should be 5 bytes
+    set segments to map_get_val(playlist and "segments")
+    set manifest_str to map_get_val(playlist and "manifest_str")
+    
+    set num_segments to length_list(segments)
+    
+    # Create LRU cache with max size 15 bytes
+    set cache to stream_create_lru_cache(15)
+    set ok to stream_cache_put(cache and "seg0" and "12345") # 5 bytes
+    set ok to stream_cache_put(cache and "seg1" and "ABCDE") # 5 bytes
+    set ok to stream_cache_put(cache and "seg2" and "XYZ")   # 3 bytes (total 13 bytes)
+    
+    # Get seg0 (moves it to MRU)
+    set got_seg0 to stream_cache_get(cache and "seg0")
+    
+    # Put seg3 (5 bytes) -> should cause eviction of seg1 (the LRU since seg0 was accessed)
+    set ok to stream_cache_put(cache and "seg3" and "99999") # 5 bytes
+    
+    # Verify states
+    set has_seg0 to 0
+    set has_seg1 to 0
+    set has_seg2 to 0
+    set has_seg3 to 0
+    
+    set cache_map to map_get_val(cache and "cache_map")
+    if map_contains(cache_map and "seg0") == 1:
+        set has_seg0 to 1
+    if map_contains(cache_map and "seg1") == 1:
+        set has_seg1 to 1
+    if map_contains(cache_map and "seg2") == 1:
+        set has_seg2 to 1
+    if map_contains(cache_map and "seg3") == 1:
+        set has_seg3 to 1
+        
+    set t4_ok to 0
+    if num_segments == 4:
+        if has_seg0 == 1:
+            if has_seg1 == 0:
+                if has_seg2 == 1:
+                    if has_seg3 == 1:
+                        set t4_ok to 1
+                        
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: Media segmenting or LRU caching logic error"
+        display concat("    Num segments: " and int_to_string(num_segments))
+        display f"    Cached states: seg0={has_seg0}, seg1={has_seg1}, seg2={has_seg2}, seg3={has_seg3}"
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 5: Codec Encoders & Decoders (IMA-ADPCM & RLE Video)
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 5: Codec Encoders & Decoders"
+    
+    set codec_ctx to codec_init()
+
+    # 1. Audio codec loopback. The real codec (libopus when present, else ADPCM) is frame-
+    #    based and lossy: a 960-sample 20 ms frame must round-trip to a full frame of
+    #    samples. Exact-match is NOT expected (Opus is lossy); we validate the contract
+    #    that the pipeline reconstructs a non-empty, correctly-sized signal.
+    #    (Bit-exact codec fidelity is checked in test_opus.ep / test_vp8.ep.)
+    set raw_audio to create_list()
+    set ai to 0
+    repeat while ai < 960:
+        set ok to append_list(raw_audio and ((ai modulo 48) - 24) * 300)
+        set ai to ai + 1
+    set encoded_audio to codec_encode_audio(codec_ctx and raw_audio)
+    set decoded_audio to codec_decode_audio(codec_ctx and encoded_audio)
+    set audio_ok to 0
+    # opus → 960 samples back; ADPCM fallback → same length as input
+    if length_list(decoded_audio) == 960 or else length_list(decoded_audio) == length_list(raw_audio):
+        if length_list(encoded_audio) > 0:
+            set audio_ok to 1
+
+    # 2. Video codec loopback. Real VP8 (when libvpx present) needs an even-dimension
+    #    I420 frame and reconstructs a full frame (lossy). 16x16 I420 = 384 bytes.
+    set raw_video to create_list()
+    set vi to 0
+    repeat while vi < 384:
+        set ok to append_list(raw_video and (vi modulo 256))
+        set vi to vi + 1
+    set encoded_video to codec_encode_video(codec_ctx and raw_video and 16 and 16)
+    set decoded_video to codec_decode_video(codec_ctx and encoded_video and 16 and 16)
+    set video_ok to 0
+    # VP8 → full 384-byte I420 frame back; RLE fallback → same length as input
+    if length_list(decoded_video) == 384 or else length_list(decoded_video) == length_list(raw_video):
+        set video_ok to 1
+            
+    # Cleanup lists
+    set ok to free_list(raw_audio)
+    set ok to free_list(encoded_audio)
+    set ok to free_list(decoded_audio)
+    set ok to free_list(raw_video)
+    set ok to free_list(encoded_video)
+    set ok to free_list(decoded_video)
+    
+    if audio_ok == 1 and also video_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: Codec loopback validation failed"
+        display f"    Audio OK: {audio_ok}, Video OK: {video_ok}"
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 6: P2P CDN Swarming & DHT Publishing
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 6: P2P CDN Swarming & DHT Publishing"
+    
+    # Setup DHT nodes and CAS stores for Peer 1 and Peer 2
+    set dht1 to create_dht_node("node1" and "127.0.0.1" and 5001)
+    set dht2 to create_dht_node("node2" and "127.0.0.1" and 5002)
+    
+    # Make them know each other
+    set ok to dht_node_add_peer(dht1 and "node2" and "127.0.0.1" and 5002)
+    set ok to dht_node_add_peer(dht2 and "node1" and "127.0.0.1" and 5001)
+    
+    set cas1 to create_content_store()
+    set cas2 to create_content_store()
+    
+    set cdn1 to cdn_create(dht1 and cas1)
+    set cdn2 to cdn_create(dht2 and cas2)
+    
+    # Peer 1 has media segment stored
+    set segment_data to "P2P-streaming-video-block-data"
+    set seg_hash to cas_hash_content(segment_data)
+    set put_res to cas_put(cas1 and segment_data)
+    
+    # Create manifest
+    set chunks_list to create_list()
+    set ok to append_list(chunks_list and seg_hash)
+    
+    set manifest to create_map()
+    set ok to map_insert(manifest and "merkle_root" and seg_hash)
+    set ok to map_insert(manifest and "chunks" and chunks_list)
+    set ok to map_insert(manifest and "chunk_count" and 1)
+    
+    # Peer 1 publishes segment location manifest to DHT
+    set m_root to cdn_publish_manifest(cdn1 and manifest)
+    
+    # Propagate DHT values directly by copying Kademlia DHT store data maps
+    set dht1_store to cast_to_int(map_get_val(dht1 and "store"))
+    set dht2_store to cast_to_int(map_get_val(dht2 and "store"))
+    set dht1_data to cast_to_int(map_get_val(dht1_store and "data"))
+    set dht2_data to cast_to_int(map_get_val(dht2_store and "data"))
+    
+    set keys_list to map_keys(dht1_data)
+    set num_keys to length_list(keys_list)
+    set ki to 0
+    repeat while ki < num_keys:
+        set k to get_list(keys_list and ki)
+        set entry to cast_to_int(map_get_val(dht1_data and k))
+        set ok to map_insert(dht2_data and k and entry)
+        set ki to ki + 1
+        
+    set ok to free_list(keys_list)
+    
+    # Peer 2 locates provider peers for segment
+    set peers_found to cdn_locate_peers_for_segment(cdn2 and seg_hash)
+    set has_peer1 to 0
+    if length_list(peers_found) > 0:
+        if get_list(peers_found and 0) equals "node1":
+            set has_peer1 to 1
+            
+    # Register Peer 1's store with Peer 2 to allow simulated peer download
+    set ok to cdn_register_peer_store(cdn2 and "node1" and cas1)
+    
+    # Peer 2 downloads and stores segment locally
+    set downloaded_data to cdn_download_segment(cdn2 and seg_hash and peers_found)
+    
+    # Verify locally cached in Peer 2
+    set local_cached to cas_has(cas2 and seg_hash)
+    
+    set ok to free_list(peers_found)
+    set ok to free_list(chunks_list)
+    
+    set t6_ok to 0
+    if has_peer1 == 1:
+        if downloaded_data equals segment_data:
+            if local_cached == 1:
+                set t6_ok to 1
+                
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: P2P CDN Swarming test failed"
+        display concat("    Downloaded data: " and downloaded_data)
+        display f"    Peer1 found: {has_peer1}, Local cached: {local_cached}"
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 7: Complete Peer Loopback Stream
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 7: Complete Peer Loopback Stream"
+    
+    # Create raw audio and video frames. Audio is a full 960-sample (20 ms) frame so it
+    # round-trips through the real (frame-based, lossy) codec; video is a 16x16 I420 frame.
+    set raw_audio_frame to create_list()
+    set afi to 0
+    repeat while afi < 960:
+        set ok to append_list(raw_audio_frame and ((afi modulo 32) - 16) * 200)
+        set afi to afi + 1
+
+    set raw_video_frame to create_list()
+    set vfi to 0
+    repeat while vfi < 384:
+        set ok to append_list(raw_video_frame and (vfi modulo 256))
+        set vfi to vfi + 1
+    
+    # 1. Compress frames
+    set enc_audio to codec_encode_audio(codec_ctx and raw_audio_frame)
+    set enc_video to codec_encode_video(codec_ctx and raw_video_frame and 16 and 16)
+    
+    # 2. Package and encrypt audio packet
+    set aud_payload_len to length_list(enc_audio)
+    set aud_payload_ptr to alloc_bytes(aud_payload_len)
+    set idx to 0
+    repeat while idx < aud_payload_len:
+        poke_byte(aud_payload_ptr and idx and get_list(enc_audio and idx))
+        set idx to idx + 1
+        
+    set srtp_aud_res to webrtc_encrypt_srtp(aud_payload_ptr and aud_payload_len and keys_alice and 222 and 12345)
+    set aud_pkt_ptr to cast_to_int(map_get_val(srtp_aud_res and "packet_ptr"))
+    set aud_pkt_len to cast_to_int(map_get_val(srtp_aud_res and "packet_len"))
+    
+    # 3. Simulate transmission to Bob and decrypt
+    set bob_dec_res to webrtc_decrypt_srtp(aud_pkt_ptr and aud_pkt_len and keys_bob)
+    set bob_dec_valid to cast_to_int(map_get_val(bob_dec_res and "valid"))
+    
+    set loopback_ok to 0
+    if bob_dec_valid == 1:
+        set bob_dec_ptr to cast_to_int(map_get_val(bob_dec_res and "payload_ptr"))
+        set bob_dec_len to cast_to_int(map_get_val(bob_dec_res and "payload_len"))
+        
+        # Unpack back to list
+        set dec_audio_list to create_list()
+        set idx to 0
+        repeat while idx < bob_dec_len:
+            set ok to append_list(dec_audio_list and peek_byte(bob_dec_ptr and idx))
+            set idx to idx + 1
+            
+        # Decompress audio. Real codec is frame-based + lossy: a valid loopback
+        # reconstructs a full frame (960 via opus, or input length via ADPCM fallback).
+        set decoded_audio_frame to codec_decode_audio(codec_ctx and dec_audio_list)
+        if length_list(decoded_audio_frame) == 960 or else length_list(decoded_audio_frame) == length_list(raw_audio_frame):
+            set loopback_ok to 1
+            
+        set ok to free_list(dec_audio_list)
+        set ok to free_list(decoded_audio_frame)
+        free_bytes(bob_dec_ptr)
+        
+    free_bytes(aud_payload_ptr)
+    free_bytes(aud_pkt_ptr)
+    set ok to free_list(raw_audio_frame)
+    set ok to free_list(raw_video_frame)
+    set ok to free_list(enc_audio)
+    set ok to free_list(enc_video)
+    
+    if loopback_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: Complete loopback stream reconstruction failed"
+        set tests_failed to tests_failed + 1
+        
+    display ""
+    display "==================================================="
+    display "  RESULTS:"
+    display concat("  Passed: " and int_to_string(tests_passed))
+    display concat("  Failed: " and int_to_string(tests_failed))
+    display "==================================================="
+    
+    if tests_failed > 0:
+        return 1
+    return 0

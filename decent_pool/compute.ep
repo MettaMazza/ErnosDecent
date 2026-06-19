@@ -1,0 +1,271 @@
+# ErnosDecent — Distributed Compute Pooling
+# Component: decent_pool/compute.ep
+# Implements: Compute job registration, worker allocation, task scheduling, and redundant verification consensus
+# Status: Production — OperationTrojanClaude Phase 12
+
+import "collections"
+import "string"
+import "../decent_net/transport"
+
+# ================================================================
+# Constants and Error Codes
+# ================================================================
+
+set COMPUTE_ERR_NONE to 0
+set COMPUTE_ERR_JOB_NOT_FOUND to 810
+set COMPUTE_ERR_UNAUTHORIZED to 811
+set COMPUTE_ERR_ALREADY_SUBMITTED to 812
+set COMPUTE_ERR_NOT_ASSIGNED to 813
+set COMPUTE_ERR_DISPUTED to 814
+set COMPUTE_ERR_NO_PENDING_JOBS to 815
+
+# Job Status
+# - "pending"
+# - "assigned"
+# - "completed"
+# - "disputed"
+# - "verification_failed"
+
+# ================================================================
+# Data Structures
+# ================================================================
+
+define structure ComputeJob:
+    field job_id as Str
+    field delegator_id as Str
+    field worker_id as Str
+    field input_data as Str
+    field result as Str
+    field status as Str
+
+# ================================================================
+# Manager Implementation
+# ================================================================
+
+define compute_create_manager returning Map:
+    set mgr to create_map()
+    set jobs to create_map()
+    set pending_list to create_list()
+    set worker_contributions to create_map() # maps worker_id -> Int (completed tasks count)
+
+    set ok to map_insert(mgr and "jobs" and jobs)
+    set ok to map_insert(mgr and "pending" and pending_list)
+    set ok to map_insert(mgr and "contributions" and worker_contributions)
+    set ok to map_insert(mgr and "job_counter" and 0)
+    return mgr
+
+define compute_submit_job with mgr as Map and delegator_id as Str and input_data as Str returning Str:
+    set jobs to map_get_val(mgr and "jobs")
+    set pending_list to map_get_val(mgr and "pending")
+    set counter to map_get_val(mgr and "job_counter")
+    
+    set job_idx to counter + 1
+    set ok to map_insert(mgr and "job_counter" and job_idx)
+
+    # Convert job_idx to string
+    set job_id to f"job_{job_idx}"
+
+    set job to create_map()
+    set ok to map_insert(job and "job_id" and job_id)
+    set ok to map_insert(job and "delegator_id" and delegator_id)
+    set ok to map_insert(job and "worker_id" and "")
+    set ok to map_insert(job and "input_data" and input_data)
+    set ok to map_insert(job and "result" and "")
+    set ok to map_insert(job and "status" and "pending")
+    
+    # Store dynamic redundancy checks
+    # To implement redundant verification:
+    # We will track all results submitted by different workers for this job.
+    set submissions to create_map()
+    set ok to map_insert(job and "submissions" and submissions)
+    set ok to map_insert(job and "required_redundancy" and 2)
+
+    set ok to map_insert(jobs and job_id and job)
+    set ok to append_list(pending_list and str_to_ptr(job_id))
+
+    return job_id
+
+define compute_assign_job with mgr as Map and worker_id as Str returning Str:
+    set pending_list to map_get_val(mgr and "pending")
+    set size to length_list(pending_list)
+    if size == 0:
+        return ""
+
+    # Grab first job
+    set job_id_ptr to get_list(pending_list and 0)
+    set job_id to ptr_to_str(job_id_ptr)
+
+    # Remove from pending queue
+    set new_pending to create_list()
+    set i to 1
+    repeat while i < size:
+        set item to get_list(pending_list and i)
+        set ok to append_list(new_pending and item)
+        set i to i + 1
+    set ok to map_insert(mgr and "pending" and new_pending)
+
+    set jobs to map_get_val(mgr and "jobs")
+    set job to map_get_val(jobs and job_id)
+    set ok to map_insert(job and "worker_id" and worker_id)
+    set ok to map_insert(job and "status" and "assigned")
+
+    return job_id
+
+define compute_submit_result with mgr as Map and job_id as Str and worker_id as Str and result as Str returning Int:
+    set jobs to map_get_val(mgr and "jobs")
+    set job to map_get_val(jobs and job_id)
+    if job == 0:
+        return COMPUTE_ERR_JOB_NOT_FOUND
+
+    # Validate that the job has been assigned or is open for submissions
+    set status to ptr_to_str(map_get_val(job and "status"))
+    if (status equals "assigned") == 0 and (status equals "pending") == 0:
+        return COMPUTE_ERR_ALREADY_SUBMITTED
+
+    # Record worker's result submission
+    set submissions to map_get_val(job and "submissions")
+    set ok to map_insert(submissions and worker_id and result)
+
+    # Update main job result and worker if this is the first submission
+    set current_worker to ptr_to_str(map_get_val(job and "worker_id"))
+    if string_length(current_worker) == 0:
+        set ok to map_insert(job and "worker_id" and worker_id)
+        set ok to map_insert(job and "result" and result)
+
+    return COMPUTE_ERR_NONE
+
+# ================================================================
+# Redundant Consensus Verification
+# ================================================================
+
+define compute_verify_result with mgr as Map and job_id as Str returning Int:
+    set jobs to map_get_val(mgr and "jobs")
+    set job to map_get_val(jobs and job_id)
+    if job == 0:
+        return COMPUTE_ERR_JOB_NOT_FOUND
+
+    set submissions to map_get_val(job and "submissions")
+    set req_red to map_get_val(job and "required_redundancy")
+
+    set num_submissions to map_size(submissions)
+    if num_submissions < req_red:
+        # Not enough submissions yet to perform consensus verification
+        return COMPUTE_ERR_NONE
+
+    set sub_keys to map_keys(submissions)
+    set first_worker_ptr to get_list(sub_keys and 0)
+    set first_worker to ptr_to_str(first_worker_ptr)
+    set consensus_result to ptr_to_str(map_get_val(submissions and first_worker))
+
+    # Check if all submitted results match
+    set match to 1
+    set i to 1
+    repeat while i < num_submissions:
+        set worker_ptr to get_list(sub_keys and i)
+        set worker_id to ptr_to_str(worker_ptr)
+        set res_val to ptr_to_str(map_get_val(submissions and worker_id))
+        if (consensus_result equals res_val) == 0:
+            set match to 0
+        set i to i + 1
+
+    if match == 1:
+        # Consensus reached!
+        set ok to map_insert(job and "status" and "completed")
+        set ok to map_insert(job and "result" and consensus_result)
+        
+        # Reward completed contributions to workers
+        set contributions to map_get_val(mgr and "contributions")
+        set i to 0
+        repeat while i < num_submissions:
+            set worker_ptr to get_list(sub_keys and i)
+            set worker_id to ptr_to_str(worker_ptr)
+            set worker_score to map_get_val(contributions and worker_id)
+            set ok to map_insert(contributions and worker_id and worker_score + 1)
+            set i to i + 1
+            
+        return COMPUTE_ERR_NONE
+    else:
+        # Mismatch detected: dispute
+        set ok to map_insert(job and "status" and "disputed")
+        return COMPUTE_ERR_DISPUTED
+
+# ================================================================
+# TCP Networking — remote job dispatch and worker connections
+# ================================================================
+
+define compute_worker_connect with address as Str and port as Int and worker_id as Str returning Map:
+    # Connect to a compute manager, request a job, execute, and submit result
+    set result to create_map()
+    set conn to transport_connect(address and port)
+    set err to map_get_val(conn and "error")
+    if err != 0:
+        set ok to map_insert(result and "error" and 1)
+        return result
+
+    # Send job request
+    set ok to transport_send(conn and "COMPUTE_REQUEST" and worker_id)
+
+    # Receive job assignment
+    set response to transport_recv(conn)
+    set recv_err to map_get_val(response and "error")
+    if recv_err != 0:
+        set ok to transport_close(conn)
+        set ok to map_insert(result and "error" and 2)
+        return result
+
+    set job_data to map_get_val(response and "payload")
+    set ok to map_insert(result and "conn" and conn)
+    set ok to map_insert(result and "job_data" and job_data)
+    set ok to map_insert(result and "error" and 0)
+    return result
+
+define compute_worker_submit with conn as Map and job_id as Str and worker_id as Str and result_data as Str returning Int:
+    # Submit a computed result back to the manager
+    set payload to concat(job_id and ":")
+    set payload to concat(payload and worker_id)
+    set payload to concat(payload and ":")
+    set payload to concat(payload and result_data)
+    set ok to transport_send(conn and "COMPUTE_RESULT" and payload)
+    set ok to transport_close(conn)
+    return COMPUTE_ERR_NONE
+
+define compute_serve with mgr as Map and port as Int returning Int:
+    # Start a compute job server that accepts worker connections
+    set listener to transport_listen(port)
+    set err to map_get_val(listener and "error")
+    if err != 0:
+        return 1
+
+    # Accept one connection and handle it
+    set conn to transport_accept(listener)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != 0:
+        set ok to transport_close(listener)
+        return 2
+
+    # Read request
+    set request to transport_recv(conn)
+    set recv_err to map_get_val(request and "error")
+    if recv_err != 0:
+        set ok to transport_close(conn)
+        set ok to transport_close(listener)
+        return 3
+
+    set msg_type to map_get_val(request and "msg_type")
+    set worker_id to map_get_val(request and "payload")
+
+    # Assign a job
+    set job_id to compute_assign_job(mgr and worker_id)
+    if string_length(job_id) == 0:
+        set ok to transport_send(conn and "COMPUTE_NO_JOBS" and "")
+    else:
+        set jobs to map_get_val(mgr and "jobs")
+        set job to map_get_val(jobs and job_id)
+        set input_data to map_get_val(job and "input_data")
+        set response_payload to concat(job_id and ":")
+        set response_payload to concat(response_payload and input_data)
+        set ok to transport_send(conn and "COMPUTE_ASSIGN" and response_payload)
+
+    set ok to transport_close(conn)
+    set ok to transport_close(listener)
+    return 0

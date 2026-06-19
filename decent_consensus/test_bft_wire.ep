@@ -1,0 +1,81 @@
+# Phase K transport-layer tests: the two pieces that sit between the (already-tested)
+# consensus engine and the (already-tested) Noise channel —
+#   (1) bft_serialize_msg → bft_deserialize_msg round-trip preserves every field,
+#       including a value that itself contains the '|' delimiter (value is the remainder);
+#   (2) bft_load_genesis_validators parses a shared validators.json into the validator
+#       list + key directory, computes the right size, and degrades safely on a bad file.
+
+import "string"
+import "collections"
+import "fs"
+import "../decent_id/keys"
+import "bft"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set ok to init_crypto()
+    set passes to 0
+
+    # --- (1) wire round-trip ---
+    set kp to generate_signing_keypair()
+    set did to "did:key:zAlice"
+    set vals to create_list()
+    set ok to append_list(vals and did)
+    set keys to create_map()
+    set ok to map_insert(keys and did and ptr_to_str(map_get_val(kp and "public_key")))
+    set node to bft_create_node(did and vals and keys and ptr_to_str(map_get_val(kp and "secret_key")) and 0)
+
+    # value deliberately contains '|' to prove it survives as the wire remainder
+    set val_in to "tx|amount=5|memo=hi"
+    set msg to bft_make_msg(node and BFT_PHASE_PREPREPARE and 2 and 7 and bft_digest(val_in) and val_in)
+    set wire to bft_serialize_msg(msg)
+    set back to bft_deserialize_msg(wire)
+
+    set err_ok to (ptr_to_str(map_get_val(back and "error")) equals "0")
+    set passes to passes + pass_if("deserialize_no_error" and err_ok)
+    set phase_ok to (ptr_to_str(map_get_val(back and "phase")) equals BFT_PHASE_PREPREPARE)
+    set passes to passes + pass_if("phase_preserved" and phase_ok)
+    set view_ok to (string_to_int(map_get_val(back and "view")) == 2)
+    set seq_ok to (string_to_int(map_get_val(back and "seq")) == 7)
+    set passes to passes + pass_if("view_seq_preserved" and (view_ok and also seq_ok))
+    set from_ok to (ptr_to_str(map_get_val(back and "from")) equals did)
+    set passes to passes + pass_if("from_preserved" and from_ok)
+    set val_ok to (ptr_to_str(map_get_val(back and "value")) equals val_in)
+    set passes to passes + pass_if("value_with_pipe_preserved" and val_ok)
+    # the deserialized message must still verify against the signer's key
+    set verr to bft_verify(node and back)
+    set passes to passes + pass_if("deserialized_msg_verifies" and (verr == BFT_OK))
+
+    # malformed wire (no delimiter) → error flagged, not a crash
+    set bad to bft_deserialize_msg("garbage-no-pipe")
+    set passes to passes + pass_if("malformed_wire_flagged" and (ptr_to_str(map_get_val(bad and "error")) equals "1"))
+
+    # --- (2) genesis validator loader ---
+    set kp2 to generate_signing_keypair()
+    set p1 to ptr_to_str(map_get_val(kp and "public_key"))
+    set p2 to ptr_to_str(map_get_val(kp2 and "public_key"))
+    set json to concat("[{\"did\":\"did:key:zAlice\",\"signing_public_key\":\"" and p1)
+    set json to concat(json and "\"},{\"did\":\"did:key:zBob\",\"signing_public_key\":\"")
+    set json to concat(json and p2)
+    set json to concat(json and "\"}]")
+    set ok to write_file("/tmp/bft_validators_test.json" and json)
+    set gen to bft_load_genesis_validators("/tmp/bft_validators_test.json")
+    set gvals to map_get_val(gen and "validators")
+    set gkeys to map_get_val(gen and "val_keys")
+    set passes to passes + pass_if("genesis_loads_two_validators" and (length_list(gvals) == 2))
+    set k_ok to (ptr_to_str(map_get_val(gkeys and "did:key:zAlice")) equals p1)
+    set k2_ok to (ptr_to_str(map_get_val(gkeys and "did:key:zBob")) equals p2)
+    set passes to passes + pass_if("genesis_keys_indexed_by_did" and (k_ok and also k2_ok))
+
+    # missing file → empty set (caller falls back to single-self)
+    set gen0 to bft_load_genesis_validators("/tmp/does_not_exist_bft.json")
+    set passes to passes + pass_if("missing_genesis_empty" and (length_list(map_get_val(gen0 and "validators")) == 0))
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/10 passed"))
+    return 0

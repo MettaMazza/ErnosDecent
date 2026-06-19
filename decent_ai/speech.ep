@@ -1,0 +1,149 @@
+# ErnosDecent -- Speech-to-Text Transcription
+# Component: decent_ai/speech.ep
+# Status: Production
+#
+# Production STT is delegated to a real whisper.cpp server over HTTP (the audio is
+# uploaded with a binary-safe curl multipart POST, since Ernos's NUL-terminated
+# strings can't carry raw audio and the HTTP client has no multipart builder).
+# `speech_transcribe_reference` is a small-model fixed-point REFERENCE only — it has
+# no mel/FFT frontend and no trained acoustic model, so it is NOT production STT.
+
+import "collections"
+import "string"
+import "net"
+import "json"
+import "inference"
+
+define speech_load_model with model_path as Str returning Map:
+    return inference_load_model(model_path)
+
+# ----------------------------------------------------------------
+# Production path: whisper.cpp HTTP backend
+# ----------------------------------------------------------------
+
+# Strict path validation so the path can't break out of the shell command. Allows
+# only [A-Za-z0-9._/-]; rejects spaces, quotes, shell metacharacters and ".." traversal.
+define speech_path_is_safe with path as Str returning Int:
+    set n to string_length(path)
+    if n == 0:
+        return 0
+    if n > 4096:
+        return 0
+    set i to 0
+    repeat while i < n:
+        set c to get_character(path and i)
+        set okc to 0
+        if c >= 97 and also c <= 122:
+            set okc to 1
+        if c >= 65 and also c <= 90:
+            set okc to 1
+        if c >= 48 and also c <= 57:
+            set okc to 1
+        if c == 46 or else c == 95 or else c == 47 or else c == 45:
+            set okc to 1
+        if okc == 0:
+            return 0
+        set i to i + 1
+    if string_contains(path and "..") == 1:
+        return 0
+    return 1
+
+define speech_whisper_up with host as Str and port as Int returning Int:
+    set fd to ep_net_connect(host and port)
+    if fd > 0:
+        set ok to ep_net_close(fd)
+        return 1
+    return 0
+
+# Extract the transcript from a whisper.cpp response. With response_format=json the
+# body is {"text":"..."}; otherwise fall back to the trimmed raw body.
+define speech_parse_whisper_json with resp as Str returning Str:
+    set root to json_parse(resp)
+    if root != 0:
+        set tnode to get_json_object_value(root and "text")
+        if tnode != 0:
+            return string_trim(get_json_value(tnode))
+    return string_trim(resp)
+
+# Transcribe an audio file via a whisper.cpp server. Returns the real transcript, or
+# an explicit "ERROR:<reason>" (never a fabricated transcription).
+define speech_transcribe_whisper with audio_path as Str and host as Str and port as Int returning Str:
+    if speech_path_is_safe(audio_path) == 0:
+        return "ERROR:unsafe_path"
+    if speech_whisper_up(host and port) == 0:
+        return "ERROR:whisper_unavailable"
+    set url to concat("http://" and host)
+    set url to concat(url and ":")
+    set url to concat(url and int_to_string(port))
+    set url to concat(url and "/inference")
+    set cmd to concat("curl -s --max-time 120 -F file=@'" and audio_path)
+    set cmd to concat(cmd and "' -F response_format=json -F temperature=0 ")
+    set cmd to concat(cmd and url)
+    set resp to run_command(cmd)
+    if string_length(resp) == 0:
+        return "ERROR:no_response"
+    return speech_parse_whisper_json(resp)
+
+# ----------------------------------------------------------------
+# Small-model REFERENCE (NOT production STT): a single output-layer matmul over raw
+# 16-sample frames + greedy decode. No mel/FFT frontend, no trained acoustic model.
+# Kept as a deterministic reference for the fixed-point matmul/decode pipeline.
+# ----------------------------------------------------------------
+define speech_transcribe_reference with model as Map and audio_data as List returning Str:
+    set tensors to map_get_val(model and "tensors")
+    set vocab to map_get_val(model and "vocab")
+    set vocab_size to length_list(vocab)
+
+    if map_contains(tensors and "output.weight") == 0:
+        return ""
+
+    set w_out_map to map_get_val(tensors and "output.weight")
+    set w_out to map_get_val(w_out_map and "data")
+
+    set audio_len to length_list(audio_data)
+    set frame_size to 16
+    set num_frames to audio_len / frame_size
+
+    if num_frames == 0:
+        return ""
+
+    set predicted_tokens to create_list()
+
+    set frame_idx to 0
+    repeat while frame_idx < num_frames:
+        set x to create_list()
+        set i to 0
+        repeat while i < frame_size:
+            set sample_val to get_list(audio_data and frame_idx * frame_size + i)
+            set ok to append_list(x and sample_val)
+            set i to i + 1
+
+        set logits to create_list()
+        fixed_matrix_vector_multiply(w_out and x and logits and vocab_size and frame_size)
+
+        set max_prob to get_list(logits and 0)
+        set max_tok to 0
+        set tok_j to 1
+        repeat while tok_j < vocab_size:
+            set prob_val to get_list(logits and tok_j)
+            if prob_val > max_prob:
+                set max_prob to prob_val
+                set max_tok to tok_j
+            set tok_j to tok_j + 1
+
+        if max_tok > 0:
+            set prev_tok_idx to length_list(predicted_tokens) - 1
+            set dup to 0
+            if prev_tok_idx >= 0:
+                if get_list(predicted_tokens and prev_tok_idx) == max_tok:
+                    set dup to 1
+            if dup == 0:
+                set ok to append_list(predicted_tokens and max_tok)
+
+        free_list(x)
+        free_list(logits)
+        set frame_idx to frame_idx + 1
+
+    set text_res to inference_detokenize(model and predicted_tokens)
+    free_list(predicted_tokens)
+    return text_res

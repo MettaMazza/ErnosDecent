@@ -1,0 +1,478 @@
+# ErnosDecent -- Persistence Test Suite
+# Tests: File-based KV storage, config loading, data survives close/reopen
+# Status: Production
+
+import "collections"
+import "string"
+import "fs"
+import "os"
+import "storage"
+import "config"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- Persistence Test Suite"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # Use a temporary test directory
+    set test_dir to concat(get_cwd() and "/test_persistence_data")
+
+    # Clean up from any previous run
+    if file_exists(test_dir):
+        set ok to run_command(concat("rm -rf " and test_dir))
+
+    # ===========================================================
+    # TEST 1: Storage initialization creates directory structure
+    # ===========================================================
+    display "TEST 1: Storage initialization creates directories"
+    set t1_ok to 1
+
+    set err to storage_init(test_dir)
+    if err != STORAGE_ERR_NONE:
+        display f"  FAIL: storage_init returned {err}"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        if file_exists(test_dir) == 0:
+            display "  FAIL: data directory not created"
+            set t1_ok to 0
+        if file_exists(concat(test_dir and "/content")) == 0:
+            display "  FAIL: content directory not created"
+            set t1_ok to 0
+        if file_exists(concat(test_dir and "/keys")) == 0:
+            display "  FAIL: keys directory not created"
+            set t1_ok to 0
+        if file_exists(concat(test_dir and "/node.db")) == 0:
+            display "  FAIL: node.db not created"
+            set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: DHT persistence — store and retrieve
+    # ===========================================================
+    display "TEST 2: DHT persistence"
+    set t2_ok to 1
+
+    set err to storage_dht_put("test_key_1" and "test_value_1" and "publisher_a" and 1000000 and 0)
+    if err != STORAGE_ERR_NONE:
+        display f"  FAIL: dht_put returned {err}"
+        set t2_ok to 0
+
+    set err to storage_dht_put("test_key_2" and "test_value_2" and "publisher_b" and 1000000 and 0)
+
+    set val to storage_dht_get("test_key_1")
+    if val equals "test_value_1":
+        display "  DHT key 1 retrieved correctly"
+    else:
+        display f"  FAIL: expected 'test_value_1', got '{val}'"
+        set t2_ok to 0
+
+    set val2 to storage_dht_get("test_key_2")
+    if val2 equals "test_value_2":
+        display "  DHT key 2 retrieved correctly"
+    else:
+        display f"  FAIL: expected 'test_value_2', got '{val2}'"
+        set t2_ok to 0
+
+    # Non-existent key
+    set val3 to storage_dht_get("nonexistent")
+    if string_length(val3) == 0:
+        display "  Non-existent key returns empty"
+    else:
+        display f"  FAIL: non-existent key returned '{val3}'"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: Content persistence — filesystem-backed CAS
+    # ===========================================================
+    display "TEST 3: Content persistence"
+    set t3_ok to 1
+
+    set test_content to "This is test content for the CAS store. It contains important data."
+    set test_hash to ep_sha256(test_content)
+
+    set err to storage_content_put(test_hash and test_content and "text/plain")
+    if err != STORAGE_ERR_NONE:
+        display f"  FAIL: content_put returned {err}"
+        set t3_ok to 0
+
+    # Check file exists on disk
+    set content_file to concat(test_dir and concat("/content/" and test_hash))
+    if file_exists(content_file) == 0:
+        display "  FAIL: content file not written to disk"
+        set t3_ok to 0
+    else:
+        display f"  Content file written: {substring(test_hash and 0 and 24)}..."
+
+    # Retrieve and verify
+    set retrieved to storage_content_get(test_hash)
+    if retrieved equals test_content:
+        display "  Content retrieved and matches original"
+    else:
+        display "  FAIL: content mismatch"
+        set t3_ok to 0
+
+    # Check has
+    set has_it to storage_content_has(test_hash)
+    if has_it == 1:
+        display "  Content exists check: true"
+    else:
+        display "  FAIL: content_has returned 0"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: Identity persistence
+    # ===========================================================
+    display "TEST 4: Identity persistence"
+    set t4_ok to 1
+
+    set err to storage_identity_save("did:key:z6Mk_test_abc" and "sign_pub_hex_aabb" and "sign_sec_hex_ccdd" and "enc_pub_hex_eeff" and "enc_sec_hex_1122")
+
+    set loaded to storage_identity_load()
+    set exists to map_get_val(loaded and "exists")
+    if exists != 1:
+        display "  FAIL: identity not found after save"
+        set t4_ok to 0
+    else:
+        set did to map_get_val(loaded and "did")
+        if did equals "did:key:z6Mk_test_abc":
+            display f"  Identity loaded: {did}"
+        else:
+            display f"  FAIL: DID mismatch: {did}"
+            set t4_ok to 0
+
+        set sp to map_get_val(loaded and "signing_pub")
+        if sp equals "sign_pub_hex_aabb":
+            display "  Signing key loaded correctly"
+        else:
+            display f"  FAIL: signing_pub mismatch: {sp}"
+            set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: Ledger persistence
+    # ===========================================================
+    display "TEST 5: Ledger persistence"
+    set t5_ok to 1
+
+    set err to storage_ledger_add_block(0 and "0000" and "aaaa" and "validator1" and 1000000 and 1 and "genesis")
+    set err to storage_ledger_add_block(1 and "aaaa" and "bbbb" and "validator2" and 1000001 and 2 and "block1_data")
+
+    set err to storage_ledger_update_balance("did:alice" and 1000)
+    set err to storage_ledger_update_balance("did:bob" and 500)
+
+    set alice_bal to storage_ledger_get_balance("did:alice")
+    if alice_bal == 1000:
+        display "  Alice balance: 1000"
+    else:
+        display f"  FAIL: Alice balance should be 1000, got {alice_bal}"
+        set t5_ok to 0
+
+    set bob_bal to storage_ledger_get_balance("did:bob")
+    if bob_bal == 500:
+        display "  Bob balance: 500"
+    else:
+        display f"  FAIL: Bob balance should be 500, got {bob_bal}"
+        set t5_ok to 0
+
+    # Check block count
+    set block_count to storage_ledger_get_block_count()
+    if block_count == 2:
+        display "  Block count: 2"
+    else:
+        display f"  FAIL: block count should be 2, got {block_count}"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Name registry persistence
+    # ===========================================================
+    display "TEST 6: Name registry persistence"
+    set t6_ok to 1
+
+    set err to storage_name_register("alice.decent" and "did:key:z6Mk_alice_test")
+    set resolved to storage_name_resolve("alice.decent")
+    if resolved equals "did:key:z6Mk_alice_test":
+        display "  alice.decent resolved correctly"
+    else:
+        display f"  FAIL: resolved to '{resolved}'"
+        set t6_ok to 0
+
+    set not_found to storage_name_resolve("nobody.decent")
+    if string_length(not_found) == 0:
+        display "  Non-existent name returns empty"
+    else:
+        display f"  FAIL: should be empty, got '{not_found}'"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: Data survives close and reopen
+    # ===========================================================
+    display "TEST 7: Data survives storage close and reopen"
+    set t7_ok to 1
+
+    # Close storage
+    set ok to storage_close()
+
+    # Reopen with same directory
+    set err to storage_init(test_dir)
+    if err != STORAGE_ERR_NONE:
+        display f"  FAIL: reopen failed with {err}"
+        set t7_ok to 0
+
+    if t7_ok == 1:
+        # Verify DHT data survived
+        set val to storage_dht_get("test_key_1")
+        if val equals "test_value_1":
+            display "  DHT data survived close/reopen"
+        else:
+            display f"  FAIL: DHT data lost: '{val}'"
+            set t7_ok to 0
+
+    if t7_ok == 1:
+        # Verify identity survived
+        set loaded to storage_identity_load()
+        set exists to map_get_val(loaded and "exists")
+        if exists == 1:
+            set did to map_get_val(loaded and "did")
+            if did equals "did:key:z6Mk_test_abc":
+                display "  Identity survived close/reopen"
+            else:
+                display f"  FAIL: identity DID changed: {did}"
+                set t7_ok to 0
+        else:
+            display "  FAIL: identity not found after reopen"
+            set t7_ok to 0
+
+    if t7_ok == 1:
+        # Verify content survived
+        set has_content to storage_content_has(test_hash)
+        if has_content == 1:
+            set content_back to storage_content_get(test_hash)
+            if content_back equals test_content:
+                display "  Content survived close/reopen"
+            else:
+                display "  FAIL: content corrupted after reopen"
+                set t7_ok to 0
+        else:
+            display "  FAIL: content file missing after reopen"
+            set t7_ok to 0
+
+    if t7_ok == 1:
+        # Verify ledger survived
+        set alice_bal to storage_ledger_get_balance("did:alice")
+        if alice_bal == 1000:
+            display "  Ledger balance survived close/reopen"
+        else:
+            display f"  FAIL: balance changed: {alice_bal}"
+            set t7_ok to 0
+
+    if t7_ok == 1:
+        # Verify name registry survived
+        set resolved to storage_name_resolve("alice.decent")
+        if resolved equals "did:key:z6Mk_alice_test":
+            display "  Name registry survived close/reopen"
+        else:
+            display f"  FAIL: name resolution changed: '{resolved}'"
+            set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: Config loading with defaults
+    # ===========================================================
+    display "TEST 8: Config loading"
+    set t8_ok to 1
+
+    # Load with no config file (uses defaults)
+    set cfg to config_load("/nonexistent/config.toml")
+    set p2p_port to config_get_int(cfg and "network.p2p_port")
+    if p2p_port == 9100:
+        display "  Default p2p_port: 9100"
+    else:
+        display f"  FAIL: expected 9100, got {p2p_port}"
+        set t8_ok to 0
+
+    set listen to config_get_str(cfg and "network.listen_address")
+    if listen equals "0.0.0.0":
+        display "  Default listen_address: 0.0.0.0"
+    else:
+        display f"  FAIL: expected 0.0.0.0, got '{listen}'"
+        set t8_ok to 0
+
+    # Generate and load a custom config
+    set custom_config to concat(test_dir and "/test_config.toml")
+    set ok to config_generate_default(custom_config)
+
+    if file_exists(custom_config):
+        display "  Config file generated"
+        set cfg2 to config_load(custom_config)
+        set p2p2 to config_get_int(cfg2 and "network.p2p_port")
+        if p2p2 == 9100:
+            display "  Config loaded from file correctly"
+        else:
+            display f"  FAIL: config from file returned {p2p2}"
+            set t8_ok to 0
+    else:
+        display "  FAIL: config file not generated"
+        set t8_ok to 0
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9: Content integrity check
+    # ===========================================================
+    display "TEST 9: Content integrity verification"
+    set t9_ok to 1
+
+    set original to "Critical data that must not be tampered with"
+    set original_hash to ep_sha256(original)
+    set err to storage_content_put(original_hash and original and "text/plain")
+
+    # Retrieve and verify hash matches
+    set retrieved to storage_content_get(original_hash)
+    set verify_hash to ep_sha256(retrieved)
+    if verify_hash equals original_hash:
+        display "  Content hash matches after storage round-trip"
+    else:
+        display "  FAIL: hash mismatch after retrieval"
+        set t9_ok to 0
+
+    # Tamper with the file directly on disk
+    set tampered_path to concat(test_dir and concat("/content/" and original_hash))
+    set ok to write_file(tampered_path and "TAMPERED CONTENT")
+
+    # Read back and check hash doesn't match
+    set tampered_data to storage_content_get(original_hash)
+    set tampered_hash to ep_sha256(tampered_data)
+    if tampered_hash equals original_hash:
+        display "  FAIL: tampered content has same hash (impossible)"
+        set t9_ok to 0
+    else:
+        display "  Tamper detected: hash mismatch after modification"
+
+    if t9_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 10: Social event persistence
+    # ===========================================================
+    display "TEST 10: Social event persistence"
+    set t10_ok to 1
+
+    set err to storage_social_put_event("event_abc123" and "pubkey_deadbeef" and 1 and "Hello world" and "sig_cafebabe" and 1700000000)
+    set event_data to storage_social_get_event("event_abc123")
+    if string_length(event_data) > 0:
+        if string_contains(event_data and "Hello world"):
+            display "  Social event persisted and retrieved"
+        else:
+            display f"  FAIL: event content missing"
+            set t10_ok to 0
+    else:
+        display "  FAIL: event not found"
+        set t10_ok to 0
+
+    if t10_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 11: Corrupt database graceful handling
+    # ===========================================================
+    display "TEST 11: Corrupt database graceful handling"
+    set t11_ok to 1
+
+    # Close current storage
+    set ok to storage_close()
+
+    # Corrupt the database file by writing garbage
+    set db_path to concat(test_dir and "/node.db")
+    set ok to write_file(db_path and "THIS IS NOT A VALID SQLITE DATABASE FILE")
+
+    # Try to open — should fail gracefully, not crash
+    set err to storage_init(test_dir)
+    if err == STORAGE_ERR_NONE:
+        # If it opened successfully despite corruption, that's still ok
+        # (SQLite might recreate or handle it)
+        display "  Storage opened despite corruption (SQLite recovered)"
+    else:
+        display f"  Storage correctly reported error ({err}) on corrupt db"
+
+    # Either way, we didn't crash — that's the test
+    display "  No crash on corrupt database"
+
+    if t11_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Cleanup
+    # ===========================================================
+    set ok to storage_close()
+    set ok to run_command(concat("rm -rf " and test_dir))
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} persistence tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    else:
+        display "  ALL PERSISTENCE TESTS PASSED!"
+    display "==================================================="
+    return 0

@@ -1,0 +1,242 @@
+# ErnosDecent -- Media Segmenter and LRU Cache
+# Component: decent_media/stream.ep
+# Status: Production -- Phase 10
+
+import "collections"
+import "string"
+import "../decent_net/transport"
+
+define stream_segment_media with media_data as Str and segment_duration_ms as Int and quality as Str returning Map:
+    set playlist to create_map()
+    set ok to map_insert(playlist and "quality" and quality)
+    set ok to map_insert(playlist and "segment_duration_ms" and segment_duration_ms)
+    
+    set segments to create_list()
+    set ok to map_insert(playlist and "segments" and segments)
+    
+    set total_len to string_length(media_data)
+    # Define chunk size based on duration: e.g. 500 bytes per 1000ms
+    set chunk_size to (segment_duration_ms * 500) / 1000
+    if chunk_size <= 0:
+        set chunk_size to 1
+        
+    set offset to 0
+    set index to 0
+    set manifest_str to "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n"
+    
+    repeat while offset < total_len:
+        set size to chunk_size
+        if offset + size > total_len:
+            set size to total_len - offset
+            
+        set chunk_str to substring(media_data and offset and size)
+        set chunk_hash to ep_sha256(chunk_str)
+        
+        set seg_info to create_map()
+        set ok to map_insert(seg_info and "index" and index)
+        set ok to map_insert(seg_info and "hash" and chunk_hash)
+        set ok to map_insert(seg_info and "data" and chunk_str)
+        set ok to map_insert(seg_info and "size" and size)
+        
+        set ok to append_list(segments and seg_info)
+        
+        set url to f"segment_{index}_{quality}.ts"
+        set manifest_str to concat(manifest_str and f"#EXTINF:2.0,\n{url}\n")
+        
+        set offset to offset + size
+        set index to index + 1
+        
+    set ok to map_insert(playlist and "manifest_str" and manifest_str)
+    return playlist
+
+define stream_create_lru_cache with max_size_bytes as Int returning Map:
+    set cache to create_map()
+    set ok to map_insert(cache and "max_size" and max_size_bytes)
+    set ok to map_insert(cache and "current_size" and 0)
+    
+    set cache_map to create_map()
+    set ok to map_insert(cache and "cache_map" and cache_map)
+    
+    # We store the access order as a list of keys
+    set order_list to create_list()
+    set ok to map_insert(cache and "order_list" and order_list)
+    
+    # To keep track of values sizes
+    set size_map to create_map()
+    set ok to map_insert(cache and "size_map" and size_map)
+    return cache
+
+define stream_cache_get with cache as Map and key as Str returning Str:
+    set cache_map to map_get_val(cache and "cache_map")
+    if map_contains(cache_map and key) == 0:
+        return ""
+        
+    # Move key to the end of order_list (MRU)
+    set order_list to map_get_val(cache and "order_list")
+    set num_keys to length_list(order_list)
+    
+    set new_order to create_list()
+    set i to 0
+    repeat while i < num_keys:
+        set k to get_list(order_list and i)
+        if k equals key:
+            # Skip it so we can append it at the end
+            set dummy to 0
+        else:
+            set ok to append_list(new_order and k)
+        set i to i + 1
+        
+    set ok to append_list(new_order and key)
+    set ok to map_insert(cache and "order_list" and new_order)
+    set ok to free_list(order_list)
+    
+    return map_get_val(cache_map and key)
+
+define stream_cache_put with cache as Map and key as Str and val as Str returning Int:
+    set cache_map to map_get_val(cache and "cache_map")
+    set size_map to map_get_val(cache and "size_map")
+    set order_list to map_get_val(cache and "order_list")
+    set val_size to string_length(val)
+    
+    # If key already exists, update size difference
+    set old_size to 0
+    if map_contains(cache_map and key) == 1:
+        set old_size to map_get_val(size_map and key)
+        set ok to map_delete(cache_map and key)
+        set ok to map_delete(size_map and key)
+        
+    set current_size to map_get_val(cache and "current_size")
+    set current_size to current_size - old_size + val_size
+    set ok to map_insert(cache and "current_size" and current_size)
+    
+    set ok to map_insert(cache_map and key and val)
+    set ok to map_insert(size_map and key and val_size)
+    
+    # Add/move key to end of order_list
+    set num_keys to length_list(order_list)
+    set new_order to create_list()
+    set i to 0
+    repeat while i < num_keys:
+        set k to get_list(order_list and i)
+        if k equals key:
+            set dummy to 0
+        else:
+            set ok to append_list(new_order and k)
+        set i to i + 1
+    set ok to append_list(new_order and key)
+    set ok to map_insert(cache and "order_list" and new_order)
+    set ok to free_list(order_list)
+    
+    # Eviction loop
+    set max_size to map_get_val(cache and "max_size")
+    set current_size to map_get_val(cache and "current_size")
+    
+    repeat while current_size > max_size:
+        set order_list to map_get_val(cache and "order_list")
+        if length_list(order_list) == 0:
+            return 0
+            
+        # Get LRU key (first key in list)
+        set lru_key to get_list(order_list and 0)
+        
+        # Evict it
+        set lru_size to map_get_val(size_map and lru_key)
+        set ok to map_delete(cache_map and lru_key)
+        set ok to map_delete(size_map and lru_key)
+        
+        set current_size to current_size - lru_size
+        set ok to map_insert(cache and "current_size" and current_size)
+        
+        # Remove from order_list
+        set new_order2 to create_list()
+        set i to 1
+        set num_keys2 to length_list(order_list)
+        repeat while i < num_keys2:
+            set ok to append_list(new_order2 and get_list(order_list and i))
+            set i to i + 1
+        set ok to map_insert(cache and "order_list" and new_order2)
+        set ok to free_list(order_list)
+        
+    return 0
+
+# ================================================================
+# TCP Streaming — serve and fetch segments over transport
+# ================================================================
+
+define stream_send_chunk with conn as Map and segment_index as Int and data as Str returning Int:
+    # Send a media chunk over a transport connection
+    set payload to concat(int_to_string(segment_index) and ":")
+    set payload to concat(payload and data)
+    return transport_send(conn and "MEDIA_CHUNK" and payload)
+
+define stream_receive_chunk with conn as Map returning Map:
+    # Receive a media chunk from a transport connection
+    set result to create_map()
+    set response to transport_recv(conn)
+    set err to map_get_val(response and "error")
+    if err != 0:
+        set ok to map_insert(result and "error" and 1)
+        return result
+
+    set payload to map_get_val(response and "payload")
+    set colon_pos to string_index_of(payload and ":")
+    if colon_pos < 0:
+        set ok to map_insert(result and "error" and 2)
+        return result
+
+    set index_str to substring(payload and 0 and colon_pos)
+    set data to substring(payload and colon_pos + 1 and string_length(payload) - colon_pos - 1)
+
+    set ok to map_insert(result and "index" and string_to_int(index_str))
+    set ok to map_insert(result and "data" and data)
+    set ok to map_insert(result and "error" and 0)
+    return result
+
+define stream_serve_segments with playlist as Map and port as Int returning Int:
+    # Listen for segment fetch requests and send segments over TCP
+    set listener to transport_listen(port)
+    set err to map_get_val(listener and "error")
+    if err != 0:
+        return 1
+
+    set segments to map_get_val(playlist and "segments")
+    set seg_count to length_list(segments)
+
+    set conn to transport_accept(listener)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != 0:
+        set ok to transport_close(listener)
+        return 2
+
+    # Send all segments
+    set si to 0
+    repeat while si < seg_count:
+        set seg to get_list(segments and si)
+        set data to map_get_val(seg and "data")
+        set ok to stream_send_chunk(conn and si and data)
+        set si to si + 1
+
+    set ok to transport_close(conn)
+    set ok to transport_close(listener)
+    return 0
+
+define stream_fetch_segments with address as Str and port as Int and expected_count as Int returning List:
+    # Fetch media segments from a remote peer over TCP
+    set result to create_list()
+    set conn to transport_connect(address and port)
+    set err to map_get_val(conn and "error")
+    if err != 0:
+        return result
+
+    set received to 0
+    repeat while received < expected_count:
+        set chunk to stream_receive_chunk(conn)
+        set chunk_err to map_get_val(chunk and "error")
+        if chunk_err != 0:
+            set ok to transport_close(conn)
+            return result
+        set ok to append_list(result and chunk)
+        set received to received + 1
+
+    set ok to transport_close(conn)
+    return result

@@ -1,0 +1,110 @@
+# ErnosDecent -- P2P Content Delivery Network
+# Component: decent_media/cdn.ep
+# Status: Production -- Phase 10
+
+import "../decent_store/content"
+import "../decent_net/dht"
+import "../decent_net/dht_transport"
+import "collections"
+import "string"
+
+define cdn_create with dht_node as Int and cas_store as Int returning Map:
+    set cdn to create_map()
+    set ok to map_insert(cdn and "dht_node" and dht_node)
+    set ok to map_insert(cdn and "cas_store" and cas_store)
+    
+    set active_downloads to create_map()
+    set ok to map_insert(cdn and "active_downloads" and active_downloads)
+    
+    # Store dynamic peer registries
+    set peer_stores to create_map()
+    set ok to map_insert(cdn and "peer_stores" and peer_stores)
+    return cdn
+
+define cdn_register_peer_store with cdn as Map and peer_id as Str and peer_cas_store as Int returning Int:
+    set peer_stores to map_get_val(cdn and "peer_stores")
+    set ok to map_insert(peer_stores and peer_id and peer_cas_store)
+    return 0
+
+define cdn_publish_manifest with cdn as Map and manifest as Map returning Str:
+    set merkle_root to map_get_val(manifest and "merkle_root")
+    set chunks to map_get_val(manifest and "chunks")
+    set chunk_count to map_get_val(manifest and "chunk_count")
+    
+    set dht_node to map_get_val(cdn and "dht_node")
+    set local_id to map_get_val(dht_node and "id")
+    
+    # Publish manifest Merkle root to DHT, pointing to the list of chunks
+    set chunks_str to ""
+    set i to 0
+    repeat while i < chunk_count:
+        set chunk_hash to get_list(chunks and i)
+        if i == 0:
+            set chunks_str to chunk_hash
+        else:
+            set chunks_str to concat(chunks_str and concat("," and chunk_hash))
+        
+        # Also announce that we host this chunk
+        set provider_key to concat("prov_" and chunk_hash)
+        set ok to dht_node_store_value(dht_node and provider_key and local_id)
+        set i to i + 1
+        
+    set ok to dht_node_store_value(dht_node and merkle_root and chunks_str)
+    return merkle_root
+
+define cdn_locate_peers_for_segment with cdn as Map and segment_hash as Str returning List:
+    set dht_node to map_get_val(cdn and "dht_node")
+    set provider_key to concat("prov_" and segment_hash)
+    
+    # Get providers from DHT (which returns a result Map, not a direct Str)
+    set dht_res to dht_lookup_value(dht_node and provider_key)
+    set providers_str to ""
+    if dht_res != 0:
+        if map_contains(dht_res and "value") == 1:
+            set providers_str to map_get_val(dht_res and "value")
+            
+    set peers_list to create_list()
+    
+    if string_length(providers_str) > 0:
+        set parts to string_split(providers_str and ",")
+        set num_parts to length_list(parts)
+        set i to 0
+        repeat while i < num_parts:
+            set part to get_list(parts and i)
+            set ok to append_list(peers_list and part)
+            set i to i + 1
+        set ok to free_list(parts)
+        
+    return peers_list
+
+define cdn_download_segment with cdn as Map and segment_hash as Str and peers as List returning Str:
+    set cas_store to map_get_val(cdn and "cas_store")
+    
+    # Check if we already have it
+    if cas_has(cas_store and segment_hash) == 1:
+        set get_res to cas_get(cas_store and segment_hash)
+        return map_get_val(get_res and "content")
+        
+    set peer_stores to map_get_val(cdn and "peer_stores")
+    set num_peers to length_list(peers)
+    
+    set i to 0
+    repeat while i < num_peers:
+        set peer_id to get_list(peers and i)
+        if map_contains(peer_stores and peer_id) == 1:
+            set peer_cas to map_get_val(peer_stores and peer_id)
+            if cas_has(peer_cas and segment_hash) == 1:
+                # Swarm download: get data from the peer's CAS
+                set get_res to cas_get(peer_cas and segment_hash)
+                set data to map_get_val(get_res and "content")
+                
+                # Verify SHA-256 integrity
+                set computed_hash to ep_sha256(data)
+                if computed_hash equals segment_hash:
+                    # Store locally
+                    set put_res to cas_put(cas_store and data)
+                    return data
+                    
+        set i to i + 1
+        
+    return ""

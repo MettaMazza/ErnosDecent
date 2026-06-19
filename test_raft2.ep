@@ -1,0 +1,73 @@
+# Test 2-node Raft election over TCP
+import "collections"
+import "string"
+import "decent_consensus/raft"
+import "decent_consensus/election"
+import "decent_consensus/state"
+import "decent_consensus/raft_transport"
+
+define main:
+    display "=== 2-node election test ==="
+
+    # Node 1
+    set peers1 to create_list()
+    set ok to append_list(peers1 and str_to_ptr("node2"))
+    set n1 to raft_create_node("node1" and peers1)
+    election_init_node(borrow n1 and 150)
+    set pa1 to create_map()
+    set ok to map_insert(pa1 and "node2" and "127.0.0.1:19301")
+    set ok to map_insert(n1 and "peer_addresses" and pa1)
+    set ok to map_insert(n1 and "running" and 1)
+    set ok to map_insert(n1 and "server_ready" and 0)
+
+    # Node 2
+    set peers2 to create_list()
+    set ok to append_list(peers2 and str_to_ptr("node1"))
+    set n2 to raft_create_node("node2" and peers2)
+    election_init_node(borrow n2 and 300)
+    set pa2 to create_map()
+    set ok to map_insert(pa2 and "node1" and "127.0.0.1:19300")
+    set ok to map_insert(n2 and "peer_addresses" and pa2)
+    set ok to map_insert(n2 and "running" and 1)
+    set ok to map_insert(n2 and "server_ready" and 0)
+
+    # Store in cluster map
+    set cluster to create_map()
+    set ok to map_insert(cluster and "node1" and n1)
+    set ok to map_insert(cluster and "node2" and n2)
+
+    # Get references via map_get_val (Any type)
+    set r1 to map_get_val(cluster and "node1")
+    set r2 to map_get_val(cluster and "node2")
+    set rp1 to map_get_val(r1 and "peer_addresses")
+    set rp2 to map_get_val(r2 and "peer_addresses")
+
+    display "Starting servers..."
+    spawn raft_server_thread(r1 and 19300)
+    spawn raft_server_thread(r2 and 19301)
+    set ok to ep_sleep_ms(100)
+    display "Servers started"
+
+    display "Starting timers..."
+    spawn raft_election_timer_thread(r1 and rp1)
+    spawn raft_election_timer_thread(r2 and rp2)
+    display "Timers started"
+
+    # Wait for election
+    set ok to ep_sleep_ms(1000)
+
+    set role1 to ptr_to_str(map_get_val(r1 and "role"))
+    set role2 to ptr_to_str(map_get_val(r2 and "role"))
+    set term1 to map_get_val(r1 and "current_term")
+    set term2 to map_get_val(r2 and "current_term")
+
+    display f"node1: role={role1} term={term1}"
+    display f"node2: role={role2} term={term2}"
+
+    # Shutdown
+    set ok to map_insert(r1 and "running" and 0)
+    set ok to map_insert(r2 and "running" and 0)
+    set ok to ep_sleep_ms(100)
+
+    display "=== DONE ==="
+    return 0

@@ -1,0 +1,230 @@
+# ErnosPlain Rebuild of ErnOS Agent Online Synchronization System
+# Component: decent_agent/sync.ep
+
+import "fs"
+import "collections"
+import "string"
+import "os"
+import "memory"
+
+# Cryptographic SHA256 helper (built-in in ErnosPlain)
+external define ep_sha256 with input as Str returning Str
+
+# Robust PII Filter character scanner
+define sync_strip_pii with text as Str returning Str:
+    set len to string_length(text)
+    set res to ""
+    set idx to 0
+    
+    repeat while idx < len:
+        # 1. SSN Check: ###-##-####
+        set is_ssn to 0
+        if idx + 10 < len:
+            # Check characters: 0, 1, 2 must be digits; 3 must be '-'; 4, 5 digits; 6 '-'; 7, 8, 9, 10 digits
+            set c0 to get_character(text and idx)
+            set c1 to get_character(text and idx + 1)
+            set c2 to get_character(text and idx + 2)
+            set c3 to get_character(text and idx + 3)
+            set c4 to get_character(text and idx + 4)
+            set c5 to get_character(text and idx + 5)
+            set c6 to get_character(text and idx + 6)
+            set c7 to get_character(text and idx + 7)
+            set c8 to get_character(text and idx + 8)
+            set c9 to get_character(text and idx + 9)
+            set c10 to get_character(text and idx + 10)
+            
+            if c0 >= 48 and also c0 <= 57:
+                if c1 >= 48 and also c1 <= 57:
+                    if c2 >= 48 and also c2 <= 57:
+                        if c3 == 45: # '-'
+                            if c4 >= 48 and also c4 <= 57:
+                                if c5 >= 48 and also c5 <= 57:
+                                    if c6 == 45: # '-'
+                                        if c7 >= 48 and also c7 <= 57:
+                                            if c8 >= 48 and also c8 <= 57:
+                                                if c9 >= 48 and also c9 <= 57:
+                                                    if c10 >= 48 and also c10 <= 57:
+                                                        set is_ssn to 1
+                                                        
+        if is_ssn == 1:
+            set res to concat(res and "[SSN REDACTED]")
+            set idx to idx + 11
+        else:
+            # 2. Credit Card Check: 16 digits
+            set is_cc to 0
+            if idx + 15 < len:
+                set all_digits to 1
+                set cc_idx to 0
+                repeat while cc_idx < 16:
+                    set cc_char to get_character(text and idx + cc_idx)
+                    if cc_char < 48 or else cc_char > 57:
+                        set all_digits to 0
+                    set cc_idx to cc_idx + 1
+                if all_digits == 1:
+                    set is_cc to 1
+            if is_cc == 1:
+                set res to concat(res and "[CC REDACTED]")
+                set idx to idx + 16
+            else:
+                # 3. Email Check: Scan for domain block after @
+                set is_email_char to get_character(text and idx)
+                if is_email_char == 64: # '@'
+                    # Strip prior characters and next domain block
+                    set res to concat(res and "@[EMAIL_REDACTED]")
+                    # Skip to space or end of word
+                    set skip_idx to idx + 1
+                    set keep_skip to 1
+                    repeat while skip_idx < len and keep_skip == 1:
+                        set sc to get_character(text and skip_idx)
+                        if sc == 32 or else sc == 10 or else sc == 13 or else sc == 9 or else sc == 46: # space, newline, dot
+                            set keep_skip to 0
+                        else:
+                            set skip_idx to skip_idx + 1
+                    set idx to skip_idx
+                else:
+                    set res to concat(res and char_from_code(is_email_char))
+                    set idx to idx + 1
+                    
+    return res
+
+define sync_merge_lessons with memory_mgr as Map and incoming_lessons as Map returning Int:
+    set lessons to map_get_val(memory_mgr and "lessons")
+    set keys to map_keys(incoming_lessons)
+    set len to length_list(keys)
+    set merged_any to 0
+    
+    set i to 0
+    repeat while i < len:
+        set k to get_list(keys and i)
+        set val_raw to map_get_val(incoming_lessons and k)
+        
+        # Scrub PII
+        set val_scrubbed to sync_strip_pii(val_raw)
+        
+        # Deduplication check via exact value match or key hash
+        set lesson_exists to 0
+        if map_contains(lessons and k) == 1:
+            set lesson_exists to 1
+            
+        if lesson_exists == 0:
+            # Cap confidence in imported knowledge (prefix with metadata)
+            set merged_val to concat("Confidence: 0.8 | Imported: " and val_scrubbed)
+            set ok to memory_store(memory_mgr and 2 and k and merged_val)
+            set merged_any to 1
+            
+        set i to i + 1
+        
+    free_list(keys)
+    if merged_any == 1:
+        set ok to memory_serialize(memory_mgr and "config/agent_memory.json")
+    return 0
+
+define sync_merge_synaptic_graph with memory_mgr as Map and incoming_nodes as Map and incoming_edges as List returning Int:
+    set syn_nodes to map_get_val(memory_mgr and "synaptic_nodes")
+    set syn_edges to map_get_val(memory_mgr and "synaptic_edges")
+    
+    # 1. Merge nodes
+    set n_keys to map_keys(incoming_nodes)
+    set n_len to length_list(n_keys)
+    set i to 0
+    repeat while i < n_len:
+        set k to get_list(n_keys and i)
+        set node_map to map_get_val(incoming_nodes and k)
+        set concept_name to map_get_val(node_map and "concept")
+        set layer_val to map_get_val(node_map and "layer")
+        set data_list to map_get_val(node_map and "data")
+        
+        # Check if concept exists in our graph
+        set target_node to 0
+        if map_contains(syn_nodes and k) == 1:
+            set target_node to map_get_val(syn_nodes and k)
+        else:
+            set target_node to create_map()
+            set ok to map_insert(target_node and "concept" and concept_name)
+            set ok to map_insert(target_node and "layer" and layer_val)
+            set target_data to create_list()
+            set ok to map_insert(target_node and "data" and target_data)
+            set ok to map_insert(syn_nodes and k and target_node)
+            
+        set target_data_list to map_get_val(target_node and "data")
+        set d_len to length_list(data_list)
+        set j to 0
+        repeat while j < d_len:
+            set item_raw to get_list(data_list and j)
+            set item_scrubbed to sync_strip_pii(item_raw)
+            
+            # Check duplicates
+            set already to 0
+            set td_len to length_list(target_data_list)
+            set idx to 0
+            repeat while idx < td_len:
+                set td_item to get_list(target_data_list and idx)
+                if td_item equals item_scrubbed:
+                    set already to 1
+                set idx to idx + 1
+                
+            if already == 0:
+                set ok to append_list(target_data_list and item_scrubbed)
+                
+            set j to j + 1
+        set i to i + 1
+    free_list(n_keys)
+    
+    # 2. Merge edges (relationships)
+    set e_len to length_list(incoming_edges)
+    set i to 0
+    repeat while i < e_len:
+        set edge_map to get_list(incoming_edges and i)
+        set from_val to map_get_val(edge_map and "from")
+        set relation_val to map_get_val(edge_map and "relation")
+        set to_val to map_get_val(edge_map and "to")
+        set weight_val to map_get_val(edge_map and "weight")
+        
+        # Cap imported connection weights at 0.8 (800,000 in scale)
+        set final_weight to weight_val
+        if final_weight > 800000:
+            set final_weight to 800000
+            
+        # Check duplicate edge
+        set edge_exists to 0
+        set se_len to length_list(syn_edges)
+        set idx to 0
+        repeat while idx < se_len:
+            set se_edge to get_list(syn_edges and idx)
+            set se_from to map_get_val(se_edge and "from")
+            set se_relation to map_get_val(se_edge and "relation")
+            set se_to to map_get_val(se_edge and "to")
+            
+            if se_from equals from_val and also se_relation equals relation_val and also se_to equals to_val:
+                set edge_exists to 1
+            set idx to idx + 1
+            
+        if edge_exists == 0:
+            set new_edge to create_map()
+            set ok to map_insert(new_edge and "from" and from_val)
+            set ok to map_insert(new_edge and "relation" and relation_val)
+            set ok to map_insert(new_edge and "to" and to_val)
+            set ok to map_insert(new_edge and "weight" and final_weight)
+            set ok to map_insert(new_edge and "activation_count" and 1)
+            set ok to map_insert(new_edge and "permanent" and 0)
+            set ok to append_list(syn_edges and new_edge)
+            
+        set i to i + 1
+        
+    set ok to memory_serialize(memory_mgr and "config/agent_memory.json")
+    return 0
+
+define sync_stage_and_verify_patch with patch_content as Str returning Int:
+    set ok to write_file("scratch/staged_patch.diff" and patch_content)
+    
+    # Run build script verification check
+    # Note: run_command executes the script, returning the status or stdout
+    set cmd_out to run_command("bash build.sh")
+    if string_contains(cmd_out and "Build complete") == 1:
+        # Build succeeded! Apply the patch diff
+        set apply_out to run_command("patch -p1 < scratch/staged_patch.diff")
+        display "[+] P2P Code Patch Verification: build succeeded, patch applied."
+        return 0
+        
+    display "[-] P2P Code Patch Verification: build failed, patch rejected."
+    return 1

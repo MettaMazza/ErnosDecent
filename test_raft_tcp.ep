@@ -1,0 +1,420 @@
+# ErnosDecent — Raft Consensus Over TCP Test Suite
+# Component: test_raft_tcp.ep
+# Tests: 3-node leader election, leader failure re-election, log replication
+# All tests use real TCP on 127.0.0.1 with separate threads per node
+# Status: Phase 3
+
+import "collections"
+import "string"
+import "decent_consensus/raft"
+import "decent_consensus/election"
+import "decent_consensus/state"
+import "decent_consensus/raft_transport"
+
+# ================================================================
+# Test Helper: Create a 3-node cluster stored in a shared map
+# Nodes are accessed via map_get_val (returns Any, avoids move tracking)
+# ================================================================
+
+define setup_cluster with port1 as Int and port2 as Int and port3 as Int returning Map:
+    # Build peer lists
+    set peers1 to create_list()
+    set ok to append_list(peers1 and str_to_ptr("node2"))
+    set ok to append_list(peers1 and str_to_ptr("node3"))
+    set node1 to raft_create_node("node1" and peers1)
+
+    set peers2 to create_list()
+    set ok to append_list(peers2 and str_to_ptr("node1"))
+    set ok to append_list(peers2 and str_to_ptr("node3"))
+    set node2 to raft_create_node("node2" and peers2)
+
+    set peers3 to create_list()
+    set ok to append_list(peers3 and str_to_ptr("node1"))
+    set ok to append_list(peers3 and str_to_ptr("node2"))
+    set node3 to raft_create_node("node3" and peers3)
+
+    # Initialize election timers: node1 shortest (500ms), others longer
+    # TCP round-trips add latency so we need wider gaps than in-memory tests
+    election_init_node(borrow node1 and 500)
+    election_init_node(borrow node2 and 1500)
+    election_init_node(borrow node3 and 1500)
+
+    # Build peer address strings
+    set addr1 to concat("127.0.0.1:" and int_to_string(port1))
+    set addr2 to concat("127.0.0.1:" and int_to_string(port2))
+    set addr3 to concat("127.0.0.1:" and int_to_string(port3))
+
+    # Peer address maps for each node
+    set pa1 to create_map()
+    set ok to map_insert(pa1 and "node2" and addr2)
+    set ok to map_insert(pa1 and "node3" and addr3)
+    set ok to map_insert(node1 and "peer_addresses" and pa1)
+
+    set pa2 to create_map()
+    set ok to map_insert(pa2 and "node1" and addr1)
+    set ok to map_insert(pa2 and "node3" and addr3)
+    set ok to map_insert(node2 and "peer_addresses" and pa2)
+
+    set pa3 to create_map()
+    set ok to map_insert(pa3 and "node1" and addr1)
+    set ok to map_insert(pa3 and "node2" and addr2)
+    set ok to map_insert(node3 and "peer_addresses" and pa3)
+
+    # Control flags
+    set ok to map_insert(node1 and "running" and 1)
+    set ok to map_insert(node1 and "server_ready" and 0)
+    set ok to map_insert(node2 and "running" and 1)
+    set ok to map_insert(node2 and "server_ready" and 0)
+    set ok to map_insert(node3 and "running" and 1)
+    set ok to map_insert(node3 and "server_ready" and 0)
+
+    # Store in cluster map (map_get_val returns Any, avoiding borrow tracking)
+    set cluster to create_map()
+    set ok to map_insert(cluster and "node1" and node1)
+    set ok to map_insert(cluster and "node2" and node2)
+    set ok to map_insert(cluster and "node3" and node3)
+    set ok to map_insert(cluster and "port1" and port1)
+    set ok to map_insert(cluster and "port2" and port2)
+    set ok to map_insert(cluster and "port3" and port3)
+
+    return cluster
+
+define start_cluster with cluster as Map:
+    # Retrieve nodes via map_get_val (Any type, not tracked by borrow checker)
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+    set port1 to map_get_val(cluster and "port1")
+    set port2 to map_get_val(cluster and "port2")
+    set port3 to map_get_val(cluster and "port3")
+
+    # Get peer addresses
+    set pa1 to map_get_val(n1 and "peer_addresses")
+    set pa2 to map_get_val(n2 and "peer_addresses")
+    set pa3 to map_get_val(n3 and "peer_addresses")
+
+    # Spawn server threads
+    spawn raft_server_thread(n1 and port1)
+    spawn raft_server_thread(n2 and port2)
+    spawn raft_server_thread(n3 and port3)
+
+    set ok to ep_sleep_ms(50)
+
+    # Spawn election timer threads
+    spawn raft_election_timer_thread(n1 and pa1)
+    spawn raft_election_timer_thread(n2 and pa2)
+    spawn raft_election_timer_thread(n3 and pa3)
+
+    return 0
+
+define stop_cluster with cluster as Map:
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+    set ok to map_insert(n1 and "running" and 0)
+    set ok to map_insert(n2 and "running" and 0)
+    set ok to map_insert(n3 and "running" and 0)
+    set ok to ep_sleep_ms(100)
+    return 0
+
+define get_leader_id with cluster as Map returning Str:
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+    set r1 to ptr_to_str(map_get_val(n1 and "role"))
+    set r2 to ptr_to_str(map_get_val(n2 and "role"))
+    set r3 to ptr_to_str(map_get_val(n3 and "role"))
+    if r1 equals RAFT_ROLE_LEADER:
+        return "node1"
+    if r2 equals RAFT_ROLE_LEADER:
+        return "node2"
+    if r3 equals RAFT_ROLE_LEADER:
+        return "node3"
+    return ""
+
+define count_leaders with cluster as Map returning Int:
+    set count to 0
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+    if ptr_to_str(map_get_val(n1 and "role")) equals RAFT_ROLE_LEADER:
+        set count to count + 1
+    if ptr_to_str(map_get_val(n2 and "role")) equals RAFT_ROLE_LEADER:
+        set count to count + 1
+    if ptr_to_str(map_get_val(n3 and "role")) equals RAFT_ROLE_LEADER:
+        set count to count + 1
+    return count
+
+# ================================================================
+# TEST 3.3: 3-Node Leader Election Over TCP
+# ================================================================
+
+define test_leader_election returning Map:
+    display "TEST 3.3: 3-node leader election over TCP"
+    set t_ok to 1
+
+    set cluster to setup_cluster(19200 and 19201 and 19202)
+    start_cluster(cluster)
+
+    # Wait for election (node1 has 500ms timeout, give ~3s for TCP round-trips)
+    set ok to ep_sleep_ms(3000)
+
+    set num_leaders to count_leaders(cluster)
+    set leader_id to get_leader_id(cluster)
+
+    if num_leaders == 1:
+        display f"  Leader elected: {leader_id}"
+    else:
+        display f"  FAIL: expected 1 leader, got {num_leaders}"
+        set t_ok to 0
+
+    # Verify leader term >= 1
+    set leader_node to map_get_val(cluster and leader_id)
+    set leader_term to map_get_val(leader_node and "current_term")
+
+    if leader_term >= 1:
+        display f"  Leader term: {leader_term}"
+    else:
+        display f"  FAIL: leader term {leader_term} should be >= 1"
+        set t_ok to 0
+
+    # Count followers
+    set follower_count to 0
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+    if ptr_to_str(map_get_val(n1 and "role")) equals RAFT_ROLE_FOLLOWER:
+        set follower_count to follower_count + 1
+    if ptr_to_str(map_get_val(n2 and "role")) equals RAFT_ROLE_FOLLOWER:
+        set follower_count to follower_count + 1
+    if ptr_to_str(map_get_val(n3 and "role")) equals RAFT_ROLE_FOLLOWER:
+        set follower_count to follower_count + 1
+
+    if follower_count == 2:
+        display "  2 followers confirmed"
+    else:
+        display f"  FAIL: expected 2 followers, got {follower_count}"
+        set t_ok to 0
+
+    if t_ok == 1:
+        display "  PASS"
+
+    set ok to map_insert(cluster and "leader_id" and leader_id)
+    set ok to map_insert(cluster and "passed" and t_ok)
+    return cluster
+
+# ================================================================
+# TEST 3.4: Leader Failure and Re-election
+# ================================================================
+
+define test_leader_failure with cluster as Map returning Int:
+    display "TEST 3.4: Leader failure + re-election"
+    set t_ok to 1
+
+    set old_leader_id to ptr_to_str(map_get_val(cluster and "leader_id"))
+    set old_leader_node to map_get_val(cluster and old_leader_id)
+    set old_term to map_get_val(old_leader_node and "current_term")
+    display f"  Old leader: {old_leader_id} (term {old_term})"
+
+    # "Kill" the leader by stopping its timer and server
+    set ok to map_insert(old_leader_node and "running" and 0)
+
+    # Wait for remaining nodes to detect timeout and re-elect
+    # Election timeout is 1500ms, need ~5s for detection + new election
+    set ok to ep_sleep_ms(5000)
+
+    # Check for new leader among surviving nodes
+    set new_leader_id to ""
+    set new_term to 0
+    set new_leaders to 0
+
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+
+    if (old_leader_id equals "node1") == 0:
+        if ptr_to_str(map_get_val(n1 and "role")) equals RAFT_ROLE_LEADER:
+            set new_leader_id to "node1"
+            set new_term to map_get_val(n1 and "current_term")
+            set new_leaders to new_leaders + 1
+    if (old_leader_id equals "node2") == 0:
+        if ptr_to_str(map_get_val(n2 and "role")) equals RAFT_ROLE_LEADER:
+            set new_leader_id to "node2"
+            set new_term to map_get_val(n2 and "current_term")
+            set new_leaders to new_leaders + 1
+    if (old_leader_id equals "node3") == 0:
+        if ptr_to_str(map_get_val(n3 and "role")) equals RAFT_ROLE_LEADER:
+            set new_leader_id to "node3"
+            set new_term to map_get_val(n3 and "current_term")
+            set new_leaders to new_leaders + 1
+
+    if string_length(new_leader_id) > 0 && new_leaders == 1:
+        display f"  New leader: {new_leader_id} (term {new_term})"
+    else:
+        display f"  FAIL: expected 1 new leader, got {new_leaders}"
+        set t_ok to 0
+
+    if new_term > old_term:
+        display f"  New term {new_term} > old term {old_term}"
+    else:
+        display f"  FAIL: new term {new_term} should be > old term {old_term}"
+        set t_ok to 0
+
+    if t_ok == 1:
+        display "  PASS"
+
+    # Stop all remaining nodes
+    stop_cluster(cluster)
+    return t_ok
+
+# ================================================================
+# TEST 3.5: Log Replication Over TCP
+# ================================================================
+
+define test_log_replication returning Int:
+    display "TEST 3.5: Log replication over TCP"
+    set t_ok to 1
+
+    # Fresh cluster on different ports
+    set cluster to setup_cluster(19210 and 19211 and 19212)
+    start_cluster(cluster)
+
+    # Wait for election (500ms base timeout + TCP overhead)
+    set ok to ep_sleep_ms(3000)
+
+    set leader_id to get_leader_id(cluster)
+    if string_length(leader_id) == 0:
+        display "  FAIL: no leader elected for replication test"
+        stop_cluster(cluster)
+        return 0
+
+    display f"  Leader: {leader_id}"
+
+    # Find the leader's port
+    set port_key to concat("port" and "1")
+    if leader_id equals "node2":
+        set port_key to concat("port" and "2")
+    if leader_id equals "node3":
+        set port_key to concat("port" and "3")
+    set leader_port to map_get_val(cluster and port_key)
+
+    # Propose a command to the leader via TCP
+    set propose_result to raft_client_propose("127.0.0.1" and leader_port and "SET x=42")
+    set propose_err to map_get_val(propose_result and "error")
+    if propose_err == RAFT_TRANSPORT_ERR_NONE:
+        display "  Command 'SET x=42' proposed to leader"
+    else:
+        display f"  FAIL: propose failed with error {propose_err}"
+        set t_ok to 0
+
+    # Wait for replication via heartbeats (50ms interval, allow multiple rounds)
+    set ok to ep_sleep_ms(1000)
+
+    # Verify log entries on all nodes
+    set n1 to map_get_val(cluster and "node1")
+    set n2 to map_get_val(cluster and "node2")
+    set n3 to map_get_val(cluster and "node3")
+
+    set log1 to map_get_val(n1 and "log")
+    set log2 to map_get_val(n2 and "log")
+    set log3 to map_get_val(n3 and "log")
+    set len1 to length_list(log1)
+    set len2 to length_list(log2)
+    set len3 to length_list(log3)
+
+    if len1 >= 1:
+        display f"  node1 log length: {len1}"
+    else:
+        display f"  FAIL: node1 log length {len1}, expected >= 1"
+        set t_ok to 0
+    if len2 >= 1:
+        display f"  node2 log length: {len2}"
+    else:
+        display f"  FAIL: node2 log length {len2}, expected >= 1"
+        set t_ok to 0
+    if len3 >= 1:
+        display f"  node3 log length: {len3}"
+    else:
+        display f"  FAIL: node3 log length {len3}, expected >= 1"
+        set t_ok to 0
+
+    # Verify commit_index
+    set c1 to map_get_val(n1 and "commit_index")
+    set c2 to map_get_val(n2 and "commit_index")
+    set c3 to map_get_val(n3 and "commit_index")
+
+    if c1 >= 1:
+        display f"  node1 commit_index: {c1}"
+    else:
+        display f"  FAIL: node1 commit_index {c1}, expected >= 1"
+        set t_ok to 0
+    if c2 >= 1:
+        display f"  node2 commit_index: {c2}"
+    else:
+        display f"  FAIL: node2 commit_index {c2}, expected >= 1"
+        set t_ok to 0
+    if c3 >= 1:
+        display f"  node3 commit_index: {c3}"
+    else:
+        display f"  FAIL: node3 commit_index {c3}, expected >= 1"
+        set t_ok to 0
+
+    # Verify state machine on leader
+    set leader_node to map_get_val(cluster and leader_id)
+    set sm to map_get_val(leader_node and "state_machine")
+    if sm != 0:
+        set x_val to ptr_to_str(map_get_val(sm and "x"))
+        if x_val equals "42":
+            display "  Leader state machine: x=42 ✓"
+        else:
+            display f"  FAIL: leader state machine x={x_val}, expected 42"
+            set t_ok to 0
+    else:
+        display "  FAIL: leader state machine not initialized"
+        set t_ok to 0
+
+    if t_ok == 1:
+        display "  PASS"
+
+    stop_cluster(cluster)
+    return t_ok
+
+# ================================================================
+# Main Entry Point
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- Phase 3 Raft TCP Test Suite"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_total to 3
+
+    # Test 3.3: Leader election
+    set cluster to test_leader_election()
+    set election_ok to map_get_val(cluster and "passed")
+    if election_ok == 1:
+        set tests_passed to tests_passed + 1
+
+    # Test 3.4: Leader failure
+    set failure_ok to test_leader_failure(cluster)
+    if failure_ok == 1:
+        set tests_passed to tests_passed + 1
+
+    # Test 3.5: Log replication (fresh cluster)
+    set repl_ok to test_log_replication()
+    if repl_ok == 1:
+        set tests_passed to tests_passed + 1
+
+    display ""
+    display "==================================================="
+    display f"  {tests_passed}/{tests_total} Raft TCP tests passed."
+    if tests_passed == tests_total:
+        display "  ALL PHASE 3 RAFT TCP TESTS PASSED!"
+    else:
+        display "  SOME TESTS FAILED"
+    display "==================================================="
+
+    return 0

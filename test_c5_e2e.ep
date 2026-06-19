@@ -1,0 +1,70 @@
+import "decent_msg/message"
+import "decent_id/keys"
+import "stdlib/string"
+
+# C5 negative-control: real E2E direct message. A encrypt-then-signs to B; the wire
+# body is ciphertext; B verify-then-decrypts to recover plaintext. Tampering and a
+# wrong signer key must be rejected.
+define main:
+    set sa to generate_signing_keypair()
+    set sa_pub to ptr_to_str(map_get_val(sa and "public_key"))
+    set sa_sec to ptr_to_str(map_get_val(sa and "secret_key"))
+    set ea to generate_encryption_keypair()
+    set ea_pub to ptr_to_str(map_get_val(ea and "public_key"))
+    set ea_sec to ptr_to_str(map_get_val(ea and "secret_key"))
+    set sb to generate_signing_keypair()
+    set sb_pub to ptr_to_str(map_get_val(sb and "public_key"))
+    set sb_sec to ptr_to_str(map_get_val(sb and "secret_key"))
+    set eb to generate_encryption_keypair()
+    set eb_pub to ptr_to_str(map_get_val(eb and "public_key"))
+    set eb_sec to ptr_to_str(map_get_val(eb and "secret_key"))
+
+    set plain to "meet at the safehouse at 9"
+    set m to msg_create_text("did:A" and "did:B" and plain)
+    set e1 to msg_encrypt_and_sign(m and eb_pub and ea_sec and sa_sec)
+    set wire to msg_serialize(m)
+    set on_wire to ptr_to_str(map_get_val(m and "body"))
+
+    set p to 0
+    set t to 0
+
+    set t to t + 1
+    if on_wire equals plain:
+        display "[FAIL] body on wire is plaintext"
+    else:
+        set p to p + 1
+        display "[PASS] wire body is ciphertext (not plaintext)"
+
+    # B receives the wire frame and verify-then-decrypts
+    set m2 to msg_deserialize(wire)
+    set d1 to msg_verify_and_decrypt(m2 and sa_pub and ea_pub and eb_sec)
+    set got to ptr_to_str(map_get_val(m2 and "body"))
+    set t to t + 1
+    if d1 == 0 and also got equals plain:
+        set p to p + 1
+        display "[PASS] B recovered the plaintext via verify-then-decrypt"
+    else:
+        display concat("[FAIL] decrypt got=" and got)
+
+    # Wrong signer key must fail verification
+    set m3 to msg_deserialize(wire)
+    set d2 to msg_verify_and_decrypt(m3 and sb_pub and ea_pub and eb_sec)
+    set t to t + 1
+    if d2 != 0:
+        set p to p + 1
+        display "[PASS] wrong signer pubkey rejected"
+    else:
+        display "[FAIL] wrong signer accepted"
+
+    # Tampered ciphertext must fail (sig over ciphertext)
+    set m4 to msg_deserialize(wire)
+    set ok to map_insert(m4 and "body" and concat(ptr_to_str(map_get_val(m4 and "body")) and "00"))
+    set d3 to msg_verify_and_decrypt(m4 and sa_pub and ea_pub and eb_sec)
+    set t to t + 1
+    if d3 != 0:
+        set p to p + 1
+        display "[PASS] tampered ciphertext rejected"
+    else:
+        display "[FAIL] tampered ciphertext accepted"
+
+    display f"RESULT: {p}/{t} passed"

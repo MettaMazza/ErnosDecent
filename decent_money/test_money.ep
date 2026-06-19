@@ -1,0 +1,817 @@
+# ErnosDecent -- Integration Test Suite for Financial Systems (decent_money)
+# Component: decent_money/test_money.ep
+# Status: Production -- OperationTrojanClaude Phase 8
+
+import "wallet"
+import "ledger"
+import "token"
+import "nft"
+import "exchange"
+import "contracts"
+import "../decent_id/keys"
+import "string"
+import "collections"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_money/test_money.ep Suite"
+    display "  OperationTrojanClaude Phase 8 Integration Test"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+    
+    # Initialize variables for GC protection references
+    set ledger_blocks to create_list()
+    set ledger_validators to create_list()
+    set ob_buys to create_list()
+    set ob_sells to create_list()
+    set contract_events to create_list()
+    
+    # General GC protection guard to hold all heap objects (strings, lists, maps)
+    set gc_guard to create_list()
+
+    # Init libsodium/crypto
+    set crypto_err to init_crypto()
+    if crypto_err != 0:
+        display "FATAL: libsodium initialization failed"
+        return 1
+
+    # ===========================================================
+    # TEST 1: HD Wallet Mnemonic, Seed, BIP44 & Keystores
+    # ===========================================================
+    display "TEST 1: HD Wallet Mnemonic, Seed, BIP44 & Keystores"
+    set t1_ok to 1
+
+    # Mnemonic generation
+    set mnemonic to wallet_generate_mnemonic()
+    set ok to append_list(gc_guard and mnemonic)
+    display concat("  DEBUG: Mnemonic is: '" and concat(mnemonic and "'"))
+    if string_length(mnemonic) > 0:
+        set ok to 1
+    else:
+        display "  FAIL: Mnemonic generation returned empty"
+        set t1_ok to 0
+
+    # Verify mnemonic has exactly 24 words (23 spaces)
+    set words to split(mnemonic and " ")
+    set ok to append_list(gc_guard and words)
+    display concat("  DEBUG: Split words list length: " and int_to_string(length_list(words)))
+    if length_list(words) == 24:
+        set ok to 1
+    else:
+        display "  FAIL: Mnemonic does not contain 24 words"
+        set t1_ok to 0
+    free_list(words)
+    set words to 0
+
+    # Seed derivation
+    set seed to wallet_mnemonic_to_seed(mnemonic and "supersecretpass")
+    set ok to append_list(gc_guard and seed)
+    if string_length(seed) == 128: # 512-bit seed is 128 hex chars
+        set ok to 1
+    else:
+        display "  FAIL: Derived seed is not 512-bit (128 hex chars)"
+        set t1_ok to 0
+
+    # BIP44 Key derivation (using Alice's path)
+    set kp_res to wallet_derive_keypair(seed and "m/44'/60'/0'/0'/0'")
+    set ok to append_list(gc_guard and kp_res)
+    if map_get_val(kp_res and "error") == 0:
+        set ok to 1
+    else:
+        display "  FAIL: Key derivation failed"
+        set t1_ok to 0
+
+    set alice_pk to map_get_val(kp_res and "public_key")
+    set ok to append_list(gc_guard and alice_pk)
+    set alice_sk to map_get_val(kp_res and "secret_key")
+    set ok to append_list(gc_guard and alice_sk)
+
+    # Keystore encryption & decryption
+    set keystore to wallet_encrypt_keystore(kp_res and "pass123")
+    set ok to append_list(gc_guard and keystore)
+    if string_length(keystore) > 0:
+        set ok to 1
+    else:
+        display "  FAIL: Keystore encryption returned empty"
+        set t1_ok to 0
+
+    set decrypted to wallet_decrypt_keystore(keystore and "pass123")
+    set ok to append_list(gc_guard and decrypted)
+    if map_get_val(decrypted and "error") == 0:
+        set dec_pk to map_get_val(decrypted and "public_key")
+        set ok to append_list(gc_guard and dec_pk)
+        set dec_sk to map_get_val(decrypted and "secret_key")
+        set ok to append_list(gc_guard and dec_sk)
+        if string_equals(dec_pk and alice_pk) == 1 and string_equals(dec_sk and alice_sk) == 1:
+            set ok to 1
+        else:
+            display "  FAIL: Decrypted keypair mismatch"
+            set t1_ok to 0
+    else:
+        display "  FAIL: Keystore decryption failed"
+        set t1_ok to 0
+    free_map(decrypted)
+    set decrypted to 0
+
+    # Keystore decryption failure on wrong passphrase
+    set decrypted_fail to wallet_decrypt_keystore(keystore and "wrong_pass")
+    set ok to append_list(gc_guard and decrypted_fail)
+    if map_get_val(decrypted_fail and "error") != 0:
+        set ok to 1
+    else:
+        display "  FAIL: Keystore decrypted successfully with wrong passphrase"
+        set t1_ok to 0
+    free_map(decrypted_fail)
+    set decrypted_fail to 0
+    free_map(kp_res)
+    set kp_res to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: Ledger Genesis, UTXO Blocks, Signing & PoS
+    # ===========================================================
+    display "TEST 2: Ledger Genesis, UTXO Blocks, Signing & PoS"
+    set t2_ok to 1
+
+    # Create Alice keypair
+    set alice_kp to generate_signing_keypair()
+    set ok to append_list(gc_guard and alice_kp)
+    set alice_pk to map_get_val(alice_kp and "public_key")
+    set ok to append_list(gc_guard and alice_pk)
+    set alice_sk to map_get_val(alice_kp and "secret_key")
+    set ok to append_list(gc_guard and alice_sk)
+
+    # Create Bob keypair
+    set bob_kp to generate_signing_keypair()
+    set ok to append_list(gc_guard and bob_kp)
+    set bob_pk to map_get_val(bob_kp and "public_key")
+    set ok to append_list(gc_guard and bob_pk)
+    set bob_sk to map_get_val(bob_kp and "secret_key")
+    set ok to append_list(gc_guard and bob_sk)
+
+    # Create Validator keypair
+    set val_kp to generate_signing_keypair()
+    set ok to append_list(gc_guard and val_kp)
+    set val_pk to map_get_val(val_kp and "public_key")
+    set ok to append_list(gc_guard and val_pk)
+    set val_sk to map_get_val(val_kp and "secret_key")
+    set ok to append_list(gc_guard and val_sk)
+
+    set ledger to ledger_create(alice_pk)
+    set ok to append_list(gc_guard and ledger)
+    set ledger_values to map_get_val(ledger and "values_list")
+    set ok to append_list(gc_guard and ledger_values)
+    set ledger_blocks to map_get_val(ledger and "blocks")
+    set ledger_validators to map_get_val(ledger and "validators")
+    
+    # Check Alice initial balance (genesis coins)
+    set alice_bal to ledger_get_balance(ledger and alice_pk)
+    if alice_bal == 1000000:
+        set ok to 1
+    else:
+        display "  FAIL: Genesis balance mismatch"
+        set t2_ok to 0
+
+    # Build transaction: Alice sends 100000 to Bob and 200000 to Validator, fee is 100
+    set tx_inputs to create_list()
+    set ok to append_list(gc_guard and tx_inputs)
+    set inp to create_map()
+    set ok to append_list(gc_guard and inp)
+    
+    # Get genesis transaction ID to spend
+    set blocks to map_get_val(ledger and "blocks")
+    set genesis_block to get_list(blocks and 0)
+    set genesis_txs to map_get_val(genesis_block and "transactions")
+    set genesis_tx to get_list(genesis_txs and 0)
+    set genesis_tx_id to map_get_val(genesis_tx and "id")
+
+    set ok to map_insert(inp and "tx_id" and genesis_tx_id)
+    set ok to map_insert(inp and "output_index" and 0)
+    set ok to append_list(tx_inputs and inp)
+
+    set tx_outputs to create_list()
+    set ok to append_list(gc_guard and tx_outputs)
+    set out_bob to create_map()
+    set ok to append_list(gc_guard and out_bob)
+    set ok to map_insert(out_bob and "recipient" and bob_pk)
+    set ok to map_insert(out_bob and "amount" and 100000)
+    set ok to map_insert(out_bob and "index" and 0)
+    set ok to append_list(tx_outputs and out_bob)
+
+    set out_val to create_map()
+    set ok to append_list(gc_guard and out_val)
+    set ok to map_insert(out_val and "recipient" and val_pk)
+    set ok to map_insert(out_val and "amount" and 200000)
+    set ok to map_insert(out_val and "index" and 1)
+    set ok to append_list(tx_outputs and out_val)
+
+    set out_alice_refund to create_map()
+    set ok to append_list(gc_guard and out_alice_refund)
+    set ok to map_insert(out_alice_refund and "recipient" and alice_pk)
+    set ok to map_insert(out_alice_refund and "amount" and 699900) # 1000000 - 100000 - 200000 - 100 = 699900
+    set ok to map_insert(out_alice_refund and "index" and 2)
+    set ok to append_list(tx_outputs and out_alice_refund)
+
+    set tx to ledger_create_tx(tx_inputs and tx_outputs and 100)
+    set ok to append_list(gc_guard and tx)
+    set tx_id to map_get_val(tx and "id")
+
+    # Sign transaction input
+    set sig_res to sign_message(tx_id and alice_sk)
+    set ok to append_list(gc_guard and sig_res)
+    set sig_hex to map_get_val(sig_res and "signature")
+    set ok to append_list(gc_guard and sig_hex)
+    set ok to map_insert(inp and "signature" and sig_hex)
+    free_map(sig_res)
+    set sig_res to 0
+
+    # Validate transaction
+    set validate_err to ledger_validate_tx(ledger and tx)
+    if validate_err == 0:
+        set ok to 1
+    else:
+        display "  FAIL: Transaction validation failed"
+        set t2_ok to 0
+
+    # C1 GUARD: conservation of supply. Value-creating transactions that still
+    # "balance" via a negative fee or a non-positive output must be rejected.
+    set atk_in to create_list()
+    set ok to append_list(gc_guard and atk_in)
+
+    # Attack A: input_sum(0) == output_sum(1000) + fee(-1000): negative-fee mint.
+    set atk_out_a to create_list()
+    set ok to append_list(gc_guard and atk_out_a)
+    set oa to create_map()
+    set ok to append_list(gc_guard and oa)
+    set ok to map_insert(oa and "recipient" and bob_pk)
+    set ok to map_insert(oa and "amount" and 1000)
+    set ok to map_insert(oa and "index" and 0)
+    set ok to append_list(atk_out_a and oa)
+    set atk_tx_a to ledger_create_tx(atk_in and atk_out_a and (0 - 1000))
+    set ok to append_list(gc_guard and atk_tx_a)
+    if ledger_validate_tx(ledger and atk_tx_a) != 0:
+        set ok to 1
+    else:
+        display "  FAIL: negative-fee mint transaction was accepted"
+        set t2_ok to 0
+
+    # Attack B: a BALANCED negative output ([1000, -1000] sums to 0, so the
+    # conservation check passes) — only the positive-amount guard can reject it.
+    set atk_out_b to create_list()
+    set ok to append_list(gc_guard and atk_out_b)
+    set ob to create_map()
+    set ok to append_list(gc_guard and ob)
+    set ok to map_insert(ob and "recipient" and bob_pk)
+    set ok to map_insert(ob and "amount" and 1000)
+    set ok to map_insert(ob and "index" and 0)
+    set ok to append_list(atk_out_b and ob)
+    set ob2 to create_map()
+    set ok to append_list(gc_guard and ob2)
+    set ok to map_insert(ob2 and "recipient" and bob_pk)
+    set ok to map_insert(ob2 and "amount" and (0 - 1000))
+    set ok to map_insert(ob2 and "index" and 1)
+    set ok to append_list(atk_out_b and ob2)
+    set atk_tx_b to ledger_create_tx(atk_in and atk_out_b and 0)
+    set ok to append_list(gc_guard and atk_tx_b)
+    if ledger_validate_tx(ledger and atk_tx_b) != 0:
+        set ok to 1
+    else:
+        display "  FAIL: negative-output mint transaction was accepted"
+        set t2_ok to 0
+
+    # Attack C: a zero-amount output must be rejected.
+    set atk_out_c to create_list()
+    set ok to append_list(gc_guard and atk_out_c)
+    set oc to create_map()
+    set ok to append_list(gc_guard and oc)
+    set ok to map_insert(oc and "recipient" and bob_pk)
+    set ok to map_insert(oc and "amount" and 0)
+    set ok to map_insert(oc and "index" and 0)
+    set ok to append_list(atk_out_c and oc)
+    set atk_tx_c to ledger_create_tx(atk_in and atk_out_c and 0)
+    set ok to append_list(gc_guard and atk_tx_c)
+    if ledger_validate_tx(ledger and atk_tx_c) != 0:
+        set ok to 1
+    else:
+        display "  FAIL: zero-output transaction was accepted"
+        set t2_ok to 0
+
+    # Attack D: integer-overflow mint. Four outputs of 2^62 sum to 2^64, which
+    # wraps to 0; without an overflow guard input_sum(0) == output_sum(0) + fee(0)
+    # would pass the conservation check and mint four enormous UTXOs.
+    set atk_out_d to create_list()
+    set ok to append_list(gc_guard and atk_out_d)
+    set di to 0
+    repeat while di < 4:
+        set od to create_map()
+        set ok to append_list(gc_guard and od)
+        set ok to map_insert(od and "recipient" and bob_pk)
+        set ok to map_insert(od and "amount" and 4611686018427387904)
+        set ok to map_insert(od and "index" and di)
+        set ok to append_list(atk_out_d and od)
+        set di to di + 1
+    set atk_tx_d to ledger_create_tx(atk_in and atk_out_d and 0)
+    set ok to append_list(gc_guard and atk_tx_d)
+    if ledger_validate_tx(ledger and atk_tx_d) != 0:
+        set ok to 1
+    else:
+        display "  FAIL: integer-overflow mint transaction was accepted"
+        set t2_ok to 0
+
+    # Mine block 1
+    # First, elect validator for block 1 (should default to Alice because no stakes registered yet)
+    set gen_hash to map_get_val(genesis_block and "hash")
+    set elected_val to ledger_elect_validator(ledger and gen_hash)
+    set ok to append_list(gc_guard and elected_val)
+    if elected_val equals alice_pk:
+        set ok to 1
+    else:
+        display "  FAIL: Elected validator for block 1 is not Alice"
+        set t2_ok to 0
+
+    # Calculate expected block hash manually to sign it
+    set expected_block_hash to ledger_compute_block_hash(tx_id and gen_hash and ep_sha256(""))
+    set ok to append_list(gc_guard and expected_block_hash)
+    set block_sig_res to sign_message(expected_block_hash and alice_sk)
+    set ok to append_list(gc_guard and block_sig_res)
+    set block_sig_hex to map_get_val(block_sig_res and "signature")
+    set ok to append_list(gc_guard and block_sig_hex)
+    free_map(block_sig_res)
+    set block_sig_res to 0
+
+    set tx_list to create_list()
+    set ok to append_list(gc_guard and tx_list)
+    set ok to append_list(tx_list and tx)
+
+    set add_err to ledger_add_block(ledger and tx_list and alice_pk and block_sig_hex and "")
+    if add_err == 0:
+        set ok to 1
+    else:
+        display concat("  FAIL: Adding block 1 failed: " and int_to_string(add_err))
+        set t2_ok to 0
+
+    # Verify balances after mining
+    set alice_bal_post to ledger_get_balance(ledger and alice_pk)
+    set bob_bal_post to ledger_get_balance(ledger and bob_pk)
+    set val_bal_post to ledger_get_balance(ledger and val_pk)
+
+    # Alice balance = 699900 + 100 (fee reward since she mined the block!) = 700000
+    if alice_bal_post == 700000 and bob_bal_post == 100000 and val_bal_post == 200000:
+        set ok to 1
+    else:
+        display "  FAIL: Post-mining balances mismatch"
+        set t2_ok to 0
+
+    # Register Validator as a PoS staking validator
+    # Validator stakes 100000 coins
+    set stake_err to ledger_stake_coins(ledger and val_pk and 100000)
+    if stake_err == 0:
+        set ok to 1
+    else:
+        display "  FAIL: Validator stake operation failed"
+        set t2_ok to 0
+
+    # Verify Validator stake amount
+    set stakes_map to map_get_val(ledger and "stakes")
+    set val_stake to map_get_val(stakes_map and val_pk)
+    if val_stake == 100000:
+        set ok to 1
+    else:
+        display "  FAIL: Validator stake registry mismatch"
+        set t2_ok to 0
+
+    # H2 GUARD: staking must BOND coins. Validator had a single 200000 UTXO and
+    # staked 100000, so the spendable balance must drop to 100000 (the change).
+    set val_bal_after_stake to ledger_get_balance(ledger and val_pk)
+    if val_bal_after_stake == 100000:
+        set ok to 1
+    else:
+        display "  FAIL: staking did not consume UTXOs (balance not reduced)"
+        set t2_ok to 0
+
+    # And re-staking the original 200000 must FAIL -- only 100000 remains
+    # spendable, so stake cannot be forged by re-staking the same balance.
+    set restake_err to ledger_stake_coins(ledger and val_pk and 200000)
+    if restake_err != 0:
+        set ok to 1
+    else:
+        display "  FAIL: validator re-staked coins it no longer has (forgeable stake)"
+        set t2_ok to 0
+
+    # Elect next validator (Validator has 100000 stake, Alice has 0, so Validator must be selected)
+    set block1 to get_list(blocks and 1)
+    set block1_hash to map_get_val(block1 and "hash")
+    set elected_val_2 to ledger_elect_validator(ledger and block1_hash)
+    set ok to append_list(gc_guard and elected_val_2)
+    if elected_val_2 equals val_pk:
+        set ok to 1
+    else:
+        display "  FAIL: PoS validator election did not select Validator key"
+        set t2_ok to 0
+
+    free_map(alice_kp)
+    set alice_kp to 0
+    free_map(bob_kp)
+    set bob_kp to 0
+    free_map(val_kp)
+    set val_kp to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: ERC-20 Fungible Token Standard
+    # ===========================================================
+    display "TEST 3: ERC-20 Fungible Token Standard"
+    set t3_ok to 1
+
+    # Create Token
+    set token to token_create("Ernos Coin" and "ERN" and 18 and 1000000 and "alice_did")
+    set ok to append_list(gc_guard and token)
+    if token_balance_of(token and "alice_did") == 1000000:
+        set ok to 1
+    else:
+        display "  FAIL: Initial token supply allocation failed"
+        set t3_ok to 0
+
+    # Transfer tokens
+    set transfer_err to token_transfer(token and "alice_did" and "bob_did" and 250000)
+    if transfer_err == 0 and token_balance_of(token and "alice_did") == 750000 and token_balance_of(token and "bob_did") == 250000:
+        set ok to 1
+    else:
+        display "  FAIL: Token transfer failed or balances incorrect"
+        set t3_ok to 0
+
+    # Approval and Allowance
+    set approve_err to token_approve(token and "alice_did" and "bob_did" and 100000)
+    if approve_err == 0 and token_allowance(token and "alice_did" and "bob_did") == 100000:
+        set ok to 1
+    else:
+        display "  FAIL: Token approval failed"
+        set t3_ok to 0
+
+    # TransferFrom using allowance
+    set tf_err to token_transfer_from(token and "bob_did" and "alice_did" and "val_did" and 40000)
+    if tf_err == 0:
+        set a_bal to token_balance_of(token and "alice_did")
+        set v_bal to token_balance_of(token and "val_did")
+        set remain_allow to token_allowance(token and "alice_did" and "bob_did")
+        if a_bal == 710000 and v_bal == 40000 and remain_allow == 60000:
+            set ok to 1
+        else:
+            display "  FAIL: Balances/Allowance mismatch after transfer_from"
+            set t3_ok to 0
+    else:
+        display "  FAIL: transfer_from failed"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: ERC-721 NFT Collection, Metadata, and Royalties
+    # ===========================================================
+    display "TEST 4: ERC-721 NFT Collection, Metadata, and Royalties"
+    set t4_ok to 1
+
+    # Create collection
+    set nft_col to nft_create_collection("Ernos Artifacts" and "E-ART" and "alice_did")
+    set ok to append_list(gc_guard and nft_col)
+    
+    # Mint NFT with 8% creator royalty fee (800 bps)
+    set mint_err to nft_mint(nft_col and "bob_did" and 777 and "ipfs://hash-value" and 800)
+    if mint_err == 0:
+        set ok to 1
+    else:
+        display "  FAIL: NFT mint failed"
+        set t4_ok to 0
+
+    if nft_owner_of(nft_col and 777) equals "bob_did":
+        set ok to 1
+    else:
+        display "  FAIL: NFT owner mismatch"
+        set t4_ok to 0
+
+    if nft_metadata(nft_col and 777) equals "ipfs://hash-value":
+        set ok to 1
+    else:
+        display "  FAIL: NFT metadata mismatch"
+        set t4_ok to 0
+
+    # Transfer NFT
+    set tx_nft_err to nft_transfer(nft_col and "bob_did" and "alice_did" and 777)
+    if tx_nft_err == 0 and nft_owner_of(nft_col and 777) equals "alice_did":
+        set ok to 1
+    else:
+        display "  FAIL: NFT transfer failed"
+        set t4_ok to 0
+
+    # Verify royalty info
+    set royalty_map to nft_royalty_info(nft_col and 777 and 10000)
+    set ok to append_list(gc_guard and royalty_map)
+    set receiver to map_get_val(royalty_map and "receiver")
+    set ok to append_list(gc_guard and receiver)
+    set royalty_amt to map_get_val(royalty_map and "amount")
+
+    # Bob was creator, so Bob should receive the royalty.
+    # 8% of 10000 is 800 tokens.
+    if receiver equals "bob_did" and royalty_amt == 800:
+        set ok to 1
+    else:
+        display "  FAIL: NFT royalty calculation incorrect"
+        set t4_ok to 0
+    free_map(royalty_map)
+    set royalty_map to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: DEX Constant-Product AMM & Orderbook
+    # ===========================================================
+    display "TEST 5: DEX Constant-Product AMM & Orderbook"
+    set t5_ok to 1
+
+    set dex to dex_create()
+    set ok to append_list(gc_guard and dex)
+    set dex_values to map_get_val(dex and "values_list")
+    set ok to append_list(gc_guard and dex_values)
+    
+    # Create tokens for DEX trading pairs
+    set usdt to token_create("Tether" and "USDT" and 6 and 20000000 and "alice_did")
+    set ok to append_list(gc_guard and usdt)
+    set btc to token_create("Bitcoin" and "BTC" and 8 and 1000 and "alice_did")
+    set ok to append_list(gc_guard and btc)
+
+    # Give some tokens to Bob
+    token_transfer(usdt and "alice_did" and "bob_did" and 1000000)
+    token_transfer(btc and "alice_did" and "bob_did" and 10)
+
+    # 1. Add Liquidity
+    # Alice adds 1000000 USDT and 100 BTC
+    set liq_res to dex_add_liquidity(dex and usdt and btc and 1000000 and 100 and "alice_did")
+    set ok to append_list(gc_guard and liq_res)
+    if map_get_val(liq_res and "error") == 0 and map_get_val(liq_res and "lp_minted") == 1000100:
+        set ok to 1
+    else:
+        display "  FAIL: DEX add liquidity failed"
+        set t5_ok to 0
+    free_map(liq_res)
+    set liq_res to 0
+
+    # 2. Swap via AMM
+    # Bob swaps 100000 USDT for BTC. Reserves are 1M USDT and 100 BTC.
+    set swap_err to dex_swap_amm(dex and usdt and btc and 100000 and "bob_did")
+    if swap_err == 0:
+        # Check Bob's BTC balance (started with 10)
+        set bob_btc_bal to token_balance_of(btc and "bob_did")
+        if bob_btc_bal > 10:
+            set ok to 1
+        else:
+            display "  FAIL: Swap executed but Bob received no tokens"
+            set t5_ok to 0
+    else:
+        display concat("  FAIL: DEX AMM swap failed with error code: " and int_to_string(swap_err))
+        set t5_ok to 0
+
+    # 3. Orderbook Limit Orders and Matching Engine
+    # Alice places a BUY limit order for 2 BTC at 9000 USDT each (escrows 18000 USDT)
+    set buy_res to dex_limit_order(dex and ORDER_BUY and 9000 and 2 and btc and usdt and "alice_did")
+    set ok to append_list(gc_guard and buy_res)
+    if map_get_val(buy_res and "error") == 0:
+        set ok to 1
+    else:
+        display "  FAIL: BUY limit order placement failed"
+        set t5_ok to 0
+    free_map(buy_res)
+    set buy_res to 0
+
+    # Bob places a SELL limit order for 2 BTC at 9000 USDT each (escrows 2 BTC)
+    set sell_res to dex_limit_order(dex and ORDER_SELL and 9000 and 2 and btc and usdt and "bob_did")
+    set ok to append_list(gc_guard and sell_res)
+    if map_get_val(sell_res and "error") == 0:
+        set ok to 1
+    else:
+        display "  FAIL: SELL limit order placement failed"
+        set t5_ok to 0
+    free_map(sell_res)
+    set sell_res to 0
+
+    # M5 GUARD: only an order's creator may cancel it. Alice places a small,
+    # non-matching buy (price 100); Bob must NOT be able to cancel it, Alice must.
+    set cx_res to dex_limit_order(dex and ORDER_BUY and 100 and 1 and btc and usdt and "alice_did")
+    set ok to append_list(gc_guard and cx_res)
+    set cx_order to map_get_val(cx_res and "order")
+    set cx_oid to map_get_val(cx_order and "order_id")
+    set wrong_cancel to dex_cancel_order(dex and cx_oid and "bob_did")
+    if wrong_cancel != 0:
+        set ok to 1
+    else:
+        display "  FAIL: a non-owner cancelled another user's order"
+        set t5_ok to 0
+    set right_cancel to dex_cancel_order(dex and cx_oid and "alice_did")
+    if right_cancel == 0:
+        set ok to 1
+    else:
+        display "  FAIL: the order owner could not cancel their own order"
+        set t5_ok to 0
+
+    # Cache orderbook lists to prevent garbage collection
+    set orderbooks to map_get_val(dex and "orderbooks")
+    set ob to map_get_val(orderbooks and "BTC-USDT")
+    set ob_buys to map_get_val(ob and "buys")
+    set ob_sells to map_get_val(ob and "sells")
+
+    # Run order matcher
+    set match_err to dex_match_orders(dex)
+    if match_err == 0:
+        # Check that balances were updated correctly after matching
+        # Alice bought 2 BTC, so her balance must increase by 2
+        set alice_btc_bal_post to token_balance_of(btc and "alice_did")
+        if alice_btc_bal_post == 892: # Alice started with 1000, transferred 10 to Bob, added 100 to LP, bought 2 = 892
+            set ok to 1
+        else:
+            display concat("  FAIL: DEX matching completed but balances are wrong. Alice balance: " and int_to_string(alice_btc_bal_post))
+            set t5_ok to 0
+    else:
+        display "  FAIL: DEX order matching failed"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Smart Contract VM Deployment, Calls & Rollback
+    # ===========================================================
+    display "TEST 6: Smart Contract VM Deployment, Calls & Rollback"
+    set t6_ok to 1
+
+    # Define contract code
+    set code_builder to create_builder()
+    set ok to append_list(gc_guard and code_builder)
+    builder_append(code_builder and "LABEL increment\n")
+    builder_append(code_builder and "  CALLER caller_did\n")
+    builder_append(code_builder and "  LOG increment_called caller_did\n")
+    builder_append(code_builder and "  LOAD counter current_val\n")
+    builder_append(code_builder and "  ADD next_val current_val 1\n")
+    builder_append(code_builder and "  SET counter next_val\n")
+    builder_append(code_builder and "  RETURN next_val\n")
+    builder_append(code_builder and "LABEL check_and_revert\n")
+    builder_append(code_builder and "  LOAD counter check_val\n")
+    builder_append(code_builder and "  GT too_high check_val 2\n")
+    builder_append(code_builder and "  IF too_high fail_branch\n")
+    builder_append(code_builder and "  RETURN check_val\n")
+    builder_append(code_builder and "LABEL fail_branch\n")
+    builder_append(code_builder and "  REVERT CounterTooLarge\n")
+    builder_append(code_builder and "LABEL state_revert\n")
+    builder_append(code_builder and "  SET counter 999\n")
+    builder_append(code_builder and "  REVERT ForceStateRevert\n")
+    
+    set contract_code to builder_to_string(code_builder)
+    set ok to append_list(gc_guard and contract_code)
+    free_list(code_builder)
+    set code_builder to 0
+
+    set contract to contract_create(contract_code and "alice_did" and 1000)
+    set ok to append_list(gc_guard and contract)
+    set contract_events to map_get_val(contract and "events")
+    
+    # Store contract values_list on the stack / gc_guard to protect all values stored in VM contract storage
+    set contract_values to map_get_val(contract and "values_list")
+    set ok to append_list(gc_guard and contract_values)
+    
+    display "  DEBUG: Calling increment first time"
+    # 2. Call increment first time (0 + 1 = 1)
+    set call1_res to contract_call(contract and "increment" and create_list() and "bob_did" and 1000)
+    set ok to append_list(gc_guard and call1_res)
+    if map_get_val(call1_res and "status") == CONTRACT_ERR_NONE and (map_get_val(call1_res and "retval") equals "1"):
+        set ok to 1
+    else:
+        display "  FAIL: Smart contract increment call 1 failed"
+        set t6_ok to 0
+    free_map(call1_res)
+    set call1_res to 0
+
+    display "  DEBUG: Calling increment second time"
+    # 3. Call increment second time (1 + 1 = 2)
+    set call2_res to contract_call(contract and "increment" and create_list() and "bob_did" and 1000)
+    set ok to append_list(gc_guard and call2_res)
+    if map_get_val(call2_res and "status") == CONTRACT_ERR_NONE and (map_get_val(call2_res and "retval") equals "2"):
+        set ok to 1
+    else:
+        display "  FAIL: Smart contract increment call 2 failed"
+        set t6_ok to 0
+    free_map(call2_res)
+    set call2_res to 0
+
+    # Verify that events were emitted and stored on the contract
+    set events to map_get_val(contract and "events")
+    if length_list(events) == 2:
+        set ev1 to get_list(events and 0)
+        set ok to append_list(gc_guard and ev1)
+        if (map_get_val(ev1 and "name") equals "increment_called") and (map_get_val(ev1 and "data") equals "bob_did"):
+            set ok to 1
+        else:
+            display "  FAIL: Event data mismatch"
+            set t6_ok to 0
+    else:
+        display "  FAIL: Event list length mismatch"
+        set t6_ok to 0
+
+    display "  DEBUG: Calling check_and_revert first time"
+    # 4. Call check_and_revert (counter = 2, so it should not revert)
+    set call3_res to contract_call(contract and "check_and_revert" and create_list() and "bob_did" and 1000)
+    set ok to append_list(gc_guard and call3_res)
+    if map_get_val(call3_res and "status") == CONTRACT_ERR_NONE:
+        set ok to 1
+    else:
+        display "  FAIL: check_and_revert reverted when counter was 2"
+        set t6_ok to 0
+    free_map(call3_res)
+    set call3_res to 0
+
+    display "  DEBUG: Calling increment third time"
+    # 5. Call increment third time (2 + 1 = 3)
+    set call4_res to contract_call(contract and "increment" and create_list() and "bob_did" and 1000)
+    set ok to append_list(gc_guard and call4_res)
+    display concat("  DEBUG: call4 status=" and int_to_string(map_get_val(call4_res and "status")))
+    if map_contains(call4_res and "error") == 1:
+        display concat("  DEBUG: call4 error=" and map_get_val(call4_res and "error"))
+    if map_contains(call4_res and "retval") == 1:
+        display concat("  DEBUG: call4 retval=" and map_get_val(call4_res and "retval"))
+    free_map(call4_res)
+    set call4_res to 0
+
+    display "  DEBUG: Calling check_and_revert second time"
+    # 6. Call check_and_revert (counter = 3, so it should revert!)
+    set call5_res to contract_call(contract and "check_and_revert" and create_list() and "bob_did" and 1000)
+    set ok to append_list(gc_guard and call5_res)
+    if map_get_val(call5_res and "status") == CONTRACT_ERR_REVERTED and (map_get_val(call5_res and "error") equals "CounterTooLarge"):
+        set ok to 1
+    else:
+        display "  FAIL: check_and_revert did not revert correctly when counter was 3"
+        set t6_ok to 0
+    free_map(call5_res)
+    set call5_res to 0
+
+    display "  DEBUG: Calling state_revert"
+    # 7. Call state_revert (should attempt to set counter to 999, revert, and roll back state to 3)
+    set call6_res to contract_call(contract and "state_revert" and create_list() and "bob_did" and 1000)
+    set ok to append_list(gc_guard and call6_res)
+    if map_get_val(call6_res and "status") == CONTRACT_ERR_REVERTED and (map_get_val(call6_res and "error") equals "ForceStateRevert"):
+        set storage_map to map_get_val(contract and "storage")
+        set final_counter to map_get_val(storage_map and "counter")
+        set ok to append_list(gc_guard and final_counter)
+        if final_counter equals "3":
+            set ok to 1
+        else:
+            display concat("  FAIL: Smart contract state rollback failed! Counter is " and final_counter)
+            set t6_ok to 0
+    else:
+        display "  FAIL: state_revert did not revert as expected"
+        set t6_ok to 0
+    free_map(call6_res)
+    set call6_res to 0
+    set t6d to contract_destroy(contract)
+    set contract to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    display ""
+    display "==================================================="
+    display "  RESULTS:"
+    display concat("  Passed: " and int_to_string(tests_passed))
+    display concat("  Failed: " and int_to_string(tests_failed))
+    display "==================================================="
+
+    # GC safety uses to prevent optimizer dead-code elimination
+    if length_list(ledger_blocks) >= 0 and also length_list(ledger_validators) >= 0 and also length_list(contract_events) >= 0 and also length_list(ob_buys) >= 0 and also length_list(ob_sells) >= 0 and also length_list(gc_guard) >= 0:
+        set dummy_gc to 1
+
+    if tests_failed > 0:
+        return 1
+    return 0

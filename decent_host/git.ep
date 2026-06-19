@@ -1,0 +1,251 @@
+# ErnosDecent — Secure P2P Git Server
+# Component: decent_host/git.ep
+# Implements: Secure Git pushing/pulling, collaborator authentication, and signature verification
+# Status: Production — OperationTrojanClaude Phase 13
+
+import "../decent_id/did"
+import "../decent_id/keys"
+import "collections"
+import "string"
+import "../decent_net/transport"
+
+# ================================================================
+# Constants and Error Codes
+# ================================================================
+
+set GIT_ERR_NONE to 0
+set GIT_ERR_REPO_NOT_FOUND to 911
+set GIT_ERR_UNAUTHORIZED to 912
+set GIT_ERR_VERIFICATION_FAILED to 913
+set GIT_ERR_INVALID_REF to 914
+
+# ================================================================
+# Data Structures
+# ================================================================
+
+define structure GitRepo:
+    field repo_name as Str
+    field authorized_collaborators as Int # Map (did -> role)
+    field ref_heads as Int # Map (branch_name -> commit_hash)
+    field object_store as Int # Map (object_hash -> payload)
+
+# ================================================================
+# Repository Creation and Access
+# ================================================================
+
+define git_create_repo with name as Str and owner_did as Str returning Map:
+    set repo to create_map()
+    set collaborators to create_map()
+    set refs to create_map()
+    set objects to create_map()
+
+    # Owner has administrative role
+    set ok to map_insert(collaborators and owner_did and "owner")
+    
+    set ok to map_insert(repo and "repo_name" and name)
+    set ok to map_insert(repo and "authorized_collaborators" and collaborators)
+    set ok to map_insert(repo and "ref_heads" and refs)
+    set ok to map_insert(repo and "object_store" and objects)
+
+    return repo
+
+define git_add_collaborator with repo as Map and owner_did as Str and collab_did as Str and role as Str returning Int:
+    set collaborators to map_get_val(repo and "authorized_collaborators")
+    
+    # Verify the request is made by the owner
+    set current_role to map_get_val(collaborators and owner_did)
+    if (current_role equals "owner") == 0:
+        return GIT_ERR_UNAUTHORIZED
+
+    set ok to map_insert(collaborators and collab_did and role)
+    return GIT_ERR_NONE
+
+# ================================================================
+# Push and Pull Operations
+# ================================================================
+
+define git_push_commit with repo as Map and pusher_did as Str and branch as Str and commit_hash as Str and payload as Str and signature as Str returning Int:
+    set collaborators to map_get_val(repo and "authorized_collaborators")
+    
+    # Check if pusher is authorized
+    set role to map_get_val(collaborators and pusher_did)
+    if role == 0:
+        return GIT_ERR_UNAUTHORIZED
+
+    # Resolve pusher's public key from DID
+    set resolve_res to did_resolve(pusher_did)
+    set err to map_get_val(resolve_res and "error")
+    if err != 0:
+        return GIT_ERR_VERIFICATION_FAILED
+
+    set keys_map to map_get_val(resolve_res and "verification_method")
+    set pub_key_hex to map_get_val(keys_map and "public_key_hex")
+
+    # Verify signature of the payload (commit changes)
+    set verify_ok to verify_signature(payload and signature and pub_key_hex)
+    if verify_ok != 0:
+        return GIT_ERR_VERIFICATION_FAILED
+
+    # Store git object (commit payload)
+    set objects to map_get_val(repo and "object_store")
+    set ok to map_insert(objects and commit_hash and payload)
+
+    # Update branch ref head
+    set refs to map_get_val(repo and "ref_heads")
+    set ok to map_insert(refs and branch and commit_hash)
+
+    return GIT_ERR_NONE
+
+define git_pull_ref with repo as Map and branch as Str returning Str:
+    set refs to map_get_val(repo and "ref_heads")
+    set commit_hash to map_get_val(refs and branch)
+    if commit_hash == 0:
+        return ""
+    return commit_hash
+
+define git_get_object with repo as Map and object_hash as Str returning Str:
+    set objects to map_get_val(repo and "object_store")
+    set payload to map_get_val(objects and object_hash)
+    if payload == 0:
+        return ""
+    return payload
+
+# ================================================================
+# TCP Networking — remote push/pull over transport
+# ================================================================
+
+define git_remote_push with address as Str and port as Int and pusher_did as Str and branch as Str and commit_hash as Str and payload as Str and signature as Str returning Int:
+    # Push a commit to a remote git server over TCP
+    set conn to transport_connect(address and port)
+    set err to map_get_val(conn and "error")
+    if err != 0:
+        return 1
+
+    # Build push payload: pusher_did|branch|commit_hash|signature|payload
+    # ('|' not ':' — DIDs contain colons; payload is the remainder so it may contain '|')
+    set msg to concat(pusher_did and "|")
+    set msg to concat(msg and branch)
+    set msg to concat(msg and "|")
+    set msg to concat(msg and commit_hash)
+    set msg to concat(msg and "|")
+    set msg to concat(msg and signature)
+    set msg to concat(msg and "|")
+    set msg to concat(msg and payload)
+
+    set ok to transport_send(conn and "GIT_PUSH" and msg)
+
+    # Receive acknowledgment
+    set response to transport_recv(conn)
+    set ok to transport_close(conn)
+
+    set recv_err to map_get_val(response and "error")
+    if recv_err != 0:
+        return 2
+    return 0
+
+define git_remote_pull with address as Str and port as Int and branch as Str returning Str:
+    # Pull a branch ref from a remote git server
+    set conn to transport_connect(address and port)
+    set err to map_get_val(conn and "error")
+    if err != 0:
+        return ""
+
+    set ok to transport_send(conn and "GIT_PULL" and branch)
+
+    set response to transport_recv(conn)
+    set ok to transport_close(conn)
+
+    set recv_err to map_get_val(response and "error")
+    if recv_err != 0:
+        return ""
+    return map_get_val(response and "payload")
+
+define git_remote_fetch_object with address as Str and port as Int and object_hash as Str returning Str:
+    # Fetch a git object from a remote server
+    set conn to transport_connect(address and port)
+    set err to map_get_val(conn and "error")
+    if err != 0:
+        return ""
+
+    set ok to transport_send(conn and "GIT_FETCH_OBJ" and object_hash)
+
+    set response to transport_recv(conn)
+    set ok to transport_close(conn)
+
+    set recv_err to map_get_val(response and "error")
+    if recv_err != 0:
+        return ""
+    return map_get_val(response and "payload")
+
+# Parse a GIT_PUSH wire message and apply it. Wire format:
+#   pusher_did|branch|commit_hash|signature|payload
+# Uses '|' (not ':') because DIDs contain colons; payload is the remainder so it
+# may itself contain '|'. Authorization + signature are enforced by git_push_commit.
+define git_apply_push with repo as Map and wire as Str returning Str:
+    set rest to wire
+    set i1 to string_index_of(rest and "|")
+    if i1 < 0:
+        return "error:malformed"
+    set pusher_did to substring(rest and 0 and i1)
+    set rest to substring(rest and i1 + 1 and string_length(rest) - i1 - 1)
+    set i2 to string_index_of(rest and "|")
+    if i2 < 0:
+        return "error:malformed"
+    set branch to substring(rest and 0 and i2)
+    set rest to substring(rest and i2 + 1 and string_length(rest) - i2 - 1)
+    set i3 to string_index_of(rest and "|")
+    if i3 < 0:
+        return "error:malformed"
+    set commit_hash to substring(rest and 0 and i3)
+    set rest to substring(rest and i3 + 1 and string_length(rest) - i3 - 1)
+    set i4 to string_index_of(rest and "|")
+    if i4 < 0:
+        return "error:malformed"
+    set signature to substring(rest and 0 and i4)
+    set push_payload to substring(rest and i4 + 1 and string_length(rest) - i4 - 1)
+    set push_err to git_push_commit(repo and pusher_did and branch and commit_hash and push_payload and signature)
+    if push_err == GIT_ERR_NONE:
+        return "ok"
+    return concat("error:" and int_to_string(push_err))
+
+define git_serve with repo as Map and port as Int returning Int:
+    # Start a git server that handles push/pull/fetch over TCP
+    set listener to transport_listen(port)
+    set err to map_get_val(listener and "error")
+    if err != 0:
+        return 1
+
+    set conn to transport_accept(listener)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != 0:
+        set ok to transport_close(listener)
+        return 2
+
+    set request to transport_recv(conn)
+    set recv_err to map_get_val(request and "error")
+    if recv_err != 0:
+        set ok to transport_close(conn)
+        set ok to transport_close(listener)
+        return 3
+
+    set msg_type to map_get_val(request and "msg_type")
+    set payload_data to map_get_val(request and "payload")
+
+    if msg_type equals "GIT_PULL":
+        set branch to payload_data
+        set commit to git_pull_ref(repo and branch)
+        set ok to transport_send(conn and "GIT_PULL_RESP" and commit)
+
+    if msg_type equals "GIT_FETCH_OBJ":
+        set obj to git_get_object(repo and payload_data)
+        set ok to transport_send(conn and "GIT_OBJ_RESP" and obj)
+
+    if msg_type equals "GIT_PUSH":
+        # Real push handling (was missing — the client sent GIT_PUSH but the server
+        # never received it). git_apply_push enforces collaborator auth + signature.
+        set push_resp to git_apply_push(repo and payload_data)
+        set ok to transport_send(conn and "GIT_PUSH_RESP" and push_resp)
+
+    set ok to transport_close(conn)
+    set ok to transport_close(listener)
+    return 0

@@ -1,0 +1,106 @@
+# Minimal election debug — trace RPC responses
+import "collections"
+import "string"
+import "decent_consensus/raft"
+import "decent_consensus/election"
+import "decent_consensus/state"
+import "decent_consensus/raft_transport"
+
+define main:
+    display "=== RPC Debug Test ==="
+
+    # Create 2 nodes
+    set peers1 to create_list()
+    set ok to append_list(peers1 and str_to_ptr("node2"))
+    set n1 to raft_create_node("node1" and peers1)
+    election_init_node(borrow n1 and 500)
+    set pa1 to create_map()
+    set ok to map_insert(pa1 and "node2" and "127.0.0.1:19501")
+    set ok to map_insert(n1 and "peer_addresses" and pa1)
+    set ok to map_insert(n1 and "running" and 1)
+    set ok to map_insert(n1 and "server_ready" and 0)
+
+    set peers2 to create_list()
+    set ok to append_list(peers2 and str_to_ptr("node1"))
+    set n2 to raft_create_node("node2" and peers2)
+    election_init_node(borrow n2 and 5000)
+    set pa2 to create_map()
+    set ok to map_insert(pa2 and "node1" and "127.0.0.1:19500")
+    set ok to map_insert(n2 and "peer_addresses" and pa2)
+    set ok to map_insert(n2 and "running" and 1)
+    set ok to map_insert(n2 and "server_ready" and 0)
+
+    set cluster to create_map()
+    set ok to map_insert(cluster and "node1" and n1)
+    set ok to map_insert(cluster and "node2" and n2)
+
+    set r1 to map_get_val(cluster and "node1")
+    set r2 to map_get_val(cluster and "node2")
+
+    # Start servers only (no timer threads)
+    spawn raft_server_thread(r1 and 19500)
+    spawn raft_server_thread(r2 and 19501)
+    set ok to ep_sleep_ms(200)
+
+    set s1 to map_get_val(r1 and "server_ready")
+    set s2 to map_get_val(r2 and "server_ready")
+    display f"Servers ready: {s1} {s2}"
+
+    # Manually trigger one election on node1
+    display "Triggering election on node1..."
+    set requests to election_start_vote(borrow r1)
+    set num_reqs to length_list(requests)
+    display f"RequestVote messages to send: {num_reqs}"
+
+    set rp1 to map_get_val(r1 and "peer_addresses")
+
+    # Dispatch manually
+    set i to 0
+    repeat while i < num_reqs:
+        set req to get_list(requests and i)
+        set target to ptr_to_str(map_get_val(req and "target"))
+        set msg_type to ptr_to_str(map_get_val(req and "type"))
+        display f"  Sending {msg_type} to {target}"
+
+        set addr_str to ptr_to_str(map_get_val(rp1 and target))
+        display f"  Address: {addr_str}"
+
+        set addr_info to raft_parse_peer_address(addr_str)
+        set host to ptr_to_str(map_get_val(addr_info and "host"))
+        set port to map_get_val(addr_info and "port")
+        display f"  Host={host} Port={port}"
+
+        set term to map_get_val(req and "term")
+        set cid to ptr_to_str(map_get_val(req and "candidate_id"))
+        set lli to map_get_val(req and "last_log_index")
+        set llt to map_get_val(req and "last_log_term")
+        set wire to raft_serialize_request_vote(term and cid and lli and llt)
+        display f"  Wire: {wire}"
+
+        set resp to raft_send_rpc(host and port and wire)
+        set rpc_err to map_get_val(resp and "error")
+        display f"  RPC error: {rpc_err}"
+
+        if rpc_err == RAFT_TRANSPORT_ERR_NONE:
+            set resp_type to ptr_to_str(map_get_val(resp and "type"))
+            display f"  Response type: {resp_type}"
+            if resp_type equals RAFT_MSG_REQUEST_VOTE_RESP:
+                set resp_term to map_get_val(resp and "term")
+                set vote_granted to map_get_val(resp and "vote_granted")
+                set sender to ptr_to_str(map_get_val(resp and "sender_id"))
+                display f"  Vote: term={resp_term} granted={vote_granted} from={sender}"
+                set ok to election_handle_vote_response(borrow r1 and sender and resp_term and vote_granted)
+                set new_role to ptr_to_str(map_get_val(r1 and "role"))
+                display f"  After handling: role={new_role}"
+
+        set i to i + 1
+
+    set role1 to ptr_to_str(map_get_val(r1 and "role"))
+    set term1 to map_get_val(r1 and "current_term")
+    display f"Final: node1 role={role1} term={term1}"
+
+    set ok to map_insert(r1 and "running" and 0)
+    set ok to map_insert(r2 and "running" and 0)
+    set ok to ep_sleep_ms(100)
+    display "=== DONE ==="
+    return 0

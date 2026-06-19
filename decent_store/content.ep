@@ -1,0 +1,327 @@
+# ErnosDecent -- Content-Addressable Storage
+# Component: decent_store/content.ep
+# Implements: SHA-256 keyed immutable content blocks,
+#             chunking, Merkle tree roots, block cache
+# Status: Production -- OperationTrojanClaude Phase 4
+
+import "../decent_id/keys"
+import "string"
+import "../storage"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set CAS_ERR_NONE to 0
+set CAS_ERR_NOT_FOUND to 701
+set CAS_ERR_ALREADY_EXISTS to 702
+set CAS_ERR_INVALID_HASH to 703
+set CAS_ERR_VERIFICATION_FAILED to 704
+set CAS_ERR_CHUNK_TOO_LARGE to 705
+set CAS_ERR_EMPTY_CONTENT to 706
+
+# Block sizes
+set CAS_MAX_BLOCK_SIZE to 65536
+set CAS_DEFAULT_CHUNK_SIZE to 4096
+
+# ================================================================
+# Content Block -- immutable data identified by its SHA-256 hash
+# ================================================================
+
+define cas_hash_content with content as Str returning Str:
+    # SHA-256 hash of the content string
+    return ep_sha256(content)
+
+define create_content_block with content as Str:
+    # Create a content block with its hash
+    set block to create_map()
+    set hash to cas_hash_content(content)
+    set ok to map_insert(block and "hash" and hash)
+    set ok to map_insert(block and "content" and content)
+    set ok to map_insert(block and "size" and string_length(content))
+    set ok to map_insert(block and "created_at" and ep_time_now_sec())
+    return block
+
+define verify_content_block with block as Int returning Int:
+    # Verify that the block content matches its hash
+    set stored_hash to map_get_val(block and "hash")
+    set content to map_get_val(block and "content")
+    set computed_hash to cas_hash_content(content)
+    if computed_hash equals stored_hash:
+        return 1
+    return 0
+
+# ================================================================
+# Content Store -- in-memory block storage
+# ================================================================
+
+define create_content_store:
+    set store to create_map()
+    set blocks to create_map()
+    set ok to map_insert(store and "blocks" and blocks)
+    set ok to map_insert(store and "block_count" and 0)
+    set ok to map_insert(store and "total_bytes" and 0)
+    return store
+
+define cas_put with store as Int and content as Str:
+    # Store content, returning its hash
+    set result to create_map()
+
+    if string_length(content) == 0:
+        set ok to map_insert(result and "error" and CAS_ERR_EMPTY_CONTENT)
+        return result
+
+    set hash to cas_hash_content(content)
+    set blocks to map_get_val(store and "blocks")
+
+    # Check if already exists (deduplication)
+    set existing to map_get_val(blocks and hash)
+    if existing != 0:
+        set ok to map_insert(result and "hash" and hash)
+        set ok to map_insert(result and "error" and CAS_ERR_NONE)
+        set ok to map_insert(result and "deduplicated" and 1)
+        return result
+
+    # Store the block
+    set block to create_content_block(content)
+    set ok to map_insert(blocks and hash and block)
+
+    # Persist to disk
+    set persist_ok to storage_content_put(hash and content and "application/octet-stream")
+
+    set count to map_get_val(store and "block_count")
+    set ok to map_insert(store and "block_count" and count + 1)
+    set total to map_get_val(store and "total_bytes")
+    set ok to map_insert(store and "total_bytes" and total + string_length(content))
+
+    set ok to map_insert(result and "hash" and hash)
+    set ok to map_insert(result and "error" and CAS_ERR_NONE)
+    set ok to map_insert(result and "deduplicated" and 0)
+    return result
+
+define cas_get with store as Int and hash as Str:
+    # Retrieve content by hash
+    set result to create_map()
+    set blocks to map_get_val(store and "blocks")
+    set block to map_get_val(blocks and hash)
+
+    if block == 0:
+        # Fallback: check persistent storage
+        set persisted to storage_content_get(hash)
+        if string_length(persisted) > 0:
+            # D2: content-addressed integrity — the bytes on disk MUST hash to the
+            # requested address. A mismatch means corruption/tampering; reject it
+            # instead of serving (and caching) poisoned content.
+            if cas_hash_content(persisted) equals hash:
+                set rehydrated to create_content_block(persisted)
+                set ok to map_insert(blocks and hash and rehydrated)
+                set ok to map_insert(result and "content" and persisted)
+                set ok to map_insert(result and "size" and string_length(persisted))
+                set ok to map_insert(result and "hash" and hash)
+                set ok to map_insert(result and "error" and CAS_ERR_NONE)
+                return result
+            set ok to map_insert(result and "error" and CAS_ERR_VERIFICATION_FAILED)
+            return result
+        set ok to map_insert(result and "error" and CAS_ERR_NOT_FOUND)
+        return result
+
+    # Verify integrity before returning
+    set valid to verify_content_block(block)
+    if valid == 0:
+        set ok to map_insert(result and "error" and CAS_ERR_VERIFICATION_FAILED)
+        return result
+
+    set ok to map_insert(result and "content" and map_get_val(block and "content"))
+    set ok to map_insert(result and "size" and map_get_val(block and "size"))
+    set ok to map_insert(result and "hash" and hash)
+    set ok to map_insert(result and "error" and CAS_ERR_NONE)
+    return result
+
+define cas_has with store as Int and hash as Str returning Int:
+    set blocks to map_get_val(store and "blocks")
+    set block to map_get_val(blocks and hash)
+    if block == 0:
+        # Fallback: check persistent storage
+        return storage_content_has(hash)
+    return 1
+
+define cas_delete with store as Int and hash as Str returning Int:
+    set blocks to map_get_val(store and "blocks")
+    set block to map_get_val(blocks and hash)
+    if block == 0:
+        return CAS_ERR_NOT_FOUND
+
+    set size to map_get_val(block and "size")
+    set ok to map_delete(blocks and hash)
+    # D4: delete the on-disk blob too — otherwise the next cas_get re-hydrates the
+    # "deleted" block from disk (non-durable delete + can't actually erase content).
+    set ok to storage_content_delete(hash)
+
+    set count to map_get_val(store and "block_count")
+    set ok to map_insert(store and "block_count" and count - 1)
+    set total to map_get_val(store and "total_bytes")
+    set ok to map_insert(store and "total_bytes" and total - size)
+    return CAS_ERR_NONE
+
+define cas_stats with store as Int:
+    set stats to create_map()
+    set ok to map_insert(stats and "block_count" and map_get_val(store and "block_count"))
+    set ok to map_insert(stats and "total_bytes" and map_get_val(store and "total_bytes"))
+    return stats
+
+# ================================================================
+# Chunking -- split large content into fixed-size blocks
+# ================================================================
+
+define cas_chunk_content with store as Int and content as Str and chunk_size as Int:
+    # Split content into chunks and store each one
+    # Returns a manifest: list of chunk hashes in order
+    set result to create_map()
+    set content_len to string_length(content)
+
+    if content_len == 0:
+        set ok to map_insert(result and "error" and CAS_ERR_EMPTY_CONTENT)
+        return result
+
+    set chunk_hashes to create_list()
+    set offset to 0
+    set chunk_count to 0
+
+    repeat while offset < content_len:
+        set remaining to content_len - offset
+        set this_chunk_size to chunk_size
+        if remaining < this_chunk_size:
+            set this_chunk_size to remaining
+
+        set chunk_data to substring(content and offset and this_chunk_size)
+        set put_result to cas_put(store and chunk_data)
+        set put_err to map_get_val(put_result and "error")
+        if put_err != CAS_ERR_NONE:
+            set ok to map_insert(result and "error" and put_err)
+            return result
+
+        set chunk_hash to map_get_val(put_result and "hash")
+        set ok to append_list(chunk_hashes and chunk_hash)
+        set offset to offset + this_chunk_size
+        set chunk_count to chunk_count + 1
+
+    set ok to map_insert(result and "chunks" and chunk_hashes)
+    set ok to map_insert(result and "chunk_count" and chunk_count)
+    set ok to map_insert(result and "total_size" and content_len)
+    set ok to map_insert(result and "error" and CAS_ERR_NONE)
+    return result
+
+define cas_reassemble_chunks with store as Int and chunk_hashes as Int:
+    # Reassemble content from a list of chunk hashes
+    set result to create_map()
+    set chunk_count to length_list(chunk_hashes)
+    set assembled to ""
+    set i to 0
+
+    repeat while i < chunk_count:
+        set hash to get_list(chunk_hashes and i)
+        set get_result to cas_get(store and hash)
+        set get_err to map_get_val(get_result and "error")
+        if get_err != CAS_ERR_NONE:
+            set ok to map_insert(result and "error" and CAS_ERR_NOT_FOUND)
+            set ok to map_insert(result and "missing_chunk" and i)
+            return result
+
+        set chunk_content to map_get_val(get_result and "content")
+        set assembled to concat(assembled and chunk_content)
+        set i to i + 1
+
+    set ok to map_insert(result and "content" and assembled)
+    set ok to map_insert(result and "size" and string_length(assembled))
+    set ok to map_insert(result and "error" and CAS_ERR_NONE)
+    return result
+
+# ================================================================
+# Merkle Tree -- compute root hash of chunk list
+# ================================================================
+
+define cas_merkle_root with chunk_hashes as Int returning Str:
+    # Compute Merkle root of a list of hashes
+    # Pairs adjacent hashes, hashes them together, repeat until one root
+    set count to length_list(chunk_hashes)
+
+    if count == 0:
+        return ""
+    if count == 1:
+        return get_list(chunk_hashes and 0)
+
+    # Build tree bottom-up
+    set current_level to create_list()
+    set i to 0
+    repeat while i < count:
+        set ok to append_list(current_level and get_list(chunk_hashes and i))
+        set i to i + 1
+
+    set level_size to count
+    repeat while level_size > 1:
+        set next_level to create_list()
+        set pi to 0
+        repeat while pi < level_size:
+            set left to get_list(current_level and pi)
+            if pi + 1 < level_size:
+                set right to get_list(current_level and pi + 1)
+                set pair to concat(left and right)
+                set parent to ep_sha256(pair)
+                set ok to append_list(next_level and parent)
+            else:
+                # Odd node: promote directly
+                set ok to append_list(next_level and left)
+            set pi to pi + 2
+
+        set current_level to next_level
+        set level_size to length_list(current_level)
+
+    return get_list(current_level and 0)
+
+# ================================================================
+# Content Manifest -- describes chunked content
+# ================================================================
+
+define create_content_manifest with content as Str and store as Int and chunk_size as Int:
+    set result to create_map()
+
+    set chunk_result to cas_chunk_content(store and content and chunk_size)
+    set chunk_err to map_get_val(chunk_result and "error")
+    if chunk_err != CAS_ERR_NONE:
+        set ok to map_insert(result and "error" and chunk_err)
+        return result
+
+    set chunks to map_get_val(chunk_result and "chunks")
+    set root to cas_merkle_root(chunks)
+
+    set manifest to create_map()
+    set ok to map_insert(manifest and "merkle_root" and root)
+    set ok to map_insert(manifest and "chunks" and chunks)
+    set ok to map_insert(manifest and "chunk_count" and map_get_val(chunk_result and "chunk_count"))
+    set ok to map_insert(manifest and "total_size" and map_get_val(chunk_result and "total_size"))
+    set ok to map_insert(manifest and "chunk_size" and chunk_size)
+    set ok to map_insert(manifest and "created_at" and ep_time_now_sec())
+
+    set ok to map_insert(result and "manifest" and manifest)
+    set ok to map_insert(result and "error" and CAS_ERR_NONE)
+    return result
+
+define verify_manifest_integrity with manifest as Int and store as Int returning Int:
+    # Verify all chunks exist and Merkle root matches
+    set chunks to map_get_val(manifest and "chunks")
+    set chunk_count to map_get_val(manifest and "chunk_count")
+
+    # Verify each chunk exists
+    set i to 0
+    repeat while i < chunk_count:
+        set hash to get_list(chunks and i)
+        if cas_has(store and hash) == 0:
+            return 0
+        set i to i + 1
+
+    # Verify Merkle root
+    set stored_root to map_get_val(manifest and "merkle_root")
+    set computed_root to cas_merkle_root(chunks)
+    if computed_root equals stored_root:
+        return 1
+    return 0

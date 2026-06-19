@@ -1,0 +1,114 @@
+# ErnosDecent -- Model Management & Verification
+# Component: decent_ai/models.ep
+# Status: Production -- OperationTrojanClaude Phase 9
+
+import "collections"
+import "crypto"
+
+external define SHA256 with data and len and hash_dest
+external define get_list_data_ptr with list
+
+external define ep_dlopen with lib:
+external define ep_dlsym with handle and name:
+external define ep_dlcall1 with fn and a0:
+external define ep_dlcall2 with fn and a0 and a1:
+external define ep_dlcall3 with fn and a0 and a1 and a2:
+external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
+
+define models_create:
+    set manager to create_map()
+    set registry to create_map()
+    set ok to map_insert(manager and "registry" and registry)
+    
+    set values_list to create_list()
+    set ok to map_insert(manager and "values_list" and values_list)
+    set ok to append_list(values_list and registry)
+    
+    return manager
+
+define models_add with manager as Map and name as Str and path as Str and size as Int and hash as Str returning Int:
+    set registry to map_get_val(manager and "registry")
+    set model_info to create_map()
+    set ok to map_insert(model_info and "name" and name)
+    set ok to map_insert(model_info and "path" and path)
+    set ok to map_insert(model_info and "size" and size)
+    set ok to map_insert(model_info and "hash" and hash)
+    
+    set ok to map_insert(registry and name and model_info)
+    
+    set values_list to map_get_val(manager and "values_list")
+    set ok to append_list(values_list and model_info)
+    set ok to append_list(values_list and name)
+    set ok to append_list(values_list and path)
+    set ok to append_list(values_list and hash)
+    
+    return 0
+
+define models_get with manager as Map and name as Str returning Map:
+    set registry to map_get_val(manager and "registry")
+    if map_contains(registry and name) == 1:
+        return map_get_val(registry and name)
+    return create_map()
+
+define models_verify with path as Str and expected_hash as Str returning Int:
+    set handle to ep_dlopen("libSystem.B.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("libc.so.6")
+    if handle == 0:
+        return 1001
+        
+    set fn_fopen to ep_dlsym(handle and "fopen")
+    set fn_fread to ep_dlsym(handle and "fread")
+    set fn_fclose to ep_dlsym(handle and "fclose")
+    set fn_fseek to ep_dlsym(handle and "fseek")
+    set fn_ftell to ep_dlsym(handle and "ftell")
+    
+    if fn_fopen == 0 or else fn_fread == 0 or else fn_fclose == 0 or else fn_fseek == 0 or else fn_ftell == 0:
+        return 1002
+        
+    set path_ptr to str_to_ptr(path)
+    set mode_ptr to str_to_ptr("rb")
+    set file_ptr to ep_dlcall2(fn_fopen and path_ptr and mode_ptr)
+    if file_ptr == 0:
+        return 1003
+        
+    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 2)
+    set size to ep_dlcall1(fn_ftell and file_ptr)
+    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 0)
+    
+    if size <= 0:
+        set dummy to ep_dlcall1(fn_fclose and file_ptr)
+        return 1004
+        
+    set buf_ptr to alloc_bytes(size)
+    set read_bytes to ep_dlcall4(fn_fread and buf_ptr and 1 and size and file_ptr)
+    set dummy to ep_dlcall1(fn_fclose and file_ptr)
+    
+    set hash_list to create_list()
+    set ok to append_list(hash_list and 0)
+    set ok to append_list(hash_list and 0)
+    set ok to append_list(hash_list and 0)
+    set ok to append_list(hash_list and 0)
+    
+    set hash_ptr to get_list_data_ptr(hash_list)
+    set dummy to SHA256(buf_ptr and size and hash_ptr)
+    set dummy to free_bytes(buf_ptr)
+    
+    set hex_res to ""
+    set word_idx to 0
+    repeat while word_idx < 4:
+        set val to get_list(hash_list and word_idx)
+        set byte_idx to 0
+        repeat while byte_idx < 8:
+            set b to get_byte(val and byte_idx)
+            set hex_res to concat(hex_res and byte_to_hex(b))
+            set byte_idx to byte_idx + 1
+        set word_idx to word_idx + 1
+        
+    set ok to free_list(hash_list)
+    
+    if hex_res equals expected_hash:
+        return 0
+    return 1005

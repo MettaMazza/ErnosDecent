@@ -1,0 +1,61 @@
+# G5 negative-control: federated-search wire (de)serialization round-trip + merge.
+
+import "string"
+import "collections"
+import "crawl"
+import "rank"
+import "query"
+
+define mk with url as Str and title as Str and score as Int returning Map:
+    set m to create_map()
+    set ok to map_insert(m and "url" and url)
+    set ok to map_insert(m and "title" and title)
+    set ok to map_insert(m and "score" and score)
+    return m
+
+define check_int with label as Str and got as Int and want as Int returning Int:
+    if got == want:
+        display concat("PASS: " and label)
+        return 1
+    display concat(concat(concat("FAIL: " and label) and " got=") and int_to_string(got))
+    return 0
+
+define check_str with label as Str and got as Str and want as Str returning Int:
+    if got equals want:
+        display concat("PASS: " and label)
+        return 1
+    display concat(concat(concat("FAIL: " and label) and " got=[") and concat(got and "]"))
+    return 0
+
+define main:
+    set passes to 0
+
+    # Round-trip: serialize 2 results then deserialize — fields preserved.
+    set src to create_list()
+    set ok to append_list(src and mk("https://a/1" and "Alpha One" and 4200))
+    set ok to append_list(src and mk("https://b/2" and "Beta Two" and 1300))
+    set wire to query_serialize_results(src)
+    set back to query_deserialize_results(wire)
+    set passes to passes + check_int("roundtrip_count" and length_list(back) and 2)
+    set passes to passes + check_str("roundtrip_url0" and ptr_to_str(map_get_val(get_list(back and 0) and "url")) and "https://a/1")
+    set passes to passes + check_str("roundtrip_title1" and ptr_to_str(map_get_val(get_list(back and 1) and "title")) and "Beta Two")
+    set passes to passes + check_int("roundtrip_score0" and map_get_val(get_list(back and 0) and "score") and 4200)
+
+    # Empty wire -> empty list (honest, no fabrication).
+    set passes to passes + check_int("empty_wire" and length_list(query_deserialize_results("")) and 0)
+
+    # Merge: local + remote, dedup by URL keeping higher score, re-ranked descending.
+    set local to create_list()
+    set ok to append_list(local and mk("https://a/1" and "Alpha" and 1000))
+    set ok to append_list(local and mk("https://c/3" and "Gamma" and 500))
+    set remote to create_list()
+    set ok to append_list(remote and mk("https://a/1" and "Alpha" and 9000))
+    set ok to append_list(remote and mk("https://d/4" and "Delta" and 7000))
+    set merged to query_merge_results(local and remote)
+    set passes to passes + check_int("merge_dedup_count" and length_list(merged) and 3)
+    # Highest score (a/1 @ 9000 from remote) ranks first; dedup kept the higher.
+    set passes to passes + check_str("merge_top_url" and ptr_to_str(map_get_val(get_list(merged and 0) and "url")) and "https://a/1")
+    set passes to passes + check_int("merge_top_score" and map_get_val(get_list(merged and 0) and "score") and 9000)
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/8 passed"))
+    return 0

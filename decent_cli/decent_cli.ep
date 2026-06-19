@@ -1,0 +1,78 @@
+# ErnosDecent — Node Control CLI
+# Component: decent_cli/decent_cli.ep
+# Status: Production — OperationTrojanClaude Phase 14
+
+import "collections"
+import "string"
+import "net"
+import "os"
+import "../config.ep"
+
+define get_command_from_args with args as List returning Str:
+    set argc to length_list(args)
+    if argc < 2:
+        return ""
+    set cmd to get_list(args and 1)
+    set i to 2
+    repeat while i < argc:
+        set next_arg to get_list(args and i)
+        set cmd to concat(cmd and " ")
+        set cmd to concat(cmd and next_arg)
+        set i to i + 1
+    return cmd
+
+define print_usage:
+    display "==================================================="
+    display "  ErnosDecent CLI Client"
+    display "==================================================="
+    display "Usage:"
+    display "  decent_cli status          Check node status"
+    display "  decent_cli wallet balance  Check wallet balance"
+    display "  decent_cli pool status     Check resource pool status"
+    display "  decent_cli stop            Stop the node daemon"
+    display "==================================================="
+    return 0
+
+define main:
+    set args to get_args()
+    set argc to length_list(args)
+    
+    if argc < 2:
+        print_usage()
+        return 0
+        
+    set cmd to get_command_from_args(args)
+    if string_length(cmd) == 0:
+        print_usage()
+        return 0
+        
+    # Resolve the IPC port from the same config the daemon uses (was hardcoded 5000),
+    # so a node started with a non-default --port is still reachable. Defaults to 5000.
+    set home to get_home_dir()
+    set cfg to config_load(concat(home and "/.ernosdecent/config.toml"))
+    set ipc_port to config_get_int(cfg and "network.ipc_port")
+    if ipc_port <= 0:
+        set ipc_port to 5000
+
+    # Connect to the daemon
+    set fd to ep_net_connect("127.0.0.1" and ipc_port)
+    if fd < 0:
+        display f"[-] Error: Could not connect to ErnosDecent daemon on port {ipc_port}. Is the daemon running?"
+        return 1
+
+    # Read the IPC auth token; the daemon requires an "AUTH <token>" prefix.
+    set tok_path to concat(home and "/.ernosdecent/ipc-token")
+    set tok to ""
+    if file_exists(tok_path) == 1:
+        set tok to string_trim(file_read(tok_path))
+
+    # Send command (token-prefixed)
+    set send_ok to ep_net_send(fd and concat("AUTH " and concat(tok and concat(" " and cmd))))
+    
+    # Receive response
+    set resp to ep_net_recv(fd and 1024)
+    display resp
+    
+    # Close connection
+    set close_ok to ep_net_close(fd)
+    return 0

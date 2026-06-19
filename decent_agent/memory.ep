@@ -1,0 +1,821 @@
+# ErnosPlain Rebuild of ErnOS Agent Memory System
+# Component: decent_agent/memory.ep
+
+import "collections"
+import "string"
+import "fs"
+import "json"
+import "../decent_ai/embeddings"
+
+define memory_create:
+    set memory_mgr to create_map()
+    set scratchpad to create_map()
+    set lessons to create_map()
+    set timeline to create_list()
+    set synaptic_graph to create_map()
+    set edges to create_map()
+    set permanent_edges to create_map()
+    
+    set ok to map_insert(memory_mgr and "scratchpad" and scratchpad)
+    set ok to map_insert(memory_mgr and "lessons" and lessons)
+    set ok to map_insert(memory_mgr and "timeline" and timeline)
+    set ok to map_insert(memory_mgr and "synaptic_graph" and synaptic_graph)
+    set ok to map_insert(memory_mgr and "edges" and edges)
+    set ok to map_insert(memory_mgr and "permanent_edges" and permanent_edges)
+    
+    # Store dynamic counters
+    set ok to map_insert(memory_mgr and "lessons_count" and 0)
+    set ok to map_insert(memory_mgr and "graph_edges_count" and 0)
+    
+    # Synaptic Graph structures
+    set syn_nodes to create_map()
+    set syn_edges to create_list()
+    set syn_layers to create_list()
+    set ok to map_insert(memory_mgr and "synaptic_nodes" and syn_nodes)
+    set ok to map_insert(memory_mgr and "synaptic_edges" and syn_edges)
+    set ok to map_insert(memory_mgr and "synaptic_layers" and syn_layers)
+    
+    # Values list for GC tracking
+    set values_list to create_list()
+    set ok to map_insert(memory_mgr and "values_list" and values_list)
+    set ok to append_list(values_list and scratchpad)
+    set ok to append_list(values_list and lessons)
+    set ok to append_list(values_list and timeline)
+    set ok to append_list(values_list and synaptic_graph)
+    set ok to append_list(values_list and edges)
+    set ok to append_list(values_list and permanent_edges)
+    set ok to append_list(values_list and syn_nodes)
+    set ok to append_list(values_list and syn_edges)
+    set ok to append_list(values_list and syn_layers)
+    
+    return memory_mgr
+
+define memory_store with memory_mgr as Map and tier as Int and key as Str and value as Str returning Int:
+    set values_list to map_get_val(memory_mgr and "values_list")
+    
+    if tier == 1:
+        # Scratchpad
+        set scratchpad to map_get_val(memory_mgr and "scratchpad")
+        set ok to map_insert(scratchpad and key and value)
+        set ok to append_list(values_list and key)
+        set ok to append_list(values_list and value)
+        return 0
+        
+    if tier == 2:
+        # Lessons
+        set lessons to map_get_val(memory_mgr and "lessons")
+        set ok to map_insert(lessons and key and value)
+        set ok to append_list(values_list and key)
+        set ok to append_list(values_list and value)
+        
+        set l_keys to map_keys(lessons)
+        set count to length_list(l_keys)
+        set ok to map_insert(memory_mgr and "lessons_count" and count)
+        free_list(l_keys)
+        return 0
+        
+    if tier == 3:
+        # Timeline
+        set timeline to map_get_val(memory_mgr and "timeline")
+        set timeline_entry to f"[{key}] {value}"
+        set ok to append_list(timeline and timeline_entry)
+        set ok to append_list(values_list and timeline_entry)
+        return 0
+        
+    return 1 # Error: Unsupported tier
+
+define string_compare with s1 as Str and s2 as Str returning Int:
+    set len1 to string_length(s1)
+    set len2 to string_length(s2)
+    set min_len to len1
+    if len2 < len1:
+        set min_len to len2
+    set i to 0
+    repeat while i < min_len:
+        set c1 to get_character(s1 and i)
+        set c2 to get_character(s2 and i)
+        if c1 < c2:
+            return 0 - 1
+        if c1 > c2:
+            return 1
+        set i to i + 1
+    if len1 < len2:
+        return 0 - 1
+    if len1 > len2:
+        return 1
+    return 0
+
+define memory_strengthen_synapse with memory_mgr as Map and concept_a as Str and concept_b as Str returning Int:
+    set concept_a_trimmed to string_trim(concept_a)
+    set concept_b_trimmed to string_trim(concept_b)
+    if concept_a_trimmed equals concept_b_trimmed:
+        return 0
+        
+    set edge_key to ""
+    if string_compare(concept_a_trimmed and concept_b_trimmed) < 0:
+        set edge_key to concat(concept_a_trimmed and concat("-" and concept_b_trimmed))
+    else:
+        set edge_key to concat(concept_b_trimmed and concat("-" and concept_a_trimmed))
+        
+    set edges to map_get_val(memory_mgr and "edges")
+    set perm to map_get_val(memory_mgr and "permanent_edges")
+    set values_list to map_get_val(memory_mgr and "values_list")
+    
+    if map_contains(perm and edge_key) == 1:
+        return 1
+        
+    set weight to 100000 # fixed-point representation of 0.1 (scale 1,000,000)
+    if map_contains(edges and edge_key) == 1:
+        set old_weight to map_get_val(edges and edge_key)
+        set one_minus_old to 1000000 - old_weight
+        set increment to (100000 * one_minus_old) / 1000000
+        set weight to old_weight + increment
+        
+    set ok to map_insert(edges and edge_key and weight)
+    set ok to append_list(values_list and edge_key)
+    
+    # If weight >= 990000 (effectively 1.0), make it permanent
+    if weight >= 990000:
+        set ok to map_insert(perm and edge_key and 1)
+        
+    set edges_keys to map_keys(edges)
+    set count to length_list(edges_keys)
+    set ok to map_insert(memory_mgr and "graph_edges_count" and count)
+    free_list(edges_keys)
+    return 1
+
+define memory_decay_synapses with memory_mgr as Map returning Int:
+    set edges to map_get_val(memory_mgr and "edges")
+    set perm to map_get_val(memory_mgr and "permanent_edges")
+    set keys to map_keys(edges)
+    set len to length_list(keys)
+    
+    set new_edges to create_map()
+    set values_list to map_get_val(memory_mgr and "values_list")
+    
+    set i to 0
+    repeat while i < len:
+        set k to get_list(keys and i)
+        if map_contains(perm and k) == 0:
+            set old_weight to map_get_val(edges and k)
+            set new_weight to (old_weight * 950000) / 1000000
+            if new_weight >= 10000: # drop below 0.01 (10,000 in scale)
+                set ok to map_insert(new_edges and k and new_weight)
+                set ok to append_list(values_list and k)
+        else:
+            set ok to map_insert(new_edges and k and 1000000)
+            set ok to append_list(values_list and k)
+        set i to i + 1
+        
+    free_list(keys)
+    set ok to map_insert(memory_mgr and "edges" and new_edges)
+    
+    set edges_keys to map_keys(new_edges)
+    set count to length_list(edges_keys)
+    set ok to map_insert(memory_mgr and "graph_edges_count" and count)
+    free_list(edges_keys)
+    return 0
+
+define memory_recall_semantic with memory_mgr as Map and model as Map and query as Str returning List:
+    set query_emb to embeddings_generate(model and query)
+    set lessons to map_get_val(memory_mgr and "lessons")
+    set keys to map_keys(lessons)
+    set len to length_list(keys)
+    
+    set best_key to ""
+    set best_score to 0
+    
+    set i to 0
+    repeat while i < len:
+        set k to get_list(keys and i)
+        set lesson_text to map_get_val(lessons and k)
+        set lesson_emb to embeddings_generate(model and lesson_text)
+        set score to embeddings_cosine_similarity(query_emb and lesson_emb)
+        if score > best_score:
+            set best_score to score
+            set best_key to k
+        free_list(lesson_emb)
+        set i to i + 1
+        
+    free_list(query_emb)
+    free_list(keys)
+    
+    set results to create_list()
+    if string_length(best_key) > 0 and also best_score > 500000: # threshold of 0.5 similarity
+        set ok to append_list(results and map_get_val(lessons and best_key))
+    return results
+
+define memory_json_escape with s as Str returning Str:
+    set len to string_length(s)
+    set result_list to create_list()
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(s and i)
+        if ch == 34: # "
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 34)
+        else:
+            if ch == 92: # \
+                set ok to append_list(result_list and 92)
+                set ok to append_list(result_list and 92)
+            else:
+                if ch == 10: # \n
+                    set ok to append_list(result_list and 92)
+                    set ok to append_list(result_list and 110)
+                else:
+                    if ch == 13: # \r
+                        set ok to append_list(result_list and 92)
+                        set ok to append_list(result_list and 114)
+                    else:
+                        if ch == 9: # \t
+                            set ok to append_list(result_list and 92)
+                            set ok to append_list(result_list and 116)
+                        else:
+                            set ok to append_list(result_list and ch)
+        set i to i + 1
+    set escaped to string_from_list(result_list)
+    free_list(result_list)
+    return escaped
+
+define memory_init_synaptic_graph with memory_mgr as Map returning Int:
+    set syn_nodes to map_get_val(memory_mgr and "synaptic_nodes")
+    set syn_edges to map_get_val(memory_mgr and "synaptic_edges")
+    set syn_layers to map_get_val(memory_mgr and "synaptic_layers")
+    
+    set layers to create_list()
+    set ok to append_list(layers and "self")
+    set ok to append_list(layers and "people")
+    set ok to append_list(layers and "places")
+    set ok to append_list(layers and "concepts")
+    set ok to append_list(layers and "projects")
+    set ok to append_list(layers and "environment")
+    
+    set descs to create_list()
+    set ok to append_list(descs and "The AI's own identity, capabilities, preferences")
+    set ok to append_list(descs and "People mentioned in conversations")
+    set ok to append_list(descs and "Locations, environments")
+    set ok to append_list(descs and "Abstract ideas, topics")
+    set ok to append_list(descs and "Ongoing work, codebases")
+    set ok to append_list(descs and "System config, hardware, tools available")
+    
+    set root_nodes to create_list()
+    
+    set len_layers to length_list(layers)
+    set i to 0
+    repeat while i < len_layers:
+        set name_val to get_list(layers and i)
+        set desc_val to get_list(descs and i)
+        set root_node_val to concat("root:" and name_val)
+        
+        # 1. Add to layers list
+        set layer_map to create_map()
+        set ok to map_insert(layer_map and "name" and name_val)
+        set ok to map_insert(layer_map and "description" and desc_val)
+        set ok to map_insert(layer_map and "root_node" and root_node_val)
+        set ok to append_list(syn_layers and layer_map)
+        
+        # 2. Add to nodes map
+        set node_map to create_map()
+        set ok to map_insert(node_map and "concept" and root_node_val)
+        set ok to map_insert(node_map and "layer" and name_val)
+        set node_data to create_list()
+        set ok to append_list(node_data and concat("Root node for '" and concat(name_val and concat("' layer: " and desc_val))))
+        set ok to map_insert(node_map and "data" and node_data)
+        
+        set ok to map_insert(syn_nodes and string_lower(root_node_val) and node_map)
+        set ok to append_list(root_nodes and root_node_val)
+        set i to i + 1
+        
+    free_list(layers)
+    free_list(descs)
+    
+    # Interconnect roots (root mesh)
+    set num_roots to length_list(root_nodes)
+    set i to 0
+    repeat while i < num_roots:
+        set from_root to get_list(root_nodes and i)
+        set j to i + 1
+        repeat while j < num_roots:
+            set to_root to get_list(root_nodes and j)
+            
+            set edge_map to create_map()
+            set ok to map_insert(edge_map and "from" and from_root)
+            set ok to map_insert(edge_map and "relation" and "root_mesh")
+            set ok to map_insert(edge_map and "to" and to_root)
+            set ok to map_insert(edge_map and "weight" and 1000000) # permanent
+            set ok to map_insert(edge_map and "activation_count" and 1000)
+            set ok to map_insert(edge_map and "permanent" and 1)
+            set ok to append_list(syn_edges and edge_map)
+            set j to j + 1
+        set i to i + 1
+        
+    free_list(root_nodes)
+    return 0
+
+define memory_serialize with memory_mgr as Map and path as Str returning Int:
+    set scratchpad to map_get_val(memory_mgr and "scratchpad")
+    set lessons to map_get_val(memory_mgr and "lessons")
+    set timeline to map_get_val(memory_mgr and "timeline")
+    set edges to map_get_val(memory_mgr and "edges")
+    set perm to map_get_val(memory_mgr and "permanent_edges")
+    set syn_nodes to map_get_val(memory_mgr and "synaptic_nodes")
+    set syn_edges to map_get_val(memory_mgr and "synaptic_edges")
+    set syn_layers to map_get_val(memory_mgr and "synaptic_layers")
+
+    set json_str to "{\n"
+
+    # 1. scratchpad
+    set json_str to concat(json_str and "  \"scratchpad\": {\n")
+    set keys to map_keys(scratchpad)
+    set k_len to length_list(keys)
+    set i to 0
+    repeat while i < k_len:
+        set k to get_list(keys and i)
+        set v to map_get_val(scratchpad and k)
+        set k_esc to memory_json_escape(k)
+        set v_esc to memory_json_escape(v)
+        set json_str to concat(json_str and f"    \"{k_esc}\": \"{v_esc}\"")
+        if i < k_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    free_list(keys)
+    set json_str to concat(json_str and "  },\n")
+
+    # 2. lessons
+    set json_str to concat(json_str and "  \"lessons\": {\n")
+    set keys to map_keys(lessons)
+    set k_len to length_list(keys)
+    set i to 0
+    repeat while i < k_len:
+        set k to get_list(keys and i)
+        set v to map_get_val(lessons and k)
+        set k_esc to memory_json_escape(k)
+        set v_esc to memory_json_escape(v)
+        set json_str to concat(json_str and f"    \"{k_esc}\": \"{v_esc}\"")
+        if i < k_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    free_list(keys)
+    set json_str to concat(json_str and "  },\n")
+
+    # 3. timeline
+    set json_str to concat(json_str and "  \"timeline\": [\n")
+    set t_len to length_list(timeline)
+    set i to 0
+    repeat while i < t_len:
+        set entry to get_list(timeline and i)
+        set entry_esc to memory_json_escape(entry)
+        set json_str to concat(json_str and f"    \"{entry_esc}\"")
+        if i < t_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    set json_str to concat(json_str and "  ],\n")
+
+    # 4. edges
+    set json_str to concat(json_str and "  \"edges\": {\n")
+    set keys to map_keys(edges)
+    set k_len to length_list(keys)
+    set i to 0
+    repeat while i < k_len:
+        set k to get_list(keys and i)
+        set v to map_get_val(edges and k)
+        set k_esc to memory_json_escape(k)
+        set json_str to concat(json_str and f"    \"{k_esc}\": {int_to_string(v)}")
+        if i < k_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    free_list(keys)
+    set json_str to concat(json_str and "  },\n")
+
+    # 5. permanent_edges
+    set json_str to concat(json_str and "  \"permanent_edges\": {\n")
+    set keys to map_keys(perm)
+    set k_len to length_list(keys)
+    set i to 0
+    repeat while i < k_len:
+        set k to get_list(keys and i)
+        set v to map_get_val(perm and k)
+        set k_esc to memory_json_escape(k)
+        set json_str to concat(json_str and f"    \"{k_esc}\": {int_to_string(v)}")
+        if i < k_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    free_list(keys)
+    set json_str to concat(json_str and "  },\n")
+    
+    # 6. synaptic_nodes
+    set json_str to concat(json_str and "  \"synaptic_nodes\": {\n")
+    set n_keys to map_keys(syn_nodes)
+    set n_len to length_list(n_keys)
+    set i to 0
+    repeat while i < n_len:
+        set k to get_list(n_keys and i)
+        set node_map to map_get_val(syn_nodes and k)
+        set c_name to map_get_val(node_map and "concept")
+        set layer_name to map_get_val(node_map and "layer")
+        set d_list to map_get_val(node_map and "data")
+        
+        set json_str to concat(json_str and "    \"")
+        set json_str to concat(json_str and memory_json_escape(k))
+        set json_str to concat(json_str and "\": {\n")
+        
+        set json_str to concat(json_str and "      \"concept\": \"")
+        set json_str to concat(json_str and memory_json_escape(c_name))
+        set json_str to concat(json_str and "\",\n")
+        
+        set json_str to concat(json_str and "      \"layer\": \"")
+        set json_str to concat(json_str and memory_json_escape(layer_name))
+        set json_str to concat(json_str and "\",\n")
+        set json_str to concat(json_str and "      \"data\": [\n")
+        
+        set d_len to length_list(d_list)
+        set j to 0
+        repeat while j < d_len:
+            set item to get_list(d_list and j)
+            set json_str to concat(json_str and "        \"")
+            set json_str to concat(json_str and memory_json_escape(item))
+            set json_str to concat(json_str and "\"")
+            if j < d_len - 1:
+                set json_str to concat(json_str and ",\n")
+            else:
+                set json_str to concat(json_str and "\n")
+            set j to j + 1
+        set json_str to concat(json_str and "      ]\n")
+        set json_str to concat(json_str and "    }")
+        if i < n_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    free_list(n_keys)
+    set json_str to concat(json_str and "  },\n")
+
+    # 7. synaptic_edges
+    set json_str to concat(json_str and "  \"synaptic_edges\": [\n")
+    set e_len to length_list(syn_edges)
+    set i to 0
+    repeat while i < e_len:
+        set edge_map to get_list(syn_edges and i)
+        set from_val to map_get_val(edge_map and "from")
+        set relation_val to map_get_val(edge_map and "relation")
+        set to_val to map_get_val(edge_map and "to")
+        set weight_val to map_get_val(edge_map and "weight")
+        set act_val to map_get_val(edge_map and "activation_count")
+        set perm_val to map_get_val(edge_map and "permanent")
+        
+        set json_str to concat(json_str and "    {\n")
+        set json_str to concat(json_str and "      \"from\": \"")
+        set json_str to concat(json_str and memory_json_escape(from_val))
+        set json_str to concat(json_str and "\",\n")
+        
+        set json_str to concat(json_str and "      \"relation\": \"")
+        set json_str to concat(json_str and memory_json_escape(relation_val))
+        set json_str to concat(json_str and "\",\n")
+        
+        set json_str to concat(json_str and "      \"to\": \"")
+        set json_str to concat(json_str and memory_json_escape(to_val))
+        set json_str to concat(json_str and "\",\n")
+        
+        set json_str to concat(json_str and "      \"weight\": ")
+        set json_str to concat(json_str and int_to_string(weight_val))
+        set json_str to concat(json_str and ",\n")
+        
+        set json_str to concat(json_str and "      \"activation_count\": ")
+        set json_str to concat(json_str and int_to_string(act_val))
+        set json_str to concat(json_str and ",\n")
+        
+        set json_str to concat(json_str and "      \"permanent\": ")
+        set json_str to concat(json_str and int_to_string(perm_val))
+        set json_str to concat(json_str and "\n")
+        set json_str to concat(json_str and "    }")
+        if i < e_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    set json_str to concat(json_str and "  ],\n")
+
+    # 8. synaptic_layers
+    set json_str to concat(json_str and "  \"synaptic_layers\": [\n")
+    set l_len to length_list(syn_layers)
+    set i to 0
+    repeat while i < l_len:
+        set layer_map to get_list(syn_layers and i)
+        set name_val to map_get_val(layer_map and "name")
+        set desc_val to map_get_val(layer_map and "description")
+        set root_val to map_get_val(layer_map and "root_node")
+        
+        set json_str to concat(json_str and "    {\n")
+        set json_str to concat(json_str and "      \"name\": \"")
+        set json_str to concat(json_str and memory_json_escape(name_val))
+        set json_str to concat(json_str and "\",\n")
+        
+        set json_str to concat(json_str and "      \"description\": \"")
+        set json_str to concat(json_str and memory_json_escape(desc_val))
+        set json_str to concat(json_str and "\",\n")
+        
+        set json_str to concat(json_str and "      \"root_node\": \"")
+        set json_str to concat(json_str and memory_json_escape(root_val))
+        set json_str to concat(json_str and "\"\n")
+        set json_str to concat(json_str and "    }")
+        if i < l_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    set json_str to concat(json_str and "  ]\n}")
+
+    set ok to write_file(path and json_str)
+    return 0
+
+define memory_load_map_str with json_obj as List and target_map as Map and values_list as List returning Int:
+    if json_obj == 0:
+        return 0
+    set type to get_json_type(json_obj)
+    if type != 4: # Object
+        return 0
+    set keys to get_list(json_obj and 1)
+    set values to get_list(json_obj and 2)
+    set len to length_list(keys)
+    set i to 0
+    repeat while i < len:
+        set k to get_list(keys and i)
+        set v_node to get_list(values and i)
+        set v_type to get_json_type(v_node)
+        if v_type == 2: # String
+            set v_val to get_json_value(v_node)
+            set ok to map_insert(target_map and k and v_val)
+            set ok to append_list(values_list and k)
+            set ok to append_list(values_list and v_val)
+        set i to i + 1
+    return 0
+
+define memory_load_map_int with json_obj as List and target_map as Map and values_list as List returning Int:
+    if json_obj == 0:
+        return 0
+    set type to get_json_type(json_obj)
+    if type != 4: # Object
+        return 0
+    set keys to get_list(json_obj and 1)
+    set values to get_list(json_obj and 2)
+    set len to length_list(keys)
+    set i to 0
+    repeat while i < len:
+        set k to get_list(keys and i)
+        set v_node to get_list(values and i)
+        set v_type to get_json_type(v_node)
+        if v_type == 1: # Integer
+            set v_val to get_json_value(v_node)
+            set ok to map_insert(target_map and k and v_val)
+            set ok to append_list(values_list and k)
+        else:
+            if v_type == 2: # String (fallback)
+                set v_str to get_json_value(v_node)
+                set v_val to string_to_int(v_str)
+                set ok to map_insert(target_map and k and v_val)
+                set ok to append_list(values_list and k)
+        set i to i + 1
+    return 0
+
+define memory_load_timeline with json_arr as List and target_list as List and values_list as List returning Int:
+    if json_arr == 0:
+        return 0
+    set type to get_json_type(json_arr)
+    if type != 3: # List
+        return 0
+    set items to get_json_value(json_arr)
+    set len to length_list(items)
+    set i to 0
+    repeat while i < len:
+        set item_node to get_list(items and i)
+        set item_type to get_json_type(item_node)
+        if item_type == 2: # String
+            set entry_val to get_json_value(item_node)
+            set ok to append_list(target_list and entry_val)
+            set ok to append_list(values_list and entry_val)
+        set i to i + 1
+    return 0
+
+define memory_load_synaptic_nodes with json_obj as List and syn_nodes as Map returning Int:
+    if json_obj == 0:
+        return 0
+    set type to get_json_type(json_obj)
+    if type != 4: # Object
+        return 0
+    set keys to get_list(json_obj and 1)
+    set values to get_list(json_obj and 2)
+    set len to length_list(keys)
+    set i to 0
+    repeat while i < len:
+        set k to get_list(keys and i)
+        set v_node to get_list(values and i)
+        if get_json_type(v_node) == 4:
+            set c_node to get_json_object_value(v_node and "concept")
+            set lay_node to get_json_object_value(v_node and "layer")
+            set data_node to get_json_object_value(v_node and "data")
+            
+            set concept_val to ""
+            if c_node != 0:
+                set concept_val to get_json_value(c_node)
+            set layer_val to "concepts"
+            if lay_node != 0:
+                set layer_val to get_json_value(lay_node)
+                
+            set data_list to create_list()
+            if data_node != 0:
+                set raw_list to get_json_value(data_node)
+                set d_len to length_list(raw_list)
+                set j to 0
+                repeat while j < d_len:
+                    set item_node to get_list(raw_list and j)
+                    set data_item to get_json_value(item_node)
+                    set ok to append_list(data_list and data_item)
+                    set j to j + 1
+                    
+            set node_map to create_map()
+            set ok to map_insert(node_map and "concept" and concept_val)
+            set ok to map_insert(node_map and "layer" and layer_val)
+            set ok to map_insert(node_map and "data" and data_list)
+            set ok to map_insert(syn_nodes and k and node_map)
+        set i to i + 1
+    return 0
+
+define memory_load_synaptic_edges with json_arr as List and syn_edges as List returning Int:
+    if json_arr == 0:
+        return 0
+    set type to get_json_type(json_arr)
+    if type != 3: # List
+        return 0
+    set raw_list to get_json_value(json_arr)
+    set len to length_list(raw_list)
+    set i to 0
+    repeat while i < len:
+        set item_node to get_list(raw_list and i)
+        if get_json_type(item_node) == 4:
+            set f_node to get_json_object_value(item_node and "from")
+            set r_node to get_json_object_value(item_node and "relation")
+            set t_node to get_json_object_value(item_node and "to")
+            set w_node to get_json_object_value(item_node and "weight")
+            set act_node to get_json_object_value(item_node and "activation_count")
+            set p_node to get_json_object_value(item_node and "permanent")
+            
+            set from_val to ""
+            if f_node != 0:
+                set from_val to get_json_value(f_node)
+            set relation_val to ""
+            if r_node != 0:
+                set relation_val to get_json_value(r_node)
+            set to_val to ""
+            if t_node != 0:
+                set to_val to get_json_value(t_node)
+            set weight_val to 500000
+            if w_node != 0:
+                set weight_val to get_json_value(w_node)
+            set act_val to 1
+            if act_node != 0:
+                set act_val to get_json_value(act_node)
+            set perm_val to 0
+            if p_node != 0:
+                set perm_val to get_json_value(p_node)
+                
+            set edge_map to create_map()
+            set ok to map_insert(edge_map and "from" and from_val)
+            set ok to map_insert(edge_map and "relation" and relation_val)
+            set ok to map_insert(edge_map and "to" and to_val)
+            set ok to map_insert(edge_map and "weight" and weight_val)
+            set ok to map_insert(edge_map and "activation_count" and act_val)
+            set ok to map_insert(edge_map and "permanent" and perm_val)
+            set ok to append_list(syn_edges and edge_map)
+        set i to i + 1
+    return 0
+
+define memory_load_synaptic_layers with json_arr as List and syn_layers as List returning Int:
+    if json_arr == 0:
+        return 0
+    set type to get_json_type(json_arr)
+    if type != 3: # List
+        return 0
+    set raw_list to get_json_value(json_arr)
+    set len to length_list(raw_list)
+    set i to 0
+    repeat while i < len:
+        set item_node to get_list(raw_list and i)
+        if get_json_type(item_node) == 4:
+            set n_node to get_json_object_value(item_node and "name")
+            set d_node to get_json_object_value(item_node and "description")
+            set r_node to get_json_object_value(item_node and "root_node")
+            
+            set name_val to ""
+            if n_node != 0:
+                set name_val to get_json_value(n_node)
+            set desc_val to ""
+            if d_node != 0:
+                set desc_val to get_json_value(d_node)
+            set root_val to ""
+            if r_node != 0:
+                set root_val to get_json_value(r_node)
+                
+            set layer_map to create_map()
+            set ok to map_insert(layer_map and "name" and name_val)
+            set ok to map_insert(layer_map and "description" and desc_val)
+            set ok to map_insert(layer_map and "root_node" and root_val)
+            set ok to append_list(syn_layers and layer_map)
+        set i to i + 1
+    return 0
+
+define memory_load with memory_mgr as Map and path as Str returning Int:
+    if file_exists(path) == 0:
+        return 0 # Not an error, just no saved state exists yet
+
+    set content to file_read(path)
+    if string_length(content) == 0:
+        return 0
+
+    set root_node to json_parse(content)
+    if root_node == 0:
+        return 1 # Invalid JSON
+
+    set values_list to map_get_val(memory_mgr and "values_list")
+
+    # 1. Load scratchpad
+    set scratchpad_node to get_json_object_value(root_node and "scratchpad")
+    if scratchpad_node != 0:
+        set scratchpad to map_get_val(memory_mgr and "scratchpad")
+        set ok to memory_load_map_str(scratchpad_node and scratchpad and values_list)
+
+    # 2. Load lessons
+    set lessons_node to get_json_object_value(root_node and "lessons")
+    if lessons_node != 0:
+        set lessons to map_get_val(memory_mgr and "lessons")
+        set ok to memory_load_map_str(lessons_node and lessons and values_list)
+        
+        # Update lessons_count
+        set l_keys to map_keys(lessons)
+        set count to length_list(l_keys)
+        set ok to map_insert(memory_mgr and "lessons_count" and count)
+        free_list(l_keys)
+
+    # 3. Load timeline
+    set timeline_node to get_json_object_value(root_node and "timeline")
+    if timeline_node != 0:
+        set timeline to map_get_val(memory_mgr and "timeline")
+        set ok to memory_load_timeline(timeline_node and timeline and values_list)
+
+    # 4. Load edges
+    set edges_node to get_json_object_value(root_node and "edges")
+    if edges_node != 0:
+        set edges to map_get_val(memory_mgr and "edges")
+        set ok to memory_load_map_int(edges_node and edges and values_list)
+        
+        # Update graph_edges_count
+        set e_keys to map_keys(edges)
+        set count to length_list(e_keys)
+        set ok to map_insert(memory_mgr and "graph_edges_count" and count)
+        free_list(e_keys)
+
+    # 5. Load permanent_edges
+    set perm_node to get_json_object_value(root_node and "permanent_edges")
+    if perm_node != 0:
+        set perm to map_get_val(memory_mgr and "permanent_edges")
+        set ok to memory_load_map_int(perm_node and perm and values_list)
+
+    # 6. Load synaptic_nodes
+    set nodes_node to get_json_object_value(root_node and "synaptic_nodes")
+    if nodes_node != 0:
+        set syn_nodes to map_get_val(memory_mgr and "synaptic_nodes")
+        set ok to memory_load_synaptic_nodes(nodes_node and syn_nodes)
+
+    # 7. Load synaptic_edges
+    set edges_node_syn to get_json_object_value(root_node and "synaptic_edges")
+    if edges_node_syn != 0:
+        set syn_edges to map_get_val(memory_mgr and "synaptic_edges")
+        set ok to memory_load_synaptic_edges(edges_node_syn and syn_edges)
+
+    # 8. Load synaptic_layers
+    set layers_node_syn to get_json_object_value(root_node and "synaptic_layers")
+    if layers_node_syn != 0:
+        set syn_layers to map_get_val(memory_mgr and "synaptic_layers")
+        set ok to memory_load_synaptic_layers(layers_node_syn and syn_layers)
+
+    return 0
+
+define memory_deserialize with path as Str returning Map:
+    set memory_mgr to memory_create()
+    set ok to memory_load(memory_mgr and path)
+    
+    # After load, if synaptic graph is empty, initialize it!
+    set syn_layers to map_get_val(memory_mgr and "synaptic_layers")
+    if length_list(syn_layers) == 0:
+        set ok to memory_init_synaptic_graph(memory_mgr)
+        
+    return memory_mgr

@@ -1,0 +1,655 @@
+# ErnosDecent -- Decentralised Exchange
+# Component: decent_money/exchange.ep
+# Implements: Hybrid DEX with constant product AMM and orderbook matching engine
+# Status: Production -- OperationTrojanClaude Phase 8
+
+import "string"
+import "collections"
+import "token"
+import "../storage"
+
+
+# ================================================================
+# Constants and Structs Simulation
+# ================================================================
+
+set ORDER_BUY to 1
+set ORDER_SELL to 2
+
+# ================================================================
+# Helpers
+# ================================================================
+
+define is_sym_less with sym_a as Str and sym_b as Str returning Int:
+    if sym_a equals sym_b:
+        return 0
+    set len_a to string_length(sym_a)
+    set len_b to string_length(sym_b)
+    set min_len to len_a
+    if len_b < len_a:
+        set min_len to len_b
+    set idx to 0
+    repeat while idx < min_len:
+        set c_a to get_character(sym_a and idx)
+        set c_b to get_character(sym_b and idx)
+        if c_a < c_b:
+            return 1
+        if c_a > c_b:
+            return 0
+        set idx to idx + 1
+    if len_a < len_b:
+        return 1
+    return 0
+
+define get_pool_key with sym_a as Str and sym_b as Str returning Str:
+    if sym_a equals sym_b:
+        return sym_a
+    set less to is_sym_less(sym_a and sym_b)
+    if less == 1:
+        set res to concat(sym_a and "-")
+        return concat(res and sym_b)
+    else:
+        set res to concat(sym_b and "-")
+        return concat(res and sym_a)
+
+# ================================================================
+# DEX Initialization
+# ================================================================
+
+define dex_create returning Map:
+    set dex to create_map()
+    
+    set pools to create_map()
+    set ok to map_insert(dex and "pools" and pools)
+    
+    set lp_balances to create_map()
+    set ok to map_insert(dex and "lp_balances" and lp_balances)
+    
+    set orderbooks to create_map()
+    set ok to map_insert(dex and "orderbooks" and orderbooks)
+    
+    set values_list to create_list()
+    set ok to map_insert(dex and "values_list" and values_list)
+    set ok to append_list(values_list and pools)
+    set ok to append_list(values_list and lp_balances)
+    set ok to append_list(values_list and orderbooks)
+    
+    # Load pools from storage
+    set stored_pools to storage_dex_load_pools()
+    set length to length_list(stored_pools)
+    set i to 0
+    repeat while i < length:
+        set pool_map to get_list(stored_pools and i)
+        set token_a_sym to map_get_val(pool_map and "token_a")
+        set token_b_sym to map_get_val(pool_map and "token_b")
+        set res_a to map_get_val(pool_map and "reserve_a")
+        set res_b to map_get_val(pool_map and "reserve_b")
+        
+        set pool_key to get_pool_key(token_a_sym and token_b_sym)
+        set pool to create_map()
+        set ok to map_insert(pool and "reserve_a" and res_a)
+        set ok to map_insert(pool and "reserve_b" and res_b)
+        set ok to map_insert(pool and "k" and res_a * res_b)
+        set ok to map_insert(pool and "total_lp" and res_a + res_b)
+        
+        set ok to map_insert(pools and pool_key and pool)
+        set i to i + 1
+        
+    # Load orders from storage
+    set stored_orders to storage_dex_load_orders()
+    set length_orders to length_list(stored_orders)
+    set i to 0
+    repeat while i < length_orders:
+        set ord_map to get_list(stored_orders and i)
+        set order_id to map_get_val(ord_map and "order_id")
+        set sym_a to map_get_val(ord_map and "token_a")
+        set sym_b to map_get_val(ord_map and "token_b")
+        set side to map_get_val(ord_map and "side")
+        set price to map_get_val(ord_map and "price")
+        set amount to map_get_val(ord_map and "amount")
+        set caller to map_get_val(ord_map and "caller")
+        
+        set ob_key to get_pool_key(sym_a and sym_b)
+        set ob to create_map()
+        if map_contains(orderbooks and ob_key) == 1:
+            set ob to map_get_val(orderbooks and ob_key)
+        else:
+            set buys to create_list()
+            set sells to create_list()
+            set ok to map_insert(ob and "buys" and buys)
+            set ok to map_insert(ob and "sells" and sells)
+            set ok to map_insert(orderbooks and ob_key and ob)
+            
+        set order to create_map()
+        set ok to map_insert(order and "order_id" and order_id)
+        set ok to map_insert(order and "caller" and caller)
+        set ok to map_insert(order and "price" and price)
+        set ok to map_insert(order and "amount" and amount)
+        
+        set tok_a to create_map()
+        set ok to map_insert(tok_a and "symbol" and sym_a)
+        set tok_b to create_map()
+        set ok to map_insert(tok_b and "symbol" and sym_b)
+        set ok to map_insert(order and "token_a" and tok_a)
+        set ok to map_insert(order and "token_b" and tok_b)
+        
+        if side equals "buy":
+            set ok to map_insert(order and "type" and ORDER_BUY)
+            set buys to map_get_val(ob and "buys")
+            set ok to append_list(buys and order)
+        else:
+            set ok to map_insert(order and "type" and ORDER_SELL)
+            set sells to map_get_val(ob and "sells")
+            set ok to append_list(sells and order)
+            
+        set i to i + 1
+        
+    return dex
+
+
+# ================================================================
+# AMM Liquidity & Swapping
+# ================================================================
+
+define dex_add_liquidity with dex as Map and token_a as Map and token_b as Map and amount_a as Int and amount_b as Int and provider_did as Str returning Map:
+    set result to create_map()
+    
+    set pools to map_get_val(dex and "pools")
+    set sym_a to map_get_val(token_a and "symbol")
+    set sym_b to map_get_val(token_b and "symbol")
+    set pool_key to get_pool_key(sym_a and sym_b)
+    
+    set pool to create_map()
+    if map_contains(pools and pool_key) == 1:
+        set pool to map_get_val(pools and pool_key)
+        
+    set res_a to 0
+    set res_b to 0
+    set total_lp to 0
+    if map_contains(pool and "reserve_a") == 1:
+        set res_a to map_get_val(pool and "reserve_a")
+        set res_b to map_get_val(pool and "reserve_b")
+        set total_lp to map_get_val(pool and "total_lp")
+
+    # Enforce deposit reserve ratios
+    set optimal_a to amount_a
+    set optimal_b to amount_b
+    if total_lp > 0:
+        set is_a_first to is_sym_less(sym_a and sym_b)
+        if is_a_first == 1:
+            set opt_b to (amount_a * res_b) / res_a
+            if opt_b <= amount_b:
+                set optimal_a to amount_a
+                set optimal_b to opt_b
+            else:
+                set opt_a to (amount_b * res_a) / res_b
+                set optimal_a to opt_a
+                set optimal_b to amount_b
+        else:
+            set opt_b to (amount_a * res_a) / res_b
+            if opt_b <= amount_b:
+                set optimal_a to amount_a
+                set optimal_b to opt_b
+            else:
+                set opt_a to (amount_b * res_b) / res_a
+                set optimal_a to opt_a
+                set optimal_b to amount_b
+
+    if optimal_a <= 0 or else optimal_b <= 0:
+        set ok to map_insert(result and "error" and 947) # Error: skewed deposit / insufficient amount
+        return result
+        
+    set err1 to token_transfer(token_a and provider_did and "dex_pool" and optimal_a)
+    set err2 to token_transfer(token_b and provider_did and "dex_pool" and optimal_b)
+    
+    if err1 != 0 or else err2 != 0:
+        if err1 == 0:
+            token_transfer(token_a and "dex_pool" and provider_did and optimal_a)
+        if err2 == 0:
+            token_transfer(token_b and "dex_pool" and provider_did and optimal_b)
+        set ok to map_insert(result and "error" and 941) # Error: insufficient funds
+        return result
+        
+    set is_a_first to is_sym_less(sym_a and sym_b)
+    set val_a_to_add to optimal_a
+    set val_b_to_add to optimal_b
+    if is_a_first == 0:
+        set val_a_to_add to optimal_b
+        set val_b_to_add to optimal_a
+
+    set minted_lp to 0
+    if total_lp == 0:
+        set minted_lp to optimal_a + optimal_b
+    else:
+        set minted_lp to (val_a_to_add * total_lp) / res_a
+        
+    set next_res_a to res_a + val_a_to_add
+    set next_res_b to res_b + val_b_to_add
+    set next_k to next_res_a * next_res_b
+    
+    set ok to map_insert(pool and "reserve_a" and next_res_a)
+    set ok to map_insert(pool and "reserve_b" and next_res_b)
+    set ok to map_insert(pool and "k" and next_k)
+    set ok to map_insert(pool and "total_lp" and total_lp + minted_lp)
+    set ok to map_insert(pools and pool_key and pool)
+    
+    set lp_balances to map_get_val(dex and "lp_balances")
+    set lp_key to concat(pool_key and ":")
+    set lp_key to concat(lp_key and provider_did)
+    set current_lp to 0
+    if map_contains(lp_balances and lp_key) == 1:
+        set current_lp to map_get_val(lp_balances and lp_key)
+    set ok to map_insert(lp_balances and lp_key and current_lp + minted_lp)
+    
+    set ok to map_insert(result and "lp_minted" and minted_lp)
+    set ok to map_insert(result and "error" and 0)
+    
+    set values_list to map_get_val(dex and "values_list")
+    set ok to append_list(values_list and pool)
+    set ok to append_list(values_list and pool_key)
+    set ok to append_list(values_list and provider_did)
+    
+    # Save pool state to SQLite
+    set t_a to sym_a
+    set t_b to sym_b
+    set r_a to next_res_a
+    set r_b to next_res_b
+    if is_a_first == 0:
+        set t_a to sym_b
+        set t_b to sym_a
+        set r_a to next_res_b
+        set r_b to next_res_a
+    set save_err to storage_dex_save_pool(t_a and t_b and r_a and r_b)
+    
+    return result
+
+define dex_swap_amm with dex as Map and token_a as Map and token_b as Map and input_amount as Int and caller_did as Str returning Int:
+    if input_amount <= 0:
+        return 942 # Error: invalid swap amount
+        
+    set pools to map_get_val(dex and "pools")
+    set sym_a to map_get_val(token_a and "symbol")
+    set sym_b to map_get_val(token_b and "symbol")
+    set pool_key to get_pool_key(sym_a and sym_b)
+    
+    if map_contains(pools and pool_key) == 0:
+        return 943 # Error: pool not found
+        
+    set pool to map_get_val(pools and pool_key)
+    set res_a to map_get_val(pool and "reserve_a")
+    set res_b to map_get_val(pool and "reserve_b")
+    
+    set input_res to res_a
+    set output_res to res_b
+    set is_a_to_b to 1
+    
+    set is_a_first to is_sym_less(sym_a and sym_b)
+    if is_a_first == 1:
+        set input_res to res_a
+        set output_res to res_b
+        set is_a_to_b to 1
+    else:
+        set input_res to res_b
+        set output_res to res_a
+        set is_a_to_b to 0
+        
+    # Constant product swap: (in + in_with_fee) * (out - out_amt) = k
+    # 0.3% trading fee: in_with_fee = input_amount * 997
+    set input_with_fee to input_amount * 997
+    set numerator to input_with_fee * output_res
+    set denominator to (input_res * 1000) + input_with_fee
+    set output_amount to numerator / denominator
+    
+    if output_amount <= 0:
+        return 944 # Error: swap output too low
+    if output_amount >= output_res:
+        return 945 # Error: insufficient pool reserves
+        
+    set err1 to 0
+    set err2 to 0
+    set err1 to token_transfer(token_a and caller_did and "dex_pool" and input_amount)
+    if err1 != 0:
+        return err1
+    set err2 to token_transfer(token_b and "dex_pool" and caller_did and output_amount)
+    if err2 != 0:
+        set rollback to token_transfer(token_a and "dex_pool" and caller_did and input_amount)
+        return err2
+        
+    # Update reserves
+    if is_a_to_b == 1:
+        set ok to map_insert(pool and "reserve_a" and res_a + input_amount)
+        set ok to map_insert(pool and "reserve_b" and res_b - output_amount)
+    else:
+        set ok to map_insert(pool and "reserve_a" and res_a - output_amount)
+        set ok to map_insert(pool and "reserve_b" and res_b + input_amount)
+        
+    set ok to map_insert(pool and "k" and map_get_val(pool and "reserve_a") * map_get_val(pool and "reserve_b"))
+
+    # Save pool state to SQLite
+    set t_a to sym_a
+    set t_b to sym_b
+    set r_a to map_get_val(pool and "reserve_a")
+    set r_b to map_get_val(pool and "reserve_b")
+    if is_a_first == 0:
+        set t_a to sym_b
+        set t_b to sym_a
+        set r_a to map_get_val(pool and "reserve_b")
+        set r_b to map_get_val(pool and "reserve_a")
+    set save_err to storage_dex_save_pool(t_a and t_b and r_a and r_b)
+
+    return 0
+
+# ================================================================
+# Orderbook limit orders
+# ================================================================
+
+define dex_limit_order with dex as Map and order_type as Int and price as Int and amount as Int and token_a as Map and token_b as Map and caller_did as Str returning Map:
+    set result to create_map()
+
+    # Reject non-positive price/amount, and guard the escrow multiplication
+    # (price*amount) against 64-bit overflow (amount >= 1 here, so no div-by-zero).
+    if price < 1 or else amount < 1:
+        set ok to map_insert(result and "error" and 948)
+        return result
+    if price > 9223372036854775807 / amount:
+        set ok to map_insert(result and "error" and 948)
+        return result
+
+    set orderbooks to map_get_val(dex and "orderbooks")
+    set sym_a to map_get_val(token_a and "symbol")
+    set sym_b to map_get_val(token_b and "symbol")
+    set ob_key to get_pool_key(sym_a and sym_b)
+    
+    set ob to create_map()
+    if map_contains(orderbooks and ob_key) == 1:
+        set ob to map_get_val(orderbooks and ob_key)
+    else:
+        set buys to create_list()
+        set sells to create_list()
+        set ok to map_insert(ob and "buys" and buys)
+        set ok to map_insert(ob and "sells" and sells)
+        set ok to map_insert(orderbooks and ob_key and ob)
+        
+    # Place tokens in escrow
+    if order_type == ORDER_BUY:
+        # Buyer locks token_b: price * amount
+        set lock_amt to price * amount
+        set err to token_transfer(token_b and caller_did and "dex_escrow" and lock_amt)
+        if err != 0:
+            set ok to map_insert(result and "error" and 946)
+            return result
+    else:
+        # Seller locks token_a: amount
+        set err to token_transfer(token_a and caller_did and "dex_escrow" and amount)
+        if err != 0:
+            set ok to map_insert(result and "error" and 946)
+            return result
+            
+    set order_id to concat("ord_" and int_to_string(ep_random_int(1000000 and 9999999)))
+    set order to create_map()
+    set ok to map_insert(order and "order_id" and order_id)
+    set ok to map_insert(order and "caller" and caller_did)
+    set ok to map_insert(order and "price" and price)
+    set ok to map_insert(order and "amount" and amount)
+    set ok to map_insert(order and "type" and order_type)
+    set ok to map_insert(order and "token_a" and token_a)
+    set ok to map_insert(order and "token_b" and token_b)
+    set ok to map_insert(order and "created_at" and ep_time_now_sec())
+    
+    if order_type == ORDER_BUY:
+        set buys to map_get_val(ob and "buys")
+        set ok to append_list(buys and order)
+    else:
+        set sells to map_get_val(ob and "sells")
+        set ok to append_list(sells and order)
+        
+    set ok to map_insert(result and "order" and order)
+    set ok to map_insert(result and "error" and 0)
+    
+    set values_list to map_get_val(dex and "values_list")
+    set ok to append_list(values_list and order)
+    set ok to append_list(values_list and ob)
+    set ok to append_list(values_list and ob_key)
+    set ok to append_list(values_list and caller_did)
+    
+    # Save order to SQLite
+    set side_str to "sell"
+    if order_type == ORDER_BUY:
+        set side_str to "buy"
+    set save_err to storage_dex_save_order(order_id and sym_a and sym_b and side_str and price and amount and caller_did and ep_time_now_sec())
+
+    return result
+
+# Stable sorting helpers for price-time priority matching
+define dex_sort_buys with buys as List returning Int:
+    set len to length_list(buys)
+    if len <= 1:
+        return 0
+    set swapped to 1
+    repeat while swapped == 1:
+        set swapped to 0
+        set i to 0
+        repeat while i < len - 1:
+            set order_i to get_list(buys and i)
+            set order_j to get_list(buys and i + 1)
+            set price_i to map_get_val(order_i and "price")
+            set price_j to map_get_val(order_j and "price")
+            # For buys, sort descending: price_i < price_j means swap
+            if price_i < price_j:
+                set ok to set_list(buys and i and order_j)
+                set ok to set_list(buys and i + 1 and order_i)
+                set swapped to 1
+            set i to i + 1
+    return 0
+
+define dex_sort_sells with sells as List returning Int:
+    set len to length_list(sells)
+    if len <= 1:
+        return 0
+    set swapped to 1
+    repeat while swapped == 1:
+        set swapped to 0
+        set i to 0
+        repeat while i < len - 1:
+            set order_i to get_list(sells and i)
+            set order_j to get_list(sells and i + 1)
+            set price_i to map_get_val(order_i and "price")
+            set price_j to map_get_val(order_j and "price")
+            # For sells, sort ascending: price_i > price_j means swap
+            if price_i > price_j:
+                set ok to set_list(sells and i and order_j)
+                set ok to set_list(sells and i + 1 and order_i)
+                set swapped to 1
+            set i to i + 1
+    return 0
+
+# Order Cancellation
+define dex_cancel_order with dex as Map and order_id as Str and caller_did as Str returning Int:
+    set orderbooks to map_get_val(dex and "orderbooks")
+    set keys to map_keys(orderbooks)
+    set keys_len to length_list(keys)
+    set i to 0
+    repeat while i < keys_len:
+        set ob_key to get_list(keys and i)
+        set ob to map_get_val(orderbooks and ob_key)
+        
+        set buys to map_get_val(ob and "buys")
+        set sells to map_get_val(ob and "sells")
+        
+        # Check buys
+        set b_idx to 0
+        repeat while b_idx < length_list(buys):
+            set order to get_list(buys and b_idx)
+            set oid to map_get_val(order and "order_id")
+            if oid equals order_id:
+                # Refund escrow
+                set caller to map_get_val(order and "caller")
+                # Ownership check: only the order's creator may cancel it.
+                if caller equals caller_did:
+                    set ok to 1
+                else:
+                    free_list(keys)
+                    return 2
+                set price to map_get_val(order and "price")
+                set amount to map_get_val(order and "amount")
+                set token_b to map_get_val(order and "token_b")
+                set refund_amt to price * amount
+                set ok to token_transfer(token_b and "dex_escrow" and caller and refund_amt)
+                
+                # Delete order from list
+                remove_list(buys and b_idx)
+                # Remove from persistent storage
+                set storage_ok to storage_dex_delete_order(order_id)
+                free_list(keys)
+                return 0
+            set b_idx to b_idx + 1
+            
+        # Check sells
+        set s_idx to 0
+        repeat while s_idx < length_list(sells):
+            set order to get_list(sells and s_idx)
+            set oid to map_get_val(order and "order_id")
+            if oid equals order_id:
+                # Refund escrow
+                set caller to map_get_val(order and "caller")
+                # Ownership check: only the order's creator may cancel it.
+                if caller equals caller_did:
+                    set ok to 1
+                else:
+                    free_list(keys)
+                    return 2
+                set amount to map_get_val(order and "amount")
+                set token_a to map_get_val(order and "token_a")
+                set ok to token_transfer(token_a and "dex_escrow" and caller and amount)
+                
+                # Delete order from list
+                remove_list(sells and s_idx)
+                # Remove from persistent storage
+                set storage_ok to storage_dex_delete_order(order_id)
+                free_list(keys)
+                return 0
+            set s_idx to s_idx + 1
+            
+        set i to i + 1
+        
+    free_list(keys)
+    return 1 # not found
+
+# Simple price-time priority orderbook matcher
+define dex_match_orders with dex as Map returning Int:
+    set orderbooks to map_get_val(dex and "orderbooks")
+    set keys to map_keys(orderbooks)
+    set keys_len to length_list(keys)
+    
+    set i to 0
+    repeat while i < keys_len:
+        set ob_key to get_list(keys and i)
+        set ob to map_get_val(orderbooks and ob_key)
+        
+        set buys to map_get_val(ob and "buys")
+        set sells to map_get_val(ob and "sells")
+        
+        # Sort buys and sells for price-time priority matching
+        set ok to dex_sort_buys(buys)
+        set ok to dex_sort_sells(sells)
+        
+        set b_idx to 0
+        repeat while b_idx < length_list(buys):
+            set buy_order to get_list(buys and b_idx)
+            set buy_price to map_get_val(buy_order and "price")
+            set buy_amt to map_get_val(buy_order and "amount")
+            set buy_oid to map_get_val(buy_order and "order_id")
+            set buy_created to map_get_val(buy_order and "created_at")
+            
+            set s_idx to 0
+            set matched to 0
+            repeat while s_idx < length_list(sells) and matched == 0:
+                set sell_order to get_list(sells and s_idx)
+                set sell_price to map_get_val(sell_order and "price")
+                set sell_amt to map_get_val(sell_order and "amount")
+                set sell_oid to map_get_val(sell_order and "order_id")
+                set sell_created to map_get_val(sell_order and "created_at")
+                
+                # Match condition: buy price >= sell price
+                if buy_price >= sell_price and buy_amt > 0 and sell_amt > 0:
+                    # Execute trade at sell_price
+                    set trade_amt to buy_amt
+                    if sell_amt < buy_amt:
+                        set trade_amt to sell_amt
+                        
+                    set buyer to map_get_val(buy_order and "caller")
+                    set seller to map_get_val(sell_order and "caller")
+                    set token_a to map_get_val(buy_order and "token_a")
+                    set token_b to map_get_val(buy_order and "token_b")
+                    set sym_a to map_get_val(token_a and "symbol")
+                    set sym_b to map_get_val(token_b and "symbol")
+                    
+                    # Settlement:
+                    # 1. Buyer gets token_a (from escrow)
+                    set t_err1 to token_transfer(token_a and "dex_escrow" and buyer and trade_amt)
+                    if t_err1 == 0:
+                        # 2. Seller gets token_b (from escrow)
+                        set cost to trade_amt * sell_price
+                        set t_err2 to token_transfer(token_b and "dex_escrow" and seller and cost)
+                        if t_err2 == 0:
+                            # 3. If buyer paid higher price, refund buyer excess token_b
+                            set refund to trade_amt * (buy_price - sell_price)
+                            set t_err3 to 0
+                            if refund > 0:
+                                set t_err3 to token_transfer(token_b and "dex_escrow" and buyer and refund)
+                            
+                            if t_err3 == 0:
+                                # All transfers succeeded! Proceed with updating orderbook state.
+                                set next_buy_amt to buy_amt - trade_amt
+                                set next_sell_amt to sell_amt - trade_amt
+                                set ok to map_insert(buy_order and "amount" and next_buy_amt)
+                                set ok to map_insert(sell_order and "amount" and next_sell_amt)
+                                
+                                set buy_amt to next_buy_amt
+                                set sell_amt to next_sell_amt
+                                
+                                # Update SQLite persistent storage
+                                if next_buy_amt == 0:
+                                    set ok to storage_dex_delete_order(buy_oid)
+                                else:
+                                    set ok to storage_dex_save_order(buy_oid and sym_a and sym_b and "buy" and buy_price and next_buy_amt and buyer and buy_created)
+                                    
+                                if next_sell_amt == 0:
+                                    set ok to storage_dex_delete_order(sell_oid)
+                                else:
+                                    set ok to storage_dex_save_order(sell_oid and sym_a and sym_b and "sell" and sell_price and next_sell_amt and seller and sell_created)
+
+                                # Remove filled orders
+                                if next_sell_amt == 0:
+                                    remove_list(sells and s_idx)
+                                    # Do not increment s_idx since element was removed
+                                else:
+                                    set s_idx to s_idx + 1
+                                    
+                                if next_buy_amt == 0:
+                                    remove_list(buys and b_idx)
+                                    set matched to 1
+                                    # Buyer fully filled, stop scanning sells for this buyer
+                            else:
+                                # refund failed, rollback cost transfer and token_a transfer
+                                token_transfer(token_b and seller and "dex_escrow" and cost)
+                                token_transfer(token_a and buyer and "dex_escrow" and trade_amt)
+                                set s_idx to s_idx + 1
+                        else:
+                            # cost transfer failed, rollback token_a transfer
+                            token_transfer(token_a and buyer and "dex_escrow" and trade_amt)
+                            set s_idx to s_idx + 1
+                    else:
+                        # token_a transfer failed, skip match
+                        set s_idx to s_idx + 1
+                else:
+                    set s_idx to s_idx + 1
+                    
+            if matched == 0:
+                set b_idx to b_idx + 1
+                
+        set i to i + 1
+        
+    free_list(keys)
+    set keys to 0
+    return 0

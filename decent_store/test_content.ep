@@ -1,0 +1,375 @@
+# ErnosDecent -- Test Suite for decent_store/content.ep
+# Tests: CAS put/get, deduplication, chunking, Merkle tree, manifests
+# Status: Production -- OperationTrojanClaude Phase 4
+
+import "content"
+import "../decent_id/keys"
+import "string"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_store/content.ep Test Suite"
+    display "  OperationTrojanClaude Phase 4"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # ===========================================================
+    # TEST 1: Hash is deterministic
+    # ===========================================================
+    display "TEST 1: Hash is deterministic"
+    set t1_ok to 1
+    set h1 to cas_hash_content("hello world")
+    set h2 to cas_hash_content("hello world")
+    if h1 equals h2:
+        set ok to 1
+    else:
+        display "  FAIL: same content should produce same hash"
+        set t1_ok to 0
+    if string_length(h1) != 64:
+        display "  FAIL: hash should be 64 hex chars"
+        set t1_ok to 0
+    # Different content -> different hash
+    set h3 to cas_hash_content("hello World")
+    if h1 equals h3:
+        display "  FAIL: different content should produce different hash"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: Content block creation and verification
+    # ===========================================================
+    display "TEST 2: Block creation and verification"
+    set t2_ok to 1
+    set block to create_content_block("test data for block")
+    if verify_content_block(block) != 1:
+        display "  FAIL: block should verify"
+        set t2_ok to 0
+    set block_hash to map_get_val(block and "hash")
+    if string_length(block_hash) != 64:
+        display "  FAIL: block hash wrong length"
+        set t2_ok to 0
+    set block_size to map_get_val(block and "size")
+    if block_size != 19:
+        display f"  FAIL: block size should be 19, got {block_size}"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: CAS put and get
+    # ===========================================================
+    display "TEST 3: CAS put and get"
+    set t3_ok to 1
+    set store to create_content_store()
+    set put_result to cas_put(store and "Hello, Content-Addressed Storage!")
+    if map_get_val(put_result and "error") != CAS_ERR_NONE:
+        display "  FAIL: put should succeed"
+        set t3_ok to 0
+    set stored_hash to ptr_to_str(map_get_val(put_result and "hash"))
+
+    set get_result to cas_get(store and stored_hash)
+    if map_get_val(get_result and "error") != CAS_ERR_NONE:
+        display "  FAIL: get should succeed"
+        set t3_ok to 0
+    set got_content to ptr_to_str(map_get_val(get_result and "content"))
+    if got_content equals "Hello, Content-Addressed Storage!":
+        set ok to 1
+    else:
+        display "  FAIL: content mismatch"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: Deduplication
+    # ===========================================================
+    display "TEST 4: Deduplication"
+    set t4_ok to 1
+    set dup_result to cas_put(store and "Hello, Content-Addressed Storage!")
+    if map_get_val(dup_result and "deduplicated") != 1:
+        display "  FAIL: should detect duplicate"
+        set t4_ok to 0
+    set dup_hash to ptr_to_str(map_get_val(dup_result and "hash"))
+    if dup_hash equals stored_hash:
+        set ok to 1
+    else:
+        display "  FAIL: duplicate hash should match original"
+        set t4_ok to 0
+    set s4 to cas_stats(store)
+    if map_get_val(s4 and "block_count") != 1:
+        display "  FAIL: should still have 1 block"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: cas_has and cas_delete
+    # ===========================================================
+    display "TEST 5: Has and delete"
+    set t5_ok to 1
+    if cas_has(store and stored_hash) != 1:
+        display "  FAIL: should have the block"
+        set t5_ok to 0
+    set del_err to cas_delete(store and stored_hash)
+    if del_err != CAS_ERR_NONE:
+        display "  FAIL: delete should succeed"
+        set t5_ok to 0
+    if cas_has(store and stored_hash) != 0:
+        display "  FAIL: should not have deleted block"
+        set t5_ok to 0
+    set s5 to cas_stats(store)
+    if map_get_val(s5 and "block_count") != 0:
+        display "  FAIL: block count should be 0"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Get non-existent returns NOT_FOUND
+    # ===========================================================
+    display "TEST 6: Get non-existent"
+    set t6_ok to 1
+    set fake_hash to "0000000000000000000000000000000000000000000000000000000000000000"
+    set miss to cas_get(store and fake_hash)
+    if map_get_val(miss and "error") != CAS_ERR_NOT_FOUND:
+        display "  FAIL: should be NOT_FOUND"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: Empty content rejected
+    # ===========================================================
+    display "TEST 7: Empty content rejected"
+    set t7_ok to 1
+    set empty_result to cas_put(store and "")
+    if map_get_val(empty_result and "error") != CAS_ERR_EMPTY_CONTENT:
+        display "  FAIL: empty should be rejected"
+        set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: Chunking and reassembly
+    # ===========================================================
+    display "TEST 8: Chunking and reassembly"
+    set t8_ok to 1
+    set store8 to create_content_store()
+    set big_content to "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz!!"
+    set chunk_result to cas_chunk_content(store8 and big_content and 10)
+    if map_get_val(chunk_result and "error") != CAS_ERR_NONE:
+        display "  FAIL: chunking should succeed"
+        set t8_ok to 0
+
+    set chunks to map_get_val(chunk_result and "chunks")
+    set chunk_count to map_get_val(chunk_result and "chunk_count")
+    display f"  Chunked into {chunk_count} chunks"
+
+    # 64 chars / 10 per chunk = 7 chunks (6 full + 1 partial)
+    if chunk_count != 7:
+        display f"  FAIL: expected 7 chunks, got {chunk_count}"
+        set t8_ok to 0
+
+    # Reassemble
+    set reassembled to cas_reassemble_chunks(store8 and chunks)
+    if map_get_val(reassembled and "error") != CAS_ERR_NONE:
+        display "  FAIL: reassembly should succeed"
+        set t8_ok to 0
+    set recovered to map_get_val(reassembled and "content")
+    if recovered equals big_content:
+        set ok to 1
+    else:
+        display "  FAIL: reassembled content mismatch"
+        set t8_ok to 0
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9: Merkle root is deterministic
+    # ===========================================================
+    display "TEST 9: Merkle root deterministic"
+    set t9_ok to 1
+    set hashes9 to create_list()
+    set ok to append_list(hashes9 and "aaaa000000000000000000000000000000000000000000000000000000000000")
+    set ok to append_list(hashes9 and "bbbb000000000000000000000000000000000000000000000000000000000000")
+    set ok to append_list(hashes9 and "cccc000000000000000000000000000000000000000000000000000000000000")
+
+    set root1 to cas_merkle_root(hashes9)
+    set root2 to cas_merkle_root(hashes9)
+    if root1 equals root2:
+        set ok to 1
+    else:
+        display "  FAIL: same hashes should produce same root"
+        set t9_ok to 0
+    if string_length(root1) != 64:
+        display "  FAIL: root should be 64 hex chars"
+        set t9_ok to 0
+
+    # Different order -> different root
+    set hashes9b to create_list()
+    set ok to append_list(hashes9b and "bbbb000000000000000000000000000000000000000000000000000000000000")
+    set ok to append_list(hashes9b and "aaaa000000000000000000000000000000000000000000000000000000000000")
+    set ok to append_list(hashes9b and "cccc000000000000000000000000000000000000000000000000000000000000")
+    set root3 to cas_merkle_root(hashes9b)
+    if root1 equals root3:
+        display "  FAIL: different order should produce different root"
+        set t9_ok to 0
+
+    if t9_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 10: Merkle single and empty
+    # ===========================================================
+    display "TEST 10: Merkle edge cases"
+    set t10_ok to 1
+    set empty_list to create_list()
+    set empty_root to cas_merkle_root(empty_list)
+    if string_length(empty_root) != 0:
+        display "  FAIL: empty list should have empty root"
+        set t10_ok to 0
+
+    set single_list to create_list()
+    set ok to append_list(single_list and "dddd000000000000000000000000000000000000000000000000000000000000")
+    set single_root to cas_merkle_root(single_list)
+    if single_root equals "dddd000000000000000000000000000000000000000000000000000000000000":
+        set ok to 1
+    else:
+        display "  FAIL: single hash should be its own root"
+        set t10_ok to 0
+
+    if t10_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 11: Content manifest creation and verification
+    # ===========================================================
+    display "TEST 11: Content manifest"
+    set t11_ok to 1
+    set store11 to create_content_store()
+    set manifest_content to "This is the content that will be chunked and stored in a manifest with Merkle proof!"
+    set manifest_result to create_content_manifest(manifest_content and store11 and 20)
+    if map_get_val(manifest_result and "error") != CAS_ERR_NONE:
+        display "  FAIL: manifest creation should succeed"
+        set t11_ok to 0
+
+    set manifest to map_get_val(manifest_result and "manifest")
+    set mroot to map_get_val(manifest and "merkle_root")
+    if string_length(mroot) != 64:
+        display "  FAIL: merkle root should be 64 hex chars"
+        set t11_ok to 0
+
+    set mchunks to map_get_val(manifest and "chunk_count")
+    display f"  Manifest: {mchunks} chunks, root: {mroot}"
+
+    # Verify integrity
+    set valid to verify_manifest_integrity(manifest and store11)
+    if valid != 1:
+        display "  FAIL: manifest should verify"
+        set t11_ok to 0
+
+    if t11_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 12: Manifest integrity fails with missing chunk
+    # ===========================================================
+    display "TEST 12: Manifest integrity fails with deletion"
+    set t12_ok to 1
+    # Delete one chunk from the store
+    set m_chunks to map_get_val(manifest and "chunks")
+    set first_chunk_hash to get_list(m_chunks and 0)
+    set ok to cas_delete(store11 and first_chunk_hash)
+
+    set valid2 to verify_manifest_integrity(manifest and store11)
+    if valid2 != 0:
+        display "  FAIL: integrity should fail with missing chunk"
+        set t12_ok to 0
+
+    if t12_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 13: Store stats
+    # ===========================================================
+    display "TEST 13: Store stats"
+    set t13_ok to 1
+    set store13 to create_content_store()
+    set ok to cas_put(store13 and "block_one")
+    set ok to cas_put(store13 and "block_two")
+    set ok to cas_put(store13 and "block_three")
+    set s13 to cas_stats(store13)
+    if map_get_val(s13 and "block_count") != 3:
+        display "  FAIL: should have 3 blocks"
+        set t13_ok to 0
+    set total_bytes to map_get_val(s13 and "total_bytes")
+    # "block_one" = 9, "block_two" = 9, "block_three" = 11
+    if total_bytes != 29:
+        display f"  FAIL: total bytes should be 29, got {total_bytes}"
+        set t13_ok to 0
+
+    if t13_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    display "==================================================="
+    return 0

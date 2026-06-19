@@ -1,0 +1,390 @@
+# ErnosDecent -- Multi-Node Integration Test
+# Tests two nodes communicating over real TCP
+# Verifies: DHT store/retrieve across nodes, Noise handshake between nodes,
+#           Relay registration and circuit forwarding
+# Status: Production
+
+import "collections"
+import "string"
+import "net"
+import "decent_net/transport"
+import "decent_net/noise_transport"
+import "decent_net/dht_transport"
+import "decent_net/relay_transport"
+import "decent_net/noise"
+import "decent_net/dht"
+import "decent_net/relay"
+import "decent_id/keys"
+
+# ================================================================
+# Node A — DHT Server + data store
+# ================================================================
+
+define node_a_dht_server with dht as Int and listen_fd as Int and msg_count as Int:
+    set i to 0
+    repeat while i < msg_count:
+        set client_fd to ep_net_accept(listen_fd)
+        if client_fd >= 0:
+            set conn to create_map()
+            set ok to map_insert(conn and "fd" and client_fd)
+            set ok to map_insert(conn and "connected" and 1)
+            set ok to dht_handle_transport_message(dht and conn)
+            transport_close(conn)
+            free_map(conn)
+        set i to i + 1
+    return 0
+
+# ================================================================
+# Node B — Relay Server
+# ================================================================
+
+define node_b_relay_server with relay as Int and listen_fd as Int and msg_count as Int:
+    set i to 0
+    repeat while i < msg_count:
+        set client_fd to ep_net_accept(listen_fd)
+        if client_fd >= 0:
+            set conn to create_map()
+            set ok to map_insert(conn and "fd" and client_fd)
+            set ok to map_insert(conn and "connected" and 1)
+            set ok to relay_handle_transport_message(relay and conn)
+            transport_close(conn)
+            free_map(conn)
+        set i to i + 1
+    return 0
+
+# ================================================================
+# Main — Run multi-node integration tests
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- Multi-Node Integration Tests"
+    display "  Two Nodes Communicating Over TCP"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    set init_err to init_crypto()
+    if init_err != 0:
+        display "FATAL: Cryptography initialization failed!"
+        return 1
+
+    # ===========================================================
+    # TEST 1: Node A stores data, Node B retrieves it via DHT
+    # ===========================================================
+    display "TEST 1: Cross-node DHT store and retrieve"
+    set t1_ok to 1
+
+    # Create Node A (DHT server)
+    set dht_a to create_dht_node("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and "127.0.0.1" and 30001)
+    # Pre-store a secret on Node A
+    set ok to dht_node_store_value(dht_a and "shared_secret" and "the_value_from_node_a")
+
+    # Start Node A DHT server (handles 1 request)
+    set listen_a to ep_net_listen(30001)
+    if listen_a < 0:
+        display "  FAIL: Node A could not listen"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        spawn node_a_dht_server(dht_a and listen_a and 1)
+        set ok to ep_sleep_ms(50)
+
+        # Node B queries Node A for the value
+        set dht_b to create_dht_node("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" and "127.0.0.1" and 30002)
+        set result to dht_rpc_find_value(dht_b and "127.0.0.1" and 30001 and "shared_secret")
+        set err to map_get_val(result and "error")
+        if err != DHT_NET_ERR_NONE:
+            display f"  FAIL: find_value failed with error {err}"
+            set t1_ok to 0
+        else:
+            set found to map_get_val(result and "found")
+            if found != 1:
+                display "  FAIL: value not found across nodes"
+                set t1_ok to 0
+            else:
+                set val to map_get_val(result and "value")
+                if val equals "the_value_from_node_a":
+                    display f"  Value retrieved: {val}"
+                else:
+                    display f"  FAIL: value mismatch: {val}"
+                    set t1_ok to 0
+        free_map(result)
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(100)
+    if listen_a >= 0:
+        set ok to ep_net_close(listen_a)
+
+    # ===========================================================
+    # TEST 2: Noise-encrypted message between two nodes
+    # ===========================================================
+    display "TEST 2: Noise-encrypted communication between nodes"
+    set t2_ok to 1
+
+    # Generate keys for both nodes
+    set keys_a to generate_encryption_keypair()
+    set pub_a to map_get_val(keys_a and "public_key")
+    set sec_a to map_get_val(keys_a and "secret_key")
+    set ptr_sec_a to alloc_bytes(32)
+    set ptr_pub_a to alloc_bytes(32)
+    set ok to hex_to_raw(sec_a and ptr_sec_a and 32)
+    set ok to hex_to_raw(pub_a and ptr_pub_a and 32)
+
+    set keys_b to generate_encryption_keypair()
+    set pub_b to map_get_val(keys_b and "public_key")
+    set sec_b to map_get_val(keys_b and "secret_key")
+    set ptr_sec_b to alloc_bytes(32)
+    set ptr_pub_b to alloc_bytes(32)
+    set ok to hex_to_raw(sec_b and ptr_sec_b and 32)
+    set ok to hex_to_raw(pub_b and ptr_pub_b and 32)
+
+    set listen_b to ep_net_listen(30010)
+    if listen_b < 0:
+        display "  FAIL: Node B could not listen"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        # Node B acts as responder
+        spawn noise_responder_echo(listen_b and ptr_sec_b and ptr_pub_b)
+        set ok to ep_sleep_ms(100)
+
+        # Node A connects and sends encrypted message
+        set conn_a to transport_connect("127.0.0.1" and 30010)
+        set conn_err to map_get_val(conn_a and "error")
+        if conn_err != TRANSPORT_ERR_NONE:
+            display f"  FAIL: Node A connect failed"
+            set t2_ok to 0
+
+    if t2_ok == 1:
+        set hs to noise_net_handshake_initiate(conn_a and ptr_sec_a and ptr_pub_a)
+        set hs_err to map_get_val(hs and "error")
+        if hs_err != NOISE_NET_ERR_NONE:
+            display f"  FAIL: handshake failed: {hs_err}"
+            set t2_ok to 0
+        else:
+            set session to map_get_val(hs and "session")
+            set remote to map_get_val(hs and "remote_static")
+            display f"  Authenticated peer: {substring(remote and 0 and 16)}..."
+
+            # Send encrypted message
+            set ok to noise_net_send(session and "SECRET_MSG" and "hello_from_node_a")
+
+            # Receive encrypted reply
+            set reply to noise_net_recv(session)
+            set r_err to map_get_val(reply and "error")
+            if r_err != NOISE_NET_ERR_NONE:
+                display f"  FAIL: recv failed: {r_err}"
+                set t2_ok to 0
+            else:
+                set r_text to map_get_val(reply and "plaintext")
+                if r_text equals "ECHO:hello_from_node_a":
+                    display f"  Encrypted echo received: {r_text}"
+                else:
+                    display f"  FAIL: expected ECHO:hello_from_node_a, got {r_text}"
+                    set t2_ok to 0
+            free_map(reply)
+
+            # Clean shutdown
+            set ok to noise_net_send(session and "STOP" and "done")
+            set stop_r to noise_net_recv(session)
+            free_map(stop_r)
+            noise_net_close(session)
+
+        free_map(conn_a)
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(200)
+    if listen_b >= 0:
+        set ok to ep_net_close(listen_b)
+
+    # ===========================================================
+    # TEST 3: Relay registration and circuit across nodes
+    # ===========================================================
+    display "TEST 3: Cross-node relay registration and circuit"
+    set t3_ok to 1
+
+    set relay_node to create_relay_node("relay_master")
+
+    set listen_r to ep_net_listen(30020)
+    if listen_r < 0:
+        display "  FAIL: Relay could not listen"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        # Relay handles: register(A), register(B), connect(A->B), forward data
+        spawn node_b_relay_server(relay_node and listen_r and 4)
+        set ok to ep_sleep_ms(50)
+
+        # Node A registers with relay
+        set reg_err to relay_rpc_register("127.0.0.1" and 30020 and "node_alpha" and "aabbcc1122")
+        if reg_err != RELAY_NET_ERR_NONE:
+            display f"  FAIL: Node A register failed: {reg_err}"
+            set t3_ok to 0
+        else:
+            display "  Node A registered with relay"
+
+    if t3_ok == 1:
+        # Node B registers with relay
+        set reg_err to relay_rpc_register("127.0.0.1" and 30020 and "node_beta" and "ddeeff3344")
+        if reg_err != RELAY_NET_ERR_NONE:
+            display f"  FAIL: Node B register failed: {reg_err}"
+            set t3_ok to 0
+        else:
+            display "  Node B registered with relay"
+
+    if t3_ok == 1:
+        # Node A creates circuit to Node B
+        set circuit_result to relay_rpc_connect("127.0.0.1" and 30020 and "node_alpha" and "node_beta")
+        set circuit_err to map_get_val(circuit_result and "error")
+        if circuit_err != RELAY_NET_ERR_NONE:
+            display f"  FAIL: circuit creation failed: {circuit_err}"
+            set t3_ok to 0
+        else:
+            set circuit_id to map_get_val(circuit_result and "circuit_id")
+            display f"  Circuit created: {substring(circuit_id and 0 and 16)}..."
+
+            # Forward encrypted data through the circuit
+            set fwd_err to relay_rpc_forward("127.0.0.1" and 30020 and circuit_id and "encrypted_payload_abc123")
+            if fwd_err != RELAY_NET_ERR_NONE:
+                display f"  FAIL: data forward failed: {fwd_err}"
+                set t3_ok to 0
+            else:
+                display "  Data forwarded through relay circuit"
+        free_map(circuit_result)
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(200)
+    if listen_r >= 0:
+        set ok to ep_net_close(listen_r)
+
+    # ===========================================================
+    # TEST 4: Full DHT peer discovery — ping then find_node
+    # ===========================================================
+    display "TEST 4: DHT peer discovery across nodes"
+    set t4_ok to 1
+
+    set dht_c to create_dht_node("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" and "127.0.0.1" and 30030)
+    set ok to dht_node_add_peer(dht_c and "1111111111111111111111111111111111111111111111111111111111111111" and "10.0.0.1" and 30031)
+    set ok to dht_node_add_peer(dht_c and "2222222222222222222222222222222222222222222222222222222222222222" and "10.0.0.2" and 30032)
+    set ok to dht_node_add_peer(dht_c and "3333333333333333333333333333333333333333333333333333333333333333" and "10.0.0.3" and 30033)
+
+    set listen_c to ep_net_listen(30030)
+    if listen_c < 0:
+        display "  FAIL: Node C could not listen"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        # Handle ping + find_node
+        spawn node_a_dht_server(dht_c and listen_c and 2)
+        set ok to ep_sleep_ms(50)
+
+        set dht_d to create_dht_node("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" and "127.0.0.1" and 30040)
+
+        # Ping first
+        set ping_err to dht_rpc_ping(dht_d and "127.0.0.1" and 30030)
+        if ping_err != DHT_NET_ERR_NONE:
+            display f"  FAIL: ping failed: {ping_err}"
+            set t4_ok to 0
+        else:
+            display "  Ping successful"
+
+    if t4_ok == 1:
+        # Then find_node
+        set find_result to dht_rpc_find_node(dht_d and "127.0.0.1" and 30030 and "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+        set find_err to map_get_val(find_result and "error")
+        if find_err != DHT_NET_ERR_NONE:
+            display f"  FAIL: find_node failed: {find_err}"
+            set t4_ok to 0
+        else:
+            set nodes to map_get_val(find_result and "nodes")
+            set node_count to length_list(nodes)
+            display f"  Discovered {node_count} peers via DHT"
+            if node_count < 3:
+                display f"  FAIL: expected >= 3 peers, got {node_count}"
+                set t4_ok to 0
+        free_map(find_result)
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(100)
+    if listen_c >= 0:
+        set ok to ep_net_close(listen_c)
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} multi-node integration tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    else:
+        display "  ALL MULTI-NODE TESTS PASSED!"
+    display "==================================================="
+    return 0
+
+# ================================================================
+# Noise echo responder for test 2
+# ================================================================
+
+define noise_responder_echo with listen_fd as Int and s_sec as Int and s_pub as Int:
+    set client_fd to ep_net_accept(listen_fd)
+    if client_fd < 0:
+        return 0
+
+    set conn to create_map()
+    set ok to map_insert(conn and "fd" and client_fd)
+    set ok to map_insert(conn and "connected" and 1)
+
+    set hs_result to noise_net_handshake_respond(conn and s_sec and s_pub)
+    set hs_err to map_get_val(hs_result and "error")
+    if hs_err != NOISE_NET_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        return 0
+
+    set session to map_get_val(hs_result and "session")
+
+    set running to 1
+    repeat while running == 1:
+        set recv_result to noise_net_recv(session)
+        set recv_err to map_get_val(recv_result and "error")
+        if recv_err != NOISE_NET_ERR_NONE:
+            set running to 0
+        else:
+            set msg_type to map_get_val(recv_result and "msg_type")
+            set plaintext to map_get_val(recv_result and "plaintext")
+            if msg_type equals "STOP":
+                set ok to noise_net_send(session and "STOP_ACK" and "bye")
+                set running to 0
+            else:
+                set echo_text to concat("ECHO:" and plaintext)
+                set ok to noise_net_send(session and msg_type and echo_text)
+        free_map(recv_result)
+
+    noise_net_close(session)
+    free_map(conn)
+    return 0

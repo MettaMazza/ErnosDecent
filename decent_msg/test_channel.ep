@@ -1,0 +1,330 @@
+# ErnosDecent -- Test Suite for decent_msg/channel.ep
+# Tests: Channel creation, membership, encryption, key sharing, messaging
+# Status: Production -- OperationTrojanClaude Phase 5
+
+import "channel"
+import "../decent_id/keys"
+import "string"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_msg/channel.ep Test Suite"
+    display "  OperationTrojanClaude Phase 5"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # Init crypto
+    set err to init_crypto()
+
+    # Generate keypairs for Alice and Bob
+    set alice_signing to generate_signing_keypair()
+    set alice_pk to map_get_val(alice_signing and "public_key")
+    set alice_sk to map_get_val(alice_signing and "secret_key")
+    set alice_id to ep_sha256(alice_pk)
+
+    set alice_enc to generate_encryption_keypair()
+    set alice_enc_pk to map_get_val(alice_enc and "public_key")
+    set alice_enc_sk to map_get_val(alice_enc and "secret_key")
+
+    set bob_signing to generate_signing_keypair()
+    set bob_pk to map_get_val(bob_signing and "public_key")
+    set bob_sk to map_get_val(bob_signing and "secret_key")
+    set bob_id to ep_sha256(bob_pk)
+
+    set bob_enc to generate_encryption_keypair()
+    set bob_enc_pk to map_get_val(bob_enc and "public_key")
+    set bob_enc_sk to map_get_val(bob_enc and "secret_key")
+
+    # ===========================================================
+    # TEST 1: Channel creation & creator ownership
+    # ===========================================================
+    display "TEST 1: Channel creation & creator ownership"
+    set t1_ok to 1
+    
+    set chan to chan_create("General" and alice_id and "")
+    
+    set c_name to map_get_val(chan and "name")
+    if c_name equals "General":
+        set ok to 1
+    else:
+        display "  FAIL: channel name mismatch"
+        set t1_ok to 0
+        
+    set c_creator to map_get_val(chan and "creator")
+    if c_creator equals alice_id:
+        set ok to 1
+    else:
+        display "  FAIL: creator mismatch"
+        set t1_ok to 0
+
+    if map_get_val(chan and "member_count") != 1:
+        display "  FAIL: member count should start at 1"
+        set t1_ok to 0
+
+    if chan_is_member(chan and alice_id) != 1:
+        display "  FAIL: creator should be a member"
+        set t1_ok to 0
+
+    if chan_get_member_role(chan and alice_id) != CHAN_ROLE_OWNER:
+        display "  FAIL: creator role should be OWNER"
+        set t1_ok to 0
+
+    if chan_is_member(chan and bob_id) != 0:
+        display "  FAIL: Bob should not be a member initially"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: Adding a member (authorized)
+    # ===========================================================
+    display "TEST 2: Adding a member (authorized)"
+    set t2_ok to 1
+
+    set add_err to chan_add_member(chan and alice_id and bob_id and CHAN_ROLE_MEMBER)
+    if add_err != CHAN_ERR_NONE:
+        display f"  FAIL: add member failed with error {add_err}"
+        set t2_ok to 0
+
+    if map_get_val(chan and "member_count") != 2:
+        display "  FAIL: member count should be 2"
+        set t2_ok to 0
+
+    if chan_is_member(chan and bob_id) != 1:
+        display "  FAIL: Bob should be a member"
+        set t2_ok to 0
+
+    if chan_get_member_role(chan and bob_id) != CHAN_ROLE_MEMBER:
+        display "  FAIL: Bob's role should be MEMBER"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: Unauthorized membership modification
+    # ===========================================================
+    display "TEST 3: Unauthorized membership modification"
+    set t3_ok to 1
+
+    set charlie_id to "charlie_temp_id_12345"
+    # Bob (regular member) attempts to add Charlie
+    set bad_add_err to chan_add_member(chan and bob_id and charlie_id and CHAN_ROLE_MEMBER)
+    if bad_add_err != CHAN_ERR_UNAUTHORIZED:
+        display f"  FAIL: expected UNAUTHORIZED, got {bad_add_err}"
+        set t3_ok to 0
+
+    if chan_is_member(chan and charlie_id) == 1:
+        display "  FAIL: Charlie should not have been added"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: Message encryption and decryption
+    # ===========================================================
+    display "TEST 4: Message encryption and decryption"
+    set t4_ok to 1
+
+    set channel_key to map_get_val(chan and "key")
+    set plain to "Top secret conversation in General channel"
+    
+    set enc_res to chan_encrypt_body(plain and channel_key)
+    if map_get_val(enc_res and "error") != CHAN_ERR_NONE:
+        display "  FAIL: encryption failed"
+        set t4_ok to 0
+
+    set ciphertext to map_get_val(enc_res and "ciphertext")
+    set nonce to map_get_val(enc_res and "nonce")
+
+    # Decrypt
+    set dec_res to chan_decrypt_body(ciphertext and nonce and channel_key)
+    if map_get_val(dec_res and "error") != CHAN_ERR_NONE:
+        display "  FAIL: decryption failed"
+        set t4_ok to 0
+
+    set recovered to map_get_val(dec_res and "plaintext")
+    if recovered equals plain:
+        set ok to 1
+    else:
+        display "  FAIL: plaintext mismatch after decryption"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: Empty body message rejected
+    # ===========================================================
+    display "TEST 5: Empty body message rejected"
+    set t5_ok to 1
+
+    set empty_enc to chan_encrypt_body("" and channel_key)
+    if map_get_val(empty_enc and "error") != CHAN_ERR_EMPTY_BODY:
+        display "  FAIL: empty body encryption should fail"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Secure key sharing (envelope encryption)
+    # ===========================================================
+    display "TEST 6: Secure key sharing (envelope encryption)"
+    set t6_ok to 1
+
+    # Alice shares key with Bob
+    set share_res to chan_share_key(channel_key and bob_enc_pk and alice_enc_sk)
+    if map_get_val(share_res and "error") != CHAN_ERR_NONE:
+        display "  FAIL: key sharing encryption failed"
+        set t6_ok to 0
+
+    # Bob receives shared key
+    set receive_res to chan_receive_shared_key(share_res and alice_enc_pk and bob_enc_sk)
+    if map_get_val(receive_res and "error") != CHAN_ERR_NONE:
+        display "  FAIL: key envelope decryption failed"
+        set t6_ok to 0
+
+    set recovered_key to map_get_val(receive_res and "key")
+    if recovered_key equals channel_key:
+        set ok to 1
+    else:
+        display "  FAIL: recovered key does not match channel key"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: Sending and receiving group messages
+    # ===========================================================
+    display "TEST 7: Sending and receiving group messages"
+    set t7_ok to 1
+
+    set send_err to chan_send_message(chan and alice_id and ciphertext and CHAN_TYPE_TEXT)
+    if send_err != CHAN_ERR_NONE:
+        display f"  FAIL: sending message failed with error {send_err}"
+        set t7_ok to 0
+
+    if map_get_val(chan and "message_count") != 1:
+        display "  FAIL: message count should be 1"
+        set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: Message pagination
+    # ===========================================================
+    display "TEST 8: Message pagination"
+    set t8_ok to 1
+
+    # Send 3 more messages
+    set ok to chan_send_message(chan and alice_id and "msg2" and CHAN_TYPE_TEXT)
+    set ok to chan_send_message(chan and alice_id and "msg3" and CHAN_TYPE_TEXT)
+    set ok to chan_send_message(chan and alice_id and "msg4" and CHAN_TYPE_TEXT)
+
+    if map_get_val(chan and "message_count") != 4:
+        display "  FAIL: expected 4 messages"
+        set t8_ok to 0
+
+    # Retrieve messages with offset 1, limit 2 (should get "msg2", "msg3")
+    set page to chan_get_messages(chan and 1 and 2)
+    if length_list(page) != 2:
+        display f"  FAIL: expected page length 2, got {length_list(page)}"
+        set t8_ok to 0
+
+    set m2 to get_list(page and 0)
+    set m2_body to map_get_val(m2 and "body")
+    if m2_body equals "msg2":
+        set ok to 1
+    else:
+        display "  FAIL: incorrect message body in page[0]"
+        set t8_ok to 0
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9: Non-member cannot send message
+    # ===========================================================
+    display "TEST 9: Non-member cannot send message"
+    set t9_ok to 1
+
+    set bad_send_err to chan_send_message(chan and charlie_id and "should fail" and CHAN_TYPE_TEXT)
+    if bad_send_err != CHAN_ERR_NOT_MEMBER:
+        display f"  FAIL: expected NOT_MEMBER, got {bad_send_err}"
+        set t9_ok to 0
+
+    if t9_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 10: Member removal & leaving
+    # ===========================================================
+    display "TEST 10: Member removal & leaving"
+    set t10_ok to 1
+
+    # Bob leaves voluntarily
+    set leave_err to chan_remove_member(chan and bob_id and bob_id)
+    if leave_err != CHAN_ERR_NONE:
+        display f"  FAIL: leave failed with error {leave_err}"
+        set t10_ok to 0
+
+    if chan_is_member(chan and bob_id) != 0:
+        display "  FAIL: Bob should not be a member after leaving"
+        set t10_ok to 0
+
+    if map_get_val(chan and "member_count") != 1:
+        display "  FAIL: member count should be back to 1"
+        set t10_ok to 0
+
+    if t10_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    display "==================================================="
+    return 0

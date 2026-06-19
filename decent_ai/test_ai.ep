@@ -1,0 +1,611 @@
+# ErnosDecent -- Integration Test Suite for Local AI Systems (decent_ai)
+# Component: decent_ai/test_ai.ep
+# Status: Production -- OperationTrojanClaude Phase 9
+
+import "models"
+import "inference"
+import "embeddings"
+import "speech"
+import "test"
+
+external define SHA256 with data and len and hash_dest
+external define get_list_data_ptr with list
+
+external define ep_dlopen with lib:
+external define ep_dlsym with handle and name:
+external define ep_dlcall1 with fn and a0:
+external define ep_dlcall2 with fn and a0 and a1:
+external define ep_dlcall3 with fn and a0 and a1 and a2:
+external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
+
+# ════════════════════════════════════════════════════════════════
+# GGUF Binary Writer Helpers
+# ════════════════════════════════════════════════════════════════
+
+define fixed_to_float32 with val as Int returning Int:
+    if val == 0:
+        return 0
+        
+    set sign_bit to 0
+    set abs_val to val
+    if val < 0:
+        set sign_bit to 1
+        set abs_val to 0 - val
+        
+    set exponent to 0
+    repeat while abs_val >= 2000000:
+        set abs_val to abs_val / 2
+        set exponent to exponent + 1
+        
+    repeat while abs_val < 1000000:
+        set abs_val to abs_val * 2
+        set exponent to exponent - 1
+        
+    set frac to abs_val - 1000000
+    set mantissa to (frac * 8388608) / 1000000
+    set exp_biased to exponent + 127
+    
+    set u32 to sign_bit * 2147483648 + exp_biased * 8388608 + mantissa
+    return u32
+
+define write_bytes with file_ptr as Int and data_ptr as Int and count as Int and fn_fwrite as Int returning Int:
+    return ep_dlcall4(fn_fwrite and data_ptr and 1 and count and file_ptr)
+    
+define write_uint32 with file_ptr as Int and val as Int and fn_fwrite as Int returning Int:
+    set buf to alloc_bytes(4)
+    poke_byte(buf and 0 and val modulo 256)
+    poke_byte(buf and 1 and (val / 256) modulo 256)
+    poke_byte(buf and 2 and (val / 65536) modulo 256)
+    poke_byte(buf and 3 and (val / 16777216) modulo 256)
+    set ok to write_bytes(file_ptr and buf and 4 and fn_fwrite)
+    free_bytes(buf)
+    return 0
+
+define write_uint64 with file_ptr as Int and val as Int and fn_fwrite as Int returning Int:
+    set buf to alloc_bytes(8)
+    set temp to val
+    set i to 0
+    repeat while i < 8:
+        poke_byte(buf and i and temp modulo 256)
+        set temp to temp / 256
+        set i to i + 1
+    set ok to write_bytes(file_ptr and buf and 8 and fn_fwrite)
+    free_bytes(buf)
+    return 0
+
+define write_gguf_string with file_ptr as Int and s as Str and fn_fwrite as Int returning Int:
+    set len to string_length(s)
+    write_uint64(file_ptr and len and fn_fwrite)
+    set s_ptr to str_to_ptr(s)
+    write_bytes(file_ptr and s_ptr and len and fn_fwrite)
+    return 0
+
+define write_test_gguf with file_path as Str returning Int:
+    set handle to ep_dlopen("libSystem.B.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("libc.so.6")
+        
+    set fn_fopen to ep_dlsym(handle and "fopen")
+    set fn_fwrite to ep_dlsym(handle and "fwrite")
+    set fn_fclose to ep_dlsym(handle and "fclose")
+    
+    set path_ptr to str_to_ptr(file_path)
+    set mode_ptr to str_to_ptr("wb")
+    set file_ptr to ep_dlcall2(fn_fopen and path_ptr and mode_ptr)
+    if file_ptr == 0:
+        return 1
+        
+    set magic_buf to alloc_bytes(4)
+    poke_byte(magic_buf and 0 and 71)
+    poke_byte(magic_buf and 1 and 71)
+    poke_byte(magic_buf and 2 and 85)
+    poke_byte(magic_buf and 3 and 70)
+    write_bytes(file_ptr and magic_buf and 4 and fn_fwrite)
+    free_bytes(magic_buf)
+    
+    write_uint32(file_ptr and 3 and fn_fwrite)
+    write_uint64(file_ptr and 8 and fn_fwrite)
+    write_uint64(file_ptr and 1 and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "tokenizer.ggml.tokens" and fn_fwrite)
+    write_uint32(file_ptr and 9 and fn_fwrite)
+    write_uint32(file_ptr and 8 and fn_fwrite)
+    write_uint64(file_ptr and 10 and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "<unk>" and fn_fwrite)
+    write_gguf_string(file_ptr and "hello" and fn_fwrite)
+    write_gguf_string(file_ptr and "world" and fn_fwrite)
+    write_gguf_string(file_ptr and "artificial" and fn_fwrite)
+    write_gguf_string(file_ptr and "intelligence" and fn_fwrite)
+    write_gguf_string(file_ptr and "decentralized" and fn_fwrite)
+    write_gguf_string(file_ptr and "network" and fn_fwrite)
+    write_gguf_string(file_ptr and "money" and fn_fwrite)
+    write_gguf_string(file_ptr and "speech" and fn_fwrite)
+    write_gguf_string(file_ptr and "transcribing" and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "token_embeddings.weight" and fn_fwrite)
+    write_uint32(file_ptr and 2 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint64(file_ptr and 10 and fn_fwrite)
+    write_uint32(file_ptr and 0 and fn_fwrite)
+    write_uint64(file_ptr and 0 and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "attention.wq.weight" and fn_fwrite)
+    write_uint32(file_ptr and 2 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint32(file_ptr and 0 and fn_fwrite)
+    write_uint64(file_ptr and 640 and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "attention.wk.weight" and fn_fwrite)
+    write_uint32(file_ptr and 2 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint32(file_ptr and 0 and fn_fwrite)
+    write_uint64(file_ptr and 1664 and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "attention.wv.weight" and fn_fwrite)
+    write_uint32(file_ptr and 2 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint32(file_ptr and 0 and fn_fwrite)
+    write_uint64(file_ptr and 2688 and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "attention.wo.weight" and fn_fwrite)
+    write_uint32(file_ptr and 2 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint32(file_ptr and 0 and fn_fwrite)
+    write_uint64(file_ptr and 3712 and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "feed_forward.w1.weight" and fn_fwrite)
+    write_uint32(file_ptr and 2 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint32(file_ptr and 0 and fn_fwrite)
+    write_uint64(file_ptr and 4736 and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "feed_forward.w2.weight" and fn_fwrite)
+    write_uint32(file_ptr and 2 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint32(file_ptr and 0 and fn_fwrite)
+    write_uint64(file_ptr and 5760 and fn_fwrite)
+    
+    write_gguf_string(file_ptr and "output.weight" and fn_fwrite)
+    write_uint32(file_ptr and 2 and fn_fwrite)
+    write_uint64(file_ptr and 16 and fn_fwrite)
+    write_uint64(file_ptr and 10 and fn_fwrite)
+    write_uint32(file_ptr and 0 and fn_fwrite)
+    write_uint64(file_ptr and 6784 and fn_fwrite)
+    
+    set fn_ftell to ep_dlsym(handle and "ftell")
+    set curr_pos to ep_dlcall1(fn_ftell and file_ptr)
+    set rem to curr_pos modulo 32
+    if rem != 0:
+        set pad_bytes to 32 - rem
+        set pad_buf to alloc_bytes(pad_bytes)
+        write_bytes(file_ptr and pad_buf and pad_bytes and fn_fwrite)
+        free_bytes(pad_buf)
+        
+    set num_floats to 1856
+    set float_buf to alloc_bytes(num_floats * 4)
+    set scale to 1000000
+    
+    set t to 0
+    repeat while t < 10:
+        set i to 0
+        repeat while i < 16:
+            set val_fixed to 0
+            if t == 1 and also i == 1:
+                set val_fixed to 500000
+            else:
+                if t == 2 and also i == 2:
+                    set val_fixed to 800000
+                else:
+                    if t == 5 and also i == 5:
+                        set val_fixed to 1000000
+                    else:
+                        if t == 6 and also i == 6:
+                            set val_fixed to scale
+                        else:
+                            if t == 7 and also i == 7:
+                                set val_fixed to scale
+            
+            set val_u32 to fixed_to_float32(val_fixed)
+            set float_idx to t * 16 + i
+            poke_byte(float_buf and float_idx * 4 and val_u32 modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 1 and (val_u32 / 256) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 2 and (val_u32 / 65536) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 3 and (val_u32 / 16777216) modulo 256)
+            set i to i + 1
+        set t to t + 1
+        
+    set r to 0
+    repeat while r < 16:
+        set c to 0
+        repeat while c < 16:
+            set val_fixed to 0
+            if r == c:
+                set val_fixed to scale
+            set val_u32 to fixed_to_float32(val_fixed)
+            set float_idx to 160 + r * 16 + c
+            poke_byte(float_buf and float_idx * 4 and val_u32 modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 1 and (val_u32 / 256) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 2 and (val_u32 / 65536) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 3 and (val_u32 / 16777216) modulo 256)
+            set c to c + 1
+        set r to r + 1
+        
+    set r to 0
+    repeat while r < 16:
+        set c to 0
+        repeat while c < 16:
+            set val_fixed to 0
+            if r == c:
+                set val_fixed to scale
+            set val_u32 to fixed_to_float32(val_fixed)
+            set float_idx to 160 + 256 + r * 16 + c
+            poke_byte(float_buf and float_idx * 4 and val_u32 modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 1 and (val_u32 / 256) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 2 and (val_u32 / 65536) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 3 and (val_u32 / 16777216) modulo 256)
+            set c to c + 1
+        set r to r + 1
+        
+    set r to 0
+    repeat while r < 16:
+        set c to 0
+        repeat while c < 16:
+            set val_fixed to 0
+            if r == c:
+                set val_fixed to scale
+            set val_u32 to fixed_to_float32(val_fixed)
+            set float_idx to 160 + 512 + r * 16 + c
+            poke_byte(float_buf and float_idx * 4 and val_u32 modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 1 and (val_u32 / 256) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 2 and (val_u32 / 65536) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 3 and (val_u32 / 16777216) modulo 256)
+            set c to c + 1
+        set r to r + 1
+        
+    set r to 0
+    repeat while r < 16:
+        set c to 0
+        repeat while c < 16:
+            set val_fixed to 0
+            if r == c:
+                set val_fixed to scale
+            set val_u32 to fixed_to_float32(val_fixed)
+            set float_idx to 160 + 768 + r * 16 + c
+            poke_byte(float_buf and float_idx * 4 and val_u32 modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 1 and (val_u32 / 256) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 2 and (val_u32 / 65536) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 3 and (val_u32 / 16777216) modulo 256)
+            set c to c + 1
+        set r to r + 1
+        
+    set r to 0
+    repeat while r < 16:
+        set c to 0
+        repeat while c < 16:
+            set val_fixed to 0
+            if r == c:
+                set val_fixed to scale
+            set val_u32 to fixed_to_float32(val_fixed)
+            set float_idx to 160 + 1024 + r * 16 + c
+            poke_byte(float_buf and float_idx * 4 and val_u32 modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 1 and (val_u32 / 256) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 2 and (val_u32 / 65536) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 3 and (val_u32 / 16777216) modulo 256)
+            set c to c + 1
+        set r to r + 1
+        
+    set r to 0
+    repeat while r < 16:
+        set c to 0
+        repeat while c < 16:
+            set val_fixed to 0
+            if r == c:
+                set val_fixed to scale
+            set val_u32 to fixed_to_float32(val_fixed)
+            set float_idx to 160 + 1280 + r * 16 + c
+            poke_byte(float_buf and float_idx * 4 and val_u32 modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 1 and (val_u32 / 256) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 2 and (val_u32 / 65536) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 3 and (val_u32 / 16777216) modulo 256)
+            set c to c + 1
+        set r to r + 1
+        
+    set r to 0
+    repeat while r < 10:
+        set c to 0
+        repeat while c < 16:
+            set val_fixed to 0
+            if c == 1 and also r == 2:
+                set val_fixed to scale
+            if c == 2 and also r == 5:
+                set val_fixed to scale
+            if c == 5 and also r == 6:
+                set val_fixed to scale
+            if c == 6 and also r == 7:
+                set val_fixed to scale
+            if c == 7 and also r == 0:
+                set val_fixed to scale
+                
+            set val_u32 to fixed_to_float32(val_fixed)
+            set float_idx to 160 + 1536 + r * 16 + c
+            poke_byte(float_buf and float_idx * 4 and val_u32 modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 1 and (val_u32 / 256) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 2 and (val_u32 / 65536) modulo 256)
+            poke_byte(float_buf and float_idx * 4 + 3 and (val_u32 / 16777216) modulo 256)
+            set c to c + 1
+        set r to r + 1
+        
+    write_bytes(file_ptr and float_buf and num_floats * 4 and fn_fwrite)
+    free_bytes(float_buf)
+    
+    ep_dlcall1(fn_fclose and file_ptr)
+    return 0
+
+# ════════════════════════════════════════════════════════════════
+# Main Integration Tests
+# ════════════════════════════════════════════════════════════════
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_ai/test_ai.ep Suite"
+    display "  OperationTrojanClaude Phase 9 Integration Test"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+    
+    set gc_guard to create_list()
+    
+    set model_file to "decent_ai/test_model.gguf"
+    set ok to write_test_gguf(model_file)
+    
+    # ════════════════════════════════════════════════════════════════
+    # TEST 1: Model Management & Verification
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 1: Model Management & Verification"
+    
+    # Calculate expected hash of written GGUF file
+    set handle to ep_dlopen("libSystem.B.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("libc.so.6")
+    set fn_fopen to ep_dlsym(handle and "fopen")
+    set fn_fread to ep_dlsym(handle and "fread")
+    set fn_fclose to ep_dlsym(handle and "fclose")
+    
+    set path_ptr to str_to_ptr(model_file)
+    set mode_ptr to str_to_ptr("rb")
+    set file_ptr to ep_dlcall2(fn_fopen and path_ptr and mode_ptr)
+    
+    set fn_fseek to ep_dlsym(handle and "fseek")
+    set fn_ftell to ep_dlsym(handle and "ftell")
+    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 2)
+    set size to ep_dlcall1(fn_ftell and file_ptr)
+    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 0)
+    
+    set buf_ptr to alloc_bytes(size)
+    set read_bytes to ep_dlcall4(fn_fread and buf_ptr and 1 and size and file_ptr)
+    set dummy to ep_dlcall1(fn_fclose and file_ptr)
+    
+    set hash_list to create_list()
+    set ok to append_list(hash_list and 0)
+    set ok to append_list(hash_list and 0)
+    set ok to append_list(hash_list and 0)
+    set ok to append_list(hash_list and 0)
+    
+    set hash_ptr to get_list_data_ptr(hash_list)
+    set dummy to SHA256(buf_ptr and size and hash_ptr)
+    free_bytes(buf_ptr)
+    
+    set expected_hash to ""
+    set word_idx to 0
+    repeat while word_idx < 4:
+        set val to get_list(hash_list and word_idx)
+        set byte_idx to 0
+        repeat while byte_idx < 8:
+            set b to get_byte(val and byte_idx)
+            set expected_hash to concat(expected_hash and byte_to_hex(b))
+            set byte_idx to byte_idx + 1
+        set word_idx to word_idx + 1
+    free_list(hash_list)
+    
+    set ok to append_list(gc_guard and expected_hash)
+    
+    set manager to models_create()
+    set ok to append_list(gc_guard and manager)
+    set manager_values to map_get_val(manager and "values_list")
+    set ok to append_list(gc_guard and manager_values)
+    
+    models_add(manager and "tiny_llama" and model_file and size and expected_hash)
+    
+    set verify_err to models_verify(model_file and expected_hash)
+    if verify_err == 0:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display concat("  FAIL: Verification failed with error: " and int_to_string(verify_err))
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 2: GGUF Model Parser
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 2: GGUF Model Parser"
+    
+    set model to inference_load_model(model_file)
+    set ok to append_list(gc_guard and model)
+    set model_values to map_get_val(model and "values_list")
+    set ok to append_list(gc_guard and model_values)
+    
+    set metadata to map_get_val(model and "metadata")
+    set tensors to map_get_val(model and "tensors")
+    set vocab to map_get_val(model and "vocab")
+    
+    if length_list(vocab) == 10 and also map_size(tensors) == 8:
+        # Check token_embeddings.weight shape
+        set emb_tensor to map_get_val(tensors and "token_embeddings.weight")
+        set dims to map_get_val(emb_tensor and "dims")
+        if get_list(dims and 0) == 16 and also get_list(dims and 1) == 10:
+            display "  PASS"
+            set tests_passed to tests_passed + 1
+        else:
+            display "  FAIL: token_embeddings.weight shape mismatch"
+            set tests_failed to tests_failed + 1
+    else:
+        display "  FAIL: vocab count or tensor count mismatch"
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 3: Tokenization & Detokenization
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 3: Tokenization & Detokenization"
+    
+    set test_str to "hello world decentralized network"
+    set tokens to inference_tokenize(model and test_str)
+    set ok to append_list(gc_guard and tokens)
+    
+    set decoded_str to inference_detokenize(model and tokens)
+    set ok to append_list(gc_guard and decoded_str)
+    
+    if decoded_str equals test_str:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display concat("  FAIL: detokenize mismatch: " and decoded_str)
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 4: Transformer Inference Engine (Text Generation)
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 4: Transformer Inference Engine (Text Generation)"
+    
+    # Prompt is "hello" (token 1).
+    # Since our output.weight maps:
+    # token 1 (hello) -> token 2 (world)
+    # token 2 (world) -> token 5 (decentralized)
+    # token 5 (decentralized) -> token 6 (network)
+    # token 6 (network) -> token 7 (money)
+    # token 7 (money) -> token 0 (EOS)
+    # The output should be "world decentralized network money"!
+    set gen_text to inference_run(model and "hello" and 0 and 5)
+    set ok to append_list(gc_guard and gen_text)
+    
+    display concat("  DEBUG: Generated response: '" and concat(gen_text and "'"))
+    
+    if gen_text equals "world decentralized network money":
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: Generated response mismatch"
+        set tests_failed to tests_failed + 1
+        
+    # ════════════════════════════════════════════════════════════════
+    # TEST 5: Vector Embeddings & Similarity Search
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 5: Vector Embeddings & Similarity Search"
+    
+    set emb_hello to embeddings_generate(model and "hello")
+    set ok to append_list(gc_guard and emb_hello)
+    set emb_world to embeddings_generate(model and "world")
+    set ok to append_list(gc_guard and emb_world)
+    set emb_hello_world to embeddings_generate(model and "hello world")
+    set ok to append_list(gc_guard and emb_hello_world)
+    
+    # Compute similarity: hello should be more similar to "hello world" than world is to a completely different term
+    set sim_hello_world to embeddings_cosine_similarity(emb_hello and emb_hello_world)
+    set sim_world_helloworld to embeddings_cosine_similarity(emb_world and emb_hello_world)
+    set sim_hello_world_self to embeddings_cosine_similarity(emb_hello and emb_hello)
+    
+    display concat("  DEBUG: sim(hello, hello_world) = " and int_to_string(sim_hello_world))
+    display concat("  DEBUG: sim(world, hello_world) = " and int_to_string(sim_world_helloworld))
+    display concat("  DEBUG: sim(hello, hello)       = " and int_to_string(sim_hello_world_self))
+    
+    # Cosine similarity self-similarity should be 1.0 (1,000,000)
+    if sim_hello_world_self >= 999900 and also sim_hello_world > 0:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: Cosine similarity calculation is incorrect"
+        set tests_failed to tests_failed + 1
+        
+    free_list(emb_hello)
+    free_list(emb_world)
+    free_list(emb_hello_world)
+    
+    # ════════════════════════════════════════════════════════════════
+    # TEST 6: Speech-to-Text Transcription
+    # ════════════════════════════════════════════════════════════════
+    display "TEST 6: Speech-to-Text Transcription"
+    
+    # Create simulated audio PCM input (48 samples = 3 frames of size 16)
+    # Frame 0: element 1 is high (projects to token 2 = world)
+    # Frame 1: element 2 is high (projects to token 5 = decentralized)
+    # Frame 2: element 5 is high (projects to token 6 = network)
+    # Output weight maps: w_out[r * 16 + c] * x[c].
+    # So if we make x have a high value at index c, the product w_out[r * 16 + c] * x[c] will be large for the mapped r!
+    set scale to 1000000
+    set audio_pcm to create_list()
+    set ok to append_list(gc_guard and audio_pcm)
+    
+    # Frame 0: index 1 is scale (1.0), others 0
+    set f0_i to 0
+    repeat while f0_i < 16:
+        if f0_i == 1:
+            set ok to append_list(audio_pcm and scale)
+        else:
+            set ok to append_list(audio_pcm and 0)
+        set f0_i to f0_i + 1
+        
+    # Frame 1: index 2 is scale (1.0)
+    set f1_i to 0
+    repeat while f1_i < 16:
+        if f1_i == 2:
+            set ok to append_list(audio_pcm and scale)
+        else:
+            set ok to append_list(audio_pcm and 0)
+        set f1_i to f1_i + 1
+        
+    # Frame 2: index 5 is scale (1.0)
+    set f2_i to 0
+    repeat while f2_i < 16:
+        if f2_i == 5:
+            set ok to append_list(audio_pcm and scale)
+        else:
+            set ok to append_list(audio_pcm and 0)
+        set f2_i to f2_i + 1
+        
+    set transcribed_text to speech_transcribe_reference(model and audio_pcm)
+    set ok to append_list(gc_guard and transcribed_text)
+    
+    display concat("  DEBUG: Transcribed speech: '" and concat(transcribed_text and "'"))
+    
+    if transcribed_text equals "world decentralized network":
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        display "  FAIL: Transcribed text mismatch"
+        set tests_failed to tests_failed + 1
+        
+    display ""
+    display "==================================================="
+    display "  RESULTS:"
+    display concat("  Passed: " and int_to_string(tests_passed))
+    display concat("  Failed: " and int_to_string(tests_failed))
+    display "==================================================="
+    
+    if length_list(gc_guard) >= 0:
+        set dummy to 1
+        
+    if tests_failed > 0:
+        return 1
+    return 0

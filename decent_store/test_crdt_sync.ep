@@ -1,0 +1,199 @@
+# ErnosDecent -- Integration Test for CRDT Synchronization Daemon
+# Component: decent_store/test_crdt_sync.ep
+# Status: Production
+
+import "crdt"
+import "sync_daemon"
+import "string"
+import "collections"
+import "../decent_net/transport"
+
+define run_server_step with listen_fd as Int and vc_b as Map and store_b as Map and ch as Int returning Int:
+    set temp_listener to create_map()
+    set ok to map_insert(temp_listener and "fd" and listen_fd)
+    
+    set res to sync_server_handle_once(temp_listener and vc_b and store_b)
+    free_map(temp_listener)
+    
+    if res != 0:
+        send 0 to ch
+        free_map(vc_b)
+        free_map(store_b)
+        return 1
+        
+    # Verify Node B's state
+    set ver_ok to 1
+    
+    if vector_clock_get(vc_b and "node_a") != 2:
+        set ver_ok to 0
+    if vector_clock_get(vc_b and "node_b") != 2:
+        set ver_ok to 0
+        
+    set reg_foo to map_get_val(store_b and "foo")
+    if reg_foo == 0:
+        set ver_ok to 0
+    else:
+        set val_foo to lww_get(reg_foo)
+        if val_foo equals "value_b" == 0:
+            set ver_ok to 0
+            
+    set reg_bar to map_get_val(store_b and "bar")
+    if reg_bar == 0:
+        set ver_ok to 0
+    else:
+        set val_bar to lww_get(reg_bar)
+        if val_bar equals "only_on_a" == 0:
+            set ver_ok to 0
+            
+    set reg_baz to map_get_val(store_b and "baz")
+    if reg_baz == 0:
+        set ver_ok to 0
+    else:
+        set val_baz to lww_get(reg_baz)
+        if val_baz equals "only_on_b" == 0:
+            set ver_ok to 0
+            
+    send ver_ok to ch
+    
+    free_map(vc_b)
+    free_map(store_b)
+    return 0
+
+define main returning Int:
+    display "==================================================="
+    display "  ErnosDecent -- CRDT Synchronization Test"
+    display "  Simulating network partition and healing..."
+    display "==================================================="
+    display ""
+
+    # 1. Initialize two mock nodes
+    set vc_a to vector_clock_create()
+    set vc_b to vector_clock_create()
+
+    set store_a to create_map()
+    set store_b to create_map()
+
+    # 2. Establish common state before partition
+    set ok to vector_clock_set(vc_a and "node_a" and 1)
+    set ok to vector_clock_set(vc_a and "node_b" and 1)
+    set ok to vector_clock_set(vc_b and "node_a" and 1)
+    set ok to vector_clock_set(vc_b and "node_b" and 1)
+
+    set reg_initial_a to lww_create("node_a" and "initial")
+    set ok to map_insert(reg_initial_a and "timestamp" and 1000)
+    set ok to map_insert(store_a and "foo" and reg_initial_a)
+
+    set reg_initial_b to lww_create("node_a" and "initial")
+    set ok to map_insert(reg_initial_b and "timestamp" and 1000)
+    set ok to map_insert(store_b and "foo" and reg_initial_b)
+
+    # 3. Simulate network partition - concurrent updates
+    # Node A updates "foo" with ts=2000, writes "bar"
+    set ok to vector_clock_increment(vc_a and "node_a")
+    set reg_update_a to lww_create("node_a" and "value_a")
+    set ok to map_insert(reg_update_a and "timestamp" and 2000)
+    set ok to map_insert(store_a and "foo" and reg_update_a)
+
+    set reg_bar to lww_create("node_a" and "only_on_a")
+    set ok to map_insert(reg_bar and "timestamp" and 1500)
+    set ok to map_insert(store_a and "bar" and reg_bar)
+
+    # Node B updates "foo" with ts=3000 (wins), writes "baz"
+    set ok to vector_clock_increment(vc_b and "node_b")
+    set reg_update_b to lww_create("node_b" and "value_b")
+    set ok to map_insert(reg_update_b and "timestamp" and 3000)
+    set ok to map_insert(store_b and "foo" and reg_update_b)
+
+    set reg_baz to lww_create("node_b" and "only_on_b")
+    set ok to map_insert(reg_baz and "timestamp" and 2500)
+    set ok to map_insert(store_b and "baz" and reg_baz)
+
+    # 4. Set up communication channel and execute sync daemon loop
+    set listener to transport_listen(9990)
+    set listen_err to map_get_val(listener and "error")
+    if listen_err != TRANSPORT_ERR_NONE:
+        display "  FAIL: Listener setup failed"
+        free_map(vc_a)
+        free_map(vc_b)
+        free_map(store_a)
+        free_map(store_b)
+        free_map(listener)
+        return 1
+
+    set listen_fd to map_get_val(listener and "fd")
+    set ch to create_channel()
+    
+    spawn run_server_step(listen_fd and vc_b and store_b and ch)
+
+    # Sleep to allow server socket to bind
+    set ok to ep_sleep_ms(100)
+
+    display "Executing sync_client_run connecting to listener..."
+    set client_res to sync_client_run("127.0.0.1" and 9990 and vc_a and store_a)
+    if client_res != 0:
+        display "  FAIL: sync_client_run returned failure code"
+        set ok to transport_close(listener)
+        free_map(vc_a)
+        free_map(store_a)
+        free_map(listener)
+        return 1
+
+    set ok to transport_close(listener)
+    free_map(listener)
+
+    # 5. Verification of Node A (main thread)
+    set a_ok to 1
+
+    # Check clock sequence numbers
+    if vector_clock_get(vc_a and "node_a") != 2:
+        set a_ok to 0
+    if vector_clock_get(vc_a and "node_b") != 2:
+        set a_ok to 0
+
+    # Check LWW-Register foo (Node B's ts=3000 wins over Node A's ts=2000)
+    set reg_a_foo to map_get_val(store_a and "foo")
+    if reg_a_foo == 0:
+        set a_ok to 0
+    else:
+        set val_a_foo to lww_get(reg_a_foo)
+        if val_a_foo equals "value_b" == 0:
+            set a_ok to 0
+
+    # Check LWW-Register bar
+    set reg_a_bar to map_get_val(store_a and "bar")
+    if reg_a_bar == 0:
+        set a_ok to 0
+    else:
+        set val_a_bar to lww_get(reg_a_bar)
+        if val_a_bar equals "only_on_a" == 0:
+            set a_ok to 0
+
+    # Check LWW-Register baz
+    set reg_a_baz to map_get_val(store_a and "baz")
+    if reg_a_baz == 0:
+        set a_ok to 0
+    else:
+        set val_a_baz to lww_get(reg_a_baz)
+        if val_a_baz equals "only_on_b" == 0:
+            set a_ok to 0
+
+    # Receive server verification status from channel
+    set server_ver to receive from ch
+
+    if a_ok == 0:
+        display "  FAIL: Node A state verification failed"
+        free_map(vc_a)
+        free_map(store_a)
+        return 1
+
+    if server_ver == 0:
+        display "  FAIL: Node B state verification failed"
+        free_map(vc_a)
+        free_map(store_a)
+        return 1
+
+    display "  PASS: Vector clocks and LWW-Register stores synchronized successfully on both nodes!"
+    
+    free_map(vc_a)
+    free_map(store_a)
+    return 0

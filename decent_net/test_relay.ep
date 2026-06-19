@@ -1,0 +1,410 @@
+# ErnosDecent -- Test Suite for decent_net/relay.ep
+# Tests: Registration, circuits, data relay, heartbeat, stats
+# Status: Production -- OperationTrojanClaude Phase 3
+
+import "relay"
+import "../decent_id/keys"
+import "string"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_net/relay.ep Test Suite"
+    display "  OperationTrojanClaude Phase 3"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # ===========================================================
+    # TEST 1: Create relay node
+    # ===========================================================
+    display "TEST 1: Create relay node"
+    set t1_ok to 1
+    set relay_id to generate_random_node_id()
+    set relay to create_relay_node(relay_id)
+    set stats to relay_get_stats(relay)
+    if map_get_val(stats and "registrations") != 0:
+        display "  FAIL: should have 0 registrations"
+        set t1_ok to 0
+    if map_get_val(stats and "circuits") != 0:
+        display "  FAIL: should have 0 circuits"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: Register a node
+    # ===========================================================
+    display "TEST 2: Register a node"
+    set t2_ok to 1
+    set alice_id to generate_random_node_id()
+    set alice_pub to "aabbccdd00112233445566778899aabbccddeeff0011223344556677aabbccdd"
+    set reg_err to relay_register(relay and alice_id and alice_pub)
+    if reg_err != RELAY_ERR_NONE:
+        display "  FAIL: register should succeed"
+        set t2_ok to 0
+    if relay_is_registered(relay and alice_id) != 1:
+        display "  FAIL: should be registered"
+        set t2_ok to 0
+    set stats2 to relay_get_stats(relay)
+    if map_get_val(stats2 and "registrations") != 1:
+        display "  FAIL: count should be 1"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: Re-register refreshes (no duplicate)
+    # ===========================================================
+    display "TEST 3: Re-register refreshes"
+    set t3_ok to 1
+    set reg_err2 to relay_register(relay and alice_id and alice_pub)
+    if reg_err2 != RELAY_ERR_NONE:
+        display "  FAIL: re-register should succeed"
+        set t3_ok to 0
+    set stats3 to relay_get_stats(relay)
+    if map_get_val(stats3 and "registrations") != 1:
+        display "  FAIL: count should still be 1"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: Unregister
+    # ===========================================================
+    display "TEST 4: Unregister"
+    set t4_ok to 1
+    set bob_id to generate_random_node_id()
+    set bob_pub to "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+    set ok to relay_register(relay and bob_id and bob_pub)
+
+    set stats4a to relay_get_stats(relay)
+    if map_get_val(stats4a and "registrations") != 2:
+        display "  FAIL: should have 2"
+        set t4_ok to 0
+
+    set unreg_err to relay_unregister(relay and bob_id)
+    if unreg_err != RELAY_ERR_NONE:
+        display "  FAIL: unregister should succeed"
+        set t4_ok to 0
+    if relay_is_registered(relay and bob_id) != 0:
+        display "  FAIL: should not be registered"
+        set t4_ok to 0
+    set stats4b to relay_get_stats(relay)
+    if map_get_val(stats4b and "registrations") != 1:
+        display "  FAIL: count should be 1 again"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: Unregister non-existent fails
+    # ===========================================================
+    display "TEST 5: Unregister non-existent fails"
+    set t5_ok to 1
+    set fake_id to generate_random_node_id()
+    set unreg_err2 to relay_unregister(relay and fake_id)
+    if unreg_err2 != RELAY_ERR_NOT_REGISTERED:
+        display "  FAIL: should return NOT_REGISTERED"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Create circuit to registered node
+    # ===========================================================
+    display "TEST 6: Create circuit"
+    set t6_ok to 1
+    # Re-register bob for this test
+    set ok to relay_register(relay and bob_id and bob_pub)
+    set charlie_id to generate_random_node_id()
+
+    # Charlie wants to reach alice through the relay
+    set circuit_result to relay_create_circuit(relay and charlie_id and alice_id)
+    set circuit_err to map_get_val(circuit_result and "error")
+    if circuit_err != RELAY_ERR_NONE:
+        display "  FAIL: circuit creation should succeed"
+        set t6_ok to 0
+
+    set circuit_id to map_get_val(circuit_result and "circuit_id")
+    if string_length(circuit_id) != 64:
+        display "  FAIL: circuit ID should be 64 hex chars"
+        set t6_ok to 0
+
+    set stats6 to relay_get_stats(relay)
+    if map_get_val(stats6 and "circuits") != 1:
+        display "  FAIL: should have 1 circuit"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: Circuit to unregistered node fails
+    # ===========================================================
+    display "TEST 7: Circuit to unregistered fails"
+    set t7_ok to 1
+    set unknown_id to generate_random_node_id()
+    set bad_circuit to relay_create_circuit(relay and charlie_id and unknown_id)
+    set bad_err to map_get_val(bad_circuit and "error")
+    if bad_err != RELAY_ERR_NOT_FOUND:
+        display "  FAIL: should return NOT_FOUND"
+        set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: Forward data through circuit
+    # ===========================================================
+    display "TEST 8: Forward data through circuit"
+    set t8_ok to 1
+    set encrypted_payload to "deadbeefcafebabe0011223344556677"
+    set fwd to relay_forward_data(relay and circuit_id and encrypted_payload)
+    set fwd_err to map_get_val(fwd and "error")
+    if fwd_err != RELAY_ERR_NONE:
+        display "  FAIL: forward should succeed"
+        set t8_ok to 0
+
+    set fwd_target to map_get_val(fwd and "target")
+    if fwd_target equals alice_id:
+        set ok to 1
+    else:
+        display "  FAIL: target should be alice"
+        set t8_ok to 0
+
+    set fwd_data to map_get_val(fwd and "data")
+    if fwd_data equals encrypted_payload:
+        set ok to 1
+    else:
+        display "  FAIL: data should be unchanged"
+        set t8_ok to 0
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9: Circuit stats track data
+    # ===========================================================
+    display "TEST 9: Circuit stats"
+    set t9_ok to 1
+    set cs to relay_get_circuit_stats(relay and circuit_id)
+    if map_get_val(cs and "error") != RELAY_ERR_NONE:
+        display "  FAIL: circuit stats should succeed"
+        set t9_ok to 0
+
+    set msgs_relayed to map_get_val(cs and "messages_relayed")
+    if msgs_relayed != 1:
+        display f"  FAIL: should have 1 message relayed, got {msgs_relayed}"
+        set t9_ok to 0
+
+    set bytes_relayed to map_get_val(cs and "bytes_relayed")
+    if bytes_relayed != 16:
+        display f"  FAIL: should have 16 bytes relayed, got {bytes_relayed}"
+        set t9_ok to 0
+
+    if t9_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 10: Close circuit
+    # ===========================================================
+    display "TEST 10: Close circuit"
+    set t10_ok to 1
+    set close_err to relay_close_circuit(relay and circuit_id)
+    if close_err != RELAY_ERR_NONE:
+        display "  FAIL: close should succeed"
+        set t10_ok to 0
+
+    # Forwarding on closed circuit should fail
+    set fwd2 to relay_forward_data(relay and circuit_id and "aabbccdd")
+    set fwd2_err to map_get_val(fwd2 and "error")
+    if fwd2_err == RELAY_ERR_NONE:
+        display "  FAIL: forward on closed circuit should fail"
+        set t10_ok to 0
+
+    if t10_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 11: RPC REGISTER message
+    # ===========================================================
+    display "TEST 11: RPC REGISTER"
+    set t11_ok to 1
+    set relay2 to create_relay_node(generate_random_node_id())
+    set dave_id to generate_random_node_id()
+    set dave_pub to "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
+    set reg_msg to create_relay_register_msg(dave_id and dave_pub)
+    set reg_resp to relay_handle_message(relay2 and reg_msg)
+    if map_get_val(reg_resp and "error") != RELAY_ERR_NONE:
+        display "  FAIL: register should succeed"
+        set t11_ok to 0
+    set reg_reply to map_get_val(reg_resp and "reply")
+    if map_get_val(reg_reply and "type") != RELAY_MSG_REGISTER_ACK:
+        display "  FAIL: should be REGISTER_ACK"
+        set t11_ok to 0
+    if relay_is_registered(relay2 and dave_id) != 1:
+        display "  FAIL: dave should be registered"
+        set t11_ok to 0
+
+    if t11_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 12: RPC CONNECT + DATA flow
+    # ===========================================================
+    display "TEST 12: RPC CONNECT + DATA flow"
+    set t12_ok to 1
+    set eve_id to generate_random_node_id()
+
+    # Eve connects to Dave through relay2
+    set conn_msg to create_relay_connect_msg(eve_id and dave_id)
+    set conn_resp to relay_handle_message(relay2 and conn_msg)
+    if map_get_val(conn_resp and "error") != RELAY_ERR_NONE:
+        display "  FAIL: connect should succeed"
+        set t12_ok to 0
+    set conn_reply to map_get_val(conn_resp and "reply")
+    set cid to map_get_val(conn_reply and "circuit_id")
+    if string_length(cid) != 64:
+        display "  FAIL: circuit ID wrong length"
+        set t12_ok to 0
+
+    # Eve sends encrypted data
+    set data_msg to create_relay_data_msg(eve_id and cid and "ff00ff00ff00ff00")
+    set data_resp to relay_handle_message(relay2 and data_msg)
+    if map_get_val(data_resp and "error") != RELAY_ERR_NONE:
+        display "  FAIL: data relay should succeed"
+        set t12_ok to 0
+    set data_reply to map_get_val(data_resp and "reply")
+    set relay_target to map_get_val(data_reply and "target")
+    if relay_target equals dave_id:
+        set ok to 1
+    else:
+        display "  FAIL: target should be dave"
+        set t12_ok to 0
+
+    if t12_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 13: RPC HEARTBEAT
+    # ===========================================================
+    display "TEST 13: RPC HEARTBEAT"
+    set t13_ok to 1
+    set hb_msg to create_relay_heartbeat_msg(dave_id)
+    set hb_resp to relay_handle_message(relay2 and hb_msg)
+    if map_get_val(hb_resp and "error") != RELAY_ERR_NONE:
+        display "  FAIL: heartbeat should succeed"
+        set t13_ok to 0
+    set hb_reply to map_get_val(hb_resp and "reply")
+    if map_get_val(hb_reply and "type") != RELAY_MSG_HEARTBEAT_ACK:
+        display "  FAIL: should be HEARTBEAT_ACK"
+        set t13_ok to 0
+
+    if t13_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 14: RPC DISCONNECT
+    # ===========================================================
+    display "TEST 14: RPC DISCONNECT"
+    set t14_ok to 1
+    set disc_msg to create_relay_disconnect_msg(eve_id and cid)
+    set disc_resp to relay_handle_message(relay2 and disc_msg)
+    if map_get_val(disc_resp and "error") != RELAY_ERR_NONE:
+        display "  FAIL: disconnect should succeed"
+        set t14_ok to 0
+
+    # Data on disconnected circuit should fail
+    set data2_msg to create_relay_data_msg(eve_id and cid and "aabbccdd")
+    set data2_resp to relay_handle_message(relay2 and data2_msg)
+    if map_get_val(data2_resp and "error") == RELAY_ERR_NONE:
+        display "  FAIL: data on closed circuit should fail"
+        set t14_ok to 0
+
+    if t14_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 15: Get public key of registered node
+    # ===========================================================
+    display "TEST 15: Get registered node public key"
+    set t15_ok to 1
+    set got_pub to relay_get_pub_hex(relay and alice_id)
+    if got_pub equals alice_pub:
+        set ok to 1
+    else:
+        display "  FAIL: pub key mismatch"
+        set t15_ok to 0
+
+    # Non-existent node returns empty
+    set no_pub to relay_get_pub_hex(relay and unknown_id)
+    if string_length(no_pub) != 0:
+        display "  FAIL: should return empty for unknown"
+        set t15_ok to 0
+
+    if t15_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    display "==================================================="
+    return 0

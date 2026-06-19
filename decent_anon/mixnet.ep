@@ -1,0 +1,124 @@
+# ErnosDecent — Mix Network (Timing Jitter & Shuffling)
+# Component: decent_anon/mixnet.ep
+# Implements: Packet queues, Fisher-Yates shuffling, and randomized timing delay (jitter)
+# Status: Production — OperationTrojanClaude Phase 11
+
+import "collections"
+import "../decent_net/transport"
+
+# ================================================================
+# Initialization & State
+# ================================================================
+
+define mixnet_create_pool with delay_ms as Int and max_size as Int returning Map:
+    set pool to create_map()
+    set packets to create_list()
+    set ok to map_insert(pool and "packets" and packets)
+    set ok to map_insert(pool and "delay_ms" and delay_ms)
+    set ok to map_insert(pool and "max_size" and max_size)
+    return pool
+
+# ================================================================
+# Queue Management
+# ================================================================
+
+define mixnet_add_packet with pool as Map and packet_json as Str returning Int:
+    set packets to map_get_val(pool and "packets")
+    set ptr to str_to_ptr(packet_json)
+    set ok to append_list(packets and ptr)
+
+    set max_size to map_get_val(pool and "max_size")
+    set current_size to length_list(packets)
+    if current_size >= max_size:
+        return 1
+    return 0
+
+# ================================================================
+# Mixing & Flushing (Fisher-Yates + Jitter)
+# ================================================================
+
+define mixnet_flush_pool with pool as Map returning List:
+    set packets to map_get_val(pool and "packets")
+    set len to length_list(packets)
+    if len == 0:
+        return packets
+
+    # Fisher-Yates Shuffle
+    set i to len - 1
+    repeat while i > 0:
+        set j to ep_random_int(0 and i)
+        set temp to get_list(packets and i)
+        set ok to set_list(packets and i and get_list(packets and j))
+        set ok to set_list(packets and j and temp)
+        set i to i - 1
+
+    # Jittered timing delay
+    set delay_ms to map_get_val(pool and "delay_ms")
+    set idx to 0
+    repeat while idx < len:
+        set jitter_range to delay_ms / 5
+        if jitter_range <= 0:
+            set jitter_range to 1
+        set jitter to ep_random_int(0 - jitter_range and jitter_range)
+        set sleep_time to delay_ms + jitter
+        if sleep_time > 0:
+            set ok to ep_sleep_ms(sleep_time)
+        set idx to idx + 1
+
+    # Reset pool queue list
+    set empty_list to create_list()
+    set ok to map_insert(pool and "packets" and empty_list)
+    return packets
+
+# ================================================================
+# TCP Networking — multi-hop forwarding
+# ================================================================
+
+define mixnet_forward_packets with packets as List and next_hop_address as Str and next_hop_port as Int returning Int:
+    # After flush, forward shuffled packets to the next relay hop over TCP
+    set conn to transport_connect(next_hop_address and next_hop_port)
+    set err to map_get_val(conn and "error")
+    if err != 0:
+        return 1
+
+    set count to length_list(packets)
+    set i to 0
+    repeat while i < count:
+        set pkt_ptr to get_list(packets and i)
+        set pkt_str to ptr_to_str(pkt_ptr)
+        set ok to transport_send(conn and "MIXNET_PACKET" and pkt_str)
+        set i to i + 1
+
+    set ok to transport_close(conn)
+    return 0
+
+define mixnet_receive_loop with pool as Map and port as Int and next_hop_address as Str and next_hop_port as Int returning Int:
+    # Listen for incoming packets, add to mixing pool, flush when full
+    set listener to transport_listen(port)
+    set err to map_get_val(listener and "error")
+    if err != 0:
+        return 1
+
+    set conn to transport_accept(listener)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != 0:
+        set ok to transport_close(listener)
+        return 2
+
+    # Receive packets until connection closes
+    set receiving to 1
+    repeat while receiving == 1:
+        set msg to transport_recv(conn)
+        set recv_err to map_get_val(msg and "error")
+        if recv_err != 0:
+            set receiving to 0
+        else:
+            set payload to map_get_val(msg and "payload")
+            set should_flush to mixnet_add_packet(pool and payload)
+            if should_flush == 1:
+                set flushed to mixnet_flush_pool(pool)
+                set fwd_ok to mixnet_forward_packets(flushed and next_hop_address and next_hop_port)
+
+    set ok to transport_close(conn)
+    set ok to transport_close(listener)
+    return 0

@@ -1,0 +1,750 @@
+# ErnosDecent -- Conflict-free Replicated Data Types (CRDTs)
+# Component: decent_store/crdt.ep
+# Implements: G-Counter, PN-Counter, LWW-Register, OR-Set, MV-Register
+#             All CRDTs support merge for eventual consistency
+# Spec: Shapiro et al., "A Comprehensive Study of CRDTs" (2011)
+# Status: Production -- OperationTrojanClaude Phase 4
+
+import "../decent_id/keys"
+import "string"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set CRDT_ERR_NONE to 0
+set CRDT_ERR_INVALID_TYPE to 801
+set CRDT_ERR_INVALID_REPLICA to 802
+set CRDT_ERR_NOT_FOUND to 803
+set CRDT_ERR_MERGE_TYPE_MISMATCH to 804
+
+set CRDT_TYPE_G_COUNTER to 1
+set CRDT_TYPE_PN_COUNTER to 2
+set CRDT_TYPE_LWW_REGISTER to 3
+set CRDT_TYPE_OR_SET to 4
+set CRDT_TYPE_MV_REGISTER to 5
+
+# ================================================================
+# G-Counter (Grow-only counter)
+# Each replica has its own entry. Value = sum of all entries.
+# Merge: take max of each replica's entry.
+# ================================================================
+
+define gcounter_create with replica_id as Str:
+    set counter to create_map()
+    set ok to map_insert(counter and "type" and CRDT_TYPE_G_COUNTER)
+    set ok to map_insert(counter and "replica_id" and replica_id)
+    set entries to create_map()
+    set ok to map_insert(entries and replica_id and 0)
+    set ok to map_insert(counter and "entries" and entries)
+    set replica_list to create_list()
+    set ok to append_list(replica_list and replica_id)
+    set ok to map_insert(counter and "replicas" and replica_list)
+    set ok to map_insert(counter and "replica_count" and 1)
+    return counter
+
+define gcounter_increment with counter as Int:
+    set replica_id to map_get_val(counter and "replica_id")
+    set entries to map_get_val(counter and "entries")
+    set current to map_get_val(entries and replica_id)
+    set ok to map_insert(entries and replica_id and current + 1)
+    return CRDT_ERR_NONE
+
+define gcounter_increment_by with counter as Int and amount as Int:
+    set replica_id to map_get_val(counter and "replica_id")
+    set entries to map_get_val(counter and "entries")
+    set current to map_get_val(entries and replica_id)
+    set ok to map_insert(entries and replica_id and current + amount)
+    return CRDT_ERR_NONE
+
+define gcounter_value with counter as Int returning Int:
+    set entries to map_get_val(counter and "entries")
+    set replicas to map_get_val(counter and "replicas")
+    set count to map_get_val(counter and "replica_count")
+    set total to 0
+    set i to 0
+    repeat while i < count:
+        set rid to get_list(replicas and i)
+        set val to map_get_val(entries and rid)
+        set total to total + val
+        set i to i + 1
+    return total
+
+define gcounter_local_value with counter as Int returning Int:
+    set replica_id to map_get_val(counter and "replica_id")
+    set entries to map_get_val(counter and "entries")
+    return map_get_val(entries and replica_id)
+
+define gcounter_merge with local as Int and remote as Int returning Int:
+    # Merge remote G-Counter into local
+    # For each replica: take max(local, remote)
+    set local_type to map_get_val(local and "type")
+    set remote_type to map_get_val(remote and "type")
+    if local_type != CRDT_TYPE_G_COUNTER:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+    if remote_type != CRDT_TYPE_G_COUNTER:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+
+    set local_entries to map_get_val(local and "entries")
+    set remote_entries to map_get_val(remote and "entries")
+    set remote_replicas to map_get_val(remote and "replicas")
+    set remote_count to map_get_val(remote and "replica_count")
+
+    set local_replicas to map_get_val(local and "replicas")
+    set local_rcount to map_get_val(local and "replica_count")
+
+    set i to 0
+    repeat while i < remote_count:
+        set rid to get_list(remote_replicas and i)
+        set remote_val to map_get_val(remote_entries and rid)
+        set local_val to map_get_val(local_entries and rid)
+
+        # Check if this replica exists locally
+        set found to 0
+        set j to 0
+        repeat while j < local_rcount:
+            set lr to get_list(local_replicas and j)
+            if lr equals rid:
+                set found to 1
+            set j to j + 1
+
+        if found == 0:
+            # New replica: add it
+            set ok to append_list(local_replicas and rid)
+            set local_rcount to local_rcount + 1
+            set ok to map_insert(local and "replica_count" and local_rcount)
+            set ok to map_insert(local_entries and rid and remote_val)
+        else:
+            # Existing replica: take max
+            if remote_val > local_val:
+                set ok to map_insert(local_entries and rid and remote_val)
+
+        set i to i + 1
+
+    return CRDT_ERR_NONE
+
+# ================================================================
+# PN-Counter (Positive-Negative counter)
+# Two G-Counters: one for increments, one for decrements.
+# Value = P - N
+# ================================================================
+
+define pncounter_create with replica_id as Str:
+    set counter to create_map()
+    set ok to map_insert(counter and "type" and CRDT_TYPE_PN_COUNTER)
+    set ok to map_insert(counter and "replica_id" and replica_id)
+    set p to gcounter_create(replica_id)
+    set n to gcounter_create(replica_id)
+    set ok to map_insert(counter and "p" and p)
+    set ok to map_insert(counter and "n" and n)
+    return counter
+
+define pncounter_increment with counter as Int:
+    set p to map_get_val(counter and "p")
+    return gcounter_increment(p)
+
+define pncounter_decrement with counter as Int:
+    set n to map_get_val(counter and "n")
+    return gcounter_increment(n)
+
+define pncounter_increment_by with counter as Int and amount as Int:
+    set p to map_get_val(counter and "p")
+    return gcounter_increment_by(p and amount)
+
+define pncounter_decrement_by with counter as Int and amount as Int:
+    set n to map_get_val(counter and "n")
+    return gcounter_increment_by(n and amount)
+
+define pncounter_value with counter as Int returning Int:
+    set p to map_get_val(counter and "p")
+    set n to map_get_val(counter and "n")
+    return gcounter_value(p) - gcounter_value(n)
+
+define pncounter_merge with local as Int and remote as Int returning Int:
+    set local_type to map_get_val(local and "type")
+    set remote_type to map_get_val(remote and "type")
+    if local_type != CRDT_TYPE_PN_COUNTER:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+    if remote_type != CRDT_TYPE_PN_COUNTER:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+
+    set local_p to map_get_val(local and "p")
+    set remote_p to map_get_val(remote and "p")
+    set err to gcounter_merge(local_p and remote_p)
+    if err != CRDT_ERR_NONE:
+        return err
+
+    set local_n to map_get_val(local and "n")
+    set remote_n to map_get_val(remote and "n")
+    return gcounter_merge(local_n and remote_n)
+
+# ================================================================
+# LWW-Register (Last-Writer-Wins Register)
+# Each update has a timestamp. Merge keeps the latest.
+# ================================================================
+
+define lww_create with replica_id as Str and initial_value as Str:
+    set reg to create_map()
+    set ok to map_insert(reg and "type" and CRDT_TYPE_LWW_REGISTER)
+    set ok to map_insert(reg and "replica_id" and replica_id)
+    set ok to map_insert(reg and "value" and initial_value)
+    set ok to map_insert(reg and "timestamp" and ep_time_now_sec())
+    set ok to map_insert(reg and "writer" and replica_id)
+    return reg
+
+define lww_set with reg as Int and value as Str:
+    set replica_id to map_get_val(reg and "replica_id")
+    set ok to map_insert(reg and "value" and value)
+    set ok to map_insert(reg and "timestamp" and ep_time_now_sec())
+    set ok to map_insert(reg and "writer" and replica_id)
+    return CRDT_ERR_NONE
+
+define lww_set_with_timestamp with reg as Int and value as Str and timestamp as Int:
+    set replica_id to map_get_val(reg and "replica_id")
+    set ok to map_insert(reg and "value" and value)
+    set ok to map_insert(reg and "timestamp" and timestamp)
+    set ok to map_insert(reg and "writer" and replica_id)
+    return CRDT_ERR_NONE
+
+define lww_get with reg as Int returning Str:
+    return map_get_val(reg and "value")
+
+define lww_timestamp with reg as Int returning Int:
+    return map_get_val(reg and "timestamp")
+
+# Deterministic total order on strings (writer ids) for the LWW tiebreaker. Returns 1
+# if a > b. Compares by a fixed character order, then by length — order-independent so
+# all replicas agree.
+define crdt_str_gt with a as Str and b as Str returning Int:
+    set order to "0123456789:;ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+    set la to string_length(a)
+    set lb to string_length(b)
+    set n to la
+    if lb < n:
+        set n to lb
+    set i to 0
+    repeat while i < n:
+        set ca to substring(a and i and 1)
+        set cb to substring(b and i and 1)
+        if ca equals cb:
+            set i to i + 1
+        else:
+            set ia to string_index_of(order and ca)
+            set ib to string_index_of(order and cb)
+            if ia > ib:
+                return 1
+            return 0
+    if la > lb:
+        return 1
+    return 0
+
+define lww_merge with local as Int and remote as Int returning Int:
+    set local_type to map_get_val(local and "type")
+    set remote_type to map_get_val(remote and "type")
+    if local_type != CRDT_TYPE_LWW_REGISTER:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+    if remote_type != CRDT_TYPE_LWW_REGISTER:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+
+    set local_ts to map_get_val(local and "timestamp")
+    set remote_ts to map_get_val(remote and "timestamp")
+
+    if remote_ts > local_ts:
+        set ok to map_insert(local and "value" and map_get_val(remote and "value"))
+        set ok to map_insert(local and "timestamp" and remote_ts)
+        set ok to map_insert(local and "writer" and map_get_val(remote and "writer"))
+    else:
+        # D3: deterministic tiebreaker on EQUAL timestamps — the higher writer-id wins,
+        # so every replica converges to the same value regardless of merge order
+        # (1-second timestamp granularity makes ties common).
+        if remote_ts == local_ts:
+            set local_w to ptr_to_str(map_get_val(local and "writer"))
+            set remote_w to ptr_to_str(map_get_val(remote and "writer"))
+            if crdt_str_gt(remote_w and local_w) == 1:
+                set ok to map_insert(local and "value" and map_get_val(remote and "value"))
+                set ok to map_insert(local and "writer" and map_get_val(remote and "writer"))
+
+    return CRDT_ERR_NONE
+
+# ================================================================
+# OR-Set (Observed-Remove Set)
+# Each element has a unique tag. Add creates new tag. Remove
+# removes all observed tags. Concurrent add wins over remove.
+# ================================================================
+
+define orset_create with replica_id as Str:
+    set s to create_map()
+    set ok to map_insert(s and "type" and CRDT_TYPE_OR_SET)
+    set ok to map_insert(s and "replica_id" and replica_id)
+    # Elements map: element_value -> list of [tag, active] pairs
+    set elements to create_map()
+    set ok to map_insert(s and "elements" and elements)
+    set ok to map_insert(s and "tag_counter" and 0)
+    set ok to map_insert(s and "size" and 0)
+    # Track element keys for iteration (maps are not iterable)
+    set element_keys to create_list()
+    set ok to map_insert(s and "element_keys" and element_keys)
+    set ok to map_insert(s and "key_count" and 0)
+    return s
+
+define orset_generate_tag with s as Int returning Str:
+    set replica_id to map_get_val(s and "replica_id")
+    set counter to map_get_val(s and "tag_counter")
+    set ok to map_insert(s and "tag_counter" and counter + 1)
+    set tag to concat(replica_id and ":")
+    set tag to concat(tag and int_to_string(counter))
+    return tag
+
+define orset_add with s as Int and element as Str returning Int:
+    set elements to map_get_val(s and "elements")
+    set tag to orset_generate_tag(s)
+
+    # Create new entry: [tag, 1 (active)]
+    set entry to create_map()
+    set ok to map_insert(entry and "tag" and tag)
+    set ok to map_insert(entry and "active" and 1)
+
+    set existing_tags to map_get_val(elements and element)
+    if existing_tags == 0:
+        set tag_list to create_list()
+        set ok to append_list(tag_list and entry)
+        set ok to map_insert(elements and element and tag_list)
+        set sz to map_get_val(s and "size")
+        set ok to map_insert(s and "size" and sz + 1)
+        # Track this element key for iteration
+        set element_keys to map_get_val(s and "element_keys")
+        set ok to append_list(element_keys and element)
+        set kc to map_get_val(s and "key_count")
+        set ok to map_insert(s and "key_count" and kc + 1)
+    else:
+        set ok to append_list(existing_tags and entry)
+
+    return CRDT_ERR_NONE
+
+define orset_remove with s as Int and element as Str returning Int:
+    set elements to map_get_val(s and "elements")
+    set tag_list to map_get_val(elements and element)
+    if tag_list == 0:
+        return CRDT_ERR_NOT_FOUND
+
+    # Mark all observed tags as removed
+    set count to length_list(tag_list)
+    set all_removed to 1
+    set i to 0
+    repeat while i < count:
+        set entry to get_list(tag_list and i)
+        set ok to map_insert(entry and "active" and 0)
+        set i to i + 1
+
+    # Check if any active remain
+    if all_removed == 1:
+        set sz to map_get_val(s and "size")
+        set ok to map_insert(s and "size" and sz - 1)
+
+    return CRDT_ERR_NONE
+
+define orset_contains with s as Int and element as Str returning Int:
+    set elements to map_get_val(s and "elements")
+    set tag_list to map_get_val(elements and element)
+    if tag_list == 0:
+        return 0
+
+    set count to length_list(tag_list)
+    set i to 0
+    repeat while i < count:
+        set entry to get_list(tag_list and i)
+        set active to map_get_val(entry and "active")
+        if active == 1:
+            return 1
+        set i to i + 1
+    return 0
+
+define orset_size with s as Int returning Int:
+    return map_get_val(s and "size")
+
+define orset_to_list with s as Int and all_elements as Int:
+    # Populate all_elements list with active elements
+    # Caller should create the list before calling this
+    set elements to map_get_val(s and "elements")
+    set element_keys to map_get_val(s and "element_keys")
+    set key_count to map_get_val(s and "key_count")
+    set ki to 0
+    repeat while ki < key_count:
+        set elem_name to get_list(element_keys and ki)
+        set tag_list to map_get_val(elements and elem_name)
+        if tag_list != 0:
+            set tcount to length_list(tag_list)
+            set has_active to 0
+            set ti to 0
+            repeat while ti < tcount:
+                set entry to get_list(tag_list and ti)
+                set active to map_get_val(entry and "active")
+                if active == 1:
+                    set has_active to 1
+                set ti to ti + 1
+            if has_active == 1:
+                set ok to append_list(all_elements and elem_name)
+        set ki to ki + 1
+    return CRDT_ERR_NONE
+
+define orset_has_tag with tag_list as Int and tag_str as Str returning Int:
+    # Check if a tag already exists in a tag list
+    set tcount to length_list(tag_list)
+    set ti to 0
+    repeat while ti < tcount:
+        set entry to get_list(tag_list and ti)
+        set existing_tag to map_get_val(entry and "tag")
+        if existing_tag equals tag_str:
+            return 1
+        set ti to ti + 1
+    return 0
+
+define orset_has_key with s as Int and element as Str returning Int:
+    # Check if element is already in the element_keys list
+    set element_keys to map_get_val(s and "element_keys")
+    set key_count to map_get_val(s and "key_count")
+    set ki to 0
+    repeat while ki < key_count:
+        set k to get_list(element_keys and ki)
+        if k equals element:
+            return 1
+        set ki to ki + 1
+    return 0
+
+define orset_merge with local as Int and remote as Int returning Int:
+    set local_type to map_get_val(local and "type")
+    set remote_type to map_get_val(remote and "type")
+    if local_type != CRDT_TYPE_OR_SET:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+    if remote_type != CRDT_TYPE_OR_SET:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+
+    # OR-Set merge: union of all tags across both replicas.
+    # A tag is active if active in EITHER replica (add wins).
+    set local_elements to map_get_val(local and "elements")
+    set remote_elements to map_get_val(remote and "elements")
+    set remote_keys to map_get_val(remote and "element_keys")
+    set remote_key_count to map_get_val(remote and "key_count")
+
+    set rki to 0
+    repeat while rki < remote_key_count:
+        set elem_name to get_list(remote_keys and rki)
+        set remote_tag_list to map_get_val(remote_elements and elem_name)
+        set local_tag_list to map_get_val(local_elements and elem_name)
+
+        if local_tag_list == 0:
+            # Element not in local: copy all tags from remote
+            set new_tag_list to create_list()
+            set rtcount to length_list(remote_tag_list)
+            set rti to 0
+            repeat while rti < rtcount:
+                set remote_entry to get_list(remote_tag_list and rti)
+                set copy to create_map()
+                set ok to map_insert(copy and "tag" and map_get_val(remote_entry and "tag"))
+                set ok to map_insert(copy and "active" and map_get_val(remote_entry and "active"))
+                set ok to append_list(new_tag_list and copy)
+                set rti to rti + 1
+            set ok to map_insert(local_elements and elem_name and new_tag_list)
+            # Track the new element key
+            if orset_has_key(local and elem_name) == 0:
+                set local_keys to map_get_val(local and "element_keys")
+                set ok to append_list(local_keys and elem_name)
+                set lkc to map_get_val(local and "key_count")
+                set ok to map_insert(local and "key_count" and lkc + 1)
+            # Update size if any tag is active
+            set has_active_new to 0
+            set chk to 0
+            repeat while chk < rtcount:
+                set ce to get_list(remote_tag_list and chk)
+                if map_get_val(ce and "active") == 1:
+                    set has_active_new to 1
+                set chk to chk + 1
+            if has_active_new == 1:
+                set sz to map_get_val(local and "size")
+                set ok to map_insert(local and "size" and sz + 1)
+        else:
+            # Element exists in both: merge tags
+            set rtcount to length_list(remote_tag_list)
+            set rti to 0
+            repeat while rti < rtcount:
+                set remote_entry to get_list(remote_tag_list and rti)
+                set remote_tag_str to map_get_val(remote_entry and "tag")
+                set remote_active to map_get_val(remote_entry and "active")
+
+                if orset_has_tag(local_tag_list and remote_tag_str) == 0:
+                    # Tag not in local: add it
+                    set copy to create_map()
+                    set ok to map_insert(copy and "tag" and remote_tag_str)
+                    set ok to map_insert(copy and "active" and remote_active)
+                    set ok to append_list(local_tag_list and copy)
+                else:
+                    # Tag exists in both: active if active in EITHER (add wins)
+                    if remote_active == 1:
+                        set ltcount to length_list(local_tag_list)
+                        set lti to 0
+                        repeat while lti < ltcount:
+                            set local_entry to get_list(local_tag_list and lti)
+                            set local_tag_str to map_get_val(local_entry and "tag")
+                            if local_tag_str equals remote_tag_str:
+                                set ok to map_insert(local_entry and "active" and 1)
+                            set lti to lti + 1
+                set rti to rti + 1
+
+        # Recompute size for this element
+        set updated_tags to map_get_val(local_elements and elem_name)
+        set utcount to length_list(updated_tags)
+        set was_active to orset_contains(local and elem_name)
+        set rki to rki + 1
+
+    # Recompute total size from scratch
+    set local_keys_final to map_get_val(local and "element_keys")
+    set lkc_final to map_get_val(local and "key_count")
+    set new_size to 0
+    set fki to 0
+    repeat while fki < lkc_final:
+        set felem to get_list(local_keys_final and fki)
+        if orset_contains(local and felem) == 1:
+            set new_size to new_size + 1
+        set fki to fki + 1
+    set ok to map_insert(local and "size" and new_size)
+
+    return CRDT_ERR_NONE
+
+# ================================================================
+# MV-Register (Multi-Value Register)
+# Like LWW but keeps ALL concurrent writes. Merge = union.
+# Read returns all concurrent values (conflict detected by caller).
+# ================================================================
+
+define mvregister_create with replica_id as Str:
+    set reg to create_map()
+    set ok to map_insert(reg and "type" and CRDT_TYPE_MV_REGISTER)
+    set ok to map_insert(reg and "replica_id" and replica_id)
+    set values to create_list()
+    set ok to map_insert(reg and "values" and values)
+    set ok to map_insert(reg and "version" and 0)
+    return reg
+
+define mvregister_set with reg as Int and value as Str:
+    set replica_id to map_get_val(reg and "replica_id")
+    set version to map_get_val(reg and "version") + 1
+    set ok to map_insert(reg and "version" and version)
+
+    # Replace all values with the new one (this replica's latest)
+    set values to create_list()
+    set entry to create_map()
+    set ok to map_insert(entry and "value" and value)
+    set ok to map_insert(entry and "version" and version)
+    set ok to map_insert(entry and "writer" and replica_id)
+    set ok to map_insert(entry and "timestamp" and ep_time_now_sec())
+    set ok to append_list(values and entry)
+    set ok to map_insert(reg and "values" and values)
+    return CRDT_ERR_NONE
+
+define mvregister_get with reg as Int:
+    # Returns the list of concurrent values
+    return map_get_val(reg and "values")
+
+define mvregister_get_single with reg as Int returning Str:
+    # Convenience: return first value (or "" if empty)
+    set values to map_get_val(reg and "values")
+    set count to length_list(values)
+    if count == 0:
+        return ""
+    set first to get_list(values and 0)
+    return map_get_val(first and "value")
+
+define mvregister_conflict_count with reg as Int returning Int:
+    set values to map_get_val(reg and "values")
+    return length_list(values)
+
+define mvregister_merge with local as Int and remote as Int returning Int:
+    set local_type to map_get_val(local and "type")
+    set remote_type to map_get_val(remote and "type")
+    if local_type != CRDT_TYPE_MV_REGISTER:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+    if remote_type != CRDT_TYPE_MV_REGISTER:
+        return CRDT_ERR_MERGE_TYPE_MISMATCH
+
+    set local_values to map_get_val(local and "values")
+    set remote_values to map_get_val(remote and "values")
+    set remote_count to length_list(remote_values)
+
+    # Add remote values that are not superseded by local values
+    set i to 0
+    repeat while i < remote_count:
+        set remote_entry to get_list(remote_values and i)
+        set remote_writer to map_get_val(remote_entry and "writer")
+        set remote_version to map_get_val(remote_entry and "version")
+
+        # Check if local has a newer version from the same writer
+        set local_count to length_list(local_values)
+        set superseded to 0
+        set j to 0
+        repeat while j < local_count:
+            set local_entry to get_list(local_values and j)
+            set local_writer to map_get_val(local_entry and "writer")
+            if local_writer equals remote_writer:
+                set local_version to map_get_val(local_entry and "version")
+                if local_version >= remote_version:
+                    set superseded to 1
+            set j to j + 1
+
+        if superseded == 0:
+            set ok to append_list(local_values and remote_entry)
+        set i to i + 1
+
+    # Update version to max
+    set local_ver to map_get_val(local and "version")
+    set remote_ver to map_get_val(remote and "version")
+    if remote_ver > local_ver:
+        set ok to map_insert(local and "version" and remote_ver)
+
+    return CRDT_ERR_NONE
+
+# ================================================================
+# Vector Clocks
+# ================================================================
+
+set VC_COMP_EQUAL to 0
+set VC_COMP_DOMINATED to 1
+set VC_COMP_DOMINATING to 2
+set VC_COMP_CONCURRENT to 3
+
+define vector_clock_create returning Map:
+    set vc to create_map()
+    set replicas to create_list()
+    set ok to map_insert(vc and "replicas" and replicas)
+    set ok to map_insert(vc and "count" and 0)
+    return vc
+
+define vector_clock_get with vc as Map and replica_id as Str returning Int:
+    if map_contains(vc and replica_id) == 1:
+        return map_get_val(vc and replica_id)
+    return 0
+
+define vector_clock_set with vc as Map and replica_id as Str and seq as Int returning Int:
+    if map_contains(vc and replica_id) == 0:
+        set replicas to map_get_val(vc and "replicas")
+        set ok to append_list(replicas and replica_id)
+        set count to map_get_val(vc and "count")
+        set ok to map_insert(vc and "count" and count + 1)
+    set ok to map_insert(vc and replica_id and seq)
+    return 0
+
+define vector_clock_increment with vc as Map and replica_id as Str returning Int:
+    set seq to vector_clock_get(vc and replica_id)
+    set ok to vector_clock_set(vc and replica_id and seq + 1)
+    return 0
+
+define vector_clock_merge with local as Map and remote as Map returning Int:
+    set remote_replicas to map_get_val(remote and "replicas")
+    set remote_count to map_get_val(remote and "count")
+    set i to 0
+    repeat while i < remote_count:
+        set rid to get_list(remote_replicas and i)
+        set remote_val to vector_clock_get(remote and rid)
+        set local_val to vector_clock_get(local and rid)
+        if remote_val > local_val:
+            set ok to vector_clock_set(local and rid and remote_val)
+        set i to i + 1
+    return 0
+
+define vector_clock_compare with v1 as Map and v2 as Map returning Int:
+    set v1_replicas to map_get_val(v1 and "replicas")
+    set v1_count to map_get_val(v1 and "count")
+    set v2_replicas to map_get_val(v2 and "replicas")
+    set v2_count to map_get_val(v2 and "count")
+    
+    set all_keys to create_list()
+    
+    set i to 0
+    repeat while i < v1_count:
+        set rid to get_list(v1_replicas and i)
+        set ok to append_list(all_keys and rid)
+        set i to i + 1
+        
+    set i to 0
+    repeat while i < v2_count:
+        set rid to get_list(v2_replicas and i)
+        set found to 0
+        set j to 0
+        set all_len to length_list(all_keys)
+        repeat while j < all_len:
+            set k to get_list(all_keys and j)
+            if k equals rid:
+                set found to 1
+            set j to j + 1
+        if found == 0:
+            set ok to append_list(all_keys and rid)
+        set i to i + 1
+        
+    set greater to 0
+    set lesser to 0
+    set all_len to length_list(all_keys)
+    
+    set i to 0
+    repeat while i < all_len:
+        set rid to get_list(all_keys and i)
+        set val1 to vector_clock_get(v1 and rid)
+        set val2 to vector_clock_get(v2 and rid)
+        
+        if val1 > val2:
+            set greater to 1
+        else if val1 < val2:
+            set lesser to 1
+            
+        set i to i + 1
+        
+    free_list(all_keys)
+    
+    if greater == 1 and lesser == 1:
+        return VC_COMP_CONCURRENT
+    if greater == 1:
+        return VC_COMP_DOMINATING
+    if lesser == 1:
+        return VC_COMP_DOMINATED
+        
+    return VC_COMP_EQUAL
+
+define vector_clock_serialize with vc as Map returning Str:
+    set replicas to map_get_val(vc and "replicas")
+    set count to map_get_val(vc and "count")
+    set s to ""
+    set i to 0
+    repeat while i < count:
+        set rid to ptr_to_str(get_list(replicas and i))
+        set seq to vector_clock_get(vc and rid)
+        set s to concat(s and rid)
+        set s to concat(s and ":")
+        set s to concat(s and int_to_string(seq))
+        if i < count - 1:
+            set s to concat(s and ",")
+        set i to i + 1
+    return s
+
+define vector_clock_deserialize with s as Str returning Map:
+    set vc to vector_clock_create()
+    if string_length(s) == 0:
+        return vc
+    set items to string_split(s and ",")
+    set len to length_list(items)
+    set i to 0
+    repeat while i < len:
+        set item to ptr_to_str(get_list(items and i))
+        set parts to string_split(item and ":")
+        set parts_len to length_list(parts)
+        if parts_len >= 2:
+            set seq_str to ptr_to_str(get_list(parts and parts_len - 1))
+            set seq to string_to_int(seq_str)
+            set rid to ptr_to_str(get_list(parts and 0))
+            set pi to 1
+            repeat while pi < parts_len - 1:
+                set rid to concat(rid and ":")
+                set rid to concat(rid and ptr_to_str(get_list(parts and pi)))
+                set pi to pi + 1
+            set ok to vector_clock_set(vc and rid and seq)
+        free_list(parts)
+        set i to i + 1
+    free_list(items)
+    return vc

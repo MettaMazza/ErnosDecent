@@ -1,0 +1,78 @@
+# Phase J — real libvpx VP8 video codec test.
+# Builds a synthetic 32x32 I420 frame, encodes it through REAL libvpx (VP8 keyframe),
+# and decodes it back. Verifies the encoder produces a non-empty compressed VP8 frame
+# and the decoder reconstructs a full 32x32 I420 image whose luma tracks the input
+# (VP8 is lossy → approximate match, not exact). Honest skip if libvpx is absent.
+
+import "collections"
+import "math"
+import "codec"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set ctx to codec_init()
+    set passes to 0
+
+    set has_vpx to map_get_val(ctx and "has_vpx")
+    set cxif to map_get_val(ctx and "vpx_cx_iface")
+    if has_vpx == 0 or else cxif == 0:
+        display "SKIP: libvpx not available — real-VP8 path not exercised."
+        display "RESULT: 0/0 passed (vpx unavailable)"
+        return 0
+    set passes to passes + pass_if("vpx_cx_iface_resolved" and (cxif != 0))
+
+    set w to 32
+    set h to 32
+    # I420: Y = w*h, U = V = (w/2)*(h/2). Y is a horizontal gradient; U/V flat 128.
+    set frame to create_list()
+    set r to 0
+    repeat while r < h:
+        set c to 0
+        repeat while c < w:
+            set ok to append_list(frame and (c * 8) modulo 256)
+            set c to c + 1
+        set r to r + 1
+    set chroma_count to (w / 2) * (h / 2) * 2
+    set k to 0
+    repeat while k < chroma_count:
+        set ok to append_list(frame and 128)
+        set k to k + 1
+
+    set enc to codec_encode_video(ctx and frame and w and h)
+    set ew to get_list(enc and 0)
+    set eh to get_list(enc and 1)
+    set esz to get_list(enc and 2)
+    set passes to passes + pass_if("encode_dims_preserved" and (ew == 32 and also eh == 32))
+    set passes to passes + pass_if("vp8_frame_nonempty" and (esz > 0))
+    # a 32x32 keyframe compresses well below the raw 1536-byte I420 frame
+    set passes to passes + pass_if("vp8_frame_compressed" and (esz < 1536))
+
+    set dec to codec_decode_video(ctx and enc and w and h)
+    set dlen to length_list(dec)
+    set passes to passes + pass_if("decode_full_i420" and (dlen == 1536))
+
+    # luma fidelity: the decoded gradient should track the input (lossy → tolerance).
+    set match to 0
+    set checks to 0
+    set idx to 0
+    repeat while idx < 1024:
+        set orig to get_list(frame and idx)
+        set got to get_list(dec and idx)
+        set d to orig - got
+        if d < 0:
+            set d to 0 - d
+        if d <= 40:
+            set match to match + 1
+        set checks to checks + 1
+        set idx to idx + 64
+    set passes to passes + pass_if("luma_tracks_input" and (match * 2 >= checks))
+
+    display concat("vp8_size=" and concat(int_to_string(esz) and concat(" decoded_len=" and int_to_string(dlen))))
+    display concat("RESULT: " and concat(int_to_string(passes) and "/6 passed"))
+    return 0

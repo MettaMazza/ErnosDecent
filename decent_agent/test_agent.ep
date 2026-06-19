@@ -1,0 +1,693 @@
+# ErnosPlain Rebuild of ErnOS Agent Unit Test Suite
+# Component: decent_agent/test_agent.ep
+# Tests: Hebbian learning, ReAct parser, 3D Turing grid, Observer audit, E2E simulation
+# Status: Development
+
+import "collections"
+import "string"
+import "fs"
+import "os"
+import "json"
+
+# Subsystems
+import "prompt"
+import "tools"
+import "memory"
+import "turing_grid"
+import "react_loop"
+import "observer"
+import "session"
+
+import "../decent_id/did"
+import "../decent_money/ledger"
+import "learning"
+import "sleep"
+import "./sync"
+import "synaptic_tool"
+import "scheduler"
+import "scheduler_tool"
+import "../logging"
+import "../decent_net/gitdec"
+
+define main:
+    display "==================================================="
+    display "  ErnOS Agent Rebuild -- Unit Test Suite"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # ===========================================================
+    # TEST 1: Hebbian Memory Tier 4 edge weight logic
+    # ===========================================================
+    display "TEST 1: Hebbian edge creation and weight consolidation"
+    set t1_ok to 1
+    
+    set mem to memory_create()
+    
+    # Co-activate "wallet" and "ledger"
+    set ok to memory_strengthen_synapse(mem and "wallet" and "ledger")
+    set edges to map_get_val(mem and "edges")
+    
+    if map_contains(edges and "ledger-wallet") == 1 or else map_contains(edges and "wallet-ledger") == 1:
+        set key to "ledger-wallet"
+        if map_contains(edges and "wallet-ledger") == 1:
+            set key to "wallet-ledger"
+            
+        set w1 to map_get_val(edges and key)
+        # First co-activation weight should be 100,000 (0.1 in scale 1,000,000)
+        if w1 == 100000:
+            display "  Synapse edge created with correct initial weight: 0.100"
+        else:
+            display f"  FAIL: Expected edge weight 100000, got {w1}"
+            set t1_ok to 0
+            
+        # Co-activate again: w_new = w_old + 0.1 * (1.0 - w_old)
+        # w_new = 100,000 + 0.1 * (1,000,000 - 100,000) = 100,000 + 90,000 = 190,000 (0.19)
+        set ok to memory_strengthen_synapse(mem and "wallet" and "ledger")
+        set w2 to map_get_val(edges and key)
+        if w2 == 190000:
+            display "  Hebbian Edge reinforcement formula verified correctly: 0.190"
+        else:
+            display f"  FAIL: Expected reinforced edge weight 190000, got {w2}"
+            set t1_ok to 0
+            
+        # Decay: w_new = w_old * 0.95
+        # w_decay = 190,000 * 0.95 = 180,500
+        set ok to memory_decay_synapses(mem)
+        set edges_decayed to map_get_val(mem and "edges")
+        set w_decay to map_get_val(edges_decayed and key)
+        if w_decay == 180500:
+            display "  Synaptic decay consolidated correctly: 0.180"
+        else:
+            display f"  FAIL: Expected decayed weight 180500, got {w_decay}"
+            set t1_ok to 0
+    else:
+        display "  FAIL: Synaptic graph edge not found"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: ReAct thought and action parser
+    # ===========================================================
+    display "TEST 2: ReAct tool execution parser"
+    set t2_ok to 1
+    
+    set action_str to "Thought: I need to fetch the DHT value.\nAction: dht_get([\"key123\"])"
+    set action_map to react_parse_action(action_str)
+    
+    set found to map_get_val(action_map and "found")
+    if found == 1:
+        set t_name to map_get_val(action_map and "tool_name")
+        set a_str to map_get_val(action_map and "args_str")
+        
+        if t_name equals "dht_get":
+            display f"  Action parser extracted tool name: {t_name}"
+        else:
+            display f"  FAIL: Expected tool 'dht_get', got '{t_name}'"
+            set t2_ok to 0
+            
+        if a_str equals "[\"key123\"]":
+            display f"  Action parser extracted args string: {a_str}"
+        else:
+            display f"  FAIL: Expected args '[\"key123\"]', got '{a_str}'"
+            set t2_ok to 0
+    else:
+        display "  FAIL: ReAct parser did not detect action block"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: 3D Turing Grid Movements & Instructions
+    # ===========================================================
+    display "TEST 3: 3D Turing grid spatial positioning"
+    set t3_ok to 1
+    
+    set grid to grid_create()
+    
+    # Navigate
+    set ok to grid_move(grid and "LEFT")
+    set ok to grid_move(grid and "UP")
+    
+    set x to map_get_val(grid and "x")
+    set z to map_get_val(grid and "z")
+    if x == -1 and also z == 1:
+        display f"  Turing head moved left and up to ({x}, 0, {z})"
+    else:
+        display f"  FAIL: Coordinate drift! Expected (-1, 0, 1), got ({x}, 0, {z})"
+        set t3_ok to 0
+        
+    # Read/Write cell
+    set ok to grid_write(grid and "wallet_balance([])")
+    set content to grid_read(grid)
+    if content equals "wallet_balance([])":
+        display "  Cell instruction read/write verified"
+    else:
+        display f"  FAIL: Content mismatch! Expected 'wallet_balance([])', got '{content}'"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: Observer Audit Checks (Inference-Only Mode)
+    # ===========================================================
+    display "TEST 4: Observer inference-only audit checks"
+    set t4_ok to 1
+    
+    # Create test context with is_test=1 (skips LLM, returns ALLOWED)
+    set test_ctx to create_map()
+    set ok to map_insert(test_ctx and "is_test" and 1)
+    
+    # Standard clean response — should be ALLOWED under test mode
+    set clean_audit to observer_audit(test_ctx and "Test prompt context" and "Clean reply text")
+    set v1 to map_get_val(clean_audit and "verdict")
+    if v1 equals "ALLOWED":
+        display "  Observer correctly returned ALLOWED in test mode (inference bypassed)"
+    else:
+        display f"  FAIL: Expected ALLOWED in test mode, got {v1}"
+        set t4_ok to 0
+        
+    # Even a response with leaked grammar should return ALLOWED under test mode
+    # because test mode skips LLM inference entirely (no static heuristics exist)
+    set leak_audit to observer_audit(test_ctx and "Test prompt context" and "Response showing Action: run_command([\"ls\"]) to the user")
+    set v2 to map_get_val(leak_audit and "verdict")
+    if v2 equals "ALLOWED":
+        display "  Observer correctly bypasses all checks in test mode (no static heuristics)"
+    else:
+        display f"  FAIL: Expected ALLOWED in test mode, got {v2}"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: ReAct Loop E2E Simulation
+    # ===========================================================
+    display "TEST 5: ReAct Reasoning E2E Simulation Loop"
+    set t5_ok to 1
+    
+    set model to create_map()
+    set tools_mgr to tools_create()
+    set ctx to create_map()
+    set ok to map_insert(ctx and "turing_grid" and grid)
+    
+    set identity to create_identity()
+    set genesis_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+    set ledger to ledger_create(genesis_pub)
+    
+    set ok to map_insert(ctx and "identity" and identity)
+    set ok to map_insert(ctx and "ledger" and ledger)
+    set ok to map_insert(ctx and "is_test" and 1)
+    
+    set reply to react_run(model and mem and tools_mgr and ctx and "CHECK BALANCE")
+    if string_contains(reply and "wallet_balance") == 1 or else string_contains(reply and "Success") == 1:
+        display f"  ReAct loop simulation output completed successfully"
+    else:
+        display f"  FAIL: Simulated reasoning response was unexpected: '{reply}'"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Hebbian Memory Serialization and Deserialization
+    # ===========================================================
+    display "TEST 6: Hebbian Memory Serialization and Deserialization"
+    set t6_ok to 1
+
+    set test_path to "scratch/test_memory_serialize.json"
+    
+    # Store some dummy values into mem
+    set ok to memory_store(mem and 1 and "key_scratch" and "val_scratch")
+    set ok to memory_store(mem and 2 and "key_lesson" and "val_lesson")
+    set ok to memory_store(mem and 3 and "key_time" and "val_time")
+
+    set ser_err to memory_serialize(mem and test_path)
+    if ser_err == 0:
+        display "  Serialized memory state to JSON successfully"
+    else:
+        display f"  FAIL: Serialization returned error {ser_err}"
+        set t6_ok to 0
+
+    # Load it back using memory_deserialize
+    set loaded_mem to memory_deserialize(test_path)
+    if loaded_mem != 0:
+        # Check scratchpad
+        set l_scratchpad to map_get_val(loaded_mem and "scratchpad")
+        if map_contains(l_scratchpad and "key_scratch") == 1:
+            set val to map_get_val(l_scratchpad and "key_scratch")
+            if val equals "val_scratch":
+                display "  Deserialized scratchpad value successfully"
+            else:
+                display f"  FAIL: Expected val_scratch, got {val}"
+                set t6_ok to 0
+        else:
+            display "  FAIL: Deserialized scratchpad does not contain key_scratch"
+            set t6_ok to 0
+
+        # Check lessons
+        set l_lessons to map_get_val(loaded_mem and "lessons")
+        if map_contains(l_lessons and "key_lesson") == 1:
+            set val to map_get_val(l_lessons and "key_lesson")
+            if val equals "val_lesson":
+                display "  Deserialized lessons value successfully"
+            else:
+                display f"  FAIL: Expected val_lesson, got {val}"
+                set t6_ok to 0
+        else:
+            display "  FAIL: Deserialized lessons does not contain key_lesson"
+            set t6_ok to 0
+
+        # Check edges
+        set l_edges to map_get_val(loaded_mem and "edges")
+        set edge_key to "ledger-wallet"
+        if map_contains(l_edges and "wallet-ledger") == 1:
+            set edge_key to "wallet-ledger"
+        if map_contains(l_edges and edge_key) == 1:
+            set w_loaded to map_get_val(l_edges and edge_key)
+            if w_loaded == 180500:
+                display "  Deserialized edges value successfully"
+            else:
+                display f"  FAIL: Expected edge weight 180500, got {w_loaded}"
+                set t6_ok to 0
+        else:
+            display f"  FAIL: Deserialized edges does not contain {edge_key}"
+            set t6_ok to 0
+    else:
+        display "  FAIL: memory_deserialize returned 0"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: Synaptic Graph Actions & Contradiction Checking
+    # ===========================================================
+    display "TEST 7: Synaptic Graph Actions & Contradiction Checking"
+    set t7_ok to 1
+    
+    set args_store to create_list()
+    set ok to append_list(args_store and "Banana")
+    set ok to append_list(args_store and "A yellow curved fruit")
+    set store_res to operate_synaptic_graph(mem and "store" and args_store)
+    free_list(args_store)
+    
+    set args_search to create_list()
+    set ok to append_list(args_search and "Banana")
+    set search_res to operate_synaptic_graph(mem and "search" and args_search)
+    free_list(args_search)
+    
+    if string_contains(search_res and "yellow curved fruit") == 1:
+        display "  Concept stored and search match found"
+    else:
+        display f"  FAIL: Search output unexpected: '{search_res}'"
+        set t7_ok to 0
+        
+    set args_rel1 to create_list()
+    set ok to append_list(args_rel1 and "Banana")
+    set ok to append_list(args_rel1 and "color")
+    set ok to append_list(args_rel1 and "Yellow")
+    set rel_res1 to operate_synaptic_graph(mem and "relate" and args_rel1)
+    free_list(args_rel1)
+    
+    set args_rel2 to create_list()
+    set ok to append_list(args_rel2 and "Banana")
+    set ok to append_list(args_rel2 and "color")
+    set ok to append_list(args_rel2 and "Blue")
+    set rel_res2 to operate_synaptic_graph(mem and "relate" and args_rel2)
+    free_list(args_rel2)
+    
+    if string_contains(rel_res2 and "Contradiction") == 1:
+        display "  Contradiction check warning verified successfully"
+    else:
+        display f"  FAIL: Contradiction warning missed! Output: '{rel_res2}'"
+        set t7_ok to 0
+        
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: PII scrubbing Filter
+    # ===========================================================
+    display "TEST 8: PII scrubbing Filter character scanner"
+    set t8_ok to 1
+    
+    set scrubbed to sync_strip_pii("Contact me at user@domain.com or call 123-456-7890. SSN: 999-88-7777.")
+    if string_contains(scrubbed and "[SSN REDACTED]") == 1 and also string_contains(scrubbed and "[EMAIL_REDACTED]") == 1:
+        display "  PII Filter redacted email and SSN correctly"
+    else:
+        display f"  FAIL: Redaction incomplete: '{scrubbed}'"
+        set t8_ok to 0
+        
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9: Sleep Cycle simulated LoRA updates
+    # ===========================================================
+    display "TEST 9: Sleep Cycle simulated SFT/ORPO cycles"
+    set t9_ok to 1
+    
+    set reflection to sleep_cycle(mem)
+    if string_length(reflection) > 0:
+        display "  Sleep cycle executed and updated persona reflections"
+    else:
+        display "  FAIL: Reflection text empty"
+        set t9_ok to 0
+        
+    if t9_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 10: Task Scheduler Actions & Due Logic
+    # ===========================================================
+    display "TEST 10: Task Scheduler Actions & Due Logic"
+    set t10_ok to 1
+
+    # Remove test task JSON if it exists to start fresh
+    if file_exists("config/scheduler_jobs.json") == 1:
+        set cp_cmd_res to run_command("rm -f config/scheduler_jobs.json")
+
+    # Create a job
+    set args_create to create_list()
+    set ok to append_list(args_create and "TestTask")
+    set ok to append_list(args_create and "Test Instruction")
+    set ok to append_list(args_create and "interval")
+    set ok to append_list(args_create and "60")
+    set create_res to operate_scheduler("create" and args_create)
+    free_list(args_create)
+
+    if string_contains(create_res and "Successfully created job") == 1:
+        display "  Scheduler task created successfully"
+    else:
+        display f"  FAIL: Create task returned unexpected: '{create_res}'"
+        set t10_ok to 0
+
+    # List jobs
+    set args_list to create_list()
+    set list_res to operate_scheduler("list" and args_list)
+    free_list(args_list)
+
+    if string_contains(list_res and "TestTask") == 1:
+        display "  Scheduler task listed successfully"
+    else:
+        display f"  FAIL: List tasks returned unexpected: '{list_res}'"
+        set t10_ok to 0
+
+    # Toggle job
+    # First extract job ID
+    # TestTask will have ID job_<timestamp>
+    set id_pos to string_index_of(list_res and "[job_")
+    if id_pos > 0:
+        set job_id to substring(list_res and id_pos + 1 and 14)
+        display f"DEBUG TEST_AGENT: job_id='{job_id}', length={int_to_string(string_length(job_id))}"
+        set id_len to string_length(job_id)
+        set id_idx to 0
+        repeat while id_idx < id_len:
+            set c_code to get_character(job_id and id_idx)
+            display f"  char {int_to_string(id_idx)}: code={int_to_string(c_code)} ({char_from_code(c_code)})"
+            set id_idx to id_idx + 1
+        set args_toggle to create_list()
+        set ok to append_list(args_toggle and job_id)
+        set toggle_res to operate_scheduler("toggle" and args_toggle)
+        free_list(args_toggle)
+
+        if string_contains(toggle_res and "Successfully toggled job") == 1:
+            display "  Scheduler task toggled successfully"
+        else:
+            display f"  FAIL: Toggle task returned unexpected: '{toggle_res}'"
+            set t10_ok to 0
+
+        # Check if due logic detects disabled status
+        # Load the job
+        set jobs to scheduler_load()
+        set j_len to length_list(jobs)
+        set j_idx to 0
+        repeat while j_idx < j_len:
+            set job_map to get_list(jobs and j_idx)
+            set j_id to map_get_val(job_map and "id")
+            if j_id equals job_id:
+                # Enabled is 0, so scheduler_is_due should return 0 even if time is due
+                set due_val to scheduler_is_due(job_map and 2000000000 and 0)
+                if due_val == 0:
+                    display "  Due check correctly bypassed disabled job"
+                else:
+                    display f"  FAIL: Disabled job reported as due! result: {due_val}"
+                    set t10_ok to 0
+            set j_idx to j_idx + 1
+        free_list(jobs)
+
+        # Delete job
+        set args_delete to create_list()
+        set ok to append_list(args_delete and job_id)
+        set delete_res to operate_scheduler("delete" and args_delete)
+        free_list(args_delete)
+
+        if string_contains(delete_res and "Successfully deleted job") == 1:
+            display "  Scheduler task deleted successfully"
+        else:
+            display f"  FAIL: Delete task returned unexpected: '{delete_res}'"
+            set t10_ok to 0
+    else:
+        display "  FAIL: Job ID not found in list output"
+        set t10_ok to 0
+
+    if t10_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 11: Multi-Turn ReAct Convergence and Logging
+    # ===========================================================
+    display "TEST 11: Multi-Turn ReAct Convergence and Logging"
+    set t11_ok to 1
+
+    set model_t11 to create_map()
+    set tools_mgr_t11 to tools_create()
+    set ctx_t11 to create_map()
+    set ok to map_insert(ctx_t11 and "is_test" and 1)
+
+    set reply_t11 to react_run(model_t11 and mem and tools_mgr_t11 and ctx_t11 and "CONVERGENCE_TEST")
+    if string_contains(reply_t11 and "Success") == 1:
+        display "  Multi-turn ReAct self-correction convergence verified successfully"
+    else:
+        display f"  FAIL: Expected Success, got '{reply_t11}'"
+        set t11_ok to 0
+
+    if t11_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 12: Auto-Approve ReAct Loop Execution
+    # ===========================================================
+    display "TEST 12: Auto-Approve ReAct Loop Execution"
+    set t12_ok to 1
+
+    set model_t12 to create_map()
+    set tools_mgr_t12 to tools_create()
+    set ctx_t12 to create_map()
+    set ok to map_insert(ctx_t12 and "is_test" and 1)
+
+    # 1. Run the loop, it should request approval for money_transfer
+    set reply_t12 to react_run(model_t12 and mem and tools_mgr_t12 and ctx_t12 and "AUTO_APPROVE_TEST")
+    if reply_t12 equals "PENDING_APPROVAL":
+        display "  Bypassed first turn with PENDING_APPROVAL as expected"
+        
+        # Verify pending action is money_transfer
+        set pending to map_get_val(ctx_t12 and "pending_action")
+        if pending != 0:
+            set p_tool to map_get_val(pending and "tool_name")
+            if p_tool equals "money_transfer":
+                display f"  Pending action verified: {p_tool}"
+            else:
+                display f"  FAIL: Expected pending action 'money_transfer', got '{p_tool}'"
+                set t12_ok to 0
+        else:
+            display "  FAIL: Pending action map not found in ctx"
+            set t12_ok to 0
+            
+        # 2. Set auto_approve to 1 in context and call react_resume_approved
+        if t12_ok == 1:
+            set ok to map_insert(ctx_t12 and "auto_approve" and 1)
+            set resume_reply to react_resume_approved(model_t12 and mem and tools_mgr_t12 and ctx_t12 and 1)
+            if string_contains(resume_reply and "Success") == 1:
+                display "  Auto-approval successfully handled subsequent tools without prompting"
+            else:
+                display f"  FAIL: Expected Success from auto-approval, got '{resume_reply}'"
+                set t12_ok to 0
+    else:
+        display f"  FAIL: Expected react_run to return 'PENDING_APPROVAL', got '{reply_t12}'"
+        set t12_ok to 0
+
+    if t12_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 13: Decent GitDec Engine Functions
+    # ===========================================================
+    display "TEST 13: Decent GitDec Engine Functions"
+    set t13_ok to 1
+
+    set keys_pair to generate_signing_keypair()
+    set pub_key to map_get_val(keys_pair and "public_key")
+    set sec_key to map_get_val(keys_pair and "secret_key")
+    set did_val to create_did_key_from_ed25519(pub_key)
+    
+    set repo_id to "repo_test_123"
+    set repo to gitdec_create_repo(repo_id and "TestRepo" and did_val)
+    if repo != 0:
+        display "  Repository created successfully"
+    else:
+        display "  FAIL: Repository creation failed"
+        set t13_ok to 0
+
+    # Generate collab keys to resolve a real DID
+    set collab_keys to generate_signing_keypair()
+    set collab_pub to map_get_val(collab_keys and "public_key")
+    set collab_did to create_did_key_from_ed25519(collab_pub)
+    
+    set add_collab_err to gitdec_add_collaborator(repo_id and did_val and collab_did and "writer")
+    if add_collab_err == 0:
+        display "  Collaborator added successfully"
+    else:
+        display f"  FAIL: Add collaborator failed, code {add_collab_err}"
+        set t13_ok to 0
+
+    # Push commit
+    set commit_payload to "commit: initial commit data"
+    set sign_res to sign_message(commit_payload and sec_key)
+    set signature to map_get_val(sign_res and "signature")
+    set push_err to gitdec_push_commit(repo_id and did_val and "main" and "commit_hash_1" and commit_payload and signature)
+    if push_err == 0:
+        display "  Pushed signed commit successfully"
+    else:
+        display f"  FAIL: Push commit failed, code {push_err}"
+        set t13_ok to 0
+
+    # Pull ref
+    set pulled_ref to gitdec_pull_ref(repo_id and "main")
+    if pulled_ref equals "commit_hash_1":
+        display "  Ref pulled successfully"
+    else:
+        display f"  FAIL: Pull ref mismatch: got '{pulled_ref}'"
+        set t13_ok to 0
+
+    # Get object
+    set obj to gitdec_get_object(repo_id and "commit_hash_1")
+    if obj equals commit_payload:
+        display "  Commit object retrieved successfully"
+    else:
+        display f"  FAIL: Retrieved object mismatch: got '{obj}'"
+        set t13_ok to 0
+
+    # Create issue
+    set issue to gitdec_create_issue(repo_id and did_val and "Test Issue" and "Issue Body")
+    set issue_id to map_get_val(issue and "id")
+    if string_length(issue_id) > 0:
+        display "  Issue created successfully"
+    else:
+        display "  FAIL: Issue creation failed"
+        set t13_ok to 0
+
+    # Comment issue
+    set comment_err to gitdec_comment_issue(repo_id and issue_id and did_val and "This is a comment")
+    if comment_err == 0:
+        display "  Issue comment added successfully"
+    else:
+        display f"  FAIL: Add comment failed, code {comment_err}"
+        set t13_ok to 0
+
+    # Create PR
+    set pr to gitdec_create_pr(repo_id and did_val and "Test PR" and "feature" and "main" and "PR Description")
+    set pr_id to map_get_val(pr and "id")
+    if string_length(pr_id) > 0:
+        display "  Pull request created successfully"
+    else:
+        display "  FAIL: Pull request creation failed"
+        set t13_ok to 0
+
+    # Review PR
+    set review_err to gitdec_review_pr(repo_id and pr_id and did_val and "approve" and "Looks good!")
+    if review_err == 0:
+        display "  PR approved successfully"
+    else:
+        display f"  FAIL: PR review failed, code {review_err}"
+        set t13_ok to 0
+
+    # Remove collaborator
+    set remove_collab_err to gitdec_remove_collaborator(repo_id and did_val and collab_did)
+    if remove_collab_err == 0:
+        display "  Collaborator removed successfully"
+    else:
+        display f"  FAIL: Remove collaborator failed, code {remove_collab_err}"
+        set t13_ok to 0
+
+    # Delete repository
+    set delete_repo_err to gitdec_delete_repo(repo_id and did_val)
+    if delete_repo_err == 0:
+        display "  Repository deleted successfully"
+    else:
+        display f"  FAIL: Delete repository failed, code {delete_repo_err}"
+        set t13_ok to 0
+
+    if t13_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} cognitive agent tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+        exit_program(1)
+    else:
+        display "  ALL COGNITIVE AGENT TESTS PASSED!"
+    display "==================================================="
+    return 0

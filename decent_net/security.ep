@@ -1,0 +1,255 @@
+# ErnosDecent -- Security Hardening Module
+# Component: decent_net/security.ep
+# Implements: Rate limiting, ban list, and input validation
+# Status: Production — Phase 7
+
+import "collections"
+import "string"
+
+external define ep_dlopen with lib:
+external define ep_dlsym with handle and name:
+external define ep_dlcall3 with fn and a0 and a1 and a2:
+
+# Resolve the remote peer's IPv4 address from a connected socket fd via libc
+# getpeername(2). Returns dotted-quad on success, "" for non-IPv4 / errors (callers
+# then fall back to a shared key). sin_addr sits at byte offset 4 of sockaddr_in on
+# both macOS (len,family,port,addr) and Linux (family,port,addr).
+define net_peer_ip with fd as Int returning Str:
+    set libc to ep_dlopen("libSystem.B.dylib")
+    if libc == 0:
+        set libc to ep_dlopen("libc.so.6")
+    if libc == 0:
+        set libc to ep_dlopen("libc.so")
+    if libc == 0:
+        return ""
+    set fn to ep_dlsym(libc and "getpeername")
+    if fn == 0:
+        return ""
+    set addr_buf to alloc_bytes(28)
+    set len_buf to alloc_bytes(8)
+    poke_byte(len_buf and 0 and 28)
+    poke_byte(len_buf and 1 and 0)
+    poke_byte(len_buf and 2 and 0)
+    poke_byte(len_buf and 3 and 0)
+    set rc to ep_dlcall3(fn and fd and addr_buf and len_buf)
+    if rc != 0:
+        set ok to free_bytes(addr_buf)
+        set ok to free_bytes(len_buf)
+        return ""
+    set fam0 to peek_byte(addr_buf and 0)
+    set fam1 to peek_byte(addr_buf and 1)
+    set is_ipv4 to 0
+    if fam1 == 2:
+        set is_ipv4 to 1
+    if fam0 == 2 and also fam1 == 0:
+        set is_ipv4 to 1
+    if is_ipv4 == 0:
+        set ok to free_bytes(addr_buf)
+        set ok to free_bytes(len_buf)
+        return ""
+    set b0 to peek_byte(addr_buf and 4)
+    set b1 to peek_byte(addr_buf and 5)
+    set b2 to peek_byte(addr_buf and 6)
+    set b3 to peek_byte(addr_buf and 7)
+    set ok to free_bytes(addr_buf)
+    set ok to free_bytes(len_buf)
+    set ip to concat(int_to_string(b0) and ".")
+    set ip to concat(ip and int_to_string(b1))
+    set ip to concat(ip and ".")
+    set ip to concat(ip and int_to_string(b2))
+    set ip to concat(ip and ".")
+    set ip to concat(ip and int_to_string(b3))
+    return ip
+
+# ================================================================
+# Constants
+# ================================================================
+
+# Rate limiting: max requests per IP per window
+set RATE_LIMIT_WINDOW_MS to 60000
+set RATE_LIMIT_MAX_REQUESTS to 100
+set RATE_LIMIT_BAN_THRESHOLD to 200
+
+# Ban list
+set BAN_DURATION_MS to 300000
+
+# Input validation
+set MAX_NODE_ID_LENGTH to 256
+set MAX_COMMAND_LENGTH to 65536
+set MAX_KEY_LENGTH to 1024
+set MAX_VALUE_LENGTH to 1048576
+
+# ================================================================
+# Rate Limiter
+# ================================================================
+
+define security_create_rate_limiter returning Map:
+    set limiter to create_map()
+    # request_counts: map of IP → request count
+    set ok to map_insert(limiter and "request_counts" and create_map())
+    # window_starts: map of IP → window start timestamp
+    set ok to map_insert(limiter and "window_starts" and create_map())
+    # ban_list: map of IP → ban expiry timestamp
+    set ok to map_insert(limiter and "ban_list" and create_map())
+    # violation_counts: map of IP → consecutive violations
+    set ok to map_insert(limiter and "violation_counts" and create_map())
+    return limiter
+
+define security_check_rate_limit with limiter as Map and ip as Str returning Int:
+    # Returns 1 if allowed, 0 if rate limited, -1 if banned
+    set ban_list to map_get_val(limiter and "ban_list")
+    set now to ep_time_now_ms()
+
+    # Check ban list first
+    if map_contains(ban_list and ip) == 1:
+        set ban_expiry to map_get_val(ban_list and ip)
+        if now < ban_expiry:
+            return 0 - 1
+        # Ban expired — remove
+        set ok to map_delete(ban_list and ip)
+
+    set counts to map_get_val(limiter and "request_counts")
+    set windows to map_get_val(limiter and "window_starts")
+
+    # Check if we have a window for this IP
+    if map_contains(windows and ip) == 0:
+        # First request — start new window
+        set ok to map_insert(windows and ip and now)
+        set ok to map_insert(counts and ip and 1)
+        return 1
+
+    set window_start to map_get_val(windows and ip)
+    set elapsed to now - window_start
+
+    # Window expired — reset
+    if elapsed > RATE_LIMIT_WINDOW_MS:
+        set ok to map_insert(windows and ip and now)
+        set ok to map_insert(counts and ip and 1)
+        return 1
+
+    # Within window — increment and check
+    set count to map_get_val(counts and ip)
+    set count to count + 1
+    set ok to map_insert(counts and ip and count)
+
+    if count > RATE_LIMIT_BAN_THRESHOLD:
+        # Excessive — add to ban list
+        set ok to map_insert(ban_list and ip and now + BAN_DURATION_MS)
+        set violations to map_get_val(limiter and "violation_counts")
+        set v_count to 0
+        if map_contains(violations and ip) == 1:
+            set v_count to map_get_val(violations and ip)
+        set ok to map_insert(violations and ip and v_count + 1)
+        return 0 - 1
+
+    if count > RATE_LIMIT_MAX_REQUESTS:
+        return 0
+
+    return 1
+
+# ================================================================
+# Input Validation
+# ================================================================
+
+define security_validate_node_id with node_id as Str returning Int:
+    # Returns 1 if valid, 0 if invalid
+    set len to string_length(node_id)
+    if len == 0:
+        return 0
+    if len > MAX_NODE_ID_LENGTH:
+        return 0
+
+    # Check for null bytes and control characters
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(node_id and i)
+        if ch < 32:
+            return 0
+        if ch == 127:
+            return 0
+        set i to i + 1
+    return 1
+
+define security_validate_command with command as Str returning Int:
+    # Returns 1 if valid, 0 if invalid
+    set len to string_length(command)
+    if len == 0:
+        return 0
+    if len > MAX_COMMAND_LENGTH:
+        return 0
+    return 1
+
+define security_validate_key with key as Str returning Int:
+    set len to string_length(key)
+    if len == 0:
+        return 0
+    if len > MAX_KEY_LENGTH:
+        return 0
+    return 1
+
+define security_validate_value with value as Str returning Int:
+    set len to string_length(value)
+    if len > MAX_VALUE_LENGTH:
+        return 0
+    return 1
+
+define security_validate_port with port as Int returning Int:
+    if port < 1:
+        return 0
+    if port > 65535:
+        return 0
+    return 1
+
+define security_validate_term with term as Int returning Int:
+    # Raft term must be non-negative
+    if term < 0:
+        return 0
+    return 1
+
+# ================================================================
+# Ban List Management
+# ================================================================
+
+define security_ban_ip with borrow limiter as Map and ip as Str and duration_ms as Int:
+    set ban_list to map_get_val(limiter and "ban_list")
+    set now to ep_time_now_ms()
+    set ok to map_insert(ban_list and ip and now + duration_ms)
+    return 0
+
+define security_unban_ip with borrow limiter as Map and ip as Str:
+    set ban_list to map_get_val(limiter and "ban_list")
+    set ok to map_delete(ban_list and ip)
+    return 0
+
+define security_is_banned with borrow limiter as Map and ip as Str returning Int:
+    set ban_list to map_get_val(limiter and "ban_list")
+    if map_contains(ban_list and ip) == 0:
+        return 0
+    set now to ep_time_now_ms()
+    set expiry to map_get_val(ban_list and ip)
+    if now > expiry:
+        set ok to map_delete(ban_list and ip)
+        return 0
+    return 1
+
+define security_get_ban_count with borrow limiter as Map returning Int:
+    set ban_list to map_get_val(limiter and "ban_list")
+    return map_size(ban_list)
+
+# ================================================================
+# Cleanup: Remove expired entries
+# ================================================================
+
+define security_cleanup_expired with borrow limiter as Map:
+    set ban_list to map_get_val(limiter and "ban_list")
+    set now to ep_time_now_ms()
+    set keys to map_keys(ban_list)
+    set num_keys to length_list(keys)
+    set i to 0
+    repeat while i < num_keys:
+        set key to ptr_to_str(get_list(keys and i))
+        set expiry to map_get_val(ban_list and key)
+        if now > expiry:
+            set ok to map_delete(ban_list and key)
+        set i to i + 1
+    return 0

@@ -1,0 +1,152 @@
+# ErnosDecent -- ActivityPub Protocol
+# Component: decent_social/activitypub.ep
+# Implements: ActivityPub actor creation, activity constructors, delivery (local + HTTP),
+#             WebFinger, inbox server, JSON-LD serialization
+# Status: Production -- Phase 2 Networking
+
+import "string"
+import "../stdlib/http"
+import "net"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set AP_ERR_NONE to 0
+set AP_ERR_DELIVERY_FAILED to 711
+set AP_ERR_ACTOR_NOT_FOUND to 712
+set AP_ERR_INVALID_ACTIVITY to 713
+set AP_ERR_SIGNATURE_INVALID to 714
+
+# ================================================================
+# Actor & Activity Operations
+# ================================================================
+
+define ap_create_actor with did_id as Str and name as Str:
+    set actor to create_map()
+    set ok to map_insert(actor and "id" and did_id)
+    set ok to map_insert(actor and "name" and name)
+    
+    # Queues
+    set inbox to create_list()
+    set outbox to create_list()
+    set ok to map_insert(actor and "inbox" and inbox)
+    set ok to map_insert(actor and "outbox" and outbox)
+    
+    return actor
+
+define ap_create_activity with actor_id as Str and type_str as Str and object_map as Int:
+    set activity to create_map()
+    set ok to map_insert(activity and "id" and ep_sha256(concat(actor_id and type_str)))
+    set ok to map_insert(activity and "actor" and actor_id)
+    set ok to map_insert(activity and "type" and type_str)
+    set ok to map_insert(activity and "object" and object_map)
+    set ok to map_insert(activity and "timestamp" and ep_time_now_sec())
+    return activity
+
+define ap_deliver_activity with activity as Int and recipient_actor as Int returning Int:
+    # Local delivery — append to in-memory inbox
+    set inbox to map_get_val(recipient_actor and "inbox")
+    set ok to append_list(inbox and activity)
+    return AP_ERR_NONE
+
+# ================================================================
+# JSON-LD Serialization
+# ================================================================
+
+define ap_activity_to_json with activity as Int returning Str:
+    # Serialize an activity to ActivityPub JSON-LD format
+    set actor_id to map_get_val(activity and "actor")
+    set type_str to map_get_val(activity and "type")
+    set act_id to map_get_val(activity and "id")
+    set timestamp to map_get_val(activity and "timestamp")
+
+    set j to "{\"@context\":\"https://www.w3.org/ns/activitystreams\","
+    set j to concat(j and f"\"id\":\"{act_id}\",")
+    set j to concat(j and f"\"type\":\"{type_str}\",")
+    set j to concat(j and f"\"actor\":\"{actor_id}\",")
+    set j to concat(j and f"\"published\":\"{int_to_string(timestamp)}\"")
+    set j to concat(j and "}")
+    return j
+
+define ap_actor_to_json with actor as Int returning Str:
+    # Serialize actor to ActivityPub JSON-LD format
+    set did_id to map_get_val(actor and "id")
+    set name to map_get_val(actor and "name")
+
+    set j to "{\"@context\":\"https://www.w3.org/ns/activitystreams\","
+    set j to concat(j and f"\"type\":\"Person\",")
+    set j to concat(j and f"\"id\":\"{did_id}\",")
+    set j to concat(j and f"\"name\":\"{name}\",")
+    set j to concat(j and f"\"inbox\":\"{did_id}/inbox\",")
+    set j to concat(j and f"\"outbox\":\"{did_id}/outbox\"")
+    set j to concat(j and "}")
+    return j
+
+# ================================================================
+# WebFinger — RFC 7033
+# ================================================================
+
+define ap_create_webfinger with did_id as Str and domain as Str returning Str:
+    # Create a WebFinger JRD response for a DID
+    set subject to concat("acct:" and did_id)
+    set subject to concat(subject and "@")
+    set subject to concat(subject and domain)
+
+    set j to "{\"subject\":\""
+    set j to concat(j and subject)
+    set j to concat(j and "\",\"links\":[{\"rel\":\"self\",\"type\":\"application/activity+json\",\"href\":\"https://")
+    set j to concat(j and domain)
+    set j to concat(j and "/users/")
+    set j to concat(j and did_id)
+    set j to concat(j and "\"}]}")
+    return j
+
+# ================================================================
+# Remote HTTP Delivery
+# ================================================================
+
+define ap_deliver_remote with activity as Int and inbox_url as Str returning Int:
+    # Deliver an activity to a remote inbox via HTTP POST
+    set body to ap_activity_to_json(activity)
+    set headers to "Content-Type: application/activity+json\r\nAccept: application/activity+json"
+    set response to http_post(inbox_url and headers and body)
+
+    if string_length(response) > 0:
+        return AP_ERR_NONE
+    return AP_ERR_DELIVERY_FAILED
+
+define ap_fetch_actor with actor_url as Str returning Str:
+    # Fetch a remote actor profile via HTTP GET
+    set headers to "Accept: application/activity+json"
+    set response to http_get(actor_url and headers)
+    return response
+
+# ================================================================
+# Inbox Server — receives inbound ActivityPub POSTs
+# ================================================================
+
+define ap_handle_inbox_request with client_fd as Int and request as Str and local_actor as Int returning Int:
+    # Parse an incoming HTTP POST to the inbox
+    # Extract the body (everything after double CRLF)
+    set body_start to string_index_of(request and "\r\n\r\n")
+    if body_start < 0:
+        set ok to send_response(client_fd and 400 and "application/json" and "{\"error\":\"no body\"}")
+        return AP_ERR_INVALID_ACTIVITY
+
+    set body to substring(request and body_start + 4 and string_length(request) - body_start - 4)
+
+    # Store the raw activity in the inbox
+    set inbox to map_get_val(local_actor and "inbox")
+    set ok to append_list(inbox and body)
+
+    set ok to send_response(client_fd and 202 and "application/json" and "{\"status\":\"accepted\"}")
+    return AP_ERR_NONE
+
+define ap_start_inbox_server with port as Int and local_actor as Int:
+    # Start an HTTP server to receive ActivityPub activities
+    set server_fd to net_listen(port)
+    if server_fd < 0:
+        return 0
+    display f"[+] ActivityPub inbox server listening on port {int_to_string(port)}"
+    return server_fd

@@ -1,0 +1,116 @@
+# ErnosPlain Rebuild of ErnOS Agent Automatic Learning System
+# Component: decent_agent/learning.ep
+
+import "fs"
+import "collections"
+import "string"
+import "memory"
+
+# Local escaping helper
+define learning_json_escape with s as Str returning Str:
+    set len to string_length(s)
+    set result_list to create_list()
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(s and i)
+        if ch == 34: # "
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 34)
+        else:
+            if ch == 92: # \
+                set ok to append_list(result_list and 92)
+                set ok to append_list(result_list and 92)
+            else:
+                if ch == 10: # \n
+                    set ok to append_list(result_list and 92)
+                    set ok to append_list(result_list and 110)
+                else:
+                    if ch == 13: # \r
+                        set ok to append_list(result_list and 92)
+                        set ok to append_list(result_list and 114)
+                    else:
+                        if ch == 9: # \t
+                            set ok to append_list(result_list and 92)
+                            set ok to append_list(result_list and 116)
+                        else:
+                            set ok to append_list(result_list and ch)
+        set i to i + 1
+    set escaped to string_from_list(result_list)
+    free_list(result_list)
+    return escaped
+
+define learning_init returning Int:
+    if file_exists("config/learning") == 0:
+        set ok to create_directory("config/learning")
+    return 0
+
+define learning_record_golden with user_prompt as Str and response as Str returning Int:
+    set ok to learning_init()
+    set prompt_esc to learning_json_escape(user_prompt)
+    set resp_esc to learning_json_escape(response)
+    set line to concat("{\"prompt\":\"" and prompt_esc)
+    set line to concat(line and "\",\"response\":\"")
+    set line to concat(line and resp_esc)
+    set line to concat(line and "\"}\n")
+    set ok to append_file("config/learning/golden_buffer.jsonl" and line)
+    return 0
+
+define learning_record_preference with memory_mgr as Map and user_prompt as Str and rejected as Str and chosen as Str and category as Str returning Int:
+    set ok to learning_init()
+    set prompt_esc to learning_json_escape(user_prompt)
+    set rej_esc to learning_json_escape(rejected)
+    set cho_esc to learning_json_escape(chosen)
+    set cat_esc to learning_json_escape(category)
+    
+    set line to concat("{\"prompt\":\"" and prompt_esc)
+    set line to concat(line and "\",\"rejected\":\"")
+    set line to concat(line and rej_esc)
+    set line to concat(line and "\",\"chosen\":\"")
+    set line to concat(line and cho_esc)
+    set line to concat(line and "\",\"category\":\"")
+    set line to concat(line and cat_esc)
+    set line to concat(line and "\"}\n")
+    set ok to append_file("config/learning/preference_buffer.jsonl" and line)
+    
+    # Increment failure tally for category to trigger distillation
+    set tally_key to concat("tally_" and category)
+    set scratchpad to map_get_val(memory_mgr and "scratchpad")
+    set count to 0
+    if map_contains(scratchpad and tally_key) == 1:
+        set count_str to map_get_val(scratchpad and tally_key)
+        set count to string_to_int(count_str)
+        
+    set count to count + 1
+    set ok to map_insert(scratchpad and tally_key and int_to_string(count))
+    
+    # Distill lesson if threshold >= 3
+    if count >= 3:
+        set lesson_key to concat("lesson_" and category)
+        set lessons to map_get_val(memory_mgr and "lessons")
+        if map_contains(lessons and lesson_key) == 0:
+            set ok to memory_store(memory_mgr and 2 and lesson_key and concat("Distilled rule: Always avoid " and concat(category and " violations.")))
+            set ok to memory_serialize(memory_mgr and "config/agent_memory.json")
+            
+    return 0
+
+define learning_record_rejection with user_prompt as Str and response as Str returning Int:
+    set ok to learning_init()
+    set prompt_esc to learning_json_escape(user_prompt)
+    set resp_esc to learning_json_escape(response)
+    set line to concat("{\"prompt\":\"" and prompt_esc)
+    set line to concat(line and "\",\"response\":\"")
+    set line to concat(line and resp_esc)
+    set line to concat(line and "\"}\n")
+    set ok to append_file("config/learning/rejections.jsonl" and line)
+    return 0
+
+define learning_record_audit with verdict as Str and reason as Str returning Int:
+    set ok to learning_init()
+    set verd_esc to learning_json_escape(verdict)
+    set reason_esc to learning_json_escape(reason)
+    set line to concat("{\"verdict\":\"" and verd_esc)
+    set line to concat(line and "\",\"reason\":\"")
+    set line to concat(line and reason_esc)
+    set line to concat(line and "\"}\n")
+    set ok to append_file("config/learning/observer_audit.jsonl" and line)
+    return 0

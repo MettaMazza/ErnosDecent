@@ -1,0 +1,212 @@
+# ErnosDecent — Search Query & Result Aggregation
+# Component: decent_search/query.ep
+# Implements: Query term parsing, result scoring, custom descending sort, and P2P result merging
+# Status: Production — OperationTrojanClaude Phase 11
+
+import "collections"
+import "string"
+import "math"
+import "crawl"
+import "rank"
+
+# ================================================================
+# Custom Shuffling & Sorting (Descending by Score)
+# ================================================================
+
+define sort_results_descending with results as List returning List:
+    set len to length_list(results)
+    if len <= 1:
+        return results
+
+    set i to 0
+    repeat while i < len:
+        set j to 0
+        set swapped to 0
+        repeat while j < len - i - 1:
+            set a_ptr to get_list(results and j)
+            set b_ptr to get_list(results and j + 1)
+
+            set score_a to map_get_val(a_ptr and "score")
+            set score_b to map_get_val(b_ptr and "score")
+
+            if score_a < score_b:
+                set ok to set_list(results and j and b_ptr)
+                set ok to set_list(results and j + 1 and a_ptr)
+                set swapped to 1
+            set j to j + 1
+        if swapped == 0:
+            return results
+        set i to i + 1
+    return results
+
+# ================================================================
+# Local Search Execution
+# ================================================================
+
+define query_search with index as Map and query_str as Str returning List:
+    set results_list to create_list()
+
+    set raw_terms to string_split(query_str and " ")
+    set num_raw to length_list(raw_terms)
+    set query_terms to create_list()
+
+    # Clean query terms
+    set i to 0
+    repeat while i < num_raw:
+        set term_ptr to get_list(raw_terms and i)
+        set term_str to ptr_to_str(term_ptr)
+        set clean_t to clean_word(term_str)
+        if string_length(clean_t) > 0:
+            set ok to append_list(query_terms and str_to_ptr(clean_t))
+        set i to i + 1
+
+    set num_clean_terms to length_list(query_terms)
+    if num_clean_terms == 0:
+        return results_list
+
+    # Find matched documents
+    set matched_docs to create_map()
+    set inverted to map_get_val(index and "inverted_index")
+
+    set j to 0
+    repeat while j < num_clean_terms:
+        set term_ptr to get_list(query_terms and j)
+        set term_str to ptr_to_str(term_ptr)
+
+        set word_map to map_get_val(inverted and term_str)
+        if word_map != 0:
+            set doc_keys to map_keys(word_map)
+            set num_docs to length_list(doc_keys)
+            set k to 0
+            repeat while k < num_docs:
+                set doc_ptr to get_list(doc_keys and k)
+                set doc_url to ptr_to_str(doc_ptr)
+                set ok to map_insert(matched_docs and doc_url and 1)
+                set k to k + 1
+        set j to j + 1
+
+    # Score matched documents
+    set matched_keys to map_keys(matched_docs)
+    set num_matched_keys to length_list(matched_keys)
+    set pages to map_get_val(index and "pages")
+
+    set k to 0
+    repeat while k < num_matched_keys:
+        set url_ptr to get_list(matched_keys and k)
+        set url_str to ptr_to_str(url_ptr)
+
+        set bm25 to rank_bm25_score(index and url_str and query_terms)
+
+        set page_meta to map_get_val(pages and url_str)
+        set pr to map_get_val(page_meta and "pagerank")
+        set title to map_get_val(page_meta and "title")
+
+        # final_score = bm25_score + pr / 10
+        set score to bm25 + pr / 10
+
+        set res_item to create_map()
+        set ok to map_insert(res_item and "url" and url_str)
+        set ok to map_insert(res_item and "score" and score)
+        set ok to map_insert(res_item and "title" and title)
+        set ok to append_list(results_list and res_item)
+
+        set k to k + 1
+
+    # Sort descending
+    set results_list to sort_results_descending(results_list)
+    return results_list
+
+# ================================================================
+# P2P Query Merging
+# Merges local and remote results, de-duplicating by URL
+# ================================================================
+
+# ================================================================
+# Federation wire format (G5)
+# Serialize/deserialize a result list for SEARCH_QUERY/SEARCH_RESULTS over the
+# Noise channel. Fields are url/title/score joined by "||F||"; records by "||R||"
+# (delimiters that won't appear in URLs/titles; multi-char string_split is supported).
+# ================================================================
+
+define query_serialize_results with results as List returning Str:
+    set s to ""
+    set n to length_list(results)
+    set i to 0
+    repeat while i < n:
+        set item to get_list(results and i)
+        set url to ptr_to_str(map_get_val(item and "url"))
+        set title to ptr_to_str(map_get_val(item and "title"))
+        set score to map_get_val(item and "score")
+        if i > 0:
+            set s to concat(s and "||R||")
+        set rec to concat(url and "||F||")
+        set rec to concat(rec and title)
+        set rec to concat(rec and "||F||")
+        set rec to concat(rec and int_to_string(score))
+        set s to concat(s and rec)
+        set i to i + 1
+    return s
+
+define query_deserialize_results with data as Str returning List:
+    set results to create_list()
+    if string_length(data) == 0:
+        return results
+    set recs to string_split(data and "||R||")
+    set n to length_list(recs)
+    set i to 0
+    repeat while i < n:
+        set rec to ptr_to_str(get_list(recs and i))
+        set fields to string_split(rec and "||F||")
+        if length_list(fields) >= 3:
+            set item to create_map()
+            set ok to map_insert(item and "url" and ptr_to_str(get_list(fields and 0)))
+            set ok to map_insert(item and "title" and ptr_to_str(get_list(fields and 1)))
+            set ok to map_insert(item and "score" and string_to_int(ptr_to_str(get_list(fields and 2))))
+            set ok to append_list(results and item)
+        set i to i + 1
+    return results
+
+define query_merge_results with local_results as List and remote_results as List returning List:
+    set merged_map to create_map()
+
+    # Ingest local
+    set len_local to length_list(local_results)
+    set i to 0
+    repeat while i < len_local:
+        set item to get_list(local_results and i)
+        set url to map_get_val(item and "url")
+        set ok to map_insert(merged_map and url and item)
+        set i to i + 1
+
+    # Ingest remote (keep highest score if duplicate)
+    set len_remote to length_list(remote_results)
+    set i to 0
+    repeat while i < len_remote:
+        set item to get_list(remote_results and i)
+        set url to map_get_val(item and "url")
+
+        set existing to map_get_val(merged_map and url)
+        if existing != 0:
+            set score_existing to map_get_val(existing and "score")
+            set score_remote to map_get_val(item and "score")
+            if score_remote > score_existing:
+                set ok to map_insert(merged_map and url and item)
+        else:
+            set ok to map_insert(merged_map and url and item)
+        set i to i + 1
+
+    # Build list from map
+    set final_list to create_list()
+    set merged_keys to map_keys(merged_map)
+    set num_keys to length_list(merged_keys)
+    set i to 0
+    repeat while i < num_keys:
+        set k_ptr to get_list(merged_keys and i)
+        set k_str to ptr_to_str(k_ptr)
+        set item to map_get_val(merged_map and k_str)
+        set ok to append_list(final_list and item)
+        set i to i + 1
+
+    # Sort descending
+    set final_list to sort_results_descending(final_list)
+    return final_list

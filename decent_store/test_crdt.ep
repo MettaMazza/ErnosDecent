@@ -1,0 +1,586 @@
+# ErnosDecent -- Test Suite for decent_store/crdt.ep
+# Tests: G-Counter, PN-Counter, LWW-Register, OR-Set, MV-Register
+# Status: Production -- OperationTrojanClaude Phase 4
+
+import "crdt"
+import "../decent_id/keys"
+import "string"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_store/crdt.ep Test Suite"
+    display "  OperationTrojanClaude Phase 4"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # ===========================================================
+    # TEST 1: G-Counter basic increment
+    # ===========================================================
+    display "TEST 1: G-Counter basic increment"
+    set t1_ok to 1
+    set gc1 to gcounter_create("replica_a")
+    if gcounter_value(gc1) != 0:
+        display "  FAIL: initial value should be 0"
+        set t1_ok to 0
+    set ok to gcounter_increment(gc1)
+    set ok to gcounter_increment(gc1)
+    set ok to gcounter_increment(gc1)
+    if gcounter_value(gc1) != 3:
+        display f"  FAIL: value should be 3, got {gcounter_value(gc1)}"
+        set t1_ok to 0
+    if gcounter_local_value(gc1) != 3:
+        display "  FAIL: local value should be 3"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: G-Counter merge
+    # ===========================================================
+    display "TEST 2: G-Counter merge"
+    set t2_ok to 1
+    set gc_a to gcounter_create("alice")
+    set gc_b to gcounter_create("bob")
+    set ok to gcounter_increment_by(gc_a and 5)
+    set ok to gcounter_increment_by(gc_b and 3)
+
+    # Merge b into a
+    set merge_err to gcounter_merge(gc_a and gc_b)
+    if merge_err != CRDT_ERR_NONE:
+        display "  FAIL: merge should succeed"
+        set t2_ok to 0
+    if gcounter_value(gc_a) != 8:
+        display f"  FAIL: merged value should be 8, got {gcounter_value(gc_a)}"
+        set t2_ok to 0
+    # Alice's local value unchanged
+    if gcounter_local_value(gc_a) != 5:
+        display "  FAIL: alice local should still be 5"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: G-Counter merge is idempotent
+    # ===========================================================
+    display "TEST 3: G-Counter merge idempotent"
+    set t3_ok to 1
+    set ok to gcounter_merge(gc_a and gc_b)
+    if gcounter_value(gc_a) != 8:
+        display "  FAIL: double merge should not change value"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: G-Counter merge is commutative
+    # ===========================================================
+    display "TEST 4: G-Counter merge commutative"
+    set t4_ok to 1
+    set gc_x to gcounter_create("x")
+    set gc_y to gcounter_create("y")
+    set ok to gcounter_increment_by(gc_x and 10)
+    set ok to gcounter_increment_by(gc_y and 7)
+
+    # Merge x into y, then y into x -- both should get 17
+    set gc_x2 to gcounter_create("x")
+    set gc_y2 to gcounter_create("y")
+    set ok to gcounter_increment_by(gc_x2 and 10)
+    set ok to gcounter_increment_by(gc_y2 and 7)
+
+    set ok to gcounter_merge(gc_x and gc_y)
+    set ok to gcounter_merge(gc_y2 and gc_x2)
+
+    if gcounter_value(gc_x) != gcounter_value(gc_y2):
+        display f"  FAIL: x+y={gcounter_value(gc_x)}, y+x={gcounter_value(gc_y2)}"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: PN-Counter increment and decrement
+    # ===========================================================
+    display "TEST 5: PN-Counter increment and decrement"
+    set t5_ok to 1
+    set pn to pncounter_create("node1")
+    set ok to pncounter_increment(pn)
+    set ok to pncounter_increment(pn)
+    set ok to pncounter_increment(pn)
+    set ok to pncounter_decrement(pn)
+    if pncounter_value(pn) != 2:
+        display f"  FAIL: value should be 2, got {pncounter_value(pn)}"
+        set t5_ok to 0
+
+    set ok to pncounter_decrement_by(pn and 5)
+    if pncounter_value(pn) != 0 - 3:
+        display f"  FAIL: value should be -3, got {pncounter_value(pn)}"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: PN-Counter merge
+    # ===========================================================
+    display "TEST 6: PN-Counter merge"
+    set t6_ok to 1
+    set pn_a to pncounter_create("pn_alice")
+    set pn_b to pncounter_create("pn_bob")
+    set ok to pncounter_increment_by(pn_a and 10)
+    set ok to pncounter_decrement_by(pn_a and 3)
+    set ok to pncounter_increment_by(pn_b and 5)
+    set ok to pncounter_decrement_by(pn_b and 1)
+
+    # Alice: 10 - 3 = 7, Bob: 5 - 1 = 4
+    set ok to pncounter_merge(pn_a and pn_b)
+    # Merged: P=15, N=4, value = 11
+    if pncounter_value(pn_a) != 11:
+        display f"  FAIL: merged should be 11, got {pncounter_value(pn_a)}"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: LWW-Register basic set and get
+    # ===========================================================
+    display "TEST 7: LWW-Register basic"
+    set t7_ok to 1
+    set lww to lww_create("r1" and "initial")
+    set v7 to lww_get(lww)
+    if v7 equals "initial":
+        set ok to 1
+    else:
+        display "  FAIL: initial value mismatch"
+        set t7_ok to 0
+
+    set ok to lww_set(lww and "updated")
+    set v7b to lww_get(lww)
+    if v7b equals "updated":
+        set ok to 1
+    else:
+        display "  FAIL: updated value mismatch"
+        set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: LWW-Register merge (latest wins)
+    # ===========================================================
+    display "TEST 8: LWW-Register merge"
+    set t8_ok to 1
+    set lww_a to lww_create("ra" and "old")
+    set lww_b to lww_create("rb" and "old")
+    set ok to lww_set_with_timestamp(lww_a and "alice_value" and 100)
+    set ok to lww_set_with_timestamp(lww_b and "bob_value" and 200)
+
+    set ok to lww_merge(lww_a and lww_b)
+    set merged_val to lww_get(lww_a)
+    if merged_val equals "bob_value":
+        set ok to 1
+    else:
+        display f"  FAIL: later timestamp should win"
+        set t8_ok to 0
+
+    # Reverse merge: earlier should not overwrite
+    set ok to lww_merge(lww_b and lww_a)
+    set merged_val2 to lww_get(lww_b)
+    if merged_val2 equals "bob_value":
+        set ok to 1
+    else:
+        display "  FAIL: earlier should not overwrite"
+        set t8_ok to 0
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9: OR-Set add and contains
+    # ===========================================================
+    display "TEST 9: OR-Set add and contains"
+    set t9_ok to 1
+    set os to orset_create("node_a")
+    set ok to orset_add(os and "apple")
+    set ok to orset_add(os and "banana")
+    set ok to orset_add(os and "cherry")
+
+    if orset_contains(os and "apple") != 1:
+        display "  FAIL: should contain apple"
+        set t9_ok to 0
+    if orset_contains(os and "banana") != 1:
+        display "  FAIL: should contain banana"
+        set t9_ok to 0
+    if orset_contains(os and "grape") != 0:
+        display "  FAIL: should not contain grape"
+        set t9_ok to 0
+
+    if t9_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 10: OR-Set remove
+    # ===========================================================
+    display "TEST 10: OR-Set remove"
+    set t10_ok to 1
+    set ok to orset_remove(os and "banana")
+    if orset_contains(os and "banana") != 0:
+        display "  FAIL: banana should be removed"
+        set t10_ok to 0
+    if orset_contains(os and "apple") != 1:
+        display "  FAIL: apple should still exist"
+        set t10_ok to 0
+
+    # Remove non-existent
+    set rem_err to orset_remove(os and "grape")
+    if rem_err != CRDT_ERR_NOT_FOUND:
+        display "  FAIL: removing non-existent should return NOT_FOUND"
+        set t10_ok to 0
+
+    if t10_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 11: OR-Set add after remove (re-add wins)
+    # ===========================================================
+    display "TEST 11: OR-Set re-add after remove"
+    set t11_ok to 1
+    set ok to orset_add(os and "banana")
+    if orset_contains(os and "banana") != 1:
+        display "  FAIL: re-added banana should be present"
+        set t11_ok to 0
+
+    if t11_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 12: MV-Register basic set and get
+    # ===========================================================
+    display "TEST 12: MV-Register basic"
+    set t12_ok to 1
+    set mv to mvregister_create("node_x")
+    set ok to mvregister_set(mv and "first_value")
+    set mv_val to mvregister_get_single(mv)
+    if mv_val equals "first_value":
+        set ok to 1
+    else:
+        display "  FAIL: value mismatch"
+        set t12_ok to 0
+    if mvregister_conflict_count(mv) != 1:
+        display "  FAIL: should have 1 value (no conflict)"
+        set t12_ok to 0
+
+    if t12_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 13: MV-Register merge detects conflict
+    # ===========================================================
+    display "TEST 13: MV-Register merge conflict"
+    set t13_ok to 1
+    set mv_a to mvregister_create("writer_a")
+    set mv_b to mvregister_create("writer_b")
+    set ok to mvregister_set(mv_a and "alice_wrote_this")
+    set ok to mvregister_set(mv_b and "bob_wrote_this")
+
+    # Merge b into a
+    set ok to mvregister_merge(mv_a and mv_b)
+    set conflicts to mvregister_conflict_count(mv_a)
+    if conflicts != 2:
+        display f"  FAIL: should have 2 concurrent values, got {conflicts}"
+        set t13_ok to 0
+
+    if t13_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 14: MV-Register set resolves conflict
+    # ===========================================================
+    display "TEST 14: MV-Register set resolves conflict"
+    set t14_ok to 1
+    set ok to mvregister_set(mv_a and "resolved_value")
+    if mvregister_conflict_count(mv_a) != 1:
+        display "  FAIL: setting should resolve to 1 value"
+        set t14_ok to 0
+    set resolved to mvregister_get_single(mv_a)
+    if resolved equals "resolved_value":
+        set ok to 1
+    else:
+        display "  FAIL: resolved value mismatch"
+        set t14_ok to 0
+
+    if t14_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 15: Type mismatch merge rejected
+    # ===========================================================
+    display "TEST 15: Type mismatch merge rejected"
+    set t15_ok to 1
+    set gc15 to gcounter_create("r15")
+    set pn15 to pncounter_create("r15")
+    set err15 to gcounter_merge(gc15 and pn15)
+    if err15 != CRDT_ERR_MERGE_TYPE_MISMATCH:
+        display "  FAIL: should reject cross-type merge"
+        set t15_ok to 0
+
+    if t15_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 16: OR-Set merge of disjoint elements
+    # ===========================================================
+    display "TEST 16: OR-Set merge disjoint elements"
+    set t16_ok to 1
+    set os_a to orset_create("replica_a")
+    set os_b to orset_create("replica_b")
+    set ok to orset_add(os_a and "apple")
+    set ok to orset_add(os_a and "banana")
+    set ok to orset_add(os_b and "cherry")
+    set ok to orset_add(os_b and "date")
+
+    set merge_err to orset_merge(os_a and os_b)
+    if merge_err != CRDT_ERR_NONE:
+        display "  FAIL: merge should succeed"
+        set t16_ok to 0
+    if orset_contains(os_a and "apple") != 1:
+        display "  FAIL: should contain apple after merge"
+        set t16_ok to 0
+    if orset_contains(os_a and "banana") != 1:
+        display "  FAIL: should contain banana after merge"
+        set t16_ok to 0
+    if orset_contains(os_a and "cherry") != 1:
+        display "  FAIL: should contain cherry after merge"
+        set t16_ok to 0
+    if orset_contains(os_a and "date") != 1:
+        display "  FAIL: should contain date after merge"
+        set t16_ok to 0
+    if orset_size(os_a) != 4:
+        display f"  FAIL: size should be 4, got {orset_size(os_a)}"
+        set t16_ok to 0
+
+    if t16_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 17: OR-Set merge concurrent add/remove (add wins)
+    # ===========================================================
+    display "TEST 17: OR-Set merge concurrent add/remove (add wins)"
+    set t17_ok to 1
+    set os_c to orset_create("replica_c")
+    set os_d to orset_create("replica_d")
+    # Both add "fig"
+    set ok to orset_add(os_c and "fig")
+    set ok to orset_add(os_d and "fig")
+    # Replica C removes "fig", Replica D keeps it (concurrent)
+    set ok to orset_remove(os_c and "fig")
+    if orset_contains(os_c and "fig") != 0:
+        display "  FAIL: fig should be removed from C before merge"
+        set t17_ok to 0
+
+    # Merge D into C: D's add-tag for fig is not in C's tags, so it gets added
+    # D's tag is active, so after merge fig should be present (add wins)
+    set merge_err to orset_merge(os_c and os_d)
+    if merge_err != CRDT_ERR_NONE:
+        display "  FAIL: merge should succeed"
+        set t17_ok to 0
+    if orset_contains(os_c and "fig") != 1:
+        display "  FAIL: concurrent add should win over remove"
+        set t17_ok to 0
+
+    if t17_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 18: OR-Set to_list returns active elements
+    # ===========================================================
+    display "TEST 18: OR-Set to_list returns active elements"
+    set t18_ok to 1
+    set os_e to orset_create("replica_e")
+    set ok to orset_add(os_e and "x")
+    set ok to orset_add(os_e and "y")
+    set ok to orset_add(os_e and "z")
+    set ok to orset_remove(os_e and "y")
+
+    set result_list to create_list()
+    set ok to orset_to_list(os_e and result_list)
+    set list_len to length_list(result_list)
+    if list_len != 2:
+        display f"  FAIL: to_list should return 2 active elements, got {list_len}"
+        set t18_ok to 0
+
+    # Verify the elements are x and z (order depends on insertion order)
+    set found_x to 0
+    set found_z to 0
+    set li to 0
+    repeat while li < list_len:
+        set elem to get_list(result_list and li)
+        if elem equals "x":
+            set found_x to 1
+        if elem equals "z":
+            set found_z to 1
+        set li to li + 1
+    if found_x != 1:
+        display "  FAIL: to_list should contain x"
+        set t18_ok to 0
+    if found_z != 1:
+        display "  FAIL: to_list should contain z"
+        set t18_ok to 0
+    free_list(result_list)
+
+    if t18_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 19: OR-Set merge convergence (commutative)
+    # ===========================================================
+    display "TEST 19: OR-Set merge convergence"
+    set t19_ok to 1
+    set os_f to orset_create("replica_f")
+    set os_g to orset_create("replica_g")
+    set ok to orset_add(os_f and "alpha")
+    set ok to orset_add(os_f and "beta")
+    set ok to orset_add(os_g and "beta")
+    set ok to orset_add(os_g and "gamma")
+
+    # Create copies for reverse merge
+    set os_f2 to orset_create("replica_f")
+    set os_g2 to orset_create("replica_g")
+    set ok to orset_add(os_f2 and "alpha")
+    set ok to orset_add(os_f2 and "beta")
+    set ok to orset_add(os_g2 and "beta")
+    set ok to orset_add(os_g2 and "gamma")
+
+    # Merge f <- g
+    set ok to orset_merge(os_f and os_g)
+    # Merge g2 <- f2
+    set ok to orset_merge(os_g2 and os_f2)
+
+    # Both should contain alpha, beta, gamma
+    if orset_contains(os_f and "alpha") != 1:
+        display "  FAIL: f merge missing alpha"
+        set t19_ok to 0
+    if orset_contains(os_f and "beta") != 1:
+        display "  FAIL: f merge missing beta"
+        set t19_ok to 0
+    if orset_contains(os_f and "gamma") != 1:
+        display "  FAIL: f merge missing gamma"
+        set t19_ok to 0
+    if orset_contains(os_g2 and "alpha") != 1:
+        display "  FAIL: g2 merge missing alpha"
+        set t19_ok to 0
+    if orset_contains(os_g2 and "beta") != 1:
+        display "  FAIL: g2 merge missing beta"
+        set t19_ok to 0
+    if orset_contains(os_g2 and "gamma") != 1:
+        display "  FAIL: g2 merge missing gamma"
+        set t19_ok to 0
+    # Same size
+    if orset_size(os_f) != orset_size(os_g2):
+        display f"  FAIL: sizes should match: {orset_size(os_f)} vs {orset_size(os_g2)}"
+        set t19_ok to 0
+
+    if t19_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 20: OR-Set merge idempotent
+    # ===========================================================
+    display "TEST 20: OR-Set merge idempotent"
+    set t20_ok to 1
+    set size_before to orset_size(os_f)
+    set ok to orset_merge(os_f and os_g)
+    set size_after to orset_size(os_f)
+    if size_before != size_after:
+        display f"  FAIL: double merge changed size: {size_before} -> {size_after}"
+        set t20_ok to 0
+    if orset_contains(os_f and "alpha") != 1:
+        display "  FAIL: alpha lost after double merge"
+        set t20_ok to 0
+    if orset_contains(os_f and "beta") != 1:
+        display "  FAIL: beta lost after double merge"
+        set t20_ok to 0
+    if orset_contains(os_f and "gamma") != 1:
+        display "  FAIL: gamma lost after double merge"
+        set t20_ok to 0
+
+    if t20_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    display "==================================================="
+    return 0

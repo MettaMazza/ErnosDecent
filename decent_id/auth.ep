@@ -1,0 +1,408 @@
+# ErnosDecent -- Authentication Flows
+# Component: decent_id/auth.ep
+# Implements: Session tokens, multi-device auth, capability-based access
+# Depends on: keys.ep, did.ep
+# Status: Production -- OperationTrojanClaude Phase 2
+
+import "did"
+import "keys"
+import "string"
+import "crypto"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set AUTH_ERR_NONE to 0
+set AUTH_ERR_INVALID_TOKEN to 301
+set AUTH_ERR_TOKEN_EXPIRED to 302
+set AUTH_ERR_INSUFFICIENT_PERMISSION to 303
+set AUTH_ERR_INVALID_CAPABILITY to 304
+set AUTH_ERR_SIGNATURE_FAILED to 305
+set AUTH_ERR_DEVICE_NOT_AUTHORIZED to 306
+set AUTH_ERR_INVALID_DID to 307
+
+# Session token validity (in seconds)
+set SESSION_TOKEN_DEFAULT_TTL to 3600
+set SESSION_TOKEN_MAX_TTL to 86400
+
+# Capability actions
+set CAP_READ to "read"
+set CAP_WRITE to "write"
+set CAP_DELETE to "delete"
+set CAP_ADMIN to "admin"
+set CAP_SIGN to "sign"
+set CAP_ENCRYPT to "encrypt"
+set CAP_DELEGATE to "delegate"
+
+# ================================================================
+# Session Tokens
+# Signed, time-limited, revocable tokens proving identity
+# Format: <payload_hex>.<signature_hex>
+# Payload: SHA256(did + issued_at + expires_at + nonce)
+# ================================================================
+
+define create_session_token with did as Str and secret_key_hex as Str and ttl_seconds as Int:
+    set result to create_map()
+
+    if string_length(did) == 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_DID)
+        return result
+
+    # Clamp TTL
+    set actual_ttl to ttl_seconds
+    if actual_ttl <= 0:
+        set actual_ttl to SESSION_TOKEN_DEFAULT_TTL
+    if actual_ttl > SESSION_TOKEN_MAX_TTL:
+        set actual_ttl to SESSION_TOKEN_MAX_TTL
+
+    set issued_at to ep_time_now_sec()
+    set expires_at to issued_at + actual_ttl
+
+    # Generate random nonce
+    set err to init_crypto()
+    if err != 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_SIGNATURE_FAILED)
+        return result
+
+    set nonce_buf to alloc_bytes(16)
+    set fn_rand to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    set ok to ep_dlcall2(fn_rand and nonce_buf and 16)
+    set nonce to raw_to_hex(nonce_buf and 16)
+    set ok to free_bytes(nonce_buf)
+
+    # Build token payload: concatenate all fields for hashing
+    set issued_str to int_to_string(issued_at)
+    set expires_str to int_to_string(expires_at)
+    set payload_input to concat(did and ":")
+    set payload_input to concat(payload_input and issued_str)
+    set payload_input to concat(payload_input and ":")
+    set payload_input to concat(payload_input and expires_str)
+    set payload_input to concat(payload_input and ":")
+    set payload_input to concat(payload_input and nonce)
+
+    set payload_hash to ep_sha256(payload_input)
+
+    # Sign the payload hash
+    set sig_result to sign_message(payload_hash and secret_key_hex)
+    set sig_err to map_get_val(sig_result and "error")
+    if sig_err != 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_SIGNATURE_FAILED)
+        return result
+
+    set signature to map_get_val(sig_result and "signature")
+
+    # Token format: payload_hash.signature (both hex)
+    set token to concat(payload_hash and ".")
+    set token to concat(token and signature)
+
+    set ok to map_insert(result and "token" and token)
+    set ok to map_insert(result and "did" and did)
+    set ok to map_insert(result and "issued_at" and issued_at)
+    set ok to map_insert(result and "expires_at" and expires_at)
+    set ok to map_insert(result and "nonce" and nonce)
+    set ok to map_insert(result and "payload_hash" and payload_hash)
+    set ok to map_insert(result and "error" and AUTH_ERR_NONE)
+    return result
+
+define verify_session_token with token as Str and public_key_hex as Str and expected_payload_hash as Str:
+    # Verify a session token:
+    # 1. Extract payload_hash and signature from token
+    # 2. Verify signature matches public key
+    # 3. Verify payload_hash matches expected (caller recomputes from stored session data)
+    #
+    # Note: expiry checking is the caller's responsibility using the stored expires_at
+    set result to create_map()
+
+    if string_length(token) == 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_TOKEN)
+        return result
+
+    # Find the '.' separator (ASCII 46)
+    set dot_pos to string_index_of(token and ".")
+    if dot_pos < 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_TOKEN)
+        return result
+
+    set payload_hash to substring(token and 0 and dot_pos)
+    set signature to substring(token and dot_pos + 1 and string_length(token) - dot_pos - 1)
+
+    # D5: payload binding is MANDATORY. An empty expected_payload_hash previously
+    # skipped the binding entirely, leaving only a bare signature check (any signed
+    # payload would pass). Reject it, and always require the match.
+    if string_length(expected_payload_hash) == 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_TOKEN)
+        return result
+    if payload_hash equals expected_payload_hash:
+        set ok to 1
+    else:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_TOKEN)
+        return result
+
+    # Verify signature
+    set verify_result to verify_signature(payload_hash and signature and public_key_hex)
+    if verify_result != 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_TOKEN)
+        return result
+
+    set ok to map_insert(result and "payload_hash" and payload_hash)
+    set ok to map_insert(result and "signature" and signature)
+    set ok to map_insert(result and "error" and AUTH_ERR_NONE)
+    return result
+
+define is_token_expired with expires_at as Int returning Int:
+    set now to ep_time_now_sec()
+    if now >= expires_at:
+        return 1
+    return 0
+
+# ================================================================
+# Capability Tokens
+# Fine-grained permissions: what a holder can do, on what resource
+# Format: signed JSON-like structure with resource + actions + expiry
+# ================================================================
+
+define create_capability with granter_did as Str and grantee_did as Str and resource as Str and actions as Str and granter_secret_key as Str and ttl_seconds as Int:
+    # Create a capability token granting specific permissions
+    # actions: comma-separated list e.g. "read,write"
+    set result to create_map()
+
+    if string_length(granter_did) == 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_DID)
+        return result
+    if string_length(grantee_did) == 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_DID)
+        return result
+    if string_length(resource) == 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_CAPABILITY)
+        return result
+
+    set issued_at to ep_time_now_sec()
+    set actual_ttl to ttl_seconds
+    if actual_ttl <= 0:
+        set actual_ttl to SESSION_TOKEN_DEFAULT_TTL
+    set expires_at to issued_at + actual_ttl
+
+    set issued_str to int_to_string(issued_at)
+    set expires_str to int_to_string(expires_at)
+
+    # Build capability string for signing
+    set cap_str to concat(granter_did and "|")
+    set cap_str to concat(cap_str and grantee_did)
+    set cap_str to concat(cap_str and "|")
+    set cap_str to concat(cap_str and resource)
+    set cap_str to concat(cap_str and "|")
+    set cap_str to concat(cap_str and actions)
+    set cap_str to concat(cap_str and "|")
+    set cap_str to concat(cap_str and issued_str)
+    set cap_str to concat(cap_str and "|")
+    set cap_str to concat(cap_str and expires_str)
+
+    set cap_hash to ep_sha256(cap_str)
+
+    # Sign with granter's key
+    set sig_result to sign_message(cap_hash and granter_secret_key)
+    set sig_err to map_get_val(sig_result and "error")
+    if sig_err != 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_SIGNATURE_FAILED)
+        return result
+
+    set signature to map_get_val(sig_result and "signature")
+
+    set ok to map_insert(result and "granter" and granter_did)
+    set ok to map_insert(result and "grantee" and grantee_did)
+    set ok to map_insert(result and "resource" and resource)
+    set ok to map_insert(result and "actions" and actions)
+    set ok to map_insert(result and "issued_at" and issued_at)
+    set ok to map_insert(result and "expires_at" and expires_at)
+    set ok to map_insert(result and "cap_hash" and cap_hash)
+    set ok to map_insert(result and "signature" and signature)
+    set ok to map_insert(result and "error" and AUTH_ERR_NONE)
+    return result
+
+define verify_capability with cap as Str and granter_pub_hex as Str and grantee_did as Str and resource as Str and required_action as Str:
+    # Verify a capability token:
+    # 1. Parse the capability fields
+    # 2. Verify the granter's signature
+    # 3. Check the grantee matches
+    # 4. Check the resource matches
+    # 5. Check the required action is in the allowed actions
+    # 6. Check expiry
+    #
+    # cap format: granter|grantee|resource|actions|issued_at|expires_at.signature
+    set result to create_map()
+
+    set dot_pos to string_index_of(cap and ".")
+    if dot_pos < 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_CAPABILITY)
+        return result
+
+    set cap_body to substring(cap and 0 and dot_pos)
+    set signature to substring(cap and dot_pos + 1 and string_length(cap) - dot_pos - 1)
+
+    # Verify signature on hash of body
+    set cap_hash to ep_sha256(cap_body)
+    set verify_result to verify_signature(cap_hash and signature and granter_pub_hex)
+    if verify_result != 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_CAPABILITY)
+        return result
+
+    # Parse fields by splitting on '|'
+    set parts to string_split(cap_body and "|")
+    set num_parts to length_list(parts)
+    if num_parts != 6:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_CAPABILITY)
+        return result
+
+    set cap_granter to get_list(parts and 0)
+    set cap_grantee to get_list(parts and 1)
+    set cap_resource to get_list(parts and 2)
+    set cap_actions to get_list(parts and 3)
+    set cap_issued_str to get_list(parts and 4)
+    set cap_expires_str to get_list(parts and 5)
+
+    # Check grantee matches
+    if cap_grantee equals grantee_did:
+        set ok to 1
+    else:
+        set ok to map_insert(result and "error" and AUTH_ERR_INSUFFICIENT_PERMISSION)
+        return result
+
+    # Check resource matches: exact, or a true path-segment prefix (the granted
+    # resource followed by "/"). A plain substring/contains check would let a
+    # capability for "/data" authorize "/database" or "/data_secret".
+    if cap_resource equals resource:
+        set ok to 1
+    else:
+        set resource_prefix to concat(cap_resource and "/")
+        if string_index_of(resource and resource_prefix) == 0:
+            set ok to 1
+        else:
+            set ok to map_insert(result and "error" and AUTH_ERR_INSUFFICIENT_PERMISSION)
+            return result
+
+    # Check the required action against the allowed set. cap_actions is a
+    # comma-separated list; match each element EXACTLY -- a substring check would
+    # let "rea" satisfy "read", or "read" satisfy a granted "readonly".
+    set action_list to string_split(cap_actions and ",")
+    set act_len to length_list(action_list)
+    set action_found to 0
+    set admin_found to 0
+    set ai to 0
+    repeat while ai < act_len:
+        set act to get_list(action_list and ai)
+        if act equals required_action:
+            set action_found to 1
+        if act equals "admin":
+            set admin_found to 1
+        set ai to ai + 1
+    if action_found != 1:
+        if admin_found != 1:
+            set ok to map_insert(result and "error" and AUTH_ERR_INSUFFICIENT_PERMISSION)
+            return result
+
+    # Enforce expiry: the signed expires_at is authoritative (the signature
+    # prevents tampering). Reject if the current time is past it. Previously
+    # `now` was computed but never compared, so tokens never expired.
+    set now to ep_time_now_sec()
+    set cap_expires to string_to_int(cap_expires_str)
+    if now > cap_expires:
+        set ok to map_insert(result and "error" and AUTH_ERR_TOKEN_EXPIRED)
+        return result
+
+    set ok to map_insert(result and "granter" and cap_granter)
+    set ok to map_insert(result and "grantee" and cap_grantee)
+    set ok to map_insert(result and "resource" and cap_resource)
+    set ok to map_insert(result and "actions" and cap_actions)
+    set ok to map_insert(result and "error" and AUTH_ERR_NONE)
+    return result
+
+# ================================================================
+# Serialized capability format for wire transmission
+# ================================================================
+
+define serialize_capability with cap_map as Int returning Str:
+    # Serialize a capability map to wire format: body.signature
+    set granter to map_get_val(cap_map and "granter")
+    set grantee to map_get_val(cap_map and "grantee")
+    set resource to map_get_val(cap_map and "resource")
+    set actions to map_get_val(cap_map and "actions")
+    set issued_str to int_to_string(map_get_val(cap_map and "issued_at"))
+    set expires_str to int_to_string(map_get_val(cap_map and "expires_at"))
+    set signature to map_get_val(cap_map and "signature")
+
+    set body to concat(granter and "|")
+    set body to concat(body and grantee)
+    set body to concat(body and "|")
+    set body to concat(body and resource)
+    set body to concat(body and "|")
+    set body to concat(body and actions)
+    set body to concat(body and "|")
+    set body to concat(body and issued_str)
+    set body to concat(body and "|")
+    set body to concat(body and expires_str)
+
+    set wire to concat(body and ".")
+    set wire to concat(wire and signature)
+    return wire
+
+# ================================================================
+# Device Authorization
+# Authorize a new device by signing its DID with an existing device's key
+# ================================================================
+
+define authorize_device with authorizer_did as Str and authorizer_secret_key as Str and new_device_did as Str:
+    # The authorizer (existing device) signs a statement:
+    # "I (authorizer_did) authorize (new_device_did) at time (timestamp)"
+    set result to create_map()
+
+    if string_length(authorizer_did) == 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_DID)
+        return result
+    if string_length(new_device_did) == 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_INVALID_DID)
+        return result
+
+    set timestamp to ep_time_now_sec()
+    set ts_str to int_to_string(timestamp)
+
+    set auth_statement to concat("DEVICE_AUTH|" and authorizer_did)
+    set auth_statement to concat(auth_statement and "|")
+    set auth_statement to concat(auth_statement and new_device_did)
+    set auth_statement to concat(auth_statement and "|")
+    set auth_statement to concat(auth_statement and ts_str)
+
+    set auth_hash to ep_sha256(auth_statement)
+
+    set sig_result to sign_message(auth_hash and authorizer_secret_key)
+    set sig_err to map_get_val(sig_result and "error")
+    if sig_err != 0:
+        set ok to map_insert(result and "error" and AUTH_ERR_SIGNATURE_FAILED)
+        return result
+
+    set signature to map_get_val(sig_result and "signature")
+
+    set ok to map_insert(result and "authorizer" and authorizer_did)
+    set ok to map_insert(result and "device" and new_device_did)
+    set ok to map_insert(result and "timestamp" and timestamp)
+    set ok to map_insert(result and "auth_hash" and auth_hash)
+    set ok to map_insert(result and "signature" and signature)
+    set ok to map_insert(result and "error" and AUTH_ERR_NONE)
+    return result
+
+define verify_device_authorization with authorizer_did as Str and authorizer_pub_hex as Str and new_device_did as Str and timestamp as Int and signature as Str returning Int:
+    # Verify a device authorization signature
+    set ts_str to int_to_string(timestamp)
+
+    set auth_statement to concat("DEVICE_AUTH|" and authorizer_did)
+    set auth_statement to concat(auth_statement and "|")
+    set auth_statement to concat(auth_statement and new_device_did)
+    set auth_statement to concat(auth_statement and "|")
+    set auth_statement to concat(auth_statement and ts_str)
+
+    set auth_hash to ep_sha256(auth_statement)
+
+    set verify_result to verify_signature(auth_hash and signature and authorizer_pub_hex)
+    if verify_result == 0:
+        return AUTH_ERR_NONE
+    return AUTH_ERR_DEVICE_NOT_AUTHORIZED

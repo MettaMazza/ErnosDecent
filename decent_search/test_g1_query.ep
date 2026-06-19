@@ -1,0 +1,58 @@
+# G1 end-to-end: index real pages, run PageRank, query returns real ranked
+# results (NOT the old hardcoded BITCOIN/ERNOS fallbacks).
+
+import "string"
+import "collections"
+import "crawl"
+import "rank"
+import "query"
+
+define check_int with label as Str and got as Int and want as Int returning Int:
+    if got == want:
+        display concat("PASS: " and label)
+        return 1
+    display concat(concat(concat("FAIL: " and label) and " got=") and int_to_string(got))
+    return 0
+
+define check_true with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set passes to 0
+    set index to crawl_create_index()
+
+    # Two pages. Page A is about "decentralized mesh networking"; page B links to A
+    # (so A gets PageRank weight). Page C is unrelated.
+    set links_b to create_list()
+    set ok to append_list(links_b and "https://site/a")
+    set links_a to create_list()
+    set links_c to create_list()
+
+    set ok to crawl_index_page(index and "https://site/a" and "Mesh A" and "decentralized mesh networking sovereign protocol mesh" and links_a)
+    set ok to crawl_index_page(index and "https://site/b" and "Hub B" and "links and references to mesh networking resources" and links_b)
+    set ok to crawl_index_page(index and "https://site/c" and "Cooking C" and "recipes for bread and soup unrelated content" and links_c)
+
+    set ok to rank_compute_pagerank(index and 20)
+
+    # Query for "mesh" — should match A and B, not C.
+    set results to query_search(index and "mesh")
+    set n to length_list(results)
+    set passes to passes + check_int("mesh_match_count" and n and 2)
+
+    # Top result must be a real indexed URL (not a hardcoded fallback domain).
+    set top_url to ptr_to_str(map_get_val(get_list(results and 0) and "url"))
+    set is_indexed to 0
+    if top_url equals "https://site/a" or else top_url equals "https://site/b":
+        set is_indexed to 1
+    set passes to passes + check_true("top_is_real_indexed_url" and is_indexed)
+
+    # Query for an unindexed term returns empty (no fabricated results).
+    set empty to query_search(index and "nonexistentzzz")
+    set passes to passes + check_int("unindexed_is_empty" and length_list(empty) and 0)
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/3 passed"))
+    return 0

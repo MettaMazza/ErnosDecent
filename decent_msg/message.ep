@@ -1,0 +1,545 @@
+# ErnosDecent -- Encrypted P2P Messaging
+# Component: decent_msg/message.ep
+# Implements: End-to-end encrypted direct messages (crypto_box / X25519 ECDH +
+#             Ed25519 signatures), conversation sessions, ordering, read receipts.
+#             NOTE: no forward secrecy / ratchet yet — a single static keypair per
+#             identity is used; do not claim FS until a ratchet is implemented.
+# Uses: Noise-encrypted transport, CAS for message storage
+# Status: Production -- OperationTrojanClaude Phase 5
+
+import "../decent_id/keys"
+import "../decent_id/auth"
+import "../decent_store/content"
+import "../decent_net/transport"
+import "string"
+import "../storage"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set MSG_ERR_NONE to 0
+set MSG_ERR_INVALID_SENDER to 901
+set MSG_ERR_INVALID_RECIPIENT to 902
+set MSG_ERR_ENCRYPTION_FAILED to 903
+set MSG_ERR_DECRYPTION_FAILED to 904
+set MSG_ERR_NOT_FOUND to 905
+set MSG_ERR_ALREADY_READ to 906
+set MSG_ERR_CONVERSATION_CLOSED to 907
+set MSG_ERR_EMPTY_BODY to 908
+set MSG_ERR_SIGNATURE_INVALID to 909
+set MSG_ERR_INVALID_FORMAT to 910
+
+# Message types
+set MSG_TYPE_TEXT to 1
+set MSG_TYPE_FILE to 2
+set MSG_TYPE_REACTION to 3
+set MSG_TYPE_SYSTEM to 4
+set MSG_TYPE_READ_RECEIPT to 5
+set MSG_TYPE_TYPING to 6
+set MSG_TYPE_DELETE to 7
+
+# Message states
+set MSG_STATE_DRAFT to 0
+set MSG_STATE_SENT to 1
+set MSG_STATE_DELIVERED to 2
+set MSG_STATE_READ to 3
+set MSG_STATE_FAILED to 4
+
+# Conversation states
+set CONV_STATE_ACTIVE to 1
+set CONV_STATE_ARCHIVED to 2
+set CONV_STATE_CLOSED to 3
+
+# ================================================================
+# Helpers
+# ================================================================
+
+define msg_generate_id returning Str:
+    # Generate a random 256-bit ID using libsodium
+    set err to init_crypto()
+    set buf to alloc_bytes(32)
+    set fn to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    set ok to ep_dlcall2(fn and buf and 32)
+    set hex to raw_to_hex(buf and 32)
+    set ok to free_bytes(buf)
+    return hex
+
+# ================================================================
+# Message -- a single encrypted message
+# ================================================================
+
+define msg_create with sender_id as Str and recipient_id as Str and body as Str and msg_type as Int:
+    set msg to create_map()
+    set msg_id to msg_generate_id()
+    set ok to map_insert(msg and "id" and msg_id)
+    set ok to map_insert(msg and "sender" and sender_id)
+    set ok to map_insert(msg and "recipient" and recipient_id)
+    set ok to map_insert(msg and "body" and body)
+    set ok to map_insert(msg and "type" and msg_type)
+    set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
+    set ok to map_insert(msg and "state" and MSG_STATE_DRAFT)
+    set ok to map_insert(msg and "signature" and "")
+    set ok to map_insert(msg and "reply_to" and "")
+    return msg
+
+define msg_create_text with sender_id as Str and recipient_id as Str and body as Str:
+    return msg_create(sender_id and recipient_id and body and MSG_TYPE_TEXT)
+
+define msg_create_file with sender_id as Str and recipient_id as Str and file_hash as Str and filename as Str:
+    set body to concat(file_hash and ":")
+    set body to concat(body and filename)
+    return msg_create(sender_id and recipient_id and body and MSG_TYPE_FILE)
+
+define msg_create_reaction with sender_id as Str and recipient_id as Str and target_msg_id as Str and reaction as Str:
+    set msg to msg_create(sender_id and recipient_id and reaction and MSG_TYPE_REACTION)
+    set ok to map_insert(msg and "reply_to" and target_msg_id)
+    return msg
+
+define msg_create_read_receipt with sender_id as Str and recipient_id as Str and msg_id as Str:
+    set msg to msg_create(sender_id and recipient_id and msg_id and MSG_TYPE_READ_RECEIPT)
+    return msg
+
+define msg_create_delete with sender_id as Str and recipient_id as Str and target_msg_id as Str:
+    set msg to msg_create(sender_id and recipient_id and target_msg_id and MSG_TYPE_DELETE)
+    return msg
+
+# ================================================================
+# Message signing and verification
+# ================================================================
+
+define msg_sign with msg as Int and signing_key_hex as Str returning Int:
+    # Sign the message content with the sender's key
+    set body to map_get_val(msg and "body")
+    set sender to map_get_val(msg and "sender")
+    set timestamp to map_get_val(msg and "timestamp")
+    set msg_id to map_get_val(msg and "id")
+
+    # Create signing payload: id + sender + body + timestamp
+    set payload to concat(msg_id and ":")
+    set payload to concat(payload and sender)
+    set payload to concat(payload and ":")
+    set payload to concat(payload and body)
+    set payload to concat(payload and ":")
+    set payload to concat(payload and int_to_string(timestamp))
+
+    set sig_result to sign_message(payload and signing_key_hex)
+    set sig to map_get_val(sig_result and "signature")
+    if string_length(sig) == 0:
+        return MSG_ERR_ENCRYPTION_FAILED
+
+    set ok to map_insert(msg and "signature" and sig)
+    set ok to map_insert(msg and "state" and MSG_STATE_SENT)
+    return MSG_ERR_NONE
+
+define msg_verify with msg as Int and verify_key_hex as Str returning Int:
+    set body to map_get_val(msg and "body")
+    set sender to map_get_val(msg and "sender")
+    set timestamp to map_get_val(msg and "timestamp")
+    set msg_id to map_get_val(msg and "id")
+    set sig to map_get_val(msg and "signature")
+
+    set payload to concat(msg_id and ":")
+    set payload to concat(payload and sender)
+    set payload to concat(payload and ":")
+    set payload to concat(payload and body)
+    set payload to concat(payload and ":")
+    set payload to concat(payload and int_to_string(timestamp))
+
+    set res to verify_signature(payload and sig and verify_key_hex)
+    if res == 0:
+        return 1
+    return 0
+
+# ================================================================
+# Message Encryption (using symmetric key from Noise session)
+# ================================================================
+
+define msg_encrypt_body with body as Str and session_key_hex as Str:
+    set result to create_map()
+    if string_length(body) == 0:
+        set ok to map_insert(result and "error" and MSG_ERR_EMPTY_BODY)
+        return result
+
+    set enc_result to encrypt_symmetric(body and session_key_hex)
+    set err to map_get_val(enc_result and "error")
+    if err != 0:
+        set ok to map_insert(result and "error" and MSG_ERR_ENCRYPTION_FAILED)
+        return result
+
+    set ciphertext to map_get_val(enc_result and "ciphertext")
+    set nonce to map_get_val(enc_result and "nonce")
+    set ok to map_insert(result and "ciphertext" and ciphertext)
+    set ok to map_insert(result and "nonce" and nonce)
+    set ok to map_insert(result and "error" and MSG_ERR_NONE)
+    return result
+
+define msg_decrypt_body with ciphertext as Str and nonce as Str and session_key_hex as Str:
+    set result to create_map()
+    set dec_result to decrypt_symmetric(ciphertext and nonce and session_key_hex)
+    set err to map_get_val(dec_result and "error")
+    if err != 0:
+        set ok to map_insert(result and "error" and MSG_ERR_DECRYPTION_FAILED)
+        return result
+
+    set plaintext to map_get_val(dec_result and "plaintext")
+    set ok to map_insert(result and "plaintext" and plaintext)
+    set ok to map_insert(result and "error" and MSG_ERR_NONE)
+    return result
+
+# Real end-to-end encrypt-then-sign for a direct message (crypto_box X25519 ECDH +
+# Ed25519). Replaces the body with ciphertext, stores the nonce, and signs the
+# (id:sender:ciphertext:timestamp) tuple. The recipient verifies the signature over
+# the ciphertext BEFORE decrypting (authenticated encryption). MSG_ERR_NONE on success.
+define msg_encrypt_and_sign with msg as Int and recipient_enc_pub_hex as Str and sender_enc_sec_hex as Str and sender_sign_sec_hex as Str returning Int:
+    set body to ptr_to_str(map_get_val(msg and "body"))
+    set enc to encrypt_to_recipient(body and recipient_enc_pub_hex and sender_enc_sec_hex)
+    if map_get_val(enc and "error") != 0:
+        return MSG_ERR_ENCRYPTION_FAILED
+    set ok to map_insert(msg and "body" and ptr_to_str(map_get_val(enc and "ciphertext")))
+    set ok to map_insert(msg and "nonce" and ptr_to_str(map_get_val(enc and "nonce")))
+    return msg_sign(msg and sender_sign_sec_hex)
+
+# Verify-then-decrypt a received direct message. Verifies the signature over the
+# ciphertext with the sender's signing pubkey, then ECDH-decrypts. On success the
+# body is replaced with plaintext. Returns MSG_ERR_NONE / SIGNATURE_INVALID / DECRYPTION_FAILED.
+define msg_verify_and_decrypt with msg as Int and sender_sign_pub_hex as Str and sender_enc_pub_hex as Str and recipient_enc_sec_hex as Str returning Int:
+    if msg_verify(msg and sender_sign_pub_hex) != 1:
+        return MSG_ERR_SIGNATURE_INVALID
+    set ciphertext to ptr_to_str(map_get_val(msg and "body"))
+    set nonce to ""
+    if map_contains(msg and "nonce") == 1:
+        set nonce to ptr_to_str(map_get_val(msg and "nonce"))
+    set dec to decrypt_from_sender(ciphertext and nonce and sender_enc_pub_hex and recipient_enc_sec_hex)
+    if map_get_val(dec and "error") != 0:
+        return MSG_ERR_DECRYPTION_FAILED
+    set ok to map_insert(msg and "body" and ptr_to_str(map_get_val(dec and "plaintext")))
+    return MSG_ERR_NONE
+
+# ================================================================
+# Conversation -- a session between two peers
+# ================================================================
+
+define conv_create with local_id as Str and remote_id as Str:
+    set conv to create_map()
+    set conv_id to msg_generate_id()
+    set ok to map_insert(conv and "id" and conv_id)
+    set ok to map_insert(conv and "local_id" and local_id)
+    set ok to map_insert(conv and "remote_id" and remote_id)
+    set ok to map_insert(conv and "state" and CONV_STATE_ACTIVE)
+    set ok to map_insert(conv and "created_at" and ep_time_now_sec())
+    set ok to map_insert(conv and "last_activity" and ep_time_now_sec())
+
+    # Message history
+    set messages to create_list()
+    set ok to map_insert(conv and "messages" and messages)
+    set ok to map_insert(conv and "message_count" and 0)
+    set ok to map_insert(conv and "unread_count" and 0)
+
+    return conv
+
+define conv_add_message with conv as Int and msg as Int returning Int:
+    set state to map_get_val(conv and "state")
+    if state == CONV_STATE_CLOSED:
+        return MSG_ERR_CONVERSATION_CLOSED
+
+    set messages to map_get_val(conv and "messages")
+    set ok to append_list(messages and msg)
+    set count to map_get_val(conv and "message_count")
+    set ok to map_insert(conv and "message_count" and count + 1)
+    set ok to map_insert(conv and "last_activity" and ep_time_now_sec())
+
+    # If incoming message, increment unread
+    set local_id to map_get_val(conv and "local_id")
+    set msg_sender to map_get_val(msg and "sender")
+    if msg_sender equals local_id:
+        set ok to 1
+    else:
+        set unread to map_get_val(conv and "unread_count")
+        set ok to map_insert(conv and "unread_count" and unread + 1)
+
+    return MSG_ERR_NONE
+
+define conv_mark_read with conv as Int returning Int:
+    set ok to map_insert(conv and "unread_count" and 0)
+    return MSG_ERR_NONE
+
+define conv_get_messages with conv as Int and offset as Int and limit as Int:
+    # Return messages from offset, up to limit
+    set result to create_list()
+    set messages to map_get_val(conv and "messages")
+    set total to map_get_val(conv and "message_count")
+
+    set i to offset
+    set count to 0
+    repeat while i < total:
+        if count >= limit:
+            return result
+        set ok to append_list(result and get_list(messages and i))
+        set count to count + 1
+        set i to i + 1
+
+    return result
+
+define conv_get_latest with conv as Int and count as Int:
+    # Return the latest 'count' messages
+    set messages to map_get_val(conv and "messages")
+    set total to map_get_val(conv and "message_count")
+    set result to create_list()
+
+    set start to total - count
+    if start < 0:
+        set start to 0
+
+    set i to start
+    repeat while i < total:
+        set ok to append_list(result and get_list(messages and i))
+        set i to i + 1
+
+    return result
+
+define conv_close with conv as Int:
+    set ok to map_insert(conv and "state" and CONV_STATE_CLOSED)
+    return MSG_ERR_NONE
+
+define conv_archive with conv as Int:
+    set ok to map_insert(conv and "state" and CONV_STATE_ARCHIVED)
+    return MSG_ERR_NONE
+
+# ================================================================
+# Message Store -- manages multiple conversations
+# ================================================================
+
+define mstore_create with local_id as Str:
+    set store to create_map()
+    set ok to map_insert(store and "local_id" and local_id)
+    set conversations to create_map()
+    set ok to map_insert(store and "conversations" and conversations)
+    set conv_list to create_list()
+    set ok to map_insert(store and "conv_list" and conv_list)
+    set ok to map_insert(store and "conv_count" and 0)
+
+    # Load persistent conversations and messages from SQLite
+    set db_convs to storage_load_conversations()
+    set db_convs_len to length_list(db_convs)
+    set c_idx to 0
+    repeat while c_idx < db_convs_len:
+        set db_conv to get_list(db_convs and c_idx)
+        set r_id to map_get_val(db_conv and "remote_id")
+        set l_id to map_get_val(db_conv and "local_id")
+        set c_state to map_get_val(db_conv and "state")
+        set c_unread to map_get_val(db_conv and "unread_count")
+        set c_updated to map_get_val(db_conv and "updated_at")
+
+        set conv to create_map()
+        set ok to map_insert(conv and "id" and r_id)
+        set ok to map_insert(conv and "local_id" and l_id)
+        set ok to map_insert(conv and "remote_id" and r_id)
+        set ok to map_insert(conv and "state" and c_state)
+        set ok to map_insert(conv and "created_at" and c_updated)
+        set ok to map_insert(conv and "last_activity" and c_updated)
+        set ok to map_insert(conv and "unread_count" and c_unread)
+
+        set messages_list to create_list()
+        set db_msgs to storage_load_messages(r_id)
+        set db_msgs_len to length_list(db_msgs)
+        set m_idx to 0
+        repeat while m_idx < db_msgs_len:
+            set db_msg to get_list(db_msgs and m_idx)
+            set msg to create_map()
+            set ok to map_insert(msg and "id" and map_get_val(db_msg and "message_id"))
+            set ok to map_insert(msg and "sender" and map_get_val(db_msg and "sender"))
+            set ok to map_insert(msg and "recipient" and map_get_val(db_msg and "recipient"))
+            set ok to map_insert(msg and "body" and map_get_val(db_msg and "body"))
+            set ok to map_insert(msg and "type" and map_get_val(db_msg and "type"))
+            set ok to map_insert(msg and "state" and map_get_val(db_msg and "state"))
+            set ok to map_insert(msg and "timestamp" and map_get_val(db_msg and "timestamp"))
+            set ok to map_insert(msg and "signature" and "")
+            set ok to map_insert(msg and "reply_to" and "")
+            set ok to append_list(messages_list and msg)
+            set m_idx to m_idx + 1
+
+        set ok to map_insert(conv and "messages" and messages_list)
+        set ok to map_insert(conv and "message_count" and db_msgs_len)
+
+        set ok to map_insert(conversations and r_id and conv)
+        set ok to append_list(conv_list and r_id)
+        set c_idx to c_idx + 1
+
+    set ok to map_insert(store and "conv_count" and db_convs_len)
+    return store
+
+define mstore_get_or_create_conv with store as Int and remote_id as Str:
+    set conversations to map_get_val(store and "conversations")
+    set existing to map_get_val(conversations and remote_id)
+    if existing != 0:
+        return existing
+
+    set local_id to map_get_val(store and "local_id")
+    set conv to conv_create(local_id and remote_id)
+    set ok to map_insert(conversations and remote_id and conv)
+
+    set conv_list to map_get_val(store and "conv_list")
+    set ok to append_list(conv_list and remote_id)
+    set count to map_get_val(store and "conv_count")
+    set ok to map_insert(store and "conv_count" and count + 1)
+
+    # Persist the newly created conversation
+    set ok to storage_save_conversation(remote_id and local_id and map_get_val(conv and "state") and map_get_val(conv and "unread_count") and map_get_val(conv and "last_activity"))
+
+    return conv
+
+define mstore_send with store as Int and remote_id as Str and body as Str:
+    set result to create_map()
+    set local_id to map_get_val(store and "local_id")
+
+    if string_length(body) == 0:
+        set ok to map_insert(result and "error" and MSG_ERR_EMPTY_BODY)
+        return result
+
+    set conv to mstore_get_or_create_conv(store and remote_id)
+    set msg to msg_create_text(local_id and remote_id and body)
+    set ok to map_insert(msg and "state" and MSG_STATE_SENT)
+    set add_err to conv_add_message(conv and msg)
+
+    # Persist the sent message and update conversation
+    set ok to storage_save_message(map_get_val(msg and "id") and remote_id and local_id and remote_id and body and map_get_val(msg and "type") and map_get_val(msg and "state") and map_get_val(msg and "timestamp"))
+    set ok to storage_save_conversation(remote_id and local_id and map_get_val(conv and "state") and map_get_val(conv and "unread_count") and map_get_val(conv and "last_activity"))
+
+    set ok to map_insert(result and "message" and msg)
+    set ok to map_insert(result and "conversation" and conv)
+    set ok to map_insert(result and "error" and add_err)
+    return result
+
+define mstore_receive with store as Int and msg as Int:
+    set result to create_map()
+    set sender to map_get_val(msg and "sender")
+    set conv to mstore_get_or_create_conv(store and sender)
+    set ok to map_insert(msg and "state" and MSG_STATE_DELIVERED)
+    set add_err to conv_add_message(conv and msg)
+
+    # Persist the received message and update conversation
+    set local_id to map_get_val(store and "local_id")
+    set ok to storage_save_message(map_get_val(msg and "id") and sender and sender and local_id and map_get_val(msg and "body") and map_get_val(msg and "type") and map_get_val(msg and "state") and map_get_val(msg and "timestamp"))
+    set ok to storage_save_conversation(sender and local_id and map_get_val(conv and "state") and map_get_val(conv and "unread_count") and map_get_val(conv and "last_activity"))
+
+    set ok to map_insert(result and "conversation" and conv)
+    set ok to map_insert(result and "error" and add_err)
+    return result
+
+define mstore_conv_count with store as Int returning Int:
+    return map_get_val(store and "conv_count")
+
+define mstore_total_unread with store as Int returning Int:
+    set conv_list to map_get_val(store and "conv_list")
+    set conversations to map_get_val(store and "conversations")
+    set count to map_get_val(store and "conv_count")
+    set total to 0
+    set i to 0
+    repeat while i < count:
+        set rid to get_list(conv_list and i)
+        set conv to map_get_val(conversations and rid)
+        set unread to map_get_val(conv and "unread_count")
+        set total to total + unread
+        set i to i + 1
+    return total
+
+# ================================================================
+# Serialization -- pipe-delimited wire format
+# ================================================================
+
+define msg_serialize with msg as Int returning Str:
+    # Serialize message map to: id|sender_id|recipient_id|body|msg_type|timestamp|signature
+    set mid to ptr_to_str(map_get_val(msg and "id"))
+    set sender to ptr_to_str(map_get_val(msg and "sender"))
+    set recipient to ptr_to_str(map_get_val(msg and "recipient"))
+    set body to ptr_to_str(map_get_val(msg and "body"))
+    set msg_type to int_to_string(map_get_val(msg and "type"))
+    set timestamp to int_to_string(map_get_val(msg and "timestamp"))
+    set signature to ptr_to_str(map_get_val(msg and "signature"))
+
+    set out to concat(mid and "|")
+    set out to concat(out and sender)
+    set out to concat(out and "|")
+    set out to concat(out and recipient)
+    set out to concat(out and "|")
+    set out to concat(out and body)
+    set out to concat(out and "|")
+    set out to concat(out and msg_type)
+    set out to concat(out and "|")
+    set out to concat(out and timestamp)
+    set out to concat(out and "|")
+    set out to concat(out and signature)
+    set nonce to ""
+    if map_contains(msg and "nonce") == 1:
+        set nonce to ptr_to_str(map_get_val(msg and "nonce"))
+    set out to concat(out and "|")
+    set out to concat(out and nonce)
+    return out
+
+define msg_deserialize with data as Str returning Int:
+    # Parse pipe-delimited string back to a message map (Int handle, consistent with
+    # msg_create so the message helpers accept it without a cast).
+    # Wire format: id|sender|recipient|body|type|timestamp|signature|nonce
+    set parts to string_split(data and "|")
+    set msg to create_map()
+    # Bounds-check: a malformed frame must not index out of range.
+    if length_list(parts) < 7:
+        set ok to map_insert(msg and "error" and MSG_ERR_INVALID_FORMAT)
+        return msg
+    set ok to map_insert(msg and "id" and get_list(parts and 0))
+    set ok to map_insert(msg and "sender" and get_list(parts and 1))
+    set ok to map_insert(msg and "recipient" and get_list(parts and 2))
+    set ok to map_insert(msg and "body" and get_list(parts and 3))
+    set ok to map_insert(msg and "type" and string_to_int(get_list(parts and 4)))
+    set ok to map_insert(msg and "timestamp" and string_to_int(get_list(parts and 5)))
+    set ok to map_insert(msg and "signature" and get_list(parts and 6))
+    set nonce to ""
+    if length_list(parts) >= 8:
+        set nonce to get_list(parts and 7)
+    set ok to map_insert(msg and "nonce" and nonce)
+    set ok to map_insert(msg and "state" and MSG_STATE_DRAFT)
+    set ok to map_insert(msg and "reply_to" and "")
+    set ok to map_insert(msg and "error" and MSG_ERR_NONE)
+    return msg
+
+# ================================================================
+# Network delivery -- send message over TCP via transport layer
+# ================================================================
+
+define msg_send_to_peer with store as Int and remote_id as Str and body as Str and address as Str and port as Int returning Map:
+    # Create the message locally via mstore_send
+    set result to mstore_send(store and remote_id and body)
+    set err to map_get_val(result and "error")
+    if err != MSG_ERR_NONE:
+        return result
+
+    # Serialize the message for the wire
+    set msg to map_get_val(result and "message")
+    set serialized to msg_serialize(msg)
+
+    # Connect to remote peer
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != 0:
+        set ok to map_insert(result and "delivered" and 0)
+        set ok to map_insert(result and "delivery_error" and conn_err)
+        return result
+
+    # Send the message
+    set send_err to transport_send(conn and MSG_TYPE_MSG_DELIVER and serialized)
+    if send_err != 0:
+        set ok to transport_close(conn)
+        set ok to map_insert(result and "delivered" and 0)
+        set ok to map_insert(result and "delivery_error" and send_err)
+        return result
+
+    # Receive ACK from remote
+    set resp to transport_recv(conn)
+    set ok to transport_close(conn)
+
+    # Mark delivery status
+    set ok to map_insert(result and "delivered" and 1)
+    set ok to map_insert(result and "delivery_error" and 0)
+    set ok to map_insert(msg and "state" and MSG_STATE_DELIVERED)
+    return result

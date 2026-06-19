@@ -1,0 +1,501 @@
+# ErnosDecent -- Test Suite for decent_net/noise.ep
+# Tests: Noise_XX handshake + encrypted transport
+# Status: Production -- OperationTrojanClaude Phase 2
+
+import "noise"
+import "../decent_id/keys"
+import "string"
+import "test"
+
+# ================================================================
+# Test 1: HMAC-SHA256 produces 32-byte output
+# ================================================================
+
+define test_hmac:
+    display "TEST 1: HMAC-SHA256 produces 32-byte output"
+    set err to init_crypto()
+    assert_true(err == 0 and "crypto init should succeed")
+
+    set key_ptr to alloc_bytes(32)
+    set data_ptr to str_to_ptr("test data for hmac")
+    set data_len to string_length("test data for hmac")
+    set out_ptr to alloc_bytes(32)
+
+    # Fill key with known bytes
+    set i to 0
+    repeat while i < 32:
+        set ok to poke_byte(key_ptr and i and i + 1)
+        set i to i + 1
+
+    set result to noise_hmac_sha256(key_ptr and 32 and data_ptr and data_len and out_ptr)
+    assert_true(result == 0 and "HMAC should succeed")
+
+    set hmac_hex to raw_to_hex(out_ptr and 32)
+    assert_true(string_length(hmac_hex) == 64 and "HMAC output should be 64 hex chars")
+
+    set ok to free_bytes(key_ptr)
+    set ok to free_bytes(out_ptr)
+
+    display f"  HMAC: {hmac_hex}"
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 2: HKDF produces two different 32-byte outputs
+# ================================================================
+
+define test_hkdf:
+    display "TEST 2: HKDF produces two different 32-byte outputs"
+    set ck_ptr to alloc_bytes(32)
+    set ikm_ptr to alloc_bytes(32)
+    set out1_ptr to alloc_bytes(32)
+    set out2_ptr to alloc_bytes(32)
+
+    # Fill with known data
+    set i to 0
+    repeat while i < 32:
+        set ok to poke_byte(ck_ptr and i and i)
+        set ok to poke_byte(ikm_ptr and i and 32 - i)
+        set i to i + 1
+
+    set result to noise_hkdf(ck_ptr and ikm_ptr and 32 and out1_ptr and out2_ptr)
+    assert_true(result == NOISE_ERR_NONE and "HKDF should succeed")
+
+    set hex1 to raw_to_hex(out1_ptr and 32)
+    set hex2 to raw_to_hex(out2_ptr and 32)
+
+    assert_true(string_length(hex1) == 64 and "output1 should be 64 hex chars")
+    assert_true(string_length(hex2) == 64 and "output2 should be 64 hex chars")
+
+    # The two outputs must differ
+    if hex1 equals hex2:
+        display "  FAIL: two HKDF outputs are identical"
+        return 1
+
+    set ok to free_bytes(ck_ptr)
+    set ok to free_bytes(ikm_ptr)
+    set ok to free_bytes(out1_ptr)
+    set ok to free_bytes(out2_ptr)
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 3: ChaChaPoly encrypt/decrypt roundtrip
+# ================================================================
+
+define test_chacha_roundtrip:
+    display "TEST 3: ChaChaPoly encrypt/decrypt roundtrip"
+    set key_ptr to alloc_bytes(32)
+    set fn_rand to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    set ok to ep_dlcall2(fn_rand and key_ptr and 32)
+
+    set plaintext to "Hello from ErnosDecent Noise Protocol!"
+    set plain_ptr to str_to_ptr(plaintext)
+    set plain_len to string_length(plaintext)
+
+    set cipher_ptr to alloc_bytes(plain_len + NOISE_TAG_LEN)
+    set cipher_len_ptr to alloc_bytes(8)
+
+    # Encrypt with nonce 0 and empty AD
+    set empty_ad to alloc_bytes(1)
+    set enc_result to noise_encrypt(key_ptr and 0 and empty_ad and 0 and plain_ptr and plain_len and cipher_ptr and cipher_len_ptr)
+    assert_true(enc_result == 0 and "encryption should succeed")
+
+    # Decrypt
+    set dec_ptr to alloc_bytes(plain_len + 1)
+    set dec_len_ptr to alloc_bytes(8)
+    set dec_result to noise_decrypt(key_ptr and 0 and empty_ad and 0 and cipher_ptr and plain_len + NOISE_TAG_LEN and dec_ptr and dec_len_ptr)
+    assert_true(dec_result == 0 and "decryption should succeed")
+
+    set ok to poke_byte(dec_ptr and plain_len and 0)
+    set recovered to ptr_to_str(dec_ptr)
+
+    # L1 GUARD: the nonce must be a full 64-bit counter. Under a 32-bit nonce,
+    # counter 2^32 produces the SAME 12-byte AEAD nonce as counter 0 (keystream
+    # reuse). Encrypt at 2^32, then prove that ciphertext does NOT decrypt at
+    # counter 0 (different nonces now) but DOES decrypt at 2^32.
+    set big_nonce to 4294967296
+    set c2_ptr to alloc_bytes(plain_len + NOISE_TAG_LEN)
+    set c2_len to alloc_bytes(8)
+    set enc2 to noise_encrypt(key_ptr and big_nonce and empty_ad and 0 and plain_ptr and plain_len and c2_ptr and c2_len)
+    assert_true(enc2 == 0 and "encrypt at nonce 2^32 should succeed")
+    set d2_ptr to alloc_bytes(plain_len + 1)
+    set d2_len to alloc_bytes(8)
+    set dec_wrong to noise_decrypt(key_ptr and 0 and empty_ad and 0 and c2_ptr and plain_len + NOISE_TAG_LEN and d2_ptr and d2_len)
+    assert_true(dec_wrong != 0 and "nonce 2^32 must NOT collide with nonce 0")
+    set dec_right to noise_decrypt(key_ptr and big_nonce and empty_ad and 0 and c2_ptr and plain_len + NOISE_TAG_LEN and d2_ptr and d2_len)
+    assert_true(dec_right == 0 and "roundtrip at nonce 2^32 should succeed")
+    set ok to free_bytes(c2_ptr)
+    set ok to free_bytes(c2_len)
+    set ok to free_bytes(d2_ptr)
+    set ok to free_bytes(d2_len)
+
+    if recovered equals plaintext:
+        display "  PASS"
+    else:
+        display "  FAIL: plaintext mismatch"
+        return 1
+
+    set ok to free_bytes(key_ptr)
+    set ok to free_bytes(cipher_ptr)
+    set ok to free_bytes(cipher_len_ptr)
+    set ok to free_bytes(dec_ptr)
+    set ok to free_bytes(dec_len_ptr)
+    set ok to free_bytes(empty_ad)
+    return 0
+
+# ================================================================
+# Test 4: CipherState encrypt then decrypt
+# ================================================================
+
+define test_cipher_state:
+    display "TEST 4: CipherState encrypt then decrypt"
+    set key_ptr to alloc_bytes(32)
+    set fn_rand to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    set ok to ep_dlcall2(fn_rand and key_ptr and 32)
+
+    set cs_enc to cipher_state_init_key(key_ptr)
+    set cs_dec to cipher_state_init_key(key_ptr)
+
+    set msg to "CipherState test message"
+    set msg_ptr to str_to_ptr(msg)
+    set msg_len to string_length(msg)
+
+    set cipher_ptr to alloc_bytes(msg_len + NOISE_TAG_LEN)
+    set cipher_len_ptr to alloc_bytes(8)
+    set empty_ad to alloc_bytes(1)
+
+    set enc_err to cipher_state_encrypt_with_ad(cs_enc and empty_ad and 0 and msg_ptr and msg_len and cipher_ptr and cipher_len_ptr)
+    assert_true(enc_err == NOISE_ERR_NONE and "cipher encrypt should succeed")
+
+    set dec_ptr to alloc_bytes(msg_len + 1)
+    set dec_len_ptr to alloc_bytes(8)
+    set dec_err to cipher_state_decrypt_with_ad(cs_dec and empty_ad and 0 and cipher_ptr and msg_len + NOISE_TAG_LEN and dec_ptr and dec_len_ptr)
+    assert_true(dec_err == NOISE_ERR_NONE and "cipher decrypt should succeed")
+
+    set ok to poke_byte(dec_ptr and msg_len and 0)
+    set recovered to ptr_to_str(dec_ptr)
+
+    # M3 GUARD: a forged packet must NOT advance the receiver's nonce, so a
+    # later legitimate message still decrypts. cs_enc/cs_dec are both at nonce 1
+    # after the roundtrip above. Feed cs_dec random (forged) bytes: it must be
+    # rejected; then a real next message must still decrypt.
+    set forged to alloc_bytes(msg_len + NOISE_TAG_LEN)
+    set fok to ep_dlcall2(fn_rand and forged and msg_len + NOISE_TAG_LEN)
+    set fdec_ptr to alloc_bytes(msg_len + 1)
+    set fdec_len to alloc_bytes(8)
+    set forged_err to cipher_state_decrypt_with_ad(cs_dec and empty_ad and 0 and forged and msg_len + NOISE_TAG_LEN and fdec_ptr and fdec_len)
+    assert_true(forged_err != NOISE_ERR_NONE and "forged packet must be rejected")
+
+    set msg2 to "second legit message"
+    set msg2_ptr to str_to_ptr(msg2)
+    set msg2_len to string_length(msg2)
+    set c2_ptr to alloc_bytes(msg2_len + NOISE_TAG_LEN)
+    set c2_len to alloc_bytes(8)
+    set enc2_err to cipher_state_encrypt_with_ad(cs_enc and empty_ad and 0 and msg2_ptr and msg2_len and c2_ptr and c2_len)
+    assert_true(enc2_err == NOISE_ERR_NONE and "second encrypt should succeed")
+    set d2_ptr to alloc_bytes(msg2_len + 1)
+    set d2_len to alloc_bytes(8)
+    set dec2_err to cipher_state_decrypt_with_ad(cs_dec and empty_ad and 0 and c2_ptr and msg2_len + NOISE_TAG_LEN and d2_ptr and d2_len)
+    assert_true(dec2_err == NOISE_ERR_NONE and "legit message after forged packet must still decrypt")
+    set ok to free_bytes(forged)
+    set ok to free_bytes(fdec_ptr)
+    set ok to free_bytes(fdec_len)
+    set ok to free_bytes(c2_ptr)
+    set ok to free_bytes(c2_len)
+    set ok to free_bytes(d2_ptr)
+    set ok to free_bytes(d2_len)
+
+    if recovered equals msg:
+        display "  PASS"
+    else:
+        display "  FAIL: message mismatch"
+        return 1
+
+    set ok to free_bytes(key_ptr)
+    set ok to free_bytes(cipher_ptr)
+    set ok to free_bytes(cipher_len_ptr)
+    set ok to free_bytes(dec_ptr)
+    set ok to free_bytes(dec_len_ptr)
+    set ok to free_bytes(empty_ad)
+    return 0
+
+# ================================================================
+# Test 5: Full Noise_XX handshake + transport encryption
+# ================================================================
+
+define test_noise_xx_full:
+    display "TEST 5: Full Noise_XX handshake + transport"
+    set err to init_crypto()
+    assert_true(err == 0 and "crypto init should succeed")
+
+    # Generate static keypairs for Alice (initiator) and Bob (responder)
+    set alice_sec to alloc_bytes(32)
+    set alice_pub to alloc_bytes(32)
+    set bob_sec to alloc_bytes(32)
+    set bob_pub to alloc_bytes(32)
+
+    set ok to noise_dh_generate(alice_sec and alice_pub)
+    set ok to noise_dh_generate(bob_sec and bob_pub)
+
+    # Initialize handshake states
+    set alice_hs to noise_handshake_init(NOISE_ROLE_INITIATOR and alice_sec and alice_pub)
+    assert_true(map_get_val(alice_hs and "error") == NOISE_ERR_NONE and "alice init should succeed")
+
+    set bob_hs to noise_handshake_init(NOISE_ROLE_RESPONDER and bob_sec and bob_pub)
+    assert_true(map_get_val(bob_hs and "error") == NOISE_ERR_NONE and "bob init should succeed")
+
+    # Message 1: Alice -> Bob (e)
+    display "  MSG 1: Alice -> Bob (e)"
+    set msg1_result to noise_xx_write_message1(alice_hs)
+    assert_true(map_get_val(msg1_result and "error") == NOISE_ERR_NONE and "msg1 write should succeed")
+    set msg1 to map_get_val(msg1_result and "message")
+    assert_true(string_length(msg1) == 64 and "msg1 should be 64 hex chars (32 bytes)")
+
+    set read1_result to noise_xx_read_message1(bob_hs and msg1)
+    assert_true(map_get_val(read1_result and "error") == NOISE_ERR_NONE and "msg1 read should succeed")
+
+    # Message 2: Bob -> Alice (e, ee, s, es)
+    display "  MSG 2: Bob -> Alice (e, ee, s, es)"
+    set msg2_result to noise_xx_write_message2(bob_hs)
+    assert_true(map_get_val(msg2_result and "error") == NOISE_ERR_NONE and "msg2 write should succeed")
+    set msg2 to map_get_val(msg2_result and "message")
+    assert_true(string_length(msg2) == 160 and "msg2 should be 160 hex chars (80 bytes)")
+
+    set read2_result to noise_xx_read_message2(alice_hs and msg2)
+    assert_true(map_get_val(read2_result and "error") == NOISE_ERR_NONE and "msg2 read should succeed")
+
+    # Message 3: Alice -> Bob (s, se)
+    display "  MSG 3: Alice -> Bob (s, se)"
+    set msg3_result to noise_xx_write_message3(alice_hs)
+    assert_true(map_get_val(msg3_result and "error") == NOISE_ERR_NONE and "msg3 write should succeed")
+    set msg3 to map_get_val(msg3_result and "message")
+    assert_true(string_length(msg3) == 96 and "msg3 should be 96 hex chars (48 bytes)")
+
+    set read3_result to noise_xx_read_message3(bob_hs and msg3)
+    assert_true(map_get_val(read3_result and "error") == NOISE_ERR_NONE and "msg3 read should succeed")
+
+    # Verify both sides know each other's static keys
+    set alice_sees_bob to noise_get_remote_static(alice_hs)
+    set bob_sees_alice to noise_get_remote_static(bob_hs)
+
+    set alice_pub_hex to raw_to_hex(alice_pub and 32)
+    set bob_pub_hex to raw_to_hex(bob_pub and 32)
+
+    if alice_sees_bob equals bob_pub_hex:
+        display "  Alice correctly identified Bob's static key"
+    else:
+        display "  FAIL: Alice has wrong key for Bob"
+        return 1
+
+    if bob_sees_alice equals alice_pub_hex:
+        display "  Bob correctly identified Alice's static key"
+    else:
+        display "  FAIL: Bob has wrong key for Alice"
+        return 1
+
+    # Transport: Alice sends encrypted message to Bob
+    display "  Transport: Alice -> Bob"
+    set enc_result to noise_transport_encrypt(alice_hs and "Hello Bob, handshake complete!")
+    assert_true(map_get_val(enc_result and "error") == NOISE_ERR_NONE and "transport encrypt should succeed")
+
+    set cipher_hex to map_get_val(enc_result and "ciphertext")
+    assert_true(string_length(cipher_hex) > 0 and "ciphertext should be non-empty")
+
+    set dec_result to noise_transport_decrypt(bob_hs and cipher_hex)
+    assert_true(map_get_val(dec_result and "error") == NOISE_ERR_NONE and "transport decrypt should succeed")
+
+    set recovered to map_get_val(dec_result and "plaintext")
+    if recovered equals "Hello Bob, handshake complete!":
+        display "  Alice -> Bob: message decrypted correctly"
+    else:
+        display "  FAIL: message mismatch"
+        display f"    got: {recovered}"
+        return 1
+
+    # Transport: Bob sends encrypted message to Alice
+    display "  Transport: Bob -> Alice"
+    set enc_result2 to noise_transport_encrypt(bob_hs and "Hello Alice, confirmed!")
+    assert_true(map_get_val(enc_result2 and "error") == NOISE_ERR_NONE and "bob encrypt should succeed")
+
+    set cipher_hex2 to map_get_val(enc_result2 and "ciphertext")
+    set dec_result2 to noise_transport_decrypt(alice_hs and cipher_hex2)
+    assert_true(map_get_val(dec_result2 and "error") == NOISE_ERR_NONE and "alice decrypt should succeed")
+
+    set recovered2 to map_get_val(dec_result2 and "plaintext")
+    if recovered2 equals "Hello Alice, confirmed!":
+        display "  Bob -> Alice: message decrypted correctly"
+    else:
+        display "  FAIL: message mismatch"
+        return 1
+
+    set ok to free_bytes(alice_sec)
+    set ok to free_bytes(alice_pub)
+    set ok to free_bytes(bob_sec)
+    set ok to free_bytes(bob_pub)
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 6: Multiple messages maintain nonce ordering
+# ================================================================
+
+define test_multiple_messages:
+    display "TEST 6: Multiple messages maintain nonce ordering"
+    set err to init_crypto()
+
+    set a_sec to alloc_bytes(32)
+    set a_pub to alloc_bytes(32)
+    set b_sec to alloc_bytes(32)
+    set b_pub to alloc_bytes(32)
+    set ok to noise_dh_generate(a_sec and a_pub)
+    set ok to noise_dh_generate(b_sec and b_pub)
+
+    set a_hs to noise_handshake_init(NOISE_ROLE_INITIATOR and a_sec and a_pub)
+    set b_hs to noise_handshake_init(NOISE_ROLE_RESPONDER and b_sec and b_pub)
+
+    # Complete handshake
+    set m1 to map_get_val(noise_xx_write_message1(a_hs) and "message")
+    set ok to noise_xx_read_message1(b_hs and m1)
+    set m2 to map_get_val(noise_xx_write_message2(b_hs) and "message")
+    set ok to noise_xx_read_message2(a_hs and m2)
+    set m3 to map_get_val(noise_xx_write_message3(a_hs) and "message")
+    set ok to noise_xx_read_message3(b_hs and m3)
+
+    # Send 5 messages from A to B
+    set msg_idx to 0
+    repeat while msg_idx < 5:
+        set msg_text to concat("Message number " and int_to_string(msg_idx))
+        set enc to noise_transport_encrypt(a_hs and msg_text)
+        assert_true(map_get_val(enc and "error") == NOISE_ERR_NONE and "encrypt should succeed")
+
+        set dec to noise_transport_decrypt(b_hs and map_get_val(enc and "ciphertext"))
+        assert_true(map_get_val(dec and "error") == NOISE_ERR_NONE and "decrypt should succeed")
+
+        set recovered to map_get_val(dec and "plaintext")
+        if recovered equals msg_text:
+            set ok to 1
+        else:
+            display f"  FAIL: message {msg_idx} mismatch"
+            return 1
+        set msg_idx to msg_idx + 1
+
+    set ok to free_bytes(a_sec)
+    set ok to free_bytes(a_pub)
+    set ok to free_bytes(b_sec)
+    set ok to free_bytes(b_pub)
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 7: Wrong key cannot decrypt
+# ================================================================
+
+define test_wrong_key_fails:
+    display "TEST 7: Wrong key cannot decrypt"
+    set err to init_crypto()
+
+    set a_sec to alloc_bytes(32)
+    set a_pub to alloc_bytes(32)
+    set b_sec to alloc_bytes(32)
+    set b_pub to alloc_bytes(32)
+    set c_sec to alloc_bytes(32)
+    set c_pub to alloc_bytes(32)
+    set ok to noise_dh_generate(a_sec and a_pub)
+    set ok to noise_dh_generate(b_sec and b_pub)
+    set ok to noise_dh_generate(c_sec and c_pub)
+
+    # A <-> B handshake
+    set a_hs to noise_handshake_init(NOISE_ROLE_INITIATOR and a_sec and a_pub)
+    set b_hs to noise_handshake_init(NOISE_ROLE_RESPONDER and b_sec and b_pub)
+
+    set m1 to map_get_val(noise_xx_write_message1(a_hs) and "message")
+    set ok to noise_xx_read_message1(b_hs and m1)
+    set m2 to map_get_val(noise_xx_write_message2(b_hs) and "message")
+    set ok to noise_xx_read_message2(a_hs and m2)
+    set m3 to map_get_val(noise_xx_write_message3(a_hs) and "message")
+    set ok to noise_xx_read_message3(b_hs and m3)
+
+    # A <-> C handshake (different session)
+    set a2_hs to noise_handshake_init(NOISE_ROLE_INITIATOR and a_sec and a_pub)
+    set c_hs to noise_handshake_init(NOISE_ROLE_RESPONDER and c_sec and c_pub)
+
+    set m1c to map_get_val(noise_xx_write_message1(a2_hs) and "message")
+    set ok to noise_xx_read_message1(c_hs and m1c)
+    set m2c to map_get_val(noise_xx_write_message2(c_hs) and "message")
+    set ok to noise_xx_read_message2(a2_hs and m2c)
+    set m3c to map_get_val(noise_xx_write_message3(a2_hs) and "message")
+    set ok to noise_xx_read_message3(c_hs and m3c)
+
+    # A sends to B
+    set enc to noise_transport_encrypt(a_hs and "secret for B only")
+    set cipher to map_get_val(enc and "ciphertext")
+
+    # C tries to decrypt with its session (should fail)
+    set dec to noise_transport_decrypt(c_hs and cipher)
+    assert_true(map_get_val(dec and "error") != NOISE_ERR_NONE and "wrong session should fail to decrypt")
+
+    set ok to free_bytes(a_sec)
+    set ok to free_bytes(a_pub)
+    set ok to free_bytes(b_sec)
+    set ok to free_bytes(b_pub)
+    set ok to free_bytes(c_sec)
+    set ok to free_bytes(c_pub)
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Main
+# ================================================================
+
+define test_transport_keyless_fails_closed:
+    display "TEST 8: Transport over a keyless cipher state must fail closed"
+    set err to init_crypto()
+    assert_true(err == 0 and "crypto init should succeed")
+
+    # Build a "completed" handshake whose transport cipher states have NO key.
+    # The transport functions must refuse rather than pass application data
+    # through unencrypted (the keyless passthrough is only valid mid-handshake).
+    set keyless_send to create_map()
+    set ok to map_insert(keyless_send and "has_key" and 0)
+    set keyless_recv to create_map()
+    set ok to map_insert(keyless_recv and "has_key" and 0)
+    set fake_hs to create_map()
+    set ok to map_insert(fake_hs and "state" and NOISE_STATE_COMPLETE)
+    set ok to map_insert(fake_hs and "cs_send" and keyless_send)
+    set ok to map_insert(fake_hs and "cs_recv" and keyless_recv)
+
+    set enc_res to noise_transport_encrypt(fake_hs and "secret application data")
+    assert_true(map_get_val(enc_res and "error") != NOISE_ERR_NONE and "keyless transport encrypt must fail closed, not emit plaintext")
+
+    set dec_res to noise_transport_decrypt(fake_hs and "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+    assert_true(map_get_val(dec_res and "error") != NOISE_ERR_NONE and "keyless transport decrypt must fail closed")
+
+    display "  PASS"
+    return 0
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_net/noise.ep Test Suite"
+    display "  OperationTrojanClaude Phase 2"
+    display "==================================================="
+    display ""
+
+    set ok to test_hmac()
+    set ok to test_hkdf()
+    set ok to test_chacha_roundtrip()
+    set ok to test_cipher_state()
+    set ok to test_noise_xx_full()
+    set ok to test_multiple_messages()
+    set ok to test_wrong_key_fails()
+    set ok to test_transport_keyless_fails_closed()
+
+    display ""
+    display "==================================================="
+    display "  8 tests executed."
+    display "==================================================="
+    return 0

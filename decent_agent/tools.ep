@@ -1,0 +1,624 @@
+# ErnosPlain Rebuild of ErnOS Agent Tools Executor
+# Component: decent_agent/tools.ep
+
+import "fs"
+import "os"
+import "collections"
+import "string"
+import "sql"
+import "../storage"
+
+# Subsystem modules to call
+import "../decent_net/dht"
+import "../decent_net/dht_transport"
+import "../decent_money/ledger"
+import "../decent_money/wallet"
+import "../decent_name/registry"
+import "./turing_grid"
+import "./synaptic_tool"
+import "./scheduler_tool"
+import "./compiler_tool"
+import "./web_search"
+import "./session"
+
+define append_string_to_char_list with char_list as List and s as Str returning Int:
+    set len to string_length(s)
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(s and i)
+        set ok to append_list(char_list and ch)
+        set i to i + 1
+    return 0
+
+define tools_create:
+    set tools_mgr to create_map()
+    set schemas to "Available Tools:\n\n"
+    set schemas to concat(schemas and "READ-ONLY (no approval required):\n")
+    set schemas to concat(schemas and "- codebase_read([path: Str]) -> Str: Read a file's contents. Use for inspecting code, configs, or documentation.\n")
+    set schemas to concat(schemas and "- read_transcripts([session_id: Str]) -> Str: Read all historical message transcripts for a given session. Use this to review prior context.\n")
+    set schemas to concat(schemas and "- dht_get([key: Str]) -> Str: Retrieve a value from the distributed hash table. Use for looking up publicly stored data.\n")
+    set schemas to concat(schemas and "- name_resolve([name: Str]) -> Str: Resolve a registered name to its DID. Use to look up identity mappings.\n")
+    set schemas to concat(schemas and "- wallet_balance([]) -> Str: Check the node's wallet balance. Safe to call anytime.\n")
+    set schemas to concat(schemas and "- operate_synaptic_graph([action: Str, args: List]) -> Str: Query your cognitive memory graph. Use 'search' to find relevant memories, 'beliefs' to list stored beliefs, 'stats' for graph metrics. These read actions are LOCAL and PRIVATE.\n")
+    set schemas to concat(schemas and "- turing_grid_op([op: 'read', args: Str]) -> Str: Read the current state of your Turing Grid scratchpad.\n")
+    set schemas to concat(schemas and "- operate_scheduler([action: 'list', args: List]) -> Str: List scheduled tasks.\n")
+    set schemas to concat(schemas and "- manage_reading_progress([action: 'get_bookmark' or 'get_notes' or 'auto_read', doc_name: Str, count_or_empty: Int/Str]) -> Str: Read document chunks or view bookmarks/notes. Use 'get_bookmark' to find where you left off, 'get_notes' to review notes, 'auto_read' to read the next count chunks (defaults to 3).\n")
+    set schemas to concat(schemas and "- web_search([query: Str]) -> Str: Search the live web. Use for fact checking, looking up news, or validating claims.\n")
+    set schemas to concat(schemas and "- web_visit([url: Str]) -> Str: Visit a specific URL directly to read its text contents.\n\n")
+    set schemas to concat(schemas and "WRITE OPERATIONS (requires user approval before execution):\n")
+    set schemas to concat(schemas and "- codebase_write([path: Str, content: Str]) -> Str: Overwrite a file. APPROVAL REQUIRED. Use only when explicitly asked to modify code.\n")
+    set schemas to concat(schemas and "- run_command([cmd: Str]) -> Str: Execute a shell command. APPROVAL REQUIRED. Use for builds, tests, file operations.\n")
+    set schemas to concat(schemas and "- dht_store([key: Str, val: Str]) -> Str: Store a key-value pair in the DHT. APPROVAL REQUIRED. WARNING: The DHT is a PUBLIC NETWORK STORE. NEVER store private user data, personal info, keys, or sensitive context here. Use operate_synaptic_graph(store) for private data.\n")
+    set schemas to concat(schemas and "- name_register([name: Str]) -> Str: Register a name for your DID on the network. APPROVAL REQUIRED.\n")
+    set schemas to concat(schemas and "- money_transfer([amount: Int, to_did: Str]) -> Str: Transfer coins to another DID. APPROVAL REQUIRED. Verify amount and recipient.\n")
+    set schemas to concat(schemas and "- operate_synaptic_graph([action: Str, args: List]) -> Str: Write to cognitive memory. 'store' saves beliefs/facts (LOCAL AND PRIVATE — correct place for personal data). 'relate' creates semantic links. 'link_memory' connects episodic memories. Write actions require APPROVAL.\n")
+    set schemas to concat(schemas and "- operate_scheduler([action: Str, args: List]) -> Str: 'create', 'delete', 'toggle' require APPROVAL. 'run_now' requires APPROVAL.\n")
+    set schemas to concat(schemas and "- turing_grid_op([op: Str, args: Str]) -> Str: 'write', 'move', 'execute' on Turing Grid. APPROVAL REQUIRED for write/execute.\n")
+    set schemas to concat(schemas and "- manage_reading_progress([action: 'bookmark' or 'take_note', doc_name: Str, value: Int/Str]) -> Str: Save progress or notes. 'bookmark' saves the current chunk index (Int). 'take_note' appends note text (Str). APPROVAL REQUIRED.\n")
+    set schemas to concat(schemas and "- system_recompile([]) -> Str: Rebuild the node binary and hot-swap. APPROVAL REQUIRED.\n\n")
+    set schemas to concat(schemas and "TERMINAL:\n")
+    set schemas to concat(schemas and "- reply_request([response: Str]) -> Str: Present the final response to the user. Always use this to end your turn.\n")
+    
+    set ok to map_insert(tools_mgr and "schemas" and schemas)
+    return tools_mgr
+
+define tools_get_schema_string with tools_mgr as Map returning Str:
+    return map_get_val(tools_mgr and "schemas")
+
+define tools_requires_approval with tool_name as Str and args_list as List returning Int:
+    if tool_name equals "money_transfer":
+        return 1
+    if tool_name equals "dht_store":
+        return 1
+    if tool_name equals "name_register":
+        return 1
+    if tool_name equals "codebase_write":
+        return 1
+    if tool_name equals "run_command":
+        return 1
+    if tool_name equals "system_recompile":
+        return 1
+    if tool_name equals "operate_synaptic_graph":
+        if length_list(args_list) > 0:
+            set sub_action to get_list(args_list and 0)
+            if sub_action equals "store" or else sub_action equals "relate" or else sub_action equals "link_memory":
+                return 1
+        return 0
+    if tool_name equals "operate_scheduler":
+        if length_list(args_list) > 0:
+            set sub_action to get_list(args_list and 0)
+            if sub_action equals "create" or else sub_action equals "delete" or else sub_action equals "toggle" or else sub_action equals "run_now":
+                return 1
+        return 0
+    if tool_name equals "turing_grid_op":
+        if length_list(args_list) > 0:
+            set sub_action to get_list(args_list and 0)
+            if sub_action equals "write" or else sub_action equals "execute" or else sub_action equals "move":
+                return 1
+        return 0
+    if tool_name equals "manage_reading_progress":
+        if length_list(args_list) > 0:
+            set sub_action to get_list(args_list and 0)
+            if sub_action equals "bookmark" or else sub_action equals "take_note":
+                return 1
+        return 0
+    return 0
+
+
+define tools_execute_transfer with ctx as Map and amount as Int and recipient as Str returning Str:
+    set identity to map_get_val(ctx and "identity")
+    set ledger to map_get_val(ctx and "ledger")
+    if identity == 0 or else ledger == 0:
+        return "Error: Ledger or Identity not configured in context."
+        
+    set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+    set sender_bal to ledger_get_balance(ledger and sign_pub)
+    
+    if amount > sender_bal:
+        return f"transfer:error,reason:insufficient_balance,balance:{sender_bal},requested:{amount}"
+    if amount <= 0:
+        return "transfer:error,reason:invalid_amount"
+        
+    # Find spendable UTXOs for sender
+    set utxos to map_get_val(ledger and "utxos")
+    set utxo_keys to map_keys(utxos)
+    set inputs to create_list()
+    set input_total to 0
+    set uk_idx to 0
+    set uk_len to length_list(utxo_keys)
+    repeat while uk_idx < uk_len and input_total < amount:
+        set ukey to get_list(utxo_keys and uk_idx)
+        set utxo_entry to map_get_val(utxos and ukey)
+        set utxo_recip to map_get_val(utxo_entry and "recipient")
+        if utxo_recip equals sign_pub:
+            set colon_pos to string_index_of(ukey and ":")
+            set ref_tx_id to substring(ukey and 0 and colon_pos)
+            set ref_idx_str to substring(ukey and colon_pos + 1 and string_length(ukey) - colon_pos - 1)
+            set ref_idx to string_to_int(ref_idx_str)
+            set ref_amt to map_get_val(utxo_entry and "amount")
+            set input_ref to create_map()
+            set ok to map_insert(input_ref and "tx_id" and ref_tx_id)
+            set ok to map_insert(input_ref and "output_index" and ref_idx)
+            set ok to map_insert(input_ref and "amount" and ref_amt)
+            set ok to map_insert(input_ref and "owner" and sign_pub)
+            set ok to map_insert(input_ref and "signature" and "pending")
+            set ok to append_list(inputs and input_ref)
+            set input_total to input_total + ref_amt
+        set uk_idx to uk_idx + 1
+    free_list(utxo_keys)
+    
+    if input_total < amount:
+        return f"transfer:error,reason:utxo_insufficient,found:{input_total},needed:{amount}"
+        
+    # Build outputs
+    set outputs to create_list()
+    set out1 to create_map()
+    set ok to map_insert(out1 and "recipient" and recipient)
+    set ok to map_insert(out1 and "amount" and amount)
+    set ok to append_list(outputs and out1)
+    set remaining to input_total - amount
+    if remaining > 0:
+        set out2 to create_map()
+        set ok to map_insert(out2 and "recipient" and sign_pub)
+        set ok to map_insert(out2 and "amount" and remaining)
+        set ok to append_list(outputs and out2)
+        
+    # Create tx and compute its ID
+    set tx to ledger_create_tx(inputs and outputs and 0)
+    set tx_hash to ledger_hash_tx(tx)
+    
+    # Sign each input
+    set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+    set in_count to length_list(inputs)
+    set si to 0
+    repeat while si < in_count:
+        set inp to get_list(inputs and si)
+        set sig_result to sign_message(tx_hash and sign_sec)
+        set sig_hex to ptr_to_str(map_get_val(sig_result and "signature"))
+        set ok to map_insert(inp and "signature" and sig_hex)
+        set si to si + 1
+        
+    # Commit block
+    set tx_list to create_list()
+    set ok to append_list(tx_list and tx)
+    set tx_hash_list to create_list()
+    set ok to append_list(tx_hash_list and tx_hash)
+    set merkle_root to calculate_merkle_root(tx_hash_list)
+    free_list(tx_hash_list)
+    
+    set blocks to map_get_val(ledger and "blocks")
+    set prev_block to get_list(blocks and length_list(blocks) - 1)
+    set prev_hash to ptr_to_str(map_get_val(prev_block and "hash"))
+    set state_root to ledger_compute_state_root()
+    set block_hash to ledger_compute_block_hash(merkle_root and prev_hash and state_root)
+    set block_sig_result to sign_message(block_hash and sign_sec)
+    set block_sig_hex to ptr_to_str(map_get_val(block_sig_result and "signature"))
+    
+    set block_err to ledger_add_block(ledger and tx_list and sign_pub and block_sig_hex and state_root)
+    if block_err == 0:
+        set new_bal to ledger_get_balance(ledger and sign_pub)
+        return f"transfer:ok,tx_id:{tx_hash},amount:{amount},to:{recipient},new_balance:{new_bal}"
+    
+    return f"transfer:error,reason:block_rejected,code:{block_err}"
+
+# E5: reject shell-injection / command-chaining / privilege-escalation in run_command.
+define tools_cmd_is_dangerous with cmd as Str returning Int:
+    if string_contains(cmd and ";") == 1:
+        return 1
+    if string_contains(cmd and "&&") == 1:
+        return 1
+    if string_contains(cmd and "||") == 1:
+        return 1
+    if string_contains(cmd and "$(") == 1:
+        return 1
+    if string_contains(cmd and "`") == 1:
+        return 1
+    if string_contains(cmd and "rm -rf") == 1:
+        return 1
+    if string_contains(cmd and "sudo ") == 1:
+        return 1
+    if string_contains(cmd and "chmod ") == 1:
+        return 1
+    if string_contains(cmd and "chown ") == 1:
+        return 1
+    return 0
+
+# E6: a session_id is used to build a transcript file path — restrict it to
+# [A-Za-z0-9_-] so it cannot traverse out of config/sessions/.
+define tools_session_id_safe with sid as Str returning Int:
+    set n to string_length(sid)
+    if n == 0 or else n > 128:
+        return 0
+    set allowed to "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    set i to 0
+    repeat while i < n:
+        if string_index_of(allowed and substring(sid and i and 1)) < 0:
+            return 0
+        set i to i + 1
+    return 1
+
+define tools_is_action_allowed with role as Str and action_name as Str and args_list as List returning Int:
+    # E2/E5: FAIL CLOSED. Only an explicit admin/owner gets full access. Every other
+    # role — including the empty string and any unknown value — falls through to the
+    # least-privilege allowlist (was: any non-"guest" role, incl. "", got full admin).
+    if role equals "admin" or else role equals "owner":
+        return 1
+    # Least-privilege allowlist (guest and all unrecognised/empty roles).
+    if action_name equals "reply_request":
+        return 1
+    if action_name equals "name_resolve":
+        return 1
+    if action_name equals "dht_get":
+        return 1
+    if action_name equals "operate_synaptic_graph":
+        if length_list(args_list) > 0:
+            set sub_action to get_list(args_list and 0)
+            if sub_action equals "search" or else sub_action equals "beliefs" or else sub_action equals "stats":
+                return 1
+        return 0
+    if action_name equals "turing_grid_op":
+        if length_list(args_list) > 0:
+            set sub_action to get_list(args_list and 0)
+            if sub_action equals "read":
+                return 1
+        return 0
+    if action_name equals "web_search":
+        return 1
+    if action_name equals "web_visit":
+        return 1
+    # E6: read_transcripts removed from the non-admin allowlist (was guest-exfiltration).
+    return 0
+
+define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str and args_list as List returning Str:
+    set sender_role to ""
+    if map_contains(ctx and "sender_role") == 1:
+        set sender_role to map_get_val(ctx and "sender_role")
+        
+    if tools_is_action_allowed(sender_role and action_name and args_list) == 0:
+        return f"Error: Access Denied. Tool '{action_name}' is restricted to administrators."
+
+    if action_name equals "codebase_read":
+        if length_list(args_list) < 1:
+            return "Error: codebase_read requires 1 argument (path)."
+        set path to get_list(args_list and 0)
+        if file_exists(path) == 0:
+            return f"Error: File '{path}' does not exist."
+        return read_file(path)
+            
+    if action_name equals "read_transcripts":
+        if length_list(args_list) < 1:
+            return "Error: read_transcripts requires 1 argument (session_id)."
+        set session_id to ptr_to_str(get_list(args_list and 0))
+        if tools_session_id_safe(session_id) == 0:
+            return "Error: invalid session_id."
+        set path to path_join("config/sessions" and concat(session_id and ".json"))
+        if file_exists(path) == 0:
+            return f"Error: Session '{session_id}' does not exist."
+            
+        set sess to session_load(path)
+        if sess == 0:
+            return f"Error: Failed to parse session '{session_id}'."
+            
+        set title_val to map_get_val(sess and "title")
+        set char_list to create_list()
+        
+        set ok to append_string_to_char_list(char_list and f"=== Transcript for Session: {title_val} ===\n\n")
+        
+        # Read compressed sessions
+        set comp_list to map_get_val(sess and "compressed_sessions")
+        if comp_list != 0:
+            set c_len to length_list(comp_list)
+            set idx to 0
+            repeat while idx < c_len:
+                set sub_path to get_list(comp_list and idx)
+                if file_exists(sub_path) == 1:
+                    set content to read_file(sub_path)
+                    set root to json_parse(content)
+                    if root != 0:
+                        set len to length_list(root)
+                        set i to 0
+                        repeat while i < len:
+                            set item_node to get_list(root and i)
+                            set r_node to get_json_object_value(item_node and "role")
+                            set c_node to get_json_object_value(item_node and "content")
+                            if r_node != 0 and also c_node != 0:
+                                set r_val to get_json_value(r_node)
+                                set c_val to get_json_value(c_node)
+                                set ok to append_string_to_char_list(char_list and f"{r_val}: {c_val}\n\n")
+                            set i to i + 1
+                set idx to idx + 1
+                
+        # Read current session messages
+        set msg_list to map_get_val(sess and "messages")
+        if msg_list != 0:
+            set len to length_list(msg_list)
+            set i to 0
+            repeat while i < len:
+                set msg_map to get_list(msg_list and i)
+                set r_val to map_get_val(msg_map and "role")
+                set c_val to map_get_val(msg_map and "content")
+                set ok to append_string_to_char_list(char_list and f"{r_val}: {c_val}\n\n")
+                set i to i + 1
+                
+        set transcript_str to string_from_list(char_list)
+        free_list(char_list)
+        return transcript_str
+        
+    if action_name equals "codebase_write":
+        if length_list(args_list) < 2:
+            return "Error: codebase_write requires 2 arguments (path, content)."
+        set path to get_list(args_list and 0)
+        set content to get_list(args_list and 1)
+        set ok to write_file(path and content)
+        return f"File '{path}' written successfully."
+        
+    if action_name equals "run_command":
+        if length_list(args_list) < 1:
+            return "Error: run_command requires 1 argument (cmd)."
+        set cmd to ptr_to_str(get_list(args_list and 0))
+        # E5: hard denylist backstop (in addition to the now fail-closed Observer audit) —
+        # reject shell chaining / command-substitution / privilege-escalation that no
+        # single legitimate command needs, so a compromised audit path can't be the only
+        # thing standing between the agent and arbitrary multi-command shell execution.
+        if tools_cmd_is_dangerous(cmd) == 1:
+            return "Error: command rejected (chaining/substitution/privilege-escalation patterns are not permitted)."
+        return run_command(cmd)
+        
+    if action_name equals "dht_store":
+        if length_list(args_list) < 2:
+            return "Error: dht_store requires 2 arguments (key, val)."
+        set key to get_list(args_list and 0)
+        set val to get_list(args_list and 1)
+        set dht_node to map_get_val(ctx and "dht_node")
+        if dht_node == 0:
+            return "Error: DHT node not available in context."
+        set store_err to dht_node_store_value(dht_node and key and val)
+        return f"dht:stored,key:{key}"
+        
+    if action_name equals "dht_get":
+        if length_list(args_list) < 1:
+            return "Error: dht_get requires 1 argument (key)."
+        set key to get_list(args_list and 0)
+        set dht_node to map_get_val(ctx and "dht_node")
+        if dht_node == 0:
+            return "Error: DHT node not available in context."
+        set dht_lookup to dht_lookup_value(dht_node and key)
+        set dht_err to map_get_val(dht_lookup and "error")
+        set dht_res to ""
+        if dht_err == 0:
+            set dht_val_ptr to map_get_val(dht_lookup and "value")
+            set dht_res to f"dht:found,key:{key},value:{ptr_to_str(dht_val_ptr)}"
+        else:
+            set dht_res to f"dht:not_found,key:{key}"
+        free_map(dht_lookup)
+        return dht_res
+        
+    if action_name equals "name_register":
+        if length_list(args_list) < 1:
+            return "Error: name_register requires 1 argument (name)."
+        set name to get_list(args_list and 0)
+        set name_reg to map_get_val(ctx and "name_reg")
+        set dht_node to map_get_val(ctx and "dht_node")
+        set identity to map_get_val(ctx and "identity")
+        set seed_addr to map_get_val(ctx and "seed_addr")
+        set seed_port to map_get_val(ctx and "seed_port")
+        if name_reg == 0 or else dht_node == 0 or else identity == 0:
+            return "Error: Name Registry, DHT, or Identity not in context."
+        set did_val to ptr_to_str(map_get_val(identity and "did"))
+        set nr_sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+        set nr_sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+        set reg_err to registry_register(name_reg and name and did_val and dht_node and seed_addr and seed_port and nr_sign_pub and nr_sign_sec)
+        if reg_err == 0:
+            return f"name:registered,name:{name},did:{did_val}"
+        return f"name:error,reason:registration_failed,code:{reg_err}"
+        
+    if action_name equals "name_resolve":
+        if length_list(args_list) < 1:
+            return "Error: name_resolve requires 1 argument (name)."
+        set name to get_list(args_list and 0)
+        set name_reg to map_get_val(ctx and "name_reg")
+        set dht_node to map_get_val(ctx and "dht_node")
+        set seed_addr to map_get_val(ctx and "seed_addr")
+        set seed_port to map_get_val(ctx and "seed_port")
+        if name_reg == 0 or else dht_node == 0:
+            return "Error: Name Registry or DHT not in context."
+        set resolved_did to registry_resolve(name_reg and name and dht_node and seed_addr and seed_port)
+        if string_length(resolved_did) > 0:
+            return f"name:resolved,name:{name},did:{resolved_did}"
+        return f"name:not_found,name:{name}"
+        
+    if action_name equals "wallet_balance":
+        set identity to map_get_val(ctx and "identity")
+        set ledger to map_get_val(ctx and "ledger")
+        if identity == 0 or else ledger == 0:
+            return "Error: Ledger or Identity not in context."
+        set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+        set balance to ledger_get_balance(ledger and sign_pub)
+        return f"wallet_balance:{balance}"
+        
+    if action_name equals "money_transfer":
+        if length_list(args_list) < 2:
+            return "Error: money_transfer requires 2 arguments (amount, to_did)."
+        set amount to get_list(args_list and 0)
+        set to_did to get_list(args_list and 1)
+        return tools_execute_transfer(ctx and amount and to_did)
+        
+    if action_name equals "turing_grid_op":
+        if length_list(args_list) < 2:
+            return "Error: turing_grid_op requires 2 arguments (op, args)."
+        set op_name to get_list(args_list and 0)
+        set op_args_str to get_list(args_list and 1)
+        set turing_grid_map to map_get_val(ctx and "turing_grid")
+        if turing_grid_map == 0:
+            return "Error: Turing Grid not available in context."
+            
+        if op_name equals "move":
+            set ok to grid_move(turing_grid_map and op_args_str)
+            return "grid:moved"
+        if op_name equals "write":
+            set ok to grid_write(turing_grid_map and op_args_str)
+            return "grid:written"
+        if op_name equals "read":
+            return grid_read(turing_grid_map)
+        if op_name equals "execute":
+            return grid_execute_cell(turing_grid_map)
+            
+        return f"Error: Unknown turing_grid_op '{op_name}'."
+        
+    if action_name equals "operate_synaptic_graph":
+        if length_list(args_list) < 1:
+            return "Error: operate_synaptic_graph requires at least 1 argument (action)."
+        set action to get_list(args_list and 0)
+        set sub_args to create_list()
+        set s_len to length_list(args_list)
+        set s_idx to 1
+        repeat while s_idx < s_len:
+            set val to get_list(args_list and s_idx)
+            set ok to append_list(sub_args and val)
+            set s_idx to s_idx + 1
+        set memory_mgr to map_get_val(ctx and "memory")
+        if memory_mgr == 0:
+            free_list(sub_args)
+            return "Error: Cognitive memory not available in context."
+        set res to operate_synaptic_graph(memory_mgr and action and sub_args)
+        free_list(sub_args)
+        return res
+
+    if action_name equals "operate_scheduler":
+        if length_list(args_list) < 1:
+            return "Error: operate_scheduler requires at least 1 argument (action)."
+        set action to get_list(args_list and 0)
+        set sub_args to create_list()
+        set s_len to length_list(args_list)
+        set s_idx to 1
+        repeat while s_idx < s_len:
+            set val to get_list(args_list and s_idx)
+            set ok to append_list(sub_args and val)
+            set s_idx to s_idx + 1
+        set res to operate_scheduler(action and sub_args)
+        free_list(sub_args)
+        return res
+
+    if action_name equals "system_recompile":
+        return system_recompile()
+        
+    if action_name equals "manage_reading_progress":
+        if length_list(args_list) < 2:
+            return "Error: manage_reading_progress requires at least 2 arguments (action, doc_name)."
+        set action to get_list(args_list and 0)
+        set doc_name to get_list(args_list and 1)
+        set DB to storage_get_db()
+        if DB == 0:
+            return "Error: Storage database is not initialized."
+            
+        if action equals "bookmark":
+            if length_list(args_list) < 3:
+                return "Error: bookmark action requires a chunk index (Int)."
+            set chunk_idx to get_list(args_list and 2)
+            set escaped_doc to string_replace(doc_name and "'" and "''")
+            set sql to concat("INSERT INTO reading_progress (document_name, current_chunk, notes, updated_at) VALUES ('" and concat(escaped_doc and concat("', " and concat(int_to_string(chunk_idx) and concat(", '', 0) ON CONFLICT(document_name) DO UPDATE SET current_chunk=" and concat(int_to_string(chunk_idx) and ";"))))))
+            set ok to sql_execute(DB and sql)
+            return f"Bookmark set for '{doc_name}' at chunk {chunk_idx}."
+            
+        if action equals "get_bookmark":
+            set escaped_doc to string_replace(doc_name and "'" and "''")
+            set sql to concat("SELECT current_chunk FROM reading_progress WHERE document_name='" and concat(escaped_doc and "';"))
+            set rows to sql_query(DB and sql)
+            if length_list(rows) > 0:
+                set row0 to get_list(rows and 0)
+                set b_val_str to get_list(row0 and 0)
+                return f"Bookmark for '{doc_name}' is at chunk {b_val_str}."
+            return f"No bookmark found for '{doc_name}'. Default is chunk 0."
+            
+        if action equals "take_note":
+            if length_list(args_list) < 3:
+                return "Error: take_note action requires note text (Str)."
+            set note_text to get_list(args_list and 2)
+            set escaped_doc to string_replace(doc_name and "'" and "''")
+            set escaped_note to string_replace(note_text and "'" and "''")
+            
+            set sql_get to concat("SELECT notes FROM reading_progress WHERE document_name='" and concat(escaped_doc and "';"))
+            set rows to sql_query(DB and sql_get)
+            set existing_notes to ""
+            if length_list(rows) > 0:
+                set row0 to get_list(rows and 0)
+                set existing_notes to get_list(row0 and 0)
+                
+            set new_notes to ""
+            if string_length(existing_notes) > 0:
+                set new_notes to concat(existing_notes and concat("\n" and note_text))
+            else:
+                set new_notes to note_text
+                
+            set escaped_new_notes to string_replace(new_notes and "'" and "''")
+            set sql_ins to concat("INSERT INTO reading_progress (document_name, current_chunk, notes, updated_at) VALUES ('" and concat(escaped_doc and concat("', 0, '" and concat(escaped_new_notes and concat("', 0) ON CONFLICT(document_name) DO UPDATE SET notes='" and concat(escaped_new_notes and "';"))))))
+            set ok to sql_execute(DB and sql_ins)
+            return f"Note appended for '{doc_name}'."
+            
+        if action equals "get_notes":
+            set escaped_doc to string_replace(doc_name and "'" and "''")
+            set sql to concat("SELECT notes FROM reading_progress WHERE document_name='" and concat(escaped_doc and "';"))
+            set rows to sql_query(DB and sql)
+            if length_list(rows) > 0:
+                set row0 to get_list(rows and 0)
+                set n_val to get_list(row0 and 0)
+                if string_length(n_val) > 0:
+                    return f"Notes for '{doc_name}':\n{n_val}"
+            return f"No notes found for '{doc_name}'."
+            
+        if action equals "auto_read":
+            set count to 3
+            if length_list(args_list) >= 3:
+                set count to get_list(args_list and 2)
+                
+            set escaped_doc to string_replace(doc_name and "'" and "''")
+            set sql_bk to concat("SELECT current_chunk FROM reading_progress WHERE document_name='" and concat(escaped_doc and "';"))
+            set rows_bk to sql_query(DB and sql_bk)
+            set start_chunk to 0
+            if length_list(rows_bk) > 0:
+                set row0 to get_list(rows_bk and 0)
+                set start_chunk_str to get_list(row0 and 0)
+                set start_chunk to string_to_int(start_chunk_str)
+                
+            set sql_chunks to concat("SELECT chunk_index, content FROM rag_chunks WHERE document_name='" and concat(escaped_doc and concat("' AND chunk_index >= " and concat(int_to_string(start_chunk) and concat(" ORDER BY chunk_index LIMIT " and concat(int_to_string(count) and ";"))))))
+            set rows_chunks to sql_query(DB and sql_chunks)
+            set chunks_len to length_list(rows_chunks)
+            if chunks_len == 0:
+                return f"No chunks found for '{doc_name}' at or after chunk {start_chunk}."
+                
+            set out to f"Auto-reading '{doc_name}' from chunk {start_chunk}:\n\n"
+            set ci to 0
+            repeat while ci < chunks_len:
+                set row_c to get_list(rows_chunks and ci)
+                set idx_c_str to get_list(row_c and 0)
+                set cont_c to get_list(row_c and 1)
+                set out to concat(out and concat(f"--- Chunk {idx_c_str} ---\n" and concat(cont_c and "\n\n")))
+                set ci to ci + 1
+                
+            set next_chunk to start_chunk + chunks_len
+            set sql_upd to concat("INSERT INTO reading_progress (document_name, current_chunk, notes, updated_at) VALUES ('" and concat(escaped_doc and concat("', " and concat(int_to_string(next_chunk) and concat(", '', 0) ON CONFLICT(document_name) DO UPDATE SET current_chunk=" and concat(int_to_string(next_chunk) and ";"))))))
+            set ok to sql_execute(DB and sql_upd)
+            
+            set out to concat(out and f"Progress saved: next bookmark is chunk {next_chunk}.")
+            return out
+            
+        return f"Error: Unknown action '{action}' for manage_reading_progress."
+
+    if action_name equals "web_search":
+        if length_list(args_list) < 1:
+            return "Error: web_search requires 1 argument (query)."
+        set query to get_list(args_list and 0)
+        return web_search_waterfall(query)
+        
+    if action_name equals "web_visit":
+        if length_list(args_list) < 1:
+            return "Error: web_visit requires 1 argument (url)."
+        set url to get_list(args_list and 0)
+        return web_search_visit(url)
+
+    if action_name equals "reply_request":
+        if length_list(args_list) < 1:
+            return "Error: reply_request requires 1 argument (response)."
+        return get_list(args_list and 0)
+        
+    return f"Error: Unknown tool '{action_name}'."

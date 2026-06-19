@@ -1,0 +1,58 @@
+# Phase H KAT: known-answer tests for the inference primitives fixed in H —
+# fixed trig (for RoPE), fp16 decode (for F16/Q8_0 scales), RoPE identity at pos 0,
+# and real Q8_0 block dequantization. Scale = 1e6 fixed-point.
+
+import "string"
+import "collections"
+import "inference"
+
+define near with label as Str and got as Int and want as Int and tol as Int returning Int:
+    set d to got - want
+    if d < 0:
+        set d to 0 - d
+    if d <= tol:
+        display concat("PASS: " and label)
+        return 1
+    display concat(concat(concat(concat("FAIL: " and label) and " got=") and int_to_string(got)) and concat(" want=" and int_to_string(want)))
+    return 0
+
+define main:
+    set passes to 0
+    set scale to 1000000
+
+    # --- fixed trig (drives RoPE) ---
+    set passes to passes + near("sin_0" and fixed_sin(0) and 0 and 2000)
+    set passes to passes + near("sin_halfpi" and fixed_sin(1570796) and 1000000 and 6000)
+    set passes to passes + near("cos_0" and fixed_cos(0) and 1000000 and 2000)
+    set passes to passes + near("sin_pi" and fixed_sin(3141593) and 0 and 6000)
+
+    # --- fp16 -> fixed (F16 tensors + Q8_0 scales) ---
+    set passes to passes + near("fp16_1.0" and fp16_to_fixed(15360) and 1000000 and 2)
+    set passes to passes + near("fp16_2.0" and fp16_to_fixed(16384) and 2000000 and 2)
+    set passes to passes + near("fp16_0.5" and fp16_to_fixed(14336) and 500000 and 2)
+    set passes to passes + near("fp16_-1.0" and fp16_to_fixed(48128) and 0 - 1000000 and 2)
+
+    # --- RoPE identity at position 0 (angle 0 -> no rotation) ---
+    set vec to create_list()
+    set ok to append_list(vec and 700000)
+    set ok to append_list(vec and 0 - 300000)
+    set ok to rope_apply(vec and 0 and 2)
+    set passes to passes + near("rope_pos0_x0" and get_list(vec and 0) and 700000 and 5)
+    set passes to passes + near("rope_pos0_x1" and get_list(vec and 1) and 0 - 300000 and 5)
+
+    # --- Q8_0 block dequant: scale=1.0 (fp16 0x3C00), quants [1, 2, -3] -> [1e6,2e6,-3e6] ---
+    set buf to alloc_bytes(40)
+    poke_byte(buf and 0 and 0)
+    poke_byte(buf and 1 and 60)
+    poke_byte(buf and 2 and 1)
+    poke_byte(buf and 3 and 2)
+    poke_byte(buf and 4 and 253)
+    set out to create_list()
+    set ok to dequant_q8_0_block(buf and 0 and out and 3)
+    set passes to passes + near("q8_0_v0" and get_list(out and 0) and 1000000 and 2)
+    set passes to passes + near("q8_0_v1" and get_list(out and 1) and 2000000 and 2)
+    set passes to passes + near("q8_0_v2" and get_list(out and 2) and 0 - 3000000 and 2)
+    set ok to free_bytes(buf)
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/13 passed"))
+    return 0

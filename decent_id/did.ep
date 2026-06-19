@@ -1,0 +1,619 @@
+# ErnosDecent -- Decentralised Identifiers (DID)
+# Component: decent_id/did.ep
+# Implements: DID:key method (deterministic DID from public key)
+#             DID Document creation and resolution
+#             DID:peer method for pairwise private connections
+# Spec: W3C DID Core v1.0 + did:key Method v0.7
+# Status: Production -- OperationTrojanClaude Phase 2
+
+import "keys"
+import "string"
+import "crypto"
+import "../storage"
+
+# ================================================================
+# Constants
+# ================================================================
+
+# Multicodec prefixes (varint-encoded)
+# Ed25519 public key: 0xed01
+set MULTICODEC_ED25519_PUB to "ed01"
+# X25519 public key: 0xec01
+set MULTICODEC_X25519_PUB to "ec01"
+
+# DID method identifiers
+set DID_METHOD_KEY to "did:key:"
+set DID_METHOD_PEER to "did:peer:"
+
+# Error codes (continue from keys.ep range)
+set DID_ERR_NONE to 0
+set DID_ERR_INVALID_KEY to 201
+set DID_ERR_INVALID_DID to 202
+set DID_ERR_UNSUPPORTED_METHOD to 203
+set DID_ERR_KEY_LENGTH to 204
+set DID_ERR_DECODE_FAILED to 205
+set DID_ERR_VERIFICATION_FAILED to 206
+
+# Key type identifiers for DID documents
+set DID_KEY_TYPE_ED25519 to "Ed25519VerificationKey2020"
+set DID_KEY_TYPE_X25519 to "X25519KeyAgreementKey2020"
+
+# ================================================================
+# Base58btc encoding (multibase prefix 'z')
+# Used by did:key method to encode the multicodec+public key
+# ================================================================
+
+# Base58btc alphabet (Bitcoin variant)
+set BASE58_ALPHABET to "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+define hex_char_to_int with ch as Int returning Int:
+    # '0'-'9' = 48-57
+    if ch >= 48:
+        if ch <= 57:
+            return ch - 48
+    # 'a'-'f' = 97-102
+    if ch >= 97:
+        if ch <= 102:
+            return ch - 87
+    # 'A'-'F' = 65-70
+    if ch >= 65:
+        if ch <= 70:
+            return ch - 55
+    return 0
+
+define base58_encode with hex_str as Str returning Str:
+    # Convert hex string to base58btc
+    # Algorithm: treat hex as big integer, repeatedly divide by 58
+    set hex_len to string_length(hex_str)
+    if hex_len == 0:
+        return ""
+
+    # Count leading zero bytes in the hex input
+    set leading_zeros to 0
+    set zi to 0
+    repeat while zi < hex_len - 1:
+        set ch1 to get_character(hex_str and zi)
+        set ch2 to get_character(hex_str and zi + 1)
+        if ch1 == 48:
+            if ch2 == 48:
+                set leading_zeros to leading_zeros + 1
+                set zi to zi + 2
+            else:
+                set zi to hex_len
+        else:
+            set zi to hex_len
+
+    # Convert hex to a list of byte values
+    set byte_count to hex_len / 2
+    set bytes to create_list()
+    set bi to 0
+    repeat while bi < byte_count:
+        set hex_pos to bi * 2
+        set hi_ch to get_character(hex_str and hex_pos)
+        set lo_ch to get_character(hex_str and hex_pos + 1)
+        set hi_val to hex_char_to_int(hi_ch)
+        set lo_val to hex_char_to_int(lo_ch)
+        set byte_val to hi_val * 16 + lo_val
+        set ok to append_list(bytes and byte_val)
+        set bi to bi + 1
+
+    # Allocate output (worst case: byte_count * 138/100 + 1 digits)
+    set output_size to byte_count * 2 + 1
+    set b58_digits to create_list()
+    set di to 0
+    repeat while di < output_size:
+        set ok to append_list(b58_digits and 0)
+        set di to di + 1
+
+    set b58_len to 0
+
+    # Process each byte
+    set bi to 0
+    repeat while bi < byte_count:
+        set carry to get_list(bytes and bi)
+        set j to 0
+        repeat while j < b58_len:
+            set existing to get_list(b58_digits and j)
+            set carry to carry + existing * 256
+            set ok to set_list(b58_digits and j and carry modulo 58)
+            set carry to carry / 58
+            set j to j + 1
+        repeat while carry > 0:
+            set ok to set_list(b58_digits and b58_len and carry modulo 58)
+            set carry to carry / 58
+            set b58_len to b58_len + 1
+        set bi to bi + 1
+
+    # Build result string (digits are in reverse order)
+    set result_chars to create_list()
+
+    # Add '1' for each leading zero byte
+    set lz to 0
+    repeat while lz < leading_zeros:
+        set ok to append_list(result_chars and 49)
+        set lz to lz + 1
+
+    # Add base58 digits in reverse
+    set ri to b58_len - 1
+    repeat while ri >= 0:
+        set digit to get_list(b58_digits and ri)
+        set ch to get_character(BASE58_ALPHABET and digit)
+        set ok to append_list(result_chars and ch)
+        set ri to ri - 1
+
+    return string_from_list(result_chars)
+
+define base58_decode with b58_str as Str returning Str:
+    # Decode base58btc string back to hex
+    set b58_len to string_length(b58_str)
+    if b58_len == 0:
+        return ""
+
+    # Count leading '1's (they represent zero bytes)
+    set leading_ones to 0
+    set li to 0
+    repeat while li < b58_len:
+        set ch to get_character(b58_str and li)
+        if ch == 49:
+            set leading_ones to leading_ones + 1
+            set li to li + 1
+        else:
+            set li to b58_len
+
+    # Allocate output bytes (worst case: b58_len * 733/1000 + 1)
+    set output_size to b58_len + 1
+    set out_bytes to create_list()
+    set oi to 0
+    repeat while oi < output_size:
+        set ok to append_list(out_bytes and 0)
+        set oi to oi + 1
+
+    set out_len to 0
+
+    # Process each base58 character
+    set ci to 0
+    repeat while ci < b58_len:
+        set ch to get_character(b58_str and ci)
+        # Find character position in alphabet
+        set carry to string_index_of(BASE58_ALPHABET and char_from_code(ch))
+        if carry < 0:
+            return ""
+
+        set j to 0
+        repeat while j < out_len:
+            set existing to get_list(out_bytes and j)
+            set carry to carry + existing * 58
+            set ok to set_list(out_bytes and j and carry modulo 256)
+            set carry to carry / 256
+            set j to j + 1
+        repeat while carry > 0:
+            set ok to set_list(out_bytes and out_len and carry modulo 256)
+            set carry to carry / 256
+            set out_len to out_len + 1
+        set ci to ci + 1
+
+    # Build hex string (out_bytes is in reverse order)
+    set hex_chars to create_list()
+
+    # Leading zero bytes from '1' characters
+    set lz to 0
+    repeat while lz < leading_ones:
+        set ok to append_list(hex_chars and 48)
+        set ok to append_list(hex_chars and 48)
+        set lz to lz + 1
+
+    # Remaining bytes in reverse
+    set ri to out_len - 1
+    repeat while ri >= 0:
+        set byte_val to get_list(out_bytes and ri)
+        set hi to byte_val / 16
+        set lo to byte_val modulo 16
+        set hi_ch to get_character("0123456789abcdef" and hi)
+        set lo_ch to get_character("0123456789abcdef" and lo)
+        set ok to append_list(hex_chars and hi_ch)
+        set ok to append_list(hex_chars and lo_ch)
+        set ri to ri - 1
+
+    return string_from_list(hex_chars)
+
+# ================================================================
+# DID:key -- Deterministic DID from public key
+# Format: did:key:z<base58btc(multicodec-prefix + raw-key-bytes)>
+# ================================================================
+
+define create_did_key_from_ed25519 with public_key_hex as Str returning Str:
+    # Validate key length: Ed25519 public key = 32 bytes = 64 hex chars
+    if string_length(public_key_hex) != 64:
+        return ""
+
+    # Prepend Ed25519 multicodec prefix: 0xed, 0x01
+    set prefixed_hex to concat(MULTICODEC_ED25519_PUB and public_key_hex)
+
+    # Base58btc encode
+    set b58 to base58_encode(prefixed_hex)
+
+    # Multibase prefix 'z' for base58btc + DID method
+    set did to concat(DID_METHOD_KEY and "z")
+    set did to concat(did and b58)
+    return did
+
+define create_did_key_from_x25519 with public_key_hex as Str returning Str:
+    # Validate key length: X25519 public key = 32 bytes = 64 hex chars
+    if string_length(public_key_hex) != 64:
+        return ""
+
+    # Prepend X25519 multicodec prefix: 0xec, 0x01
+    set prefixed_hex to concat(MULTICODEC_X25519_PUB and public_key_hex)
+
+    # Base58btc encode
+    set b58 to base58_encode(prefixed_hex)
+
+    # Multibase prefix 'z' for base58btc
+    set did to concat(DID_METHOD_KEY and "z")
+    set did to concat(did and b58)
+    return did
+
+define resolve_did_key with did as Str:
+    # Parse a did:key and return the public key hex + key type
+    # Returns a map with: method, multibase, public_key_hex, key_type, error
+    set result to create_map()
+
+    # Check prefix
+    set prefix_len to string_length(DID_METHOD_KEY)
+    if string_length(did) <= prefix_len:
+        set ok to map_insert(result and "error" and DID_ERR_INVALID_DID)
+        return result
+
+    set prefix to substring(did and 0 and prefix_len)
+    if prefix equals DID_METHOD_KEY:
+        set ok to 1
+    else:
+        set ok to map_insert(result and "error" and DID_ERR_UNSUPPORTED_METHOD)
+        return result
+
+    # Extract multibase-encoded part (everything after "did:key:")
+    set multibase_str to substring(did and prefix_len and string_length(did) - prefix_len)
+
+    # Check multibase prefix (must be 'z' for base58btc)
+    set mb_prefix to get_character(multibase_str and 0)
+    if mb_prefix != 122:
+        # 122 = 'z'
+        set ok to map_insert(result and "error" and DID_ERR_DECODE_FAILED)
+        return result
+
+    # Decode base58btc (skip the 'z' prefix)
+    set b58_part to substring(multibase_str and 1 and string_length(multibase_str) - 1)
+    set decoded_hex to base58_decode(b58_part)
+
+    if string_length(decoded_hex) < 4:
+        set ok to map_insert(result and "error" and DID_ERR_DECODE_FAILED)
+        return result
+
+    # Extract multicodec prefix (first 2 bytes = 4 hex chars)
+    set codec_prefix to substring(decoded_hex and 0 and 4)
+
+    # Extract raw public key bytes (everything after the prefix)
+    set pub_key_hex to substring(decoded_hex and 4 and string_length(decoded_hex) - 4)
+
+    # Determine key type from multicodec prefix
+    set key_type to ""
+    if codec_prefix equals MULTICODEC_ED25519_PUB:
+        set key_type to DID_KEY_TYPE_ED25519
+        if string_length(pub_key_hex) != 64:
+            set ok to map_insert(result and "error" and DID_ERR_KEY_LENGTH)
+            return result
+    else:
+        if codec_prefix equals MULTICODEC_X25519_PUB:
+            set key_type to DID_KEY_TYPE_X25519
+            if string_length(pub_key_hex) != 64:
+                set ok to map_insert(result and "error" and DID_ERR_KEY_LENGTH)
+                return result
+        else:
+            set ok to map_insert(result and "error" and DID_ERR_UNSUPPORTED_METHOD)
+            return result
+
+    set ok to map_insert(result and "method" and "key")
+    set ok to map_insert(result and "public_key_hex" and pub_key_hex)
+    set ok to map_insert(result and "key_type" and key_type)
+    set ok to map_insert(result and "did" and did)
+    set ok to map_insert(result and "error" and DID_ERR_NONE)
+    return result
+
+# ================================================================
+# DID Document -- W3C DID Core v1.0 structure
+# ================================================================
+
+define create_did_document with signing_pub_hex as Str and encryption_pub_hex as Str:
+    # Generate a full DID document from signing + encryption public keys
+    set result to create_map()
+
+    if string_length(signing_pub_hex) != 64:
+        set ok to map_insert(result and "error" and DID_ERR_KEY_LENGTH)
+        return result
+    if string_length(encryption_pub_hex) != 64:
+        set ok to map_insert(result and "error" and DID_ERR_KEY_LENGTH)
+        return result
+
+    # The DID is derived from the signing key (Ed25519)
+    set did to create_did_key_from_ed25519(signing_pub_hex)
+    if string_length(did) == 0:
+        set ok to map_insert(result and "error" and DID_ERR_INVALID_KEY)
+        return result
+
+    # Key agreement DID (X25519)
+    set enc_did to create_did_key_from_x25519(encryption_pub_hex)
+
+    # Verification method ID: did#signing-key-1
+    set sign_vm_id to concat(did and "#signing-key-1")
+    set enc_vm_id to concat(did and "#encryption-key-1")
+
+    # Build JSON document per W3C DID Core v1.0
+    set j to "{\n"
+    set j to concat(j and "  \"@context\": [\"https://www.w3.org/ns/did/v1\", \"https://w3id.org/security/suites/ed25519-2020/v1\"],\n")
+    set j to concat(j and f"  \"id\": \"{did}\",\n")
+
+    # Authentication: can authenticate as this DID
+    set j to concat(j and f"  \"authentication\": [\"{sign_vm_id}\"],\n")
+
+    # Assertion: can issue verifiable credentials
+    set j to concat(j and f"  \"assertionMethod\": [\"{sign_vm_id}\"],\n")
+
+    # Key agreement: can perform key exchange
+    set j to concat(j and f"  \"keyAgreement\": [\"{enc_vm_id}\"],\n")
+
+    # Verification methods
+    set j to concat(j and "  \"verificationMethod\": [\n")
+    set j to concat(j and "    {\n")
+    set j to concat(j and f"      \"id\": \"{sign_vm_id}\",\n")
+    set j to concat(j and f"      \"type\": \"{DID_KEY_TYPE_ED25519}\",\n")
+    set j to concat(j and f"      \"controller\": \"{did}\",\n")
+    set j to concat(j and f"      \"publicKeyHex\": \"{signing_pub_hex}\"\n")
+    set j to concat(j and "    },\n")
+    set j to concat(j and "    {\n")
+    set j to concat(j and f"      \"id\": \"{enc_vm_id}\",\n")
+    set j to concat(j and f"      \"type\": \"{DID_KEY_TYPE_X25519}\",\n")
+    set j to concat(j and f"      \"controller\": \"{did}\",\n")
+    set j to concat(j and f"      \"publicKeyHex\": \"{encryption_pub_hex}\"\n")
+    set j to concat(j and "    }\n")
+    set j to concat(j and "  ]\n")
+    set j to concat(j and "}")
+
+    set ok to map_insert(result and "did" and did)
+    set ok to map_insert(result and "document" and j)
+    set ok to map_insert(result and "signing_did" and did)
+    set ok to map_insert(result and "encryption_did" and enc_did)
+    set ok to map_insert(result and "error" and DID_ERR_NONE)
+    return result
+
+# ================================================================
+# DID:peer -- Pairwise DIDs for private connections
+# Method 0: simply the inception key (like did:key but for private use)
+# Format: did:peer:0z<base58btc(multicodec-prefix + raw-key-bytes)>
+# ================================================================
+
+define create_did_peer with signing_pub_hex as Str returning Str:
+    if string_length(signing_pub_hex) != 64:
+        return ""
+
+    set prefixed_hex to concat(MULTICODEC_ED25519_PUB and signing_pub_hex)
+    set b58 to base58_encode(prefixed_hex)
+    set did to concat(DID_METHOD_PEER and "0z")
+    set did to concat(did and b58)
+    return did
+
+define resolve_did_peer with did as Str:
+    # Parse a did:peer:0z... and extract the public key
+    set result to create_map()
+
+    set peer_prefix to "did:peer:0z"
+    set prefix_len to string_length(peer_prefix)
+
+    if string_length(did) <= prefix_len:
+        set ok to map_insert(result and "error" and DID_ERR_INVALID_DID)
+        return result
+
+    set prefix to substring(did and 0 and prefix_len)
+    if prefix equals peer_prefix:
+        set ok to 1
+    else:
+        set ok to map_insert(result and "error" and DID_ERR_UNSUPPORTED_METHOD)
+        return result
+
+    set b58_part to substring(did and prefix_len and string_length(did) - prefix_len)
+    set decoded_hex to base58_decode(b58_part)
+
+    if string_length(decoded_hex) < 4:
+        set ok to map_insert(result and "error" and DID_ERR_DECODE_FAILED)
+        return result
+
+    set codec_prefix to substring(decoded_hex and 0 and 4)
+    set pub_key_hex to substring(decoded_hex and 4 and string_length(decoded_hex) - 4)
+
+    set key_type to ""
+    if codec_prefix equals MULTICODEC_ED25519_PUB:
+        set key_type to DID_KEY_TYPE_ED25519
+    else:
+        set ok to map_insert(result and "error" and DID_ERR_UNSUPPORTED_METHOD)
+        return result
+
+    if string_length(pub_key_hex) != 64:
+        set ok to map_insert(result and "error" and DID_ERR_KEY_LENGTH)
+        return result
+
+    set ok to map_insert(result and "method" and "peer")
+    set ok to map_insert(result and "public_key_hex" and pub_key_hex)
+    set ok to map_insert(result and "key_type" and key_type)
+    set ok to map_insert(result and "did" and did)
+    set ok to map_insert(result and "error" and DID_ERR_NONE)
+    return result
+
+# ================================================================
+# Challenge-response authentication
+# Prove you control the private key for a DID
+# ================================================================
+
+define create_auth_challenge returning Str:
+    # Generate a random 32-byte challenge (hex encoded)
+    # Uses libsodium randombytes via keys.ep
+    set err to init_crypto()
+    if err != 0:
+        return ""
+
+    set buf to alloc_bytes(32)
+    set fn to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    set ok to ep_dlcall2(fn and buf and 32)
+    set challenge to raw_to_hex(buf and 32)
+    set ok to free_bytes(buf)
+    return challenge
+
+define respond_to_challenge with challenge as Str and secret_key_hex as Str:
+    # Sign the challenge with the DID's secret key
+    # Returns map with: response (signature hex), challenge, error
+    set result to create_map()
+
+    if string_length(challenge) == 0:
+        set ok to map_insert(result and "error" and DID_ERR_INVALID_KEY)
+        return result
+
+    set sig_result to sign_message(challenge and secret_key_hex)
+    set sig_err to map_get_val(sig_result and "error")
+    if sig_err != 0:
+        set ok to map_insert(result and "error" and DID_ERR_VERIFICATION_FAILED)
+        return result
+
+    set signature to map_get_val(sig_result and "signature")
+    set ok to map_insert(result and "response" and signature)
+    set ok to map_insert(result and "challenge" and challenge)
+    set ok to map_insert(result and "error" and DID_ERR_NONE)
+    return result
+
+define verify_challenge_response with challenge as Str and response as Str and public_key_hex as Str returning Int:
+    # Verify that the response is a valid signature of the challenge
+    # by the holder of the given public key
+    if string_length(challenge) == 0:
+        return DID_ERR_INVALID_KEY
+    if string_length(response) == 0:
+        return DID_ERR_VERIFICATION_FAILED
+    if string_length(public_key_hex) != 64:
+        return DID_ERR_KEY_LENGTH
+
+    set verify_result to verify_signature(challenge and response and public_key_hex)
+    if verify_result == 0:
+        return DID_ERR_NONE
+    return DID_ERR_VERIFICATION_FAILED
+
+# ================================================================
+# Identity creation -- high-level convenience
+# Generates keypair, creates DID, builds DID document
+# ================================================================
+
+define create_identity:
+    # Generate a full identity: keypairs + DID + DID document
+    # If an identity was previously saved, load it instead of generating new keys
+    set result to create_map()
+
+    # Check for saved identity
+    if storage_identity_exists() == 1:
+        set saved to storage_identity_load()
+        set saved_exists to map_get_val(saved and "exists")
+        if saved_exists == 1:
+            set saved_did to map_get_val(saved and "did")
+            set saved_sign_pub to map_get_val(saved and "signing_pub")
+            set saved_sign_sec to map_get_val(saved and "signing_sec")
+            set saved_enc_pub to map_get_val(saved and "enc_pub")
+            set saved_enc_sec to map_get_val(saved and "enc_sec")
+
+            # Rebuild DID document from saved keys
+            set doc_result to create_did_document(saved_sign_pub and saved_enc_pub)
+            set doc_err to map_get_val(doc_result and "error")
+            set document to ""
+            if doc_err == 0:
+                set document to map_get_val(doc_result and "document")
+
+            set combined to concat(saved_sign_pub and saved_enc_pub)
+            set identity_hash to ep_sha256(combined)
+
+            set ok to map_insert(result and "did" and saved_did)
+            set ok to map_insert(result and "document" and document)
+            set ok to map_insert(result and "signing_public_key" and saved_sign_pub)
+            set ok to map_insert(result and "signing_secret_key" and saved_sign_sec)
+            set ok to map_insert(result and "encryption_public_key" and saved_enc_pub)
+            set ok to map_insert(result and "encryption_secret_key" and saved_enc_sec)
+            set ok to map_insert(result and "identity_hash" and identity_hash)
+            set ok to map_insert(result and "error" and DID_ERR_NONE)
+            return result
+
+    set identity to generate_identity_keypair()
+    set id_err to map_get_val(identity and "error")
+    if id_err != 0:
+        set ok to map_insert(result and "error" and id_err)
+        return result
+
+    set signing to map_get_val(identity and "signing")
+    set encryption to map_get_val(identity and "encryption")
+    set sign_pub to map_get_val(signing and "public_key")
+    set sign_sec to map_get_val(signing and "secret_key")
+    set enc_pub to map_get_val(encryption and "public_key")
+    set enc_sec to map_get_val(encryption and "secret_key")
+
+    # Create DID from signing key
+    set did to create_did_key_from_ed25519(sign_pub)
+    if string_length(did) == 0:
+        set ok to map_insert(result and "error" and DID_ERR_INVALID_KEY)
+        return result
+
+    # Create DID document
+    set doc_result to create_did_document(sign_pub and enc_pub)
+    set doc_err to map_get_val(doc_result and "error")
+    if doc_err != 0:
+        set ok to map_insert(result and "error" and doc_err)
+        return result
+
+    set document to map_get_val(doc_result and "document")
+    set identity_hash to map_get_val(identity and "identity_hash")
+
+    # Persist the new identity to storage
+    set save_ok to storage_identity_save(did and sign_pub and sign_sec and enc_pub and enc_sec)
+
+    set ok to map_insert(result and "did" and did)
+    set ok to map_insert(result and "document" and document)
+    set ok to map_insert(result and "signing_public_key" and sign_pub)
+    set ok to map_insert(result and "signing_secret_key" and sign_sec)
+    set ok to map_insert(result and "encryption_public_key" and enc_pub)
+    set ok to map_insert(result and "encryption_secret_key" and enc_sec)
+    set ok to map_insert(result and "identity_hash" and identity_hash)
+    set ok to map_insert(result and "error" and DID_ERR_NONE)
+    return result
+
+define did_resolve with did as Str returning Map:
+    set prefix_key to "did:key:"
+    set prefix_peer to "did:peer:0z"
+    
+    set res to create_map()
+    
+    set len to string_length(did)
+    set resolved to 0
+    if len >= 8:
+        if substring(did and 0 and 8) equals prefix_key:
+            set resolved to resolve_did_key(did)
+    if len >= 11:
+        if substring(did and 0 and 11) equals prefix_peer:
+            set resolved to resolve_did_peer(did)
+            
+    if resolved == 0:
+        set ok to map_insert(res and "error" and DID_ERR_UNSUPPORTED_METHOD)
+        return res
+        
+    set err to map_get_val(resolved and "error")
+    if err != 0:
+        set ok to map_insert(res and "error" and err)
+        return res
+        
+    set vm_map to create_map()
+    set pub_key to map_get_val(resolved and "public_key_hex")
+    set ok to map_insert(vm_map and "public_key_hex" and pub_key)
+    
+    set ok to map_insert(res and "verification_method" and vm_map)
+    set ok to map_insert(res and "error" and DID_ERR_NONE)
+    return res
+

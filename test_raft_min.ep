@@ -1,0 +1,89 @@
+# Minimal Raft TCP test — just test serialization first
+import "collections"
+import "string"
+import "decent_consensus/raft"
+import "decent_consensus/election"
+import "decent_consensus/state"
+import "decent_consensus/raft_transport"
+
+define main:
+    display "=== Serialization Test ==="
+
+    # Test RequestVote serialization
+    set rv_str to raft_serialize_request_vote(1 and "node1" and 0 and 0)
+    display f"RV: {rv_str}"
+
+    # Test deserialization
+    set rv_parsed to raft_deserialize_message(rv_str)
+    set rv_type to ptr_to_str(map_get_val(rv_parsed and "type"))
+    set rv_term to map_get_val(rv_parsed and "term")
+    set rv_cid to ptr_to_str(map_get_val(rv_parsed and "candidate_id"))
+    display f"Parsed: type={rv_type} term={rv_term} cid={rv_cid}"
+
+    # Test RVR serialization
+    set rvr_str to raft_serialize_request_vote_response(1 and 1 and "node2")
+    display f"RVR: {rvr_str}"
+
+    # Test AE serialization with empty entries
+    set empty to create_list()
+    set ae_str to raft_serialize_append_entries(1 and "node1" and 0 and 0 and empty and 0)
+    display f"AE empty: {ae_str}"
+
+    # Test AE with one entry
+    set entries to create_list()
+    set e1 to create_map()
+    set ok to map_insert(e1 and "term" and 1)
+    set ok to map_insert(e1 and "index" and 1)
+    set ok to map_insert(e1 and "command" and "SET x=42")
+    set ok to append_list(entries and e1)
+    set ae_str2 to raft_serialize_append_entries(1 and "node1" and 0 and 0 and entries and 0)
+    display f"AE 1 entry: {ae_str2}"
+
+    # Deserialize the AE
+    set ae_parsed to raft_deserialize_message(ae_str2)
+    set ae_type to ptr_to_str(map_get_val(ae_parsed and "type"))
+    set ae_leader to ptr_to_str(map_get_val(ae_parsed and "leader_id"))
+    set ae_entries to map_get_val(ae_parsed and "entries")
+    set ae_num to length_list(ae_entries)
+    display f"AE parsed: type={ae_type} leader={ae_leader} entries={ae_num}"
+
+    if ae_num > 0:
+        set entry0 to get_list(ae_entries and 0)
+        set e_term to map_get_val(entry0 and "term")
+        set e_cmd to ptr_to_str(map_get_val(entry0 and "command"))
+        display f"  Entry 0: term={e_term} cmd={e_cmd}"
+
+    display "=== Serialization OK ==="
+
+    # Test node creation and server startup
+    display "=== Server Test ==="
+    set peers to create_list()
+    set ok to append_list(peers and str_to_ptr("node2"))
+    set node to raft_create_node("node1" and peers)
+    election_init_node(borrow node and 150)
+    set ok to map_insert(node and "running" and 1)
+    set ok to map_insert(node and "server_ready" and 0)
+
+    # Store in map to avoid move tracking
+    set cluster to create_map()
+    set ok to map_insert(cluster and "node1" and node)
+    set n1 to map_get_val(cluster and "node1")
+
+    set nid to ptr_to_str(map_get_val(n1 and "node_id"))
+    display f"Node ID: {nid}"
+    set nrole to ptr_to_str(map_get_val(n1 and "role"))
+    display f"Role: {nrole}"
+
+    # Start server on a port
+    spawn raft_server_thread(n1 and 19300)
+    set ok to ep_sleep_ms(100)
+
+    set srv_ready to map_get_val(n1 and "server_ready")
+    display f"Server ready: {srv_ready}"
+
+    # Stop it
+    set ok to map_insert(n1 and "running" and 0)
+    set ok to ep_sleep_ms(100)
+
+    display "=== DONE ==="
+    return 0

@@ -1,0 +1,86 @@
+# Phase: onion circuit construction + DHT relay directory.
+# Proves the full layered route end-to-end using REAL directory-published descriptors
+# and a fresh ephemeral key: build a 3-hop circuit, then walk it hop-by-hop calling
+# onion_process_hop with each relay's OWN encryption secret (as the live relay handler
+# does), and confirm (a) each non-exit hop forwards to the next relay's address, (b) the
+# exit recovers the exact query addressed to the destination, (c) the ephemeral key is
+# NOT any relay's key (origin unlinkability), (d) a tampered wire fails closed.
+
+import "string"
+import "collections"
+import "../decent_id/keys"
+import "onion"
+import "circuit"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set ok to onion_init()
+    set passes to 0
+
+    # three relays, each with its own X25519 encryption keypair + address
+    set g to generate_encryption_keypair()
+    set m to generate_encryption_keypair()
+    set x to generate_encryption_keypair()
+    set g_sec to ptr_to_str(map_get_val(g and "secret_key"))
+    set m_sec to ptr_to_str(map_get_val(m and "secret_key"))
+    set x_sec to ptr_to_str(map_get_val(x and "secret_key"))
+
+    # descriptors as they would come back from the DHT directory ("addr:port:enc_pub")
+    set g_desc to onion_parse_descriptor(concat("10.0.0.1:9100:" and ptr_to_str(map_get_val(g and "public_key"))))
+    set m_desc to onion_parse_descriptor(concat("10.0.0.2:9100:" and ptr_to_str(map_get_val(m and "public_key"))))
+    set x_desc to onion_parse_descriptor(concat("10.0.0.3:9100:" and ptr_to_str(map_get_val(x and "public_key"))))
+    set passes to passes + pass_if("descriptor_parse" and (map_get_val(g_desc and "error") == 0 and also (map_get_val(g_desc and "port") == 9100)))
+
+    set relays to create_list()
+    set ok to append_list(relays and g_desc)
+    set ok to append_list(relays and m_desc)
+    set ok to append_list(relays and x_desc)
+
+    set query to "SEARCH:ernos decentralized web"
+    set built to onion_build_query(relays and "10.9.9.9" and 7777 and query)
+    set passes to passes + pass_if("circuit_built" and (map_get_val(built and "error") == 0))
+    set passes to passes + pass_if("first_hop_is_guard" and (ptr_to_str(map_get_val(built and "first_addr")) equals "10.0.0.1"))
+
+    set eph_pub to ptr_to_str(map_get_val(built and "eph_pub"))
+    # origin unlinkability: ephemeral key must differ from every relay's pubkey
+    set unlinkable to 1
+    if eph_pub equals ptr_to_str(map_get_val(g and "public_key")):
+        set unlinkable to 0
+    if eph_pub equals ptr_to_str(map_get_val(m and "public_key")):
+        set unlinkable to 0
+    set passes to passes + pass_if("ephemeral_key_unlinkable" and unlinkable)
+
+    # hop 1: guard decrypts with ITS secret → forwards to middle
+    set h1 to onion_process_hop(g_sec and ptr_to_str(map_get_val(built and "wire")))
+    set passes to passes + pass_if("guard_decrypts" and (map_get_val(h1 and "error") == 0))
+    set passes to passes + pass_if("guard_not_exit" and (map_get_val(h1 and "is_exit") == 0))
+    set passes to passes + pass_if("guard_routes_to_middle" and (ptr_to_str(map_get_val(h1 and "next_addr")) equals "10.0.0.2"))
+
+    # hop 2: middle decrypts with ITS secret → forwards to exit
+    set h2 to onion_process_hop(m_sec and ptr_to_str(map_get_val(h1 and "fwd_wire")))
+    set passes to passes + pass_if("middle_not_exit" and (map_get_val(h2 and "is_exit") == 0))
+    set passes to passes + pass_if("middle_routes_to_exit" and (ptr_to_str(map_get_val(h2 and "next_addr")) equals "10.0.0.3"))
+
+    # hop 3: exit decrypts with ITS secret → recovers query + destination
+    set h3 to onion_process_hop(x_sec and ptr_to_str(map_get_val(h2 and "fwd_wire")))
+    set passes to passes + pass_if("exit_is_exit" and (map_get_val(h3 and "is_exit") == 1))
+    set passes to passes + pass_if("exit_dest_addr" and (ptr_to_str(map_get_val(h3 and "next_addr")) equals "10.9.9.9"))
+    set passes to passes + pass_if("exit_dest_port" and (map_get_val(h3 and "next_port") == 7777))
+    set passes to passes + pass_if("exit_recovers_query" and (ptr_to_str(map_get_val(h3 and "payload")) equals query))
+
+    # a relay using the WRONG key (not its own) must fail to peel its layer
+    set wrong to onion_process_hop(m_sec and ptr_to_str(map_get_val(built and "wire")))
+    set passes to passes + pass_if("wrong_key_fails_closed" and (map_get_val(wrong and "error") != 0))
+
+    # malformed wire fails closed
+    set bad to onion_process_hop(g_sec and "no-delimiters-here")
+    set passes to passes + pass_if("malformed_wire_fails_closed" and (map_get_val(bad and "error") != 0))
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/15 passed"))
+    return 0

@@ -1,0 +1,295 @@
+# ErnosDecent -- DHT-over-Transport Test Suite
+# Component: decent_net/test_dht_transport.ep
+# Tests: Ping/Pong, Store/Retrieve, FindNode over real TCP
+
+import "dht_transport"
+import "dht"
+import "transport"
+import "string"
+import "collections"
+import "net"
+import "../decent_id/keys"
+
+define dht_test_server with dht as Int and listen_fd as Int and msg_count as Int:
+    # Handle a fixed number of messages
+    set i to 0
+    repeat while i < msg_count:
+        set client_fd to ep_net_accept(listen_fd)
+        if client_fd >= 0:
+            set conn to create_map()
+            set ok to map_insert(conn and "fd" and client_fd)
+            set ok to map_insert(conn and "connected" and 1)
+            set ok to dht_handle_transport_message(dht and conn)
+            transport_close(conn)
+            free_map(conn)
+        set i to i + 1
+    return 0
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- DHT-over-Transport Test Suite"
+    display "  Decentralised Hash Table over TCP — Phase 2"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    set init_err to init_crypto()
+
+    # ===========================================================
+    # TEST 1: DHT Ping/Pong over TCP
+    # ===========================================================
+    display "TEST 1: DHT Ping/Pong over TCP"
+    set t1_ok to 1
+
+    set dht_client to create_dht_node("node_alpha" and "127.0.0.1" and 20001)
+    set dht_server to create_dht_node("node_beta" and "127.0.0.1" and 20002)
+
+    set listen_fd to ep_net_listen(20002)
+    if listen_fd < 0:
+        display "  FAIL: could not listen on port 20002"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        spawn dht_test_server(dht_server and listen_fd and 1)
+        set ok to ep_sleep_ms(50)
+
+        set ping_err to dht_rpc_ping(dht_client and "127.0.0.1" and 20002)
+        if ping_err != DHT_NET_ERR_NONE:
+            display f"  FAIL: ping failed with error {ping_err}"
+            set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(100)
+    if listen_fd >= 0:
+        set ok to ep_net_close(listen_fd)
+
+    # ===========================================================
+    # TEST 2: DHT Store over TCP
+    # ===========================================================
+    display "TEST 2: DHT Store over TCP"
+    set t2_ok to 1
+
+    set dht_client2 to create_dht_node("node_store_client" and "127.0.0.1" and 20011)
+    set dht_server2 to create_dht_node("node_store_server" and "127.0.0.1" and 20012)
+
+    set listen_fd2 to ep_net_listen(20012)
+    if listen_fd2 < 0:
+        display "  FAIL: could not listen on port 20012"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        # Server handles 2 messages: store + find_value check
+        spawn dht_test_server(dht_server2 and listen_fd2 and 1)
+        set ok to ep_sleep_ms(50)
+
+        set store_err to dht_rpc_store(dht_client2 and "127.0.0.1" and 20012 and "test_key" and "test_value")
+        if store_err != DHT_NET_ERR_NONE:
+            display f"  FAIL: store failed with error {store_err}"
+            set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(100)
+    if listen_fd2 >= 0:
+        set ok to ep_net_close(listen_fd2)
+
+    # ===========================================================
+    # TEST 3: DHT FindValue over TCP
+    # ===========================================================
+    display "TEST 3: DHT FindValue over TCP"
+    set t3_ok to 1
+
+    set dht_client3 to create_dht_node("node_find_client" and "127.0.0.1" and 20021)
+    set dht_server3 to create_dht_node("node_find_server" and "127.0.0.1" and 20013)
+    # Pre-store a value on the server node
+    set ok to dht_node_store_value(dht_server3 and "secret_key" and "secret_data_123")
+
+    set listen_fd3 to ep_net_listen(20013)
+    if listen_fd3 < 0:
+        display "  FAIL: could not listen on port 20013"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        spawn dht_test_server(dht_server3 and listen_fd3 and 1)
+        set ok to ep_sleep_ms(50)
+
+        set find_result to dht_rpc_find_value(dht_client3 and "127.0.0.1" and 20013 and "secret_key")
+        set find_err to map_get_val(find_result and "error")
+        if find_err != DHT_NET_ERR_NONE:
+            display f"  FAIL: find_value failed with error {find_err}"
+            set t3_ok to 0
+        else:
+            set found to map_get_val(find_result and "found")
+            if found != 1:
+                display "  FAIL: value not found"
+                set t3_ok to 0
+            else:
+                set val to map_get_val(find_result and "value")
+                if val equals "secret_data_123":
+                    set ok to 1
+                else:
+                    display f"  FAIL: value mismatch, got {val}"
+                    set t3_ok to 0
+        free_map(find_result)
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(100)
+    if listen_fd3 >= 0:
+        set ok to ep_net_close(listen_fd3)
+
+    # ===========================================================
+    # TEST 4: DHT FindNode over TCP (node list serialization)
+    # ===========================================================
+    display "TEST 4: DHT FindNode over TCP"
+    set t4_ok to 1
+
+    set dht_client4 to create_dht_node("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and "127.0.0.1" and 20031)
+    set dht_server4 to create_dht_node("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" and "127.0.0.1" and 20014)
+    set ok to dht_node_add_peer(dht_server4 and "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" and "10.0.0.3" and 20003)
+    set ok to dht_node_add_peer(dht_server4 and "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" and "10.0.0.4" and 20004)
+
+    set listen_fd4 to ep_net_listen(20014)
+    if listen_fd4 < 0:
+        display "  FAIL: could not listen on port 20014"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        spawn dht_test_server(dht_server4 and listen_fd4 and 1)
+        set ok to ep_sleep_ms(50)
+
+        set find_result to dht_rpc_find_node(dht_client4 and "127.0.0.1" and 20014 and "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+        set find_err to map_get_val(find_result and "error")
+        if find_err != DHT_NET_ERR_NONE:
+            display f"  FAIL: find_node failed with error {find_err}"
+            set t4_ok to 0
+        else:
+            set nodes to map_get_val(find_result and "nodes")
+            set node_count to length_list(nodes)
+            if node_count < 2:
+                display f"  FAIL: expected >= 2 nodes, got {node_count}"
+                set t4_ok to 0
+        free_map(find_result)
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(100)
+    if listen_fd4 >= 0:
+        set ok to ep_net_close(listen_fd4)
+
+    # ===========================================================
+    # TEST 5: FindValue for non-existent key
+    # ===========================================================
+    display "TEST 5: DHT FindValue non-existent key"
+    set t5_ok to 1
+
+    set dht_client5 to create_dht_node("node_nf_client" and "127.0.0.1" and 20041)
+    set dht_server5 to create_dht_node("node_nf_server" and "127.0.0.1" and 20015)
+
+    set listen_fd5 to ep_net_listen(20015)
+    if listen_fd5 < 0:
+        display "  FAIL: could not listen on port 20015"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        spawn dht_test_server(dht_server5 and listen_fd5 and 1)
+        set ok to ep_sleep_ms(50)
+
+        set find_result to dht_rpc_find_value(dht_client5 and "127.0.0.1" and 20015 and "nonexistent_key")
+        set find_err to map_get_val(find_result and "error")
+        if find_err != DHT_NET_ERR_NONE:
+            display f"  FAIL: find_value failed with error {find_err}"
+            set t5_ok to 0
+        else:
+            set found to map_get_val(find_result and "found")
+            if found != 0:
+                display "  FAIL: should not find nonexistent key"
+                set t5_ok to 0
+        free_map(find_result)
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(100)
+    if listen_fd5 >= 0:
+        set ok to ep_net_close(listen_fd5)
+
+    # ===========================================================
+    # TEST 6: Node list serialization round-trip
+    # ===========================================================
+    display "TEST 6: Node list serialization round-trip"
+    set t6_ok to 1
+
+    set test_nodes to create_list()
+    set n1 to create_map()
+    set ok to map_insert(n1 and "id" and "node_one")
+    set ok to map_insert(n1 and "address" and "10.0.0.1")
+    set ok to map_insert(n1 and "port" and 8001)
+    set ok to append_list(test_nodes and n1)
+    set n2 to create_map()
+    set ok to map_insert(n2 and "id" and "node_two")
+    set ok to map_insert(n2 and "address" and "10.0.0.2")
+    set ok to map_insert(n2 and "port" and 8002)
+    set ok to append_list(test_nodes and n2)
+
+    set serialized to dht_serialize_node_list(test_nodes)
+    set deserialized to dht_deserialize_node_list(serialized)
+    set deser_count to length_list(deserialized)
+    if deser_count != 2:
+        display f"  FAIL: expected 2 nodes, got {deser_count}"
+        set t6_ok to 0
+    else:
+        set first to get_list(deserialized and 0)
+        set first_id to map_get_val(first and "id")
+        if first_id equals "node_one":
+            set ok to 1
+        else:
+            display f"  FAIL: first node id {first_id}"
+            set t6_ok to 0
+        set second to get_list(deserialized and 1)
+        set second_addr to map_get_val(second and "address")
+        if second_addr equals "10.0.0.2":
+            set ok to 1
+        else:
+            display f"  FAIL: second node addr {second_addr}"
+            set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    display "==================================================="
+    return 0

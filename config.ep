@@ -1,0 +1,229 @@
+# ErnosDecent -- Configuration System
+# Component: config.ep
+# Loads TOML config file with sensible defaults
+# Status: Production
+
+import "toml"
+import "string"
+import "fs"
+import "os"
+import "collections"
+
+# ================================================================
+# Default Configuration
+# ================================================================
+
+define config_defaults returning Map:
+    set cfg to create_map()
+
+    # [node]
+    set ok to map_insert(cfg and "node.name" and "ernosdecent-node")
+    set ok to map_insert(cfg and "node.data_dir" and "~/.ernosdecent")
+    set ok to map_insert(cfg and "node.log_level" and "info")
+
+    # [network]
+    set ok to map_insert(cfg and "network.listen_address" and "0.0.0.0")
+    set ok to map_insert(cfg and "network.p2p_port" and 9100)
+    set ok to map_insert(cfg and "network.dht_port" and 9101)
+    set ok to map_insert(cfg and "network.relay_port" and 9102)
+    set ok to map_insert(cfg and "network.ipc_port" and 5000)
+    set ok to map_insert(cfg and "network.web_port" and 8088)
+    set ok to map_insert(cfg and "network.max_connections" and 256)
+    set ok to map_insert(cfg and "network.max_message_size" and 1048576)
+    set ok to map_insert(cfg and "network.seed_addr" and "")
+    set ok to map_insert(cfg and "network.seed_port" and 0)
+
+    # [consensus]
+    set ok to map_insert(cfg and "consensus.raft_port" and 9103)
+    set ok to map_insert(cfg and "consensus.election_timeout_ms" and 3000)
+    set ok to map_insert(cfg and "consensus.heartbeat_interval_ms" and 1000)
+
+    # [security]
+    set ok to map_insert(cfg and "security.rate_limit_per_minute" and 100)
+    set ok to map_insert(cfg and "security.ban_threshold" and 10)
+    set ok to map_insert(cfg and "security.ban_duration_sec" and 600)
+
+    # [storage]
+    set ok to map_insert(cfg and "storage.max_content_size" and 104857600)
+    set ok to map_insert(cfg and "storage.dht_ttl_sec" and 86400)
+
+    # [ai] — whisper.cpp STT backend (8090 by default to avoid llama.cpp's 8080)
+    set ok to map_insert(cfg and "ai.whisper_host" and "127.0.0.1")
+    set ok to map_insert(cfg and "ai.whisper_port" and 8090)
+
+    return cfg
+
+# ================================================================
+# Load config from file, falling back to defaults
+# ================================================================
+
+define config_load with path as Str returning Map:
+    set cfg to config_defaults()
+
+    if file_exists(path) == 0:
+        return cfg
+
+    set content to read_file(path)
+    if string_length(content) == 0:
+        return cfg
+
+    set toml_store to toml_parse(content)
+
+    # Override defaults with TOML values
+    set ok to config_override_str(cfg and toml_store and "node" and "name" and "node.name")
+    set ok to config_override_str(cfg and toml_store and "node" and "data_dir" and "node.data_dir")
+    set ok to config_override_str(cfg and toml_store and "node" and "log_level" and "node.log_level")
+
+    set ok to config_override_str(cfg and toml_store and "network" and "listen_address" and "network.listen_address")
+    set ok to config_override_int(cfg and toml_store and "network" and "p2p_port" and "network.p2p_port")
+    set ok to config_override_int(cfg and toml_store and "network" and "dht_port" and "network.dht_port")
+    set ok to config_override_int(cfg and toml_store and "network" and "relay_port" and "network.relay_port")
+    set ok to config_override_int(cfg and toml_store and "network" and "ipc_port" and "network.ipc_port")
+    set ok to config_override_int(cfg and toml_store and "network" and "web_port" and "network.web_port")
+    set ok to config_override_int(cfg and toml_store and "network" and "max_connections" and "network.max_connections")
+    set ok to config_override_int(cfg and toml_store and "network" and "max_message_size" and "network.max_message_size")
+    set ok to config_override_str(cfg and toml_store and "network" and "seed_addr" and "network.seed_addr")
+    set ok to config_override_int(cfg and toml_store and "network" and "seed_port" and "network.seed_port")
+
+    set ok to config_override_str(cfg and toml_store and "ai" and "whisper_host" and "ai.whisper_host")
+    set ok to config_override_int(cfg and toml_store and "ai" and "whisper_port" and "ai.whisper_port")
+
+    set ok to config_override_int(cfg and toml_store and "consensus" and "raft_port" and "consensus.raft_port")
+    set ok to config_override_int(cfg and toml_store and "consensus" and "election_timeout_ms" and "consensus.election_timeout_ms")
+    set ok to config_override_int(cfg and toml_store and "consensus" and "heartbeat_interval_ms" and "consensus.heartbeat_interval_ms")
+
+    set ok to config_override_int(cfg and toml_store and "security" and "rate_limit_per_minute" and "security.rate_limit_per_minute")
+    set ok to config_override_int(cfg and toml_store and "security" and "ban_threshold" and "security.ban_threshold")
+    set ok to config_override_int(cfg and toml_store and "security" and "ban_duration_sec" and "security.ban_duration_sec")
+
+    set ok to config_override_int(cfg and toml_store and "storage" and "max_content_size" and "storage.max_content_size")
+    set ok to config_override_int(cfg and toml_store and "storage" and "dht_ttl_sec" and "storage.dht_ttl_sec")
+
+    return cfg
+
+# ================================================================
+# Override helpers
+# ================================================================
+
+define config_override_str with cfg as Map and toml_store as Int and section as Str and key as Str and cfg_key as Str returning Int:
+    set val to toml_get_string(toml_store and section and key)
+    if string_length(val) > 0:
+        set ok to map_insert(cfg and cfg_key and val)
+    return 0
+
+define config_override_int with cfg as Map and toml_store as Int and section as Str and key as Str and cfg_key as Str returning Int:
+    set val_str to toml_get_string(toml_store and section and key)
+    if string_length(val_str) > 0:
+        set val to toml_get_int(toml_store and section and key)
+        if val != 0:
+            set ok to map_insert(cfg and cfg_key and val)
+    return 0
+
+# ================================================================
+# Accessors
+# ================================================================
+
+define config_get_str with cfg as Map and key as Str returning Str:
+    set val to map_get_val(cfg and key)
+    return val
+
+define config_get_int with cfg as Map and key as Str returning Int:
+    return map_get_val(cfg and key)
+
+# ================================================================
+# Resolve ~ in data_dir
+# ================================================================
+
+define config_resolve_data_dir with cfg as Map returning Str:
+    set raw to config_get_str(cfg and "node.data_dir")
+    if string_length(raw) > 0:
+        set first_char to get_character(raw and 0)
+        if first_char == 126:
+            set home to get_home_dir()
+            set rest to substring(raw and 1 and string_length(raw) - 1)
+            return concat(home and rest)
+    return raw
+
+# ================================================================
+# Generate default config file
+# ================================================================
+
+define config_generate_default with path as Str returning Int:
+    set content to "# ErnosDecent Node Configuration\n\n"
+    set content to concat(content and "[node]\n")
+    set content to concat(content and "name = \"ernosdecent-node\"\n")
+    set content to concat(content and "data_dir = \"~/.ernosdecent\"\n")
+    set content to concat(content and "log_level = \"info\"\n\n")
+
+    set content to concat(content and "[network]\n")
+    set content to concat(content and "listen_address = \"0.0.0.0\"\n")
+    set content to concat(content and "p2p_port = 9100\n")
+    set content to concat(content and "dht_port = 9101\n")
+    set content to concat(content and "relay_port = 9102\n")
+    set content to concat(content and "ipc_port = 5000\n")
+    set content to concat(content and "web_port = 8088\n")
+    set content to concat(content and "max_connections = 256\n")
+    set content to concat(content and "max_message_size = 1048576\n\n")
+
+    set content to concat(content and "[consensus]\n")
+    set content to concat(content and "raft_port = 9103\n")
+    set content to concat(content and "election_timeout_ms = 3000\n")
+    set content to concat(content and "heartbeat_interval_ms = 1000\n\n")
+
+    set content to concat(content and "[security]\n")
+    set content to concat(content and "rate_limit_per_minute = 100\n")
+    set content to concat(content and "ban_threshold = 10\n")
+    set content to concat(content and "ban_duration_sec = 600\n\n")
+
+    set content to concat(content and "[storage]\n")
+    set content to concat(content and "max_content_size = 104857600\n")
+    set content to concat(content and "dht_ttl_sec = 86400\n\n")
+
+    set content to concat(content and "[ai]\n")
+    set content to concat(content and "whisper_host = \"127.0.0.1\"\n")
+    set content to concat(content and "whisper_port = 8090\n")
+
+    set ok to write_file(path and content)
+    return ok
+
+# ================================================================
+# Save configuration back to TOML file
+# ================================================================
+
+define config_save with path as Str and cfg as Map returning Int:
+    set content to "# ErnosDecent Node Configuration\n\n"
+
+    set content to concat(content and "[node]\n")
+    set content to concat(content and concat("name = \"" and concat(config_get_str(cfg and "node.name") and "\"\n")))
+    set content to concat(content and concat("data_dir = \"" and concat(config_get_str(cfg and "node.data_dir") and "\"\n")))
+    set content to concat(content and concat("log_level = \"" and concat(config_get_str(cfg and "node.log_level") and "\"\n\n")))
+
+    set content to concat(content and "[network]\n")
+    set content to concat(content and concat("listen_address = \"" and concat(config_get_str(cfg and "network.listen_address") and "\"\n")))
+    set content to concat(content and concat("p2p_port = " and concat(int_to_string(config_get_int(cfg and "network.p2p_port")) and "\n")))
+    set content to concat(content and concat("dht_port = " and concat(int_to_string(config_get_int(cfg and "network.dht_port")) and "\n")))
+    set content to concat(content and concat("relay_port = " and concat(int_to_string(config_get_int(cfg and "network.relay_port")) and "\n")))
+    set content to concat(content and concat("ipc_port = " and concat(int_to_string(config_get_int(cfg and "network.ipc_port")) and "\n")))
+    set content to concat(content and concat("web_port = " and concat(int_to_string(config_get_int(cfg and "network.web_port")) and "\n")))
+    set content to concat(content and concat("max_connections = " and concat(int_to_string(config_get_int(cfg and "network.max_connections")) and "\n")))
+    set content to concat(content and concat("max_message_size = " and concat(int_to_string(config_get_int(cfg and "network.max_message_size")) and "\n")))
+    set content to concat(content and concat("seed_addr = \"" and concat(config_get_str(cfg and "network.seed_addr") and "\"\n")))
+    set content to concat(content and concat("seed_port = " and concat(int_to_string(config_get_int(cfg and "network.seed_port")) and "\n\n")))
+
+    set content to concat(content and "[consensus]\n")
+    set content to concat(content and concat("raft_port = " and concat(int_to_string(config_get_int(cfg and "consensus.raft_port")) and "\n")))
+    set content to concat(content and concat("election_timeout_ms = " and concat(int_to_string(config_get_int(cfg and "consensus.election_timeout_ms")) and "\n")))
+    set content to concat(content and concat("heartbeat_interval_ms = " and concat(int_to_string(config_get_int(cfg and "consensus.heartbeat_interval_ms")) and "\n\n")))
+
+    set content to concat(content and "[security]\n")
+    set content to concat(content and concat("rate_limit_per_minute = " and concat(int_to_string(config_get_int(cfg and "security.rate_limit_per_minute")) and "\n")))
+    set content to concat(content and concat("ban_threshold = " and concat(int_to_string(config_get_int(cfg and "security.ban_threshold")) and "\n")))
+    set content to concat(content and concat("ban_duration_sec = " and concat(int_to_string(config_get_int(cfg and "security.ban_duration_sec")) and "\n\n")))
+
+    set content to concat(content and "[storage]\n")
+    set content to concat(content and concat("max_content_size = " and concat(int_to_string(config_get_int(cfg and "storage.max_content_size")) and "\n")))
+    set content to concat(content and concat("dht_ttl_sec = " and concat(int_to_string(config_get_int(cfg and "storage.dht_ttl_sec")) and "\n")))
+
+    set ok to write_file(path and content)
+    return ok
+

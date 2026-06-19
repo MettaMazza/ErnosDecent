@@ -1,0 +1,447 @@
+# ErnosPlain Rebuild of ErnOS Agent Session Manager
+# Component: decent_agent/session.ep
+
+import "fs"
+import "json"
+import "collections"
+import "string"
+
+# ---- JSON escaping helper ----
+define session_json_escape with s as Str returning Str:
+    set len to string_length(s)
+    set result_list to create_list()
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(s and i)
+        if ch == 34: # "
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 34)
+        else:
+            if ch == 92: # \
+                set ok to append_list(result_list and 92)
+                set ok to append_list(result_list and 92)
+            else:
+                if ch == 10: # \n
+                    set ok to append_list(result_list and 92)
+                    set ok to append_list(result_list and 110)
+                else:
+                    if ch == 13: # \r
+                        set ok to append_list(result_list and 92)
+                        set ok to append_list(result_list and 114)
+                    else:
+                        if ch == 9: # \t
+                            set ok to append_list(result_list and 92)
+                            set ok to append_list(result_list and 116)
+                        else:
+                            set ok to append_list(result_list and ch)
+        set i to i + 1
+    set escaped to string_from_list(result_list)
+    free_list(result_list)
+    return escaped
+
+# ---- Create session Map ----
+define session_create_new with id as Str and title as Str and model as Str and system_prompt as Str returning Map:
+    set sess to create_map()
+    set ok to map_insert(sess and "id" and id)
+    set ok to map_insert(sess and "title" and title)
+    set ok to map_insert(sess and "model" and model)
+    set ok to map_insert(sess and "system_prompt" and system_prompt)
+    set ok to map_insert(sess and "messages" and create_list())
+    set ok to map_insert(sess and "compressed_sessions" and create_list())
+    return sess
+
+# ---- Add message helper ----
+define session_add_message with sess as Map and role as Str and content as Str returning Int:
+    set messages_list to map_get_val(sess and "messages")
+    set msg_map to create_map()
+    set ok to map_insert(msg_map and "role" and role)
+    set ok to map_insert(msg_map and "content" and content)
+    set ok to append_list(messages_list and msg_map)
+    return 0
+
+# ---- Manual JSON Serializer ----
+define session_serialize with sess as Map and path as Str returning Int:
+    set id_val to map_get_val(sess and "id")
+    set title_val to map_get_val(sess and "title")
+    set model_val to map_get_val(sess and "model")
+    set system_val to map_get_val(sess and "system_prompt")
+    set messages_list to map_get_val(sess and "messages")
+    set comp_list to map_get_val(sess and "compressed_sessions")
+    
+    set summary_val to ""
+    if map_contains(sess and "compression_summary") == 1:
+        set summary_val to map_get_val(sess and "compression_summary")
+    
+    set json_str to "{\n"
+    set json_str to concat(json_str and f"  \"id\": \"{session_json_escape(id_val)}\",\n")
+    set json_str to concat(json_str and f"  \"title\": \"{session_json_escape(title_val)}\",\n")
+    set json_str to concat(json_str and f"  \"model\": \"{session_json_escape(model_val)}\",\n")
+    set json_str to concat(json_str and f"  \"system_prompt\": \"{session_json_escape(system_val)}\",\n")
+    set json_str to concat(json_str and f"  \"compression_summary\": \"{session_json_escape(summary_val)}\",\n")
+    
+    # messages list
+    set json_str to concat(json_str and "  \"messages\": [\n")
+    set m_len to length_list(messages_list)
+    set idx to 0
+    repeat while idx < m_len:
+        set msg_map to get_list(messages_list and idx)
+        set r_val to map_get_val(msg_map and "role")
+        set c_val to map_get_val(msg_map and "content")
+        set json_str to concat(json_str and "    {\n")
+        set json_str to concat(json_str and f"      \"role\": \"{session_json_escape(r_val)}\",\n")
+        set json_str to concat(json_str and f"      \"content\": \"{session_json_escape(c_val)}\"\n")
+        if idx < m_len - 1:
+            set json_str to concat(json_str and "    },\n")
+        else:
+            set json_str to concat(json_str and "    }\n")
+        set idx to idx + 1
+    set json_str to concat(json_str and "  ],\n")
+    
+    # compressed_sessions list
+    set json_str to concat(json_str and "  \"compressed_sessions\": [\n")
+    set c_len to length_list(comp_list)
+    set idx to 0
+    repeat while idx < c_len:
+        set c_val to get_list(comp_list and idx)
+        set json_str to concat(json_str and f"    \"{session_json_escape(c_val)}\"")
+        if idx < c_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set idx to idx + 1
+    set json_str to concat(json_str and "  ]\n}")
+    
+    set ok to write_file(path and json_str)
+    return 0
+
+# ---- Deserialize JSON ----
+define session_deserialize_json with content as Str returning Map:
+    set root to json_parse(content)
+    if root == 0:
+        return 0
+        
+    set id_node to get_json_object_value(root and "id")
+    set title_node to get_json_object_value(root and "title")
+    set model_node to get_json_object_value(root and "model")
+    set system_node to get_json_object_value(root and "system_prompt")
+    set messages_node to get_json_object_value(root and "messages")
+    set comp_node to get_json_object_value(root and "compressed_sessions")
+    set summary_node to get_json_object_value(root and "compression_summary")
+    
+    set sess to create_map()
+    if id_node != 0:
+        set ok to map_insert(sess and "id" and get_json_value(id_node))
+    if title_node != 0:
+        set ok to map_insert(sess and "title" and get_json_value(title_node))
+    if model_node != 0:
+        set ok to map_insert(sess and "model" and get_json_value(model_node))
+    if system_node != 0:
+        set ok to map_insert(sess and "system_prompt" and get_json_value(system_node))
+    if summary_node != 0:
+        set ok to map_insert(sess and "compression_summary" and get_json_value(summary_node))
+        
+    set msg_list to create_list()
+    if messages_node != 0:
+        set raw_list to get_json_value(messages_node)
+        set len to length_list(raw_list)
+        set i to 0
+        repeat while i < len:
+            set item_node to get_list(raw_list and i)
+            set r_node to get_json_object_value(item_node and "role")
+            set c_node to get_json_object_value(item_node and "content")
+            set msg_map to create_map()
+            if r_node != 0:
+                set ok to map_insert(msg_map and "role" and get_json_value(r_node))
+            if c_node != 0:
+                set ok to map_insert(msg_map and "content" and get_json_value(c_node))
+            set ok to append_list(msg_list and msg_map)
+            set i to i + 1
+    set ok to map_insert(sess and "messages" and msg_list)
+    
+    set comp_list to create_list()
+    if comp_node != 0:
+        set raw_list to get_json_value(comp_node)
+        set len to length_list(raw_list)
+        set i to 0
+        repeat while i < len:
+            set item_node to get_list(raw_list and i)
+            set ok to append_list(comp_list and get_json_value(item_node))
+            set i to i + 1
+    set ok to map_insert(sess and "compressed_sessions" and comp_list)
+    
+    return sess
+
+define session_load with path as Str returning Map:
+    if file_exists(path) == 0:
+        return 0
+    set content to read_file(path)
+    return session_deserialize_json(content)
+
+# ---- Session Manager ----
+define session_manager_create with dir as Str returning Map:
+    set mgr to create_map()
+    set ok to map_insert(mgr and "sessions_dir" and dir)
+    set ok to map_insert(mgr and "sessions" and create_map())
+    set ok to map_insert(mgr and "active_session_id" and "")
+    return mgr
+
+define session_manager_load_all with mgr as Map returning Int:
+    set dir to map_get_val(mgr and "sessions_dir")
+    if file_exists(dir) == 0:
+        set ok to create_directory(dir)
+        return 0
+    set files to list_directory(dir)
+    set len to length_list(files)
+    set sessions_map to map_get_val(mgr and "sessions")
+    set active_id to ""
+    set i to 0
+    repeat while i < len:
+        set filename to get_list(files and i)
+        if string_contains(filename and ".json") == 1 and also string_contains(filename and "_transcript_") == 0:
+            set filepath to path_join(dir and filename)
+            set sess to session_load(filepath)
+            if sess != 0:
+                if map_contains(sess and "id") == 1:
+                    set sess_id to map_get_val(sess and "id")
+                    if string_length(sess_id) > 0:
+                        set ok to map_insert(sessions_map and sess_id and sess)
+                        set active_id to sess_id
+        set i to i + 1
+    set ok to map_insert(mgr and "active_session_id" and active_id)
+    return 0
+
+define session_manager_get_active with mgr as Map returning Map:
+    set active_id to map_get_val(mgr and "active_session_id")
+    set sessions_map to map_get_val(mgr and "sessions")
+    if string_length(active_id) == 0:
+        # Create a default session
+        set active_id to "default"
+        set sess to session_create_new(active_id and "Default Session" and "" and "You are a helpful assistant.")
+        set ok to map_insert(sessions_map and active_id and sess)
+        set ok to map_insert(mgr and "active_session_id" and active_id)
+        
+        # Save to disk
+        set dir to map_get_val(mgr and "sessions_dir")
+        set filepath to path_join(dir and "default.json")
+        set ok to session_serialize(sess and filepath)
+        
+    return map_get_val(sessions_map and active_id)
+
+define session_manager_new_session with mgr as Map and id as Str and title as Str and model as Str and sys_prompt as Str returning Map:
+    set sessions_map to map_get_val(mgr and "sessions")
+    set sess to session_create_new(id and title and model and sys_prompt)
+    set ok to map_insert(sessions_map and id and sess)
+    set ok to map_insert(mgr and "active_session_id" and id)
+    
+    # Save to disk
+    set dir to map_get_val(mgr and "sessions_dir")
+    set filepath to path_join(dir and concat(id and ".json"))
+    set ok to session_serialize(sess and filepath)
+    
+    return sess
+
+define session_manager_switch_to with mgr as Map and id as Str returning Int:
+    set sessions_map to map_get_val(mgr and "sessions")
+    if map_contains(sessions_map and id) == 1:
+        set ok to map_insert(mgr and "active_session_id" and id)
+        return 1
+    return 0
+
+define session_manager_delete with mgr as Map and id as Str returning Int:
+    set sessions_map to map_get_val(mgr and "sessions")
+    if map_contains(sessions_map and id) == 1:
+        set dir to map_get_val(mgr and "sessions_dir")
+        set filepath to path_join(dir and concat(id and ".json"))
+        if file_exists(filepath) == 1:
+            set ok to remove_file(filepath)
+        set ok to map_delete(sessions_map and id)
+        return 1
+    return 0
+
+define session_manager_rename with mgr as Map and id as Str and new_title as Str returning Int:
+    set sessions_map to map_get_val(mgr and "sessions")
+    if map_contains(sessions_map and id) == 1:
+        set sess to map_get_val(sessions_map and id)
+        set ok to map_insert(sess and "title" and new_title)
+        set dir to map_get_val(mgr and "sessions_dir")
+        set filepath to path_join(dir and concat(id and ".json"))
+        set ok to session_serialize(sess and filepath)
+        return 1
+    return 0
+
+define session_manager_list_json with mgr as Map returning Str:
+    set sessions_map to map_get_val(mgr and "sessions")
+    set keys to map_keys(sessions_map)
+    set len to length_list(keys)
+    set json_str to "["
+    set i to 0
+    repeat while i < len:
+        set k to get_list(keys and i)
+        set sess to map_get_val(sessions_map and k)
+        set title_val to map_get_val(sess and "title")
+        set model_val to map_get_val(sess and "model")
+        
+        set item_str to "{\"id\":\""
+        set item_str to concat(item_str and session_json_escape(k))
+        set item_str to concat(item_str and "\",\"title\":\"")
+        set item_str to concat(item_str and session_json_escape(title_val))
+        set item_str to concat(item_str and "\",\"model\":\"")
+        set item_str to concat(item_str and session_json_escape(model_val))
+        set item_str to concat(item_str and "\"}")
+        
+        set json_str to concat(json_str and item_str)
+        if i < len - 1:
+            set json_str to concat(json_str and ",")
+        set i to i + 1
+    set json_str to concat(json_str and "]")
+    return json_str
+
+define session_serialize_json_string with sess as Map returning Str:
+    set id_val to map_get_val(sess and "id")
+    set title_val to map_get_val(sess and "title")
+    set model_val to map_get_val(sess and "model")
+    set system_val to map_get_val(sess and "system_prompt")
+    set messages_list to map_get_val(sess and "messages")
+    set comp_list to map_get_val(sess and "compressed_sessions")
+    
+    set summary_val to ""
+    if map_contains(sess and "compression_summary") == 1:
+        set summary_val to map_get_val(sess and "compression_summary")
+        
+    set json_str to "{\"id\":\""
+    set json_str to concat(json_str and session_json_escape(id_val))
+    set json_str to concat(json_str and "\",\"title\":\"")
+    set json_str to concat(json_str and session_json_escape(title_val))
+    set json_str to concat(json_str and "\",\"model\":\"")
+    set json_str to concat(json_str and session_json_escape(model_val))
+    set json_str to concat(json_str and "\",\"system_prompt\":\"")
+    set json_str to concat(json_str and session_json_escape(system_val))
+    set json_str to concat(json_str and "\",\"compression_summary\":\"")
+    set json_str to concat(json_str and session_json_escape(summary_val))
+    set json_str to concat(json_str and "\",")
+    
+    # messages list
+    set json_str to concat(json_str and "\"messages\":[")
+    set m_len to length_list(messages_list)
+    set idx to 0
+    repeat while idx < m_len:
+        set msg_map to get_list(messages_list and idx)
+        set r_val to map_get_val(msg_map and "role")
+        set c_val to map_get_val(msg_map and "content")
+        
+        set item_str to "{\"role\":\""
+        set item_str to concat(item_str and session_json_escape(r_val))
+        set item_str to concat(item_str and "\",\"content\":\"")
+        set item_str to concat(item_str and session_json_escape(c_val))
+        set item_str to concat(item_str and "\"}")
+        
+        set json_str to concat(json_str and item_str)
+        if idx < m_len - 1:
+            set json_str to concat(json_str and ",")
+        set idx to idx + 1
+    set json_str to concat(json_str and "],")
+    
+    # compressed_sessions list
+    set json_str to concat(json_str and "\"compressed_sessions\":[")
+    set c_len to length_list(comp_list)
+    set idx to 0
+    repeat while idx < c_len:
+        set c_val to get_list(comp_list and idx)
+        set json_str to concat(json_str and "\"")
+        set json_str to concat(json_str and session_json_escape(c_val))
+        set json_str to concat(json_str and "\"")
+        if idx < c_len - 1:
+            set json_str to concat(json_str and ",")
+        set idx to idx + 1
+    set json_str to concat(json_str and "]}")
+    return json_str
+
+define session_compress_active with mgr as Map and sess as Map and model_name as Str returning Int:
+    set messages_list to map_get_val(sess and "messages")
+    set m_len to length_list(messages_list)
+    if m_len < 4:
+        return 0
+        
+    set total_chars to 0
+    set i to 0
+    repeat while i < m_len:
+        set msg_map to get_list(messages_list and i)
+        set content_val to map_get_val(msg_map and "content")
+        set total_chars to total_chars + string_length(content_val)
+        set i to i + 1
+        
+    if total_chars < 12000:
+        return 0
+        
+    set last_msg to get_list(messages_list and m_len - 1)
+    set comp_msgs to create_list()
+    set i to 0
+    repeat while i < m_len - 1:
+        set msg_map to get_list(messages_list and i)
+        set ok to append_list(comp_msgs and msg_map)
+        set i to i + 1
+        
+    set sess_id to map_get_val(sess and "id")
+    set comp_list to map_get_val(sess and "compressed_sessions")
+    set comp_count to length_list(comp_list)
+    set dir to map_get_val(mgr and "sessions_dir")
+    set transcript_filename to f"{sess_id}_transcript_{comp_count}.json"
+    set transcript_path to path_join(dir and transcript_filename)
+    
+    set json_str to "[\n"
+    set c_len to length_list(comp_msgs)
+    set idx to 0
+    repeat while idx < c_len:
+        set msg_map to get_list(comp_msgs and idx)
+        set r_val to map_get_val(msg_map and "role")
+        set c_val to map_get_val(msg_map and "content")
+        set json_str to concat(json_str and "  {\n")
+        set json_str to concat(json_str and f"    \"role\": \"{session_json_escape(r_val)}\",\n")
+        set json_str to concat(json_str and f"    \"content\": \"{session_json_escape(c_val)}\"\n")
+        if idx < c_len - 1:
+            set json_str to concat(json_str and "  },\n")
+        else:
+            set json_str to concat(json_str and "  }\n")
+        set idx to idx + 1
+    set json_str to concat(json_str and "]")
+    set ok to write_file(transcript_path and json_str)
+    
+    set ok to append_list(comp_list and transcript_path)
+    
+    set summary_text to f"Conversation up to turn {m_len - 1} was compressed due to context limits. Topics discussed included: "
+    set topics to ""
+    set i to 0
+    repeat while i < c_len:
+        set msg_map to get_list(comp_msgs and i)
+        set role_val to map_get_val(msg_map and "role")
+        if role_val equals "user":
+            set content_val to map_get_val(msg_map and "content")
+            set short_prompt to substring(content_val and 0 and 40)
+            if string_length(topics) > 0:
+                set topics to concat(topics and f"; \"{short_prompt}...\"")
+            else:
+                set topics to f"\"{short_prompt}...\""
+        set i to i + 1
+    set summary_text to concat(summary_text and topics)
+    
+    set ok to map_insert(sess and "compression_summary" and summary_text)
+    
+    set new_msgs to create_list()
+    set ok to append_list(new_msgs and last_msg)
+    set ok to map_insert(sess and "messages" and new_msgs)
+    
+    set sess_filepath to path_join(dir and concat(sess_id and ".json"))
+    set ok to session_serialize(sess and sess_filepath)
+    return 1
+
+define session_manager_set_model with mgr as Map and id as Str and model as Str returning Int:
+    set sessions_map to map_get_val(mgr and "sessions")
+    if map_contains(sessions_map and id) == 1:
+        set sess to map_get_val(sessions_map and id)
+        set ok to map_insert(sess and "model" and model)
+        set dir to map_get_val(mgr and "sessions_dir")
+        set filepath to path_join(dir and concat(id and ".json"))
+        set ok to session_serialize(sess and filepath)
+        return 1
+    return 0
+

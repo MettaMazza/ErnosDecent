@@ -1,0 +1,919 @@
+# ErnosDecent -- Noise Protocol Framework
+# Component: decent_net/noise.ep
+# Implements: Noise_XX handshake pattern (mutual authentication)
+#             ChaChaPoly1305 AEAD + Curve25519 DH + SHA-256 hash
+# Spec: Noise Protocol Framework, Revision 34
+# Status: Production -- OperationTrojanClaude Phase 2
+
+import "../decent_id/keys"
+import "string"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set NOISE_ERR_NONE to 0
+set NOISE_ERR_INIT_FAILED to 401
+set NOISE_ERR_DH_FAILED to 402
+set NOISE_ERR_ENCRYPT_FAILED to 403
+set NOISE_ERR_DECRYPT_FAILED to 404
+set NOISE_ERR_HANDSHAKE_FAILED to 405
+set NOISE_ERR_INVALID_STATE to 406
+set NOISE_ERR_INVALID_MESSAGE to 407
+set NOISE_ERR_BAD_LENGTH to 408
+
+# Noise_XX pattern:
+#   -> e
+#   <- e, ee, s, es
+#   -> s, se
+# Initiator sends ephemeral, responder sends ephemeral+static, initiator sends static
+
+# Handshake states
+set NOISE_STATE_INIT to 0
+set NOISE_STATE_SENT_E to 1
+set NOISE_STATE_RECV_E_EE_S_ES to 2
+set NOISE_STATE_COMPLETE to 3
+
+# Roles
+set NOISE_ROLE_INITIATOR to 1
+set NOISE_ROLE_RESPONDER to 2
+
+# Crypto sizes
+set NOISE_DH_LEN to 32
+set NOISE_KEY_LEN to 32
+set NOISE_NONCE_LEN to 12
+set NOISE_TAG_LEN to 16
+set NOISE_HASH_LEN to 32
+set NOISE_HMAC_LEN to 32
+
+# Protocol name for Noise_XX_25519_ChaChaPoly_SHA256
+set NOISE_PROTOCOL_NAME to "Noise_XX_25519_ChaChaPoly_SHA256"
+
+# ================================================================
+# Low-level crypto primitives via libsodium FFI
+# These wrap the raw libsodium C functions needed for Noise
+# ================================================================
+
+define noise_dh with secret_key_ptr as Int and public_key_ptr as Int and output_ptr as Int returning Int:
+    # X25519 Diffie-Hellman: output = secret_key * public_key
+    # crypto_scalarmult(q, n, p): q = n * p
+    set fn to ep_dlsym(SODIUM_HANDLE and "crypto_scalarmult")
+    set result to ep_dlcall3(fn and output_ptr and secret_key_ptr and public_key_ptr)
+    return result
+
+define noise_dh_generate with secret_ptr as Int and public_ptr as Int returning Int:
+    # Generate X25519 keypair
+    # crypto_box_keypair generates X25519 keys
+    set fn to ep_dlsym(SODIUM_HANDLE and "crypto_box_keypair")
+    set result to ep_dlcall2(fn and public_ptr and secret_ptr)
+    return result
+
+define noise_encrypt with key_ptr as Int and nonce_val as Int and ad_ptr as Int and ad_len as Int and plaintext_ptr as Int and plain_len as Int and ciphertext_ptr as Int and cipher_len_ptr as Int returning Int:
+    # ChaChaPoly1305-IETF AEAD encrypt
+    # Build 12-byte nonce: 4 zero bytes + 8-byte little-endian nonce_val
+    set nonce_ptr to alloc_bytes(12)
+    # Zero the nonce buffer first
+    set fn_zero to ep_dlsym(SODIUM_HANDLE and "sodium_memzero")
+    set ok to ep_dlcall2(fn_zero and nonce_ptr and 12)
+    # Write nonce_val as a full 64-bit little-endian counter at offset 4 (bytes
+    # 4..11). Writing only 4 bytes left a 32-bit counter that wraps after 2^32
+    # messages, reusing a (key, nonce) pair -- catastrophic for ChaCha20-Poly1305.
+    set ok to poke_byte(nonce_ptr and 4 and nonce_val modulo 256)
+    set ok to poke_byte(nonce_ptr and 5 and (nonce_val / 256) modulo 256)
+    set ok to poke_byte(nonce_ptr and 6 and (nonce_val / 65536) modulo 256)
+    set ok to poke_byte(nonce_ptr and 7 and (nonce_val / 16777216) modulo 256)
+    set ok to poke_byte(nonce_ptr and 8 and (nonce_val / 4294967296) modulo 256)
+    set ok to poke_byte(nonce_ptr and 9 and (nonce_val / 1099511627776) modulo 256)
+    set ok to poke_byte(nonce_ptr and 10 and (nonce_val / 281474976710656) modulo 256)
+    set ok to poke_byte(nonce_ptr and 11 and (nonce_val / 72057594037927936) modulo 256)
+
+    set fn to ep_dlsym(SODIUM_HANDLE and "crypto_aead_chacha20poly1305_ietf_encrypt")
+    set result to ep_dlcall9(fn and ciphertext_ptr and cipher_len_ptr and plaintext_ptr and plain_len and ad_ptr and ad_len and 0 and nonce_ptr and key_ptr)
+
+    set ok to free_bytes(nonce_ptr)
+    return result
+
+define noise_decrypt with key_ptr as Int and nonce_val as Int and ad_ptr as Int and ad_len as Int and ciphertext_ptr as Int and cipher_len as Int and plaintext_ptr as Int and plain_len_ptr as Int returning Int:
+    # ChaChaPoly1305-IETF AEAD decrypt
+    set nonce_ptr to alloc_bytes(12)
+    set fn_zero to ep_dlsym(SODIUM_HANDLE and "sodium_memzero")
+    set ok to ep_dlcall2(fn_zero and nonce_ptr and 12)
+    # Full 64-bit little-endian counter at offset 4 (must match noise_encrypt).
+    set ok to poke_byte(nonce_ptr and 4 and nonce_val modulo 256)
+    set ok to poke_byte(nonce_ptr and 5 and (nonce_val / 256) modulo 256)
+    set ok to poke_byte(nonce_ptr and 6 and (nonce_val / 65536) modulo 256)
+    set ok to poke_byte(nonce_ptr and 7 and (nonce_val / 16777216) modulo 256)
+    set ok to poke_byte(nonce_ptr and 8 and (nonce_val / 4294967296) modulo 256)
+    set ok to poke_byte(nonce_ptr and 9 and (nonce_val / 1099511627776) modulo 256)
+    set ok to poke_byte(nonce_ptr and 10 and (nonce_val / 281474976710656) modulo 256)
+    set ok to poke_byte(nonce_ptr and 11 and (nonce_val / 72057594037927936) modulo 256)
+
+    set fn to ep_dlsym(SODIUM_HANDLE and "crypto_aead_chacha20poly1305_ietf_decrypt")
+    set result to ep_dlcall9(fn and plaintext_ptr and plain_len_ptr and 0 and ciphertext_ptr and cipher_len and ad_ptr and ad_len and nonce_ptr and key_ptr)
+
+    set ok to free_bytes(nonce_ptr)
+    return result
+
+define noise_hmac_sha256 with key_ptr as Int and key_len as Int and data_ptr as Int and data_len as Int and output_ptr as Int returning Int:
+    # HMAC-SHA256 using crypto_auth_hmacsha256 init/update/final
+    # Simpler: use crypto_auth_hmacsha256 directly (key must be 32 bytes)
+    # For Noise HKDF we need variable-length key HMAC, so use init/update/final
+    set state_size to 208
+    set state_ptr to alloc_bytes(state_size)
+
+    set fn_init to ep_dlsym(SODIUM_HANDLE and "crypto_auth_hmacsha256_init")
+    set result to ep_dlcall3(fn_init and state_ptr and key_ptr and key_len)
+    if result != 0:
+        set ok to free_bytes(state_ptr)
+        return result
+
+    set fn_update to ep_dlsym(SODIUM_HANDLE and "crypto_auth_hmacsha256_update")
+    set result to ep_dlcall3(fn_update and state_ptr and data_ptr and data_len)
+    if result != 0:
+        set ok to free_bytes(state_ptr)
+        return result
+
+    set fn_final to ep_dlsym(SODIUM_HANDLE and "crypto_auth_hmacsha256_final")
+    set result to ep_dlcall2(fn_final and state_ptr and output_ptr)
+    set ok to free_bytes(state_ptr)
+    return result
+
+define noise_sha256 with data_ptr as Int and data_len as Int and output_ptr as Int returning Int:
+    set fn to ep_dlsym(SODIUM_HANDLE and "crypto_hash_sha256")
+    return ep_dlcall3(fn and output_ptr and data_ptr and data_len)
+
+# ================================================================
+# Noise HKDF -- Extract and Expand (RFC 5869 with SHA-256)
+# ================================================================
+
+define noise_hkdf with chaining_key_ptr as Int and input_key_ptr as Int and input_len as Int and output1_ptr as Int and output2_ptr as Int returning Int:
+    # HKDF with 2 outputs as specified by Noise Protocol
+    # temp_key = HMAC-SHA256(chaining_key, input_key_material)
+    # output1 = HMAC-SHA256(temp_key, 0x01)
+    # output2 = HMAC-SHA256(temp_key, output1 || 0x02)
+
+    set temp_key to alloc_bytes(32)
+    set result to noise_hmac_sha256(chaining_key_ptr and 32 and input_key_ptr and input_len and temp_key)
+    if result != 0:
+        set ok to free_bytes(temp_key)
+        return NOISE_ERR_DH_FAILED
+
+    # output1 = HMAC(temp_key, [0x01])
+    set one_byte to alloc_bytes(1)
+    set ok to poke_byte(one_byte and 0 and 1)
+    set result to noise_hmac_sha256(temp_key and 32 and one_byte and 1 and output1_ptr)
+    if result != 0:
+        set ok to free_bytes(temp_key)
+        set ok to free_bytes(one_byte)
+        return NOISE_ERR_DH_FAILED
+
+    # output2 = HMAC(temp_key, output1 || [0x02])
+    set concat_buf to alloc_bytes(33)
+    # Copy output1 (32 bytes) into concat_buf
+    set ci to 0
+    repeat while ci < 32:
+        set b to peek_byte(output1_ptr and ci)
+        set ok to poke_byte(concat_buf and ci and b)
+        set ci to ci + 1
+    set ok to poke_byte(concat_buf and 32 and 2)
+
+    set result to noise_hmac_sha256(temp_key and 32 and concat_buf and 33 and output2_ptr)
+
+    set fn_zero to ep_dlsym(SODIUM_HANDLE and "sodium_memzero")
+    set ok to ep_dlcall2(fn_zero and temp_key and 32)
+    set ok to free_bytes(temp_key)
+    set ok to free_bytes(one_byte)
+    set ok to free_bytes(concat_buf)
+
+    if result != 0:
+        return NOISE_ERR_DH_FAILED
+    return NOISE_ERR_NONE
+
+# ================================================================
+# CipherState -- tracks encryption key + nonce counter
+# Stored as a map: { key_ptr, nonce, has_key }
+# ================================================================
+
+define cipher_state_init:
+    set cs to create_map()
+    set ok to map_insert(cs and "key_ptr" and 0)
+    set ok to map_insert(cs and "nonce" and 0)
+    set ok to map_insert(cs and "has_key" and 0)
+    return cs
+
+define cipher_state_init_key with key_ptr as Int:
+    set cs to create_map()
+    # Copy the key to our own buffer
+    set our_key to alloc_bytes(32)
+    set i to 0
+    repeat while i < 32:
+        set b to peek_byte(key_ptr and i)
+        set ok to poke_byte(our_key and i and b)
+        set i to i + 1
+    set ok to map_insert(cs and "key_ptr" and our_key)
+    set ok to map_insert(cs and "nonce" and 0)
+    set ok to map_insert(cs and "has_key" and 1)
+    return cs
+
+define cipher_state_encrypt_with_ad with cs as Int and ad_ptr as Int and ad_len as Int and plaintext_ptr as Int and plain_len as Int and ciphertext_ptr as Int and cipher_len_ptr as Int returning Int:
+    set has_key to map_get_val(cs and "has_key")
+    if has_key == 0:
+        # No key: copy plaintext to ciphertext (unencrypted)
+        set i to 0
+        repeat while i < plain_len:
+            set b to peek_byte(plaintext_ptr and i)
+            set ok to poke_byte(ciphertext_ptr and i and b)
+            set i to i + 1
+        return NOISE_ERR_NONE
+
+    set key_ptr to map_get_val(cs and "key_ptr")
+    set nonce to map_get_val(cs and "nonce")
+
+    set result to noise_encrypt(key_ptr and nonce and ad_ptr and ad_len and plaintext_ptr and plain_len and ciphertext_ptr and cipher_len_ptr)
+
+    # Advance the nonce only on SUCCESS, so a failed encryption does not push the
+    # sender's counter ahead of what it actually transmitted (which would desync
+    # the peer's decryptor).
+    if result != 0:
+        return NOISE_ERR_ENCRYPT_FAILED
+    set ok to map_insert(cs and "nonce" and nonce + 1)
+    return NOISE_ERR_NONE
+
+define cipher_state_decrypt_with_ad with cs as Int and ad_ptr as Int and ad_len as Int and ciphertext_ptr as Int and cipher_len as Int and plaintext_ptr as Int and plain_len_ptr as Int returning Int:
+    set has_key to map_get_val(cs and "has_key")
+    if has_key == 0:
+        # No key: copy ciphertext to plaintext
+        set i to 0
+        repeat while i < cipher_len:
+            set b to peek_byte(ciphertext_ptr and i)
+            set ok to poke_byte(plaintext_ptr and i and b)
+            set i to i + 1
+        return NOISE_ERR_NONE
+
+    set key_ptr to map_get_val(cs and "key_ptr")
+    set nonce to map_get_val(cs and "nonce")
+
+    set result to noise_decrypt(key_ptr and nonce and ad_ptr and ad_len and ciphertext_ptr and cipher_len and plaintext_ptr and plain_len_ptr)
+
+    # Advance the nonce only on SUCCESS. Advancing on a failed AEAD verification
+    # would let a single forged/corrupt packet permanently desync the counter so
+    # that every subsequent legitimate message fails to decrypt (a 1-packet DoS).
+    if result != 0:
+        return NOISE_ERR_DECRYPT_FAILED
+    set ok to map_insert(cs and "nonce" and nonce + 1)
+    return NOISE_ERR_NONE
+
+# ================================================================
+# SymmetricState -- chaining key + cipher state + hash
+# ================================================================
+
+define symmetric_state_init:
+    set ss to create_map()
+
+    # Initialize h = SHA-256(protocol_name) if len <= 32, else SHA-256(protocol_name)
+    set proto_name to NOISE_PROTOCOL_NAME
+    set proto_ptr to str_to_ptr(proto_name)
+    set proto_len to string_length(proto_name)
+
+    set h_ptr to alloc_bytes(32)
+    if proto_len <= 32:
+        # Pad protocol name to 32 bytes (zero-padded)
+        set fn_zero to ep_dlsym(SODIUM_HANDLE and "sodium_memzero")
+        set ok to ep_dlcall2(fn_zero and h_ptr and 32)
+        set i to 0
+        repeat while i < proto_len:
+            set b to peek_byte(proto_ptr and i)
+            set ok to poke_byte(h_ptr and i and b)
+            set i to i + 1
+    else:
+        set ok to noise_sha256(proto_ptr and proto_len and h_ptr)
+
+    # ck = h (chaining key starts as h)
+    set ck_ptr to alloc_bytes(32)
+    set i to 0
+    repeat while i < 32:
+        set b to peek_byte(h_ptr and i)
+        set ok to poke_byte(ck_ptr and i and b)
+        set i to i + 1
+
+    set cs to cipher_state_init()
+
+    set ok to map_insert(ss and "h_ptr" and h_ptr)
+    set ok to map_insert(ss and "ck_ptr" and ck_ptr)
+    set ok to map_insert(ss and "cs" and cs)
+    return ss
+
+define symmetric_state_mix_hash with ss as Int and data_ptr as Int and data_len as Int returning Int:
+    # h = SHA-256(h || data)
+    set h_ptr to map_get_val(ss and "h_ptr")
+    set combined to alloc_bytes(32 + data_len)
+
+    # Copy h
+    set i to 0
+    repeat while i < 32:
+        set b to peek_byte(h_ptr and i)
+        set ok to poke_byte(combined and i and b)
+        set i to i + 1
+
+    # Copy data
+    set i to 0
+    repeat while i < data_len:
+        set b to peek_byte(data_ptr and i)
+        set ok to poke_byte(combined and 32 + i and b)
+        set i to i + 1
+
+    set ok to noise_sha256(combined and 32 + data_len and h_ptr)
+    set ok to free_bytes(combined)
+    return NOISE_ERR_NONE
+
+define symmetric_state_mix_key with ss as Int and input_key_ptr as Int and input_len as Int returning Int:
+    # ck, temp_k = HKDF(ck, input_key_material)
+    # Then re-init cipher state with temp_k
+    set ck_ptr to map_get_val(ss and "ck_ptr")
+    set new_ck to alloc_bytes(32)
+    set temp_k to alloc_bytes(32)
+
+    set result to noise_hkdf(ck_ptr and input_key_ptr and input_len and new_ck and temp_k)
+    if result != NOISE_ERR_NONE:
+        set ok to free_bytes(new_ck)
+        set ok to free_bytes(temp_k)
+        return result
+
+    # Update chaining key
+    set i to 0
+    repeat while i < 32:
+        set b to peek_byte(new_ck and i)
+        set ok to poke_byte(ck_ptr and i and b)
+        set i to i + 1
+    set ok to free_bytes(new_ck)
+
+    # Re-init cipher state with temp_k
+    set new_cs to cipher_state_init_key(temp_k)
+    set ok to map_insert(ss and "cs" and new_cs)
+
+    set fn_zero to ep_dlsym(SODIUM_HANDLE and "sodium_memzero")
+    set ok to ep_dlcall2(fn_zero and temp_k and 32)
+    set ok to free_bytes(temp_k)
+
+    return NOISE_ERR_NONE
+
+define symmetric_state_encrypt_and_hash with ss as Int and plaintext_ptr as Int and plain_len as Int and ciphertext_ptr as Int and cipher_len_ptr as Int returning Int:
+    # Encrypt with h as AD, then mix_hash the ciphertext
+    set cs to map_get_val(ss and "cs")
+    set h_ptr to map_get_val(ss and "h_ptr")
+
+    set result to cipher_state_encrypt_with_ad(cs and h_ptr and 32 and plaintext_ptr and plain_len and ciphertext_ptr and cipher_len_ptr)
+    if result != NOISE_ERR_NONE:
+        return result
+
+    # Determine output length
+    set has_key to map_get_val(cs and "has_key")
+    set out_len to plain_len
+    if has_key == 1:
+        set out_len to plain_len + NOISE_TAG_LEN
+
+    set ok to symmetric_state_mix_hash(ss and ciphertext_ptr and out_len)
+    return NOISE_ERR_NONE
+
+define symmetric_state_decrypt_and_hash with ss as Int and ciphertext_ptr as Int and cipher_len as Int and plaintext_ptr as Int and plain_len_ptr as Int returning Int:
+    # Save current h, decrypt with h as AD, then mix_hash the ciphertext
+    set cs to map_get_val(ss and "cs")
+    set h_ptr to map_get_val(ss and "h_ptr")
+
+    # Save h before decryption (we need the pre-decryption h as AD)
+    set saved_h to alloc_bytes(32)
+    set i to 0
+    repeat while i < 32:
+        set b to peek_byte(h_ptr and i)
+        set ok to poke_byte(saved_h and i and b)
+        set i to i + 1
+
+    set result to cipher_state_decrypt_with_ad(cs and saved_h and 32 and ciphertext_ptr and cipher_len and plaintext_ptr and plain_len_ptr)
+
+    # Mix hash with ciphertext (even if decrypt failed, for consistency)
+    set ok to symmetric_state_mix_hash(ss and ciphertext_ptr and cipher_len)
+
+    set ok to free_bytes(saved_h)
+    return result
+
+define symmetric_state_split with ss as Int:
+    # Split into two CipherStates for transport
+    # temp_k1, temp_k2 = HKDF(ck, empty)
+    set ck_ptr to map_get_val(ss and "ck_ptr")
+    set k1_ptr to alloc_bytes(32)
+    set k2_ptr to alloc_bytes(32)
+    set empty to alloc_bytes(1)
+
+    set result to noise_hkdf(ck_ptr and empty and 0 and k1_ptr and k2_ptr)
+    set ok to free_bytes(empty)
+
+    if result != NOISE_ERR_NONE:
+        set ok to free_bytes(k1_ptr)
+        set ok to free_bytes(k2_ptr)
+        set split_result to create_map()
+        set ok to map_insert(split_result and "error" and result)
+        return split_result
+
+    set cs1 to cipher_state_init_key(k1_ptr)
+    set cs2 to cipher_state_init_key(k2_ptr)
+
+    set fn_zero to ep_dlsym(SODIUM_HANDLE and "sodium_memzero")
+    set ok to ep_dlcall2(fn_zero and k1_ptr and 32)
+    set ok to ep_dlcall2(fn_zero and k2_ptr and 32)
+    set ok to free_bytes(k1_ptr)
+    set ok to free_bytes(k2_ptr)
+
+    set split_result to create_map()
+    set ok to map_insert(split_result and "cs_send" and cs1)
+    set ok to map_insert(split_result and "cs_recv" and cs2)
+    set ok to map_insert(split_result and "error" and NOISE_ERR_NONE)
+    return split_result
+
+# ================================================================
+# HandshakeState -- Noise_XX pattern
+# ================================================================
+
+define noise_handshake_init with role as Int and static_secret_ptr as Int and static_public_ptr as Int:
+    # Initialize handshake state
+    set err to init_crypto()
+    if err != 0:
+        set result to create_map()
+        set ok to map_insert(result and "error" and NOISE_ERR_INIT_FAILED)
+        return result
+
+    set hs to create_map()
+
+    # Copy static keys
+    set s_sec to alloc_bytes(32)
+    set s_pub to alloc_bytes(32)
+    set i to 0
+    repeat while i < 32:
+        set b to peek_byte(static_secret_ptr and i)
+        set ok to poke_byte(s_sec and i and b)
+        set b to peek_byte(static_public_ptr and i)
+        set ok to poke_byte(s_pub and i and b)
+        set i to i + 1
+
+    # Generate ephemeral keypair
+    set e_sec to alloc_bytes(32)
+    set e_pub to alloc_bytes(32)
+    set ok to noise_dh_generate(e_sec and e_pub)
+
+    # Initialize symmetric state
+    set ss to symmetric_state_init()
+
+    set ok to map_insert(hs and "role" and role)
+    set ok to map_insert(hs and "s_sec" and s_sec)
+    set ok to map_insert(hs and "s_pub" and s_pub)
+    set ok to map_insert(hs and "e_sec" and e_sec)
+    set ok to map_insert(hs and "e_pub" and e_pub)
+    set ok to map_insert(hs and "re_pub" and 0)
+    set ok to map_insert(hs and "rs_pub" and 0)
+    set ok to map_insert(hs and "ss" and ss)
+    set ok to map_insert(hs and "state" and NOISE_STATE_INIT)
+    set ok to map_insert(hs and "error" and NOISE_ERR_NONE)
+    return hs
+
+# ================================================================
+# Noise_XX Message 1: Initiator -> Responder
+# Initiator sends: e (ephemeral public key, 32 bytes)
+# ================================================================
+
+define noise_xx_write_message1 with hs as Int:
+    set result to create_map()
+    set role to map_get_val(hs and "role")
+    if role != NOISE_ROLE_INITIATOR:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    set ss to map_get_val(hs and "ss")
+    set e_pub to map_get_val(hs and "e_pub")
+
+    # -> e: mix_hash(e.public)
+    set ok to symmetric_state_mix_hash(ss and e_pub and 32)
+
+    # Output message: e.public (32 bytes, unencrypted)
+    set msg_hex to raw_to_hex(e_pub and 32)
+
+    set ok to map_insert(hs and "state" and NOISE_STATE_SENT_E)
+    set ok to map_insert(result and "message" and msg_hex)
+    set ok to map_insert(result and "error" and NOISE_ERR_NONE)
+    return result
+
+# ================================================================
+# Noise_XX Message 1: Responder reads
+# ================================================================
+
+define noise_xx_read_message1 with hs as Int and msg_hex as Str:
+    set result to create_map()
+    set role to map_get_val(hs and "role")
+    if role != NOISE_ROLE_RESPONDER:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    if string_length(msg_hex) != 64:
+        set ok to map_insert(result and "error" and NOISE_ERR_BAD_LENGTH)
+        return result
+
+    set ss to map_get_val(hs and "ss")
+
+    # Read re (remote ephemeral)
+    set re_pub to alloc_bytes(32)
+    set ok to hex_to_raw(msg_hex and re_pub and 32)
+
+    set ok to map_insert(hs and "re_pub" and re_pub)
+
+    # mix_hash(re)
+    set ok to symmetric_state_mix_hash(ss and re_pub and 32)
+
+    set ok to map_insert(hs and "state" and NOISE_STATE_SENT_E)
+    set ok to map_insert(result and "error" and NOISE_ERR_NONE)
+    return result
+
+# ================================================================
+# Noise_XX Message 2: Responder -> Initiator
+# Responder sends: e, ee, s, es
+# Output: e.public (32B) + encrypted(s.public) (32B + 16B tag)
+# ================================================================
+
+define noise_xx_write_message2 with hs as Int:
+    set result to create_map()
+    set role to map_get_val(hs and "role")
+    if role != NOISE_ROLE_RESPONDER:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    set ss to map_get_val(hs and "ss")
+    set e_pub to map_get_val(hs and "e_pub")
+    set e_sec to map_get_val(hs and "e_sec")
+    set s_pub to map_get_val(hs and "s_pub")
+    set s_sec to map_get_val(hs and "s_sec")
+    set re_pub to map_get_val(hs and "re_pub")
+
+    # -> e: send ephemeral, mix_hash
+    set ok to symmetric_state_mix_hash(ss and e_pub and 32)
+
+    # -> ee: DH(e, re)
+    set dh_result to alloc_bytes(32)
+    set dh_res to noise_dh(e_sec and re_pub and dh_result)
+    if dh_res < 0:
+        set ok to free_bytes(dh_result)
+        set ok to map_insert(result and "error" and NOISE_ERR_DH_FAILED)
+        return result
+    set ok to symmetric_state_mix_key(ss and dh_result and 32)
+    set ok to free_bytes(dh_result)
+
+    # -> s: encrypt and send static public key
+    set encrypted_s to alloc_bytes(32 + NOISE_TAG_LEN)
+    set enc_len_ptr to alloc_bytes(8)
+    set ok to symmetric_state_encrypt_and_hash(ss and s_pub and 32 and encrypted_s and enc_len_ptr)
+
+    # -> es: DH(s, re)
+    set dh_result2 to alloc_bytes(32)
+    set dh_res2 to noise_dh(s_sec and re_pub and dh_result2)
+    if dh_res2 < 0:
+        set ok to free_bytes(dh_result2)
+        set ok to free_bytes(encrypted_s)
+        set ok to free_bytes(enc_len_ptr)
+        set ok to map_insert(result and "error" and NOISE_ERR_DH_FAILED)
+        return result
+    set ok to symmetric_state_mix_key(ss and dh_result2 and 32)
+    set ok to free_bytes(dh_result2)
+
+    # Build output message: e_pub (32B) + encrypted_s (48B)
+    set e_hex to raw_to_hex(e_pub and 32)
+    set s_enc_hex to raw_to_hex(encrypted_s and 48)
+    set msg_hex to concat(e_hex and s_enc_hex)
+
+    set ok to free_bytes(encrypted_s)
+    set ok to free_bytes(enc_len_ptr)
+
+    set ok to map_insert(hs and "state" and NOISE_STATE_RECV_E_EE_S_ES)
+    set ok to map_insert(result and "message" and msg_hex)
+    set ok to map_insert(result and "error" and NOISE_ERR_NONE)
+    return result
+
+# ================================================================
+# Noise_XX Message 2: Initiator reads
+# ================================================================
+
+define noise_xx_read_message2 with hs as Int and msg_hex as Str:
+    set result to create_map()
+    set role to map_get_val(hs and "role")
+    if role != NOISE_ROLE_INITIATOR:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    # Message: re_pub (64 hex) + encrypted_s (96 hex = 48 bytes)
+    if string_length(msg_hex) != 160:
+        set ok to map_insert(result and "error" and NOISE_ERR_BAD_LENGTH)
+        return result
+
+    set ss to map_get_val(hs and "ss")
+    set e_sec to map_get_val(hs and "e_sec")
+    set s_sec to map_get_val(hs and "s_sec")
+
+    # Read re
+    set re_hex to substring(msg_hex and 0 and 64)
+    set re_pub to alloc_bytes(32)
+    set ok to hex_to_raw(re_hex and re_pub and 32)
+    set ok to map_insert(hs and "re_pub" and re_pub)
+
+    # mix_hash(re)
+    set ok to symmetric_state_mix_hash(ss and re_pub and 32)
+
+    # ee: DH(e, re)
+    set dh_result to alloc_bytes(32)
+    set dh_res to noise_dh(e_sec and re_pub and dh_result)
+    if dh_res < 0:
+        set ok to free_bytes(dh_result)
+        set ok to free_bytes(re_pub)
+        set ok to map_insert(result and "error" and NOISE_ERR_DH_FAILED)
+        return result
+    set ok to symmetric_state_mix_key(ss and dh_result and 32)
+    set ok to free_bytes(dh_result)
+
+    # Read encrypted static key
+    set enc_s_hex to substring(msg_hex and 64 and 96)
+    set enc_s_ptr to alloc_bytes(48)
+    set ok to hex_to_raw(enc_s_hex and enc_s_ptr and 48)
+
+    # Decrypt to get rs (remote static)
+    set rs_pub to alloc_bytes(32)
+    set plain_len_ptr to alloc_bytes(8)
+    set dec_err to symmetric_state_decrypt_and_hash(ss and enc_s_ptr and 48 and rs_pub and plain_len_ptr)
+    set ok to free_bytes(enc_s_ptr)
+    set ok to free_bytes(plain_len_ptr)
+
+    if dec_err != NOISE_ERR_NONE:
+        set ok to free_bytes(rs_pub)
+        set ok to free_bytes(re_pub)
+        set ok to map_insert(result and "error" and NOISE_ERR_DECRYPT_FAILED)
+        return result
+
+    set ok to map_insert(hs and "rs_pub" and rs_pub)
+
+    # es: DH(s, re) -- initiator uses own static with remote ephemeral
+    # Wait -- in XX pattern for initiator reading msg2:
+    # es means DH(e_initiator_secret, rs_responder_static)
+    set dh_result2 to alloc_bytes(32)
+    set dh_res2 to noise_dh(e_sec and rs_pub and dh_result2)
+    if dh_res2 < 0:
+        set ok to free_bytes(dh_result2)
+        set ok to free_bytes(re_pub)
+        set ok to free_bytes(rs_pub)
+        set ok to map_insert(result and "error" and NOISE_ERR_DH_FAILED)
+        return result
+    set ok to symmetric_state_mix_key(ss and dh_result2 and 32)
+    set ok to free_bytes(dh_result2)
+
+    set ok to map_insert(hs and "state" and NOISE_STATE_RECV_E_EE_S_ES)
+    set ok to map_insert(result and "error" and NOISE_ERR_NONE)
+    return result
+
+# ================================================================
+# Noise_XX Message 3: Initiator -> Responder
+# Initiator sends: s, se
+# Output: encrypted(s.public) (48B)
+# ================================================================
+
+define noise_xx_write_message3 with hs as Int:
+    set result to create_map()
+    set role to map_get_val(hs and "role")
+    if role != NOISE_ROLE_INITIATOR:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    set ss to map_get_val(hs and "ss")
+    set s_pub to map_get_val(hs and "s_pub")
+    set s_sec to map_get_val(hs and "s_sec")
+    set e_sec to map_get_val(hs and "e_sec")
+    set re_pub to map_get_val(hs and "re_pub")
+
+    # -> s: encrypt and send static key
+    set encrypted_s to alloc_bytes(32 + NOISE_TAG_LEN)
+    set enc_len_ptr to alloc_bytes(8)
+    set ok to symmetric_state_encrypt_and_hash(ss and s_pub and 32 and encrypted_s and enc_len_ptr)
+
+    # -> se: DH(s, re)
+    set dh_result to alloc_bytes(32)
+    set dh_res to noise_dh(s_sec and re_pub and dh_result)
+    if dh_res < 0:
+        set ok to free_bytes(dh_result)
+        set ok to free_bytes(encrypted_s)
+        set ok to free_bytes(enc_len_ptr)
+        set ok to map_insert(result and "error" and NOISE_ERR_DH_FAILED)
+        return result
+    set ok to symmetric_state_mix_key(ss and dh_result and 32)
+    set ok to free_bytes(dh_result)
+
+    # Build output
+    set msg_hex to raw_to_hex(encrypted_s and 48)
+    set ok to free_bytes(encrypted_s)
+    set ok to free_bytes(enc_len_ptr)
+
+    # Split to get transport keys
+    set split to symmetric_state_split(ss)
+    set split_err to map_get_val(split and "error")
+    if split_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and split_err)
+        return result
+
+    # Zeroize and clear e_sec and s_sec
+    set fn_zero to ep_dlsym(SODIUM_HANDLE and "sodium_memzero")
+    if s_sec != 0:
+        set ok to ep_dlcall2(fn_zero and s_sec and 32)
+        set ok to free_bytes(s_sec)
+        set ok to map_delete(hs and "s_sec")
+    if e_sec != 0:
+        set ok to ep_dlcall2(fn_zero and e_sec and 32)
+        set ok to free_bytes(e_sec)
+        set ok to map_delete(hs and "e_sec")
+
+    set ok to map_insert(hs and "state" and NOISE_STATE_COMPLETE)
+    set ok to map_insert(hs and "cs_send" and map_get_val(split and "cs_send"))
+    set ok to map_insert(hs and "cs_recv" and map_get_val(split and "cs_recv"))
+
+    set ok to map_insert(result and "message" and msg_hex)
+    set ok to map_insert(result and "error" and NOISE_ERR_NONE)
+    return result
+
+# ================================================================
+# Noise_XX Message 3: Responder reads
+# ================================================================
+
+define noise_xx_read_message3 with hs as Int and msg_hex as Str:
+    set result to create_map()
+    set role to map_get_val(hs and "role")
+    if role != NOISE_ROLE_RESPONDER:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    # Message: encrypted_s (96 hex = 48 bytes)
+    if string_length(msg_hex) != 96:
+        set ok to map_insert(result and "error" and NOISE_ERR_BAD_LENGTH)
+        return result
+
+    set ss to map_get_val(hs and "ss")
+    set e_sec to map_get_val(hs and "e_sec")
+
+    # Decrypt to get rs
+    set enc_s_ptr to alloc_bytes(48)
+    set ok to hex_to_raw(msg_hex and enc_s_ptr and 48)
+
+    set rs_pub to alloc_bytes(32)
+    set plain_len_ptr to alloc_bytes(8)
+    set dec_err to symmetric_state_decrypt_and_hash(ss and enc_s_ptr and 48 and rs_pub and plain_len_ptr)
+    set ok to free_bytes(enc_s_ptr)
+    set ok to free_bytes(plain_len_ptr)
+
+    if dec_err != NOISE_ERR_NONE:
+        set ok to free_bytes(rs_pub)
+        set ok to map_insert(result and "error" and NOISE_ERR_DECRYPT_FAILED)
+        return result
+
+    set ok to map_insert(hs and "rs_pub" and rs_pub)
+
+    # se: DH(e, rs) -- responder uses own ephemeral with remote static
+    set dh_result to alloc_bytes(32)
+    set dh_res to noise_dh(e_sec and rs_pub and dh_result)
+    if dh_res < 0:
+        set ok to free_bytes(dh_result)
+        set ok to free_bytes(rs_pub)
+        set ok to map_insert(result and "error" and NOISE_ERR_DH_FAILED)
+        return result
+    set ok to symmetric_state_mix_key(ss and dh_result and 32)
+    set ok to free_bytes(dh_result)
+
+    # Split to get transport keys (reversed for responder)
+    set split to symmetric_state_split(ss)
+    set split_err to map_get_val(split and "error")
+    if split_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and split_err)
+        return result
+
+    # Zeroize and clear e_sec and s_sec
+    set s_sec to map_get_val(hs and "s_sec")
+    set e_sec to map_get_val(hs and "e_sec")
+    set fn_zero to ep_dlsym(SODIUM_HANDLE and "sodium_memzero")
+    if s_sec != 0:
+        set ok to ep_dlcall2(fn_zero and s_sec and 32)
+        set ok to free_bytes(s_sec)
+        set ok to map_delete(hs and "s_sec")
+    if e_sec != 0:
+        set ok to ep_dlcall2(fn_zero and e_sec and 32)
+        set ok to free_bytes(e_sec)
+        set ok to map_delete(hs and "e_sec")
+
+    set ok to map_insert(hs and "state" and NOISE_STATE_COMPLETE)
+    # Responder's send = initiator's recv, and vice versa
+    set ok to map_insert(hs and "cs_send" and map_get_val(split and "cs_recv"))
+    set ok to map_insert(hs and "cs_recv" and map_get_val(split and "cs_send"))
+
+    set ok to map_insert(result and "error" and NOISE_ERR_NONE)
+    return result
+
+# ================================================================
+# Transport messages -- post-handshake encrypted communication
+# ================================================================
+
+define noise_transport_encrypt with hs as Int and plaintext as Str:
+    set result to create_map()
+
+    set state to map_get_val(hs and "state")
+    if state != NOISE_STATE_COMPLETE:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    set cs_send to map_get_val(hs and "cs_send")
+    # Fail closed: a transport CipherState MUST have a key. If it does not, the
+    # underlying cipher would copy the plaintext through UNENCRYPTED (correct only
+    # for the pre-key handshake message, never for application data). Refuse to
+    # transmit over a keyless transport state rather than leak plaintext.
+    if map_get_val(cs_send and "has_key") != 1:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    set plain_ptr to str_to_ptr(plaintext)
+    set plain_len to string_length(plaintext)
+
+    set cipher_len to plain_len + NOISE_TAG_LEN
+    set cipher_ptr to alloc_bytes(cipher_len)
+    set cipher_len_ptr to alloc_bytes(8)
+
+    # Empty AD for transport messages
+    set empty_ad to alloc_bytes(1)
+    set enc_err to cipher_state_encrypt_with_ad(cs_send and empty_ad and 0 and plain_ptr and plain_len and cipher_ptr and cipher_len_ptr)
+    set ok to free_bytes(empty_ad)
+
+    if enc_err != NOISE_ERR_NONE:
+        set ok to free_bytes(cipher_ptr)
+        set ok to free_bytes(cipher_len_ptr)
+        set ok to map_insert(result and "error" and NOISE_ERR_ENCRYPT_FAILED)
+        return result
+
+    set cipher_hex to raw_to_hex(cipher_ptr and cipher_len)
+    set ok to free_bytes(cipher_ptr)
+    set ok to free_bytes(cipher_len_ptr)
+
+    set ok to map_insert(result and "ciphertext" and cipher_hex)
+    set ok to map_insert(result and "error" and NOISE_ERR_NONE)
+    return result
+
+define noise_transport_decrypt with hs as Int and ciphertext_hex as Str:
+    set result to create_map()
+
+    set state to map_get_val(hs and "state")
+    if state != NOISE_STATE_COMPLETE:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    set cs_recv to map_get_val(hs and "cs_recv")
+    # Fail closed: refuse to "decrypt" over a keyless transport state, which would
+    # otherwise pass the ciphertext through as if it were authenticated plaintext.
+    if map_get_val(cs_recv and "has_key") != 1:
+        set ok to map_insert(result and "error" and NOISE_ERR_INVALID_STATE)
+        return result
+
+    set cipher_len to string_length(ciphertext_hex) / 2
+
+    if cipher_len < NOISE_TAG_LEN:
+        set ok to map_insert(result and "error" and NOISE_ERR_BAD_LENGTH)
+        return result
+
+    set cipher_ptr to alloc_bytes(cipher_len)
+    set ok to hex_to_raw(ciphertext_hex and cipher_ptr and cipher_len)
+
+    set plain_len to cipher_len - NOISE_TAG_LEN
+    set plain_ptr to alloc_bytes(plain_len + 1)
+    set plain_len_ptr to alloc_bytes(8)
+
+    set empty_ad to alloc_bytes(1)
+    set dec_err to cipher_state_decrypt_with_ad(cs_recv and empty_ad and 0 and cipher_ptr and cipher_len and plain_ptr and plain_len_ptr)
+    set ok to free_bytes(empty_ad)
+    set ok to free_bytes(cipher_ptr)
+    set ok to free_bytes(plain_len_ptr)
+
+    if dec_err != NOISE_ERR_NONE:
+        set ok to free_bytes(plain_ptr)
+        set ok to map_insert(result and "error" and NOISE_ERR_DECRYPT_FAILED)
+        return result
+
+    # Null-terminate and convert to string
+    set ok to poke_byte(plain_ptr and plain_len and 0)
+    set plaintext to ptr_to_str(plain_ptr)
+    set ok to free_bytes(plain_ptr)
+
+    set ok to map_insert(result and "plaintext" and plaintext)
+    set ok to map_insert(result and "error" and NOISE_ERR_NONE)
+    return result
+
+# ================================================================
+# Get remote static public key (after handshake)
+# ================================================================
+
+define noise_get_remote_static with hs as Int returning Str:
+    set rs_pub to map_get_val(hs and "rs_pub")
+    if rs_pub == 0:
+        return ""
+    return raw_to_hex(rs_pub and 32)

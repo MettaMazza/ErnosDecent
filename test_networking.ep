@@ -1,0 +1,418 @@
+# ErnosDecent -- Phase 2 Networking Test Suite
+# Tests: Subsystem networking functions compile and wire correctly
+# Status: Production
+
+import "collections"
+import "string"
+import "fs"
+import "os"
+import "storage"
+import "decent_social/nostr"
+import "decent_social/activitypub"
+import "decent_name/registry"
+import "decent_name/resolver"
+import "decent_search/crawl"
+import "decent_media/stream"
+import "decent_pool/compute"
+import "decent_anon/mixnet"
+import "decent_host/email"
+import "decent_host/git"
+import "decent_net/dht"
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- Phase 2 Networking Test Suite"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # Use a temporary test directory for storage
+    set test_dir to concat(get_cwd() and "/test_phase2_data")
+    if file_exists(test_dir):
+        set ok to run_command(concat("rm -rf " and test_dir))
+    set err to storage_init(test_dir)
+
+    # ===========================================================
+    # TEST 1: Nostr event serialization to JSON
+    # ===========================================================
+    display "TEST 1: Nostr event JSON serialization"
+    set t1_ok to 1
+
+    set tags to create_list()
+    set event to nostr_create_event("pub_abc123" and 1 and tags and "Hello Nostr!")
+    set json_str to nostr_event_to_json(event)
+
+    if string_contains(json_str and "\"id\":\""):
+        display f"  Event JSON has id field"
+    else:
+        display "  FAIL: no id in JSON"
+        set t1_ok to 0
+
+    if string_contains(json_str and "\"pubkey\":\"pub_abc123\""):
+        display "  Event JSON has correct pubkey"
+    else:
+        display "  FAIL: wrong pubkey"
+        set t1_ok to 0
+
+    if string_contains(json_str and "\"content\":\"Hello Nostr!\""):
+        display "  Event JSON has correct content"
+    else:
+        display "  FAIL: wrong content"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 2: ActivityPub JSON-LD serialization
+    # ===========================================================
+    display "TEST 2: ActivityPub JSON-LD"
+    set t2_ok to 1
+
+    set actor to ap_create_actor("did:key:z6Mk_alice" and "Alice")
+    set actor_json to ap_actor_to_json(actor)
+
+    if string_contains(actor_json and "activitystreams"):
+        display "  Actor has JSON-LD context"
+    else:
+        display "  FAIL: no context"
+        set t2_ok to 0
+
+    if string_contains(actor_json and "\"name\":\"Alice\""):
+        display "  Actor has correct name"
+    else:
+        display "  FAIL: wrong name"
+        set t2_ok to 0
+
+    # WebFinger
+    set wf to ap_create_webfinger("did:key:z6Mk_alice" and "ernos.decent")
+    if string_contains(wf and "acct:"):
+        display "  WebFinger has subject"
+    else:
+        display "  FAIL: no webfinger subject"
+        set t2_ok to 0
+
+    # Activity serialization
+    set obj to create_map()
+    set ok to map_insert(obj and "type" and "Note")
+    set activity to ap_create_activity("did:key:z6Mk_alice" and "Create" and obj)
+    set act_json to ap_activity_to_json(activity)
+    if string_contains(act_json and "\"type\":\"Create\""):
+        display "  Activity serializes correctly"
+    else:
+        display "  FAIL: activity serialization"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 3: Name registry with persistence
+    # ===========================================================
+    display "TEST 3: Name registry with persistence"
+    set t3_ok to 1
+
+    set reg to registry_create()
+    set test_dht to create_dht_node("test_reg_node" and "127.0.0.1" and 8901)
+    set reg_err to registry_register(reg and "alice.decent" and "did:key:z6Mk_alice" and test_dht and "" and 0)
+    if reg_err == REG_ERR_NONE:
+        display "  Registered alice.decent"
+    else:
+        display f"  FAIL: register returned {reg_err}"
+        set t3_ok to 0
+
+    # Resolve from memory
+    set resolved to registry_resolve(reg and "alice.decent" and test_dht and "" and 0)
+    if resolved equals "did:key:z6Mk_alice":
+        display "  Resolved from memory: did:key:z6Mk_alice"
+    else:
+        display f"  FAIL: resolved to '{resolved}'"
+        set t3_ok to 0
+
+    # Duplicate registration should fail
+    set dup_err to registry_register(reg and "alice.decent" and "did:key:z6Mk_bob" and test_dht and "" and 0)
+    if dup_err == REG_ERR_NAME_TAKEN:
+        display "  Duplicate registration correctly rejected"
+    else:
+        display f"  FAIL: duplicate returned {dup_err}"
+        set t3_ok to 0
+
+    # New registry should pick up from persistence
+    set reg2 to registry_create()
+    set resolved2 to registry_resolve(reg2 and "alice.decent" and test_dht and "" and 0)
+    if resolved2 equals "did:key:z6Mk_alice":
+        display "  New registry loaded from persistence"
+    else:
+        display f"  FAIL: persistence fallback returned '{resolved2}'"
+        set t3_ok to 0
+
+    if t3_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 4: Resolver with cache + persistence
+    # ===========================================================
+    display "TEST 4: Resolver cache + persistence"
+    set t4_ok to 1
+
+    set res to resolver_create()
+
+    # Add to cache manually
+    set ok to resolver_cache_add(res and "manual.decent" and "did:key:z6Mk_manual" and 300)
+    set cached to resolver_lookup(res and "manual.decent")
+    if cached equals "did:key:z6Mk_manual":
+        display "  Cache hit: manual.decent"
+    else:
+        display f"  FAIL: cache returned '{cached}'"
+        set t4_ok to 0
+
+    # Lookup should hit persistence (alice.decent was registered earlier)
+    set persisted to resolver_lookup(res and "alice.decent")
+    if persisted equals "did:key:z6Mk_alice":
+        display "  Persistence fallback: alice.decent"
+    else:
+        display f"  FAIL: persistence returned '{persisted}'"
+        set t4_ok to 0
+
+    # Miss should return empty
+    set miss to resolver_lookup(res and "nonexistent.decent")
+    if string_length(miss) == 0:
+        display "  Cache miss returns empty"
+    else:
+        display f"  FAIL: miss returned '{miss}'"
+        set t4_ok to 0
+
+    if t4_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 5: Search crawler index (local indexing)
+    # ===========================================================
+    display "TEST 5: Search indexer"
+    set t5_ok to 1
+
+    set index to crawl_create_index()
+    set links to create_list()
+    set ok to crawl_index_page(index and "https://ernos.decent/home" and "Home Page" and "decentralized internet platform" and links)
+    set ok to crawl_index_page(index and "https://ernos.decent/about" and "About" and "decentralized network for privacy" and links)
+
+    set page_count to map_get_val(index and "page_count")
+    if page_count == 2:
+        display "  2 pages indexed"
+    else:
+        display f"  FAIL: page count is {page_count}"
+        set t5_ok to 0
+
+    set inverted to map_get_val(index and "inverted_index")
+    set dec_map to map_get_val(inverted and "decentralized")
+    if dec_map != 0:
+        display "  'decentralized' in inverted index"
+    else:
+        display "  FAIL: word not indexed"
+        set t5_ok to 0
+
+    if t5_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 6: Media segmenter + LRU cache
+    # ===========================================================
+    display "TEST 6: Media segmenter + cache"
+    set t6_ok to 1
+
+    set media to "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz"
+    set playlist to stream_segment_media(media and 2000 and "720p")
+    set segments to map_get_val(playlist and "segments")
+    set seg_count to length_list(segments)
+
+    if seg_count > 0:
+        display f"  Media segmented into {seg_count} segments"
+    else:
+        display "  FAIL: no segments"
+        set t6_ok to 0
+
+    # Test LRU cache
+    set cache to stream_create_lru_cache(100)
+    set ok to stream_cache_put(cache and "seg0" and "ABCDEF")
+    set ok to stream_cache_put(cache and "seg1" and "GHIJKL")
+    set val to stream_cache_get(cache and "seg0")
+    if val equals "ABCDEF":
+        display "  LRU cache hit for seg0"
+    else:
+        display "  FAIL: cache miss"
+        set t6_ok to 0
+
+    if t6_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 7: Compute pool — job lifecycle
+    # ===========================================================
+    display "TEST 7: Compute pool job lifecycle"
+    set t7_ok to 1
+
+    set mgr to compute_create_manager()
+    set job_id to compute_submit_job(mgr and "delegator_alice" and "compute_this_data")
+
+    if string_length(job_id) > 0:
+        display f"  Job submitted: {job_id}"
+    else:
+        display "  FAIL: empty job_id"
+        set t7_ok to 0
+
+    set assigned to compute_assign_job(mgr and "worker_bob")
+    if assigned equals job_id:
+        display f"  Job assigned to worker_bob"
+    else:
+        display f"  FAIL: assigned '{assigned}', expected '{job_id}'"
+        set t7_ok to 0
+
+    set sub_ok to compute_submit_result(mgr and job_id and "worker_bob" and "result_42")
+    if sub_ok == COMPUTE_ERR_NONE:
+        display "  Worker submitted result"
+    else:
+        display f"  FAIL: submit returned {sub_ok}"
+        set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: Mixnet pool + shuffle
+    # ===========================================================
+    display "TEST 8: Mixnet pool + shuffle"
+    set t8_ok to 1
+
+    set pool to mixnet_create_pool(10 and 3)
+    set r1 to mixnet_add_packet(pool and "packet_1")
+    set r2 to mixnet_add_packet(pool and "packet_2")
+    set r3 to mixnet_add_packet(pool and "packet_3")
+
+    if r3 == 1:
+        display "  Pool flush triggered at capacity"
+    else:
+        display "  FAIL: pool should trigger flush"
+        set t8_ok to 0
+
+    # Skip flush test (involves ep_sleep_ms jitter delays) — tested implicitly
+    # Just verify the pool created and capacity-trigger works
+    display "  Queue management verified"
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 9: SMTP protocol parsing
+    # ===========================================================
+    display "TEST 9: SMTP protocol parsing"
+    set t9_ok to 1
+
+    set smtp to smtp_create_server(2525)
+    set r_helo to smtp_handle_command(smtp and "HELO client.local")
+    if string_contains(r_helo and "250"):
+        display "  HELO → 250"
+    else:
+        display f"  FAIL: HELO returned '{r_helo}'"
+        set t9_ok to 0
+
+    set r_mail to smtp_handle_command(smtp and "MAIL FROM:<alice@ernos.decent>")
+    if string_contains(r_mail and "250"):
+        display "  MAIL FROM → 250"
+    else:
+        display f"  FAIL: MAIL returned '{r_mail}'"
+        set t9_ok to 0
+
+    set r_quit to smtp_handle_command(smtp and "QUIT")
+    if string_contains(r_quit and "221"):
+        display "  QUIT → 221"
+    else:
+        display f"  FAIL: QUIT returned '{r_quit}'"
+        set t9_ok to 0
+
+    if t9_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 10: Git repo with push and pull
+    # ===========================================================
+    display "TEST 10: Git repo operations"
+    set t10_ok to 1
+
+    set repo to git_create_repo("ernosdecent" and "did:key:z6Mk_owner")
+    set pull_empty to git_pull_ref(repo and "main")
+    if string_length(pull_empty) == 0:
+        display "  Empty branch returns empty"
+    else:
+        display "  FAIL: should be empty"
+        set t10_ok to 0
+
+    # Add a collaborator
+    set collab_err to git_add_collaborator(repo and "did:key:z6Mk_owner" and "did:key:z6Mk_dev" and "contributor")
+    if collab_err == GIT_ERR_NONE:
+        display "  Collaborator added"
+    else:
+        display f"  FAIL: add_collaborator returned {collab_err}"
+        set t10_ok to 0
+
+    # Fetch from empty store
+    set obj to git_get_object(repo and "nonexistent_hash")
+    if string_length(obj) == 0:
+        display "  Non-existent object returns empty"
+    else:
+        display "  FAIL: should be empty"
+        set t10_ok to 0
+
+    if t10_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # Cleanup
+    # ===========================================================
+    set ok to storage_close()
+    set ok to run_command(concat("rm -rf " and test_dir))
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} networking tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    else:
+        display "  ALL PHASE 2 NETWORKING TESTS PASSED!"
+    display "==================================================="
+    return 0

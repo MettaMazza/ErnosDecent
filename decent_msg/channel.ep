@@ -1,0 +1,268 @@
+# ErnosDecent -- Group Channels with Membership
+# Component: decent_msg/channel.ep
+# Implements: Group messaging channels with secure membership, 
+#             symmetric message encryption, and envelope key sharing
+# Uses: libsodium symmetric and asymmetric crypto (via keys.ep)
+# Status: Production -- OperationTrojanClaude Phase 5
+
+import "../decent_id/keys"
+import "string"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set CHAN_ERR_NONE to 0
+set CHAN_ERR_NOT_MEMBER to 951
+set CHAN_ERR_INVALID_SENDER to 952
+set CHAN_ERR_UNAUTHORIZED to 953
+set CHAN_ERR_EMPTY_BODY to 954
+set CHAN_ERR_ENCRYPTION_FAILED to 955
+set CHAN_ERR_DECRYPTION_FAILED to 956
+set CHAN_ERR_NOT_FOUND to 957
+
+# Channel Message Types
+set CHAN_TYPE_TEXT to 1
+set CHAN_TYPE_FILE to 2
+set CHAN_TYPE_REACTION to 3
+
+# Roles
+set CHAN_ROLE_OWNER to 1
+set CHAN_ROLE_ADMIN to 2
+set CHAN_ROLE_MEMBER to 3
+
+# ================================================================
+# Helpers
+# ================================================================
+
+define chan_generate_id returning Str:
+    # Generate random 256-bit ID using libsodium
+    set err to init_crypto()
+    set buf to alloc_bytes(32)
+    set fn to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    set ok to ep_dlcall2(fn and buf and 32)
+    set hex to raw_to_hex(buf and 32)
+    set ok to free_bytes(buf)
+    return hex
+
+# ================================================================
+# Channel Creation & Membership Management
+# ================================================================
+
+define chan_create with name as Str and creator_id as Str and key_hex as Str:
+    set chan to create_map()
+    set chan_id to chan_generate_id()
+    set ok to map_insert(chan and "id" and chan_id)
+    set ok to map_insert(chan and "name" and name)
+    set ok to map_insert(chan and "creator" and creator_id)
+    set ok to map_insert(chan and "created_at" and ep_time_now_sec())
+    
+    # Generate symmetric key if not provided
+    set final_key to key_hex
+    if string_length(key_hex) == 0:
+        set key_res to generate_symmetric_key()
+        set final_key to map_get_val(key_res and "key")
+    set ok to map_insert(chan and "key" and final_key)
+
+    # Members map: member_id (Str) -> role (Int)
+    set members to create_map()
+    set ok to map_insert(members and creator_id and CHAN_ROLE_OWNER)
+    set ok to map_insert(chan and "members" and members)
+
+    # Members list for iteration/checking
+    set member_list to create_list()
+    set ok to append_list(member_list and creator_id)
+    set ok to map_insert(chan and "member_list" and member_list)
+    set ok to map_insert(chan and "member_count" and 1)
+
+    # Message history
+    set messages to create_list()
+    set ok to map_insert(chan and "messages" and messages)
+    set ok to map_insert(chan and "message_count" and 0)
+
+    return chan
+
+define chan_get_member_role with chan as Int and member_id as Str returning Int:
+    set members to map_get_val(chan and "members")
+    return map_get_val(members and member_id)
+
+define chan_is_member with chan as Int and member_id as Str returning Int:
+    set role to chan_get_member_role(chan and member_id)
+    if role > 0:
+        return 1
+    return 0
+
+define chan_add_member with chan as Int and adder_id as Str and new_member_id as Str and role as Int returning Int:
+    # Verify adder has permission (must be Owner or Admin)
+    set adder_role to chan_get_member_role(chan and adder_id)
+    if adder_role != CHAN_ROLE_OWNER:
+        if adder_role != CHAN_ROLE_ADMIN:
+            return CHAN_ERR_UNAUTHORIZED
+
+    set members to map_get_val(chan and "members")
+    set member_list to map_get_val(chan and "member_list")
+    
+    # If already a member, just update role
+    set exists to chan_is_member(chan and new_member_id)
+    set ok to map_insert(members and new_member_id and role)
+    
+    if exists == 0:
+        set ok to append_list(member_list and new_member_id)
+        set count to map_get_val(chan and "member_count")
+        set ok to map_insert(chan and "member_count" and count + 1)
+
+    return CHAN_ERR_NONE
+
+define chan_remove_member with chan as Int and remover_id as Str and member_id as Str returning Int:
+    # Verify permission: remover must be Owner/Admin, OR member leaving voluntarily
+    set remover_role to chan_get_member_role(chan and remover_id)
+    set is_self to 0
+    if remover_id equals member_id:
+        set is_self to 1
+
+    if is_self == 0:
+        if remover_role != CHAN_ROLE_OWNER:
+            if remover_role != CHAN_ROLE_ADMIN:
+                return CHAN_ERR_UNAUTHORIZED
+
+    set members to map_get_val(chan and "members")
+    if map_contains(members and member_id) == 0:
+        return CHAN_ERR_NOT_FOUND
+
+    # Set role to 0 (inactive/removed)
+    set ok to map_insert(members and member_id and 0)
+    
+    # Rebuild member_list to exclude removed members
+    set old_list to map_get_val(chan and "member_list")
+    set old_count to length_list(old_list)
+    set new_list to create_list()
+    set active_count to 0
+    set i to 0
+    repeat while i < old_count:
+        set mid to get_list(old_list and i)
+        set role to map_get_val(members and mid)
+        if role > 0:
+            set ok to append_list(new_list and mid)
+            set active_count to active_count + 1
+        set i to i + 1
+        
+    set ok to map_insert(chan and "member_list" and new_list)
+    set ok to map_insert(chan and "member_count" and active_count)
+
+    # C6: rotate the channel key so a removed member cannot decrypt FUTURE messages
+    # with the symmetric key they still hold. Remaining members must be re-issued the
+    # new key out-of-band via chan_share_key (per-recipient sealed envelopes).
+    set rekey_res to generate_symmetric_key()
+    if map_get_val(rekey_res and "error") == 0:
+        set ok to map_insert(chan and "key" and map_get_val(rekey_res and "key"))
+    return CHAN_ERR_NONE
+
+# ================================================================
+# Channel Message Handling
+# ================================================================
+
+define chan_encrypt_body with body as Str and channel_key_hex as Str:
+    set result to create_map()
+    if string_length(body) == 0:
+        set ok to map_insert(result and "error" and CHAN_ERR_EMPTY_BODY)
+        return result
+
+    set enc_result to encrypt_symmetric(body and channel_key_hex)
+    set err to map_get_val(enc_result and "error")
+    if err != 0:
+        set ok to map_insert(result and "error" and CHAN_ERR_ENCRYPTION_FAILED)
+        return result
+
+    set ciphertext to map_get_val(enc_result and "ciphertext")
+    set nonce to map_get_val(enc_result and "nonce")
+    set ok to map_insert(result and "ciphertext" and ciphertext)
+    set ok to map_insert(result and "nonce" and nonce)
+    set ok to map_insert(result and "error" and CHAN_ERR_NONE)
+    return result
+
+define chan_decrypt_body with ciphertext as Str and nonce as Str and channel_key_hex as Str:
+    set result to create_map()
+    set dec_result to decrypt_symmetric(ciphertext and nonce and channel_key_hex)
+    set err to map_get_val(dec_result and "error")
+    if err != 0:
+        set ok to map_insert(result and "error" and CHAN_ERR_DECRYPTION_FAILED)
+        return result
+
+    set plaintext to map_get_val(dec_result and "plaintext")
+    set ok to map_insert(result and "plaintext" and plaintext)
+    set ok to map_insert(result and "error" and CHAN_ERR_NONE)
+    return result
+
+define chan_send_message with chan as Int and sender_id as Str and encrypted_body as Str and msg_type as Int returning Int:
+    # Verify sender is member
+    if chan_is_member(chan and sender_id) == 0:
+        return CHAN_ERR_NOT_MEMBER
+
+    set msg to create_map()
+    set msg_id to chan_generate_id()
+    set ok to map_insert(msg and "id" and msg_id)
+    set ok to map_insert(msg and "sender" and sender_id)
+    set ok to map_insert(msg and "body" and encrypted_body)
+    set ok to map_insert(msg and "type" and msg_type)
+    set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
+    set ok to map_insert(msg and "channel_id" and map_get_val(chan and "id"))
+
+    set messages to map_get_val(chan and "messages")
+    set ok to append_list(messages and msg)
+    set count to map_get_val(chan and "message_count")
+    set ok to map_insert(chan and "message_count" and count + 1)
+
+    return CHAN_ERR_NONE
+
+define chan_get_messages with chan as Int and offset as Int and limit as Int:
+    set result to create_list()
+    set messages to map_get_val(chan and "messages")
+    set total to map_get_val(chan and "message_count")
+
+    set i to offset
+    set count to 0
+    repeat while i < total:
+        if count >= limit:
+            return result
+        set ok to append_list(result and get_list(messages and i))
+        set count to count + 1
+        set i to i + 1
+
+    return result
+
+# ================================================================
+# Encrypted Key Sharing
+# ================================================================
+
+define chan_share_key with channel_key as Str and recipient_pk_hex as Str and sender_sk_hex as Str:
+    set result to create_map()
+    
+    # Encrypt channel key with recipient's public key (using sender's private key for authentication)
+    set enc_result to encrypt_to_recipient(channel_key and recipient_pk_hex and sender_sk_hex)
+    set err to map_get_val(enc_result and "error")
+    if err != 0:
+        set ok to map_insert(result and "error" and CHAN_ERR_ENCRYPTION_FAILED)
+        return result
+
+    set ciphertext to map_get_val(enc_result and "ciphertext")
+    set nonce to map_get_val(enc_result and "nonce")
+    set ok to map_insert(result and "ciphertext" and ciphertext)
+    set ok to map_insert(result and "nonce" and nonce)
+    set ok to map_insert(result and "error" and CHAN_ERR_NONE)
+    return result
+
+define chan_receive_shared_key with encrypted_envelope as Int and sender_pk_hex as Str and recipient_sk_hex as Str:
+    set result to create_map()
+    set ciphertext to map_get_val(encrypted_envelope and "ciphertext")
+    set nonce to map_get_val(encrypted_envelope and "nonce")
+
+    set dec_result to decrypt_from_sender(ciphertext and nonce and sender_pk_hex and recipient_sk_hex)
+    set err to map_get_val(dec_result and "error")
+    if err != 0:
+        set ok to map_insert(result and "error" and CHAN_ERR_DECRYPTION_FAILED)
+        return result
+
+    set key_hex to map_get_val(dec_result and "plaintext")
+    set ok to map_insert(result and "key" and key_hex)
+    set ok to map_insert(result and "error" and CHAN_ERR_NONE)
+    return result

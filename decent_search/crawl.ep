@@ -1,0 +1,231 @@
+# ErnosDecent — Search Crawler & Indexer
+# Component: decent_search/crawl.ep
+# Implements: Inverted index generation, basic tokenization, and metadata storage
+# Status: Production — OperationTrojanClaude Phase 11
+
+import "collections"
+import "string"
+import "../stdlib/http"
+
+# ================================================================
+# Helper: Word Normalization
+# ================================================================
+
+define clean_word with word as Str returning Str:
+    set w to string_lower(string_trim(word))
+    set len to string_length(w)
+    if len == 0:
+        return ""
+    # Strip trailing punctuation (., ?!)
+    set last_char to get_character(w and len - 1)
+    if last_char == 46 || last_char == 44 || last_char == 63 || last_char == 33:
+        set w to substring(w and 0 and len - 1)
+    return w
+
+# ================================================================
+# Index Creation & Management
+# ================================================================
+
+define crawl_create_index returning Map:
+    set index to create_map()
+    set pages to create_map()
+    set inverted to create_map()
+    set ok to map_insert(index and "pages" and pages)
+    set ok to map_insert(index and "inverted_index" and inverted)
+    set ok to map_insert(index and "page_count" and 0)
+    return index
+
+# ================================================================
+# Page Indexing (Inverted Index)
+# ================================================================
+
+define crawl_index_page with index as Map and url as Str and title as Str and body as Str and links as List returning Int:
+    set pages to map_get_val(index and "pages")
+
+    # Store page metadata
+    set page_meta to create_map()
+    set ok to map_insert(page_meta and "url" and url)
+    set ok to map_insert(page_meta and "title" and title)
+    set ok to map_insert(page_meta and "body" and body)
+    set ok to map_insert(page_meta and "links" and links)
+    set ok to map_insert(page_meta and "pagerank" and 1000000) # Initial PageRank = 1.0 (scaled)
+    set ok to map_insert(pages and url and page_meta)
+
+    # Update page count
+    set count to map_get_val(index and "page_count")
+    set ok to map_insert(index and "page_count" and count + 1)
+
+    # Tokenize body to populate inverted index
+    set words to string_split(body and " ")
+    set num_words to length_list(words)
+    set inverted to map_get_val(index and "inverted_index")
+
+    set i to 0
+    repeat while i < num_words:
+        set word_ptr to get_list(words and i)
+        set raw_word to ptr_to_str(word_ptr)
+        set clean_w to clean_word(raw_word)
+        if string_length(clean_w) > 0:
+            set word_map to map_get_val(inverted and clean_w)
+            if word_map == 0:
+                set word_map to create_map()
+                set ok to map_insert(inverted and clean_w and word_map)
+
+            set current_count to map_get_val(word_map and url)
+            set ok to map_insert(word_map and url and current_count + 1)
+        set i to i + 1
+
+    return 0
+
+# ================================================================
+# Link extraction — real <a href> parsing for the PageRank graph
+# ================================================================
+
+# Return scheme://host for a URL (strip any path), so root-relative hrefs resolve.
+define crawl_base_origin with url as Str returning Str:
+    set scheme_end to string_index_of(url and "://")
+    if scheme_end < 0:
+        return url
+    set after to scheme_end + 3
+    set rest to substring(url and after and string_length(url) - after)
+    set slash to string_index_of(rest and "/")
+    if slash < 0:
+        return url
+    set host_len to after + slash
+    return substring(url and 0 and host_len)
+
+# Resolve an href to an absolute URL, or "" if it should be skipped
+# (fragments, javascript:, mailto:, data:, empty).
+define crawl_resolve_url with href as Str and origin as Str returning Str:
+    set h to string_trim(href)
+    if string_length(h) == 0:
+        return ""
+    set c0 to get_character(h and 0)
+    if c0 == 35:
+        return ""
+    if string_contains(h and "javascript:") == 1:
+        return ""
+    if string_contains(h and "mailto:") == 1:
+        return ""
+    if string_contains(h and "data:") == 1:
+        return ""
+    if string_index_of(h and "http://") == 0 or else string_index_of(h and "https://") == 0:
+        return h
+    # protocol-relative //host/path
+    if string_index_of(h and "//") == 0:
+        return concat("https:" and h)
+    # root-relative /path
+    if c0 == 47:
+        return concat(origin and h)
+    # other relative paths
+    return concat(concat(origin and "/") and h)
+
+define list_contains_str with lst as List and val as Str returning Int:
+    set n to length_list(lst)
+    set i to 0
+    repeat while i < n:
+        if ptr_to_str(get_list(lst and i)) equals val:
+            return 1
+        set i to i + 1
+    return 0
+
+# Scan HTML for href="..." / href='...' and return a deduped list of absolute URLs.
+# No regex in Ernos, so we walk a shrinking remainder; a guard bounds the loop.
+define crawl_extract_links with html as Str and base_url as Str returning List:
+    set links to create_list()
+    set origin to crawl_base_origin(base_url)
+    set remainder to html
+    set guard to 0
+    repeat while guard < 20000:
+        set guard to guard + 1
+        set hpos to string_index_of(remainder and "href=")
+        if hpos < 0:
+            return links
+        set after_href to hpos + 5
+        set rem2 to substring(remainder and after_href and string_length(remainder) - after_href)
+        if string_length(rem2) == 0:
+            return links
+        set q to get_character(rem2 and 0)
+        if q == 34 or else q == 39:
+            set inner to substring(rem2 and 1 and string_length(rem2) - 1)
+            set close_pos to string_index_of(inner and char_from_code(q))
+            if close_pos >= 0:
+                set url_str to substring(inner and 0 and close_pos)
+                set remainder to substring(inner and close_pos + 1 and string_length(inner) - close_pos - 1)
+                set resolved to crawl_resolve_url(url_str and origin)
+                if string_length(resolved) > 0:
+                    if list_contains_str(links and resolved) == 0:
+                        set ok to append_list(links and resolved)
+            else:
+                set remainder to inner
+        else:
+            # unquoted href= form; skip past to keep making progress
+            set remainder to rem2
+    return links
+
+# ================================================================
+# HTTP Fetcher — real networking for page crawling
+# ================================================================
+
+define crawl_fetch_page with url as Str returning Map:
+    # Fetch a web page via HTTP GET and return its content
+    set result to create_map()
+    set headers to "Accept: text/html"
+    set response to http_get(url and headers)
+
+    if string_length(response) == 0:
+        set ok to map_insert(result and "error" and 1)
+        return result
+
+    # Extract title from <title> tag
+    set title_start to string_index_of(response and "<title>")
+    set title to url
+    if title_start >= 0:
+        set title_content_start to title_start + 7
+        set title_end to string_index_of(response and "</title>")
+        if title_end > title_content_start:
+            set title to substring(response and title_content_start and title_end - title_content_start)
+
+    # Strip HTML tags to get body text (simple approach: remove < to >)
+    set body to ""
+    set in_tag to 0
+    set ci to 0
+    set resp_len to string_length(response)
+    repeat while ci < resp_len:
+        set ch to get_character(response and ci)
+        if ch == 60:
+            set in_tag to 1
+        else:
+            if ch == 62:
+                set in_tag to 0
+                set body to concat(body and " ")
+            else:
+                if in_tag == 0:
+                    set body to concat(body and char_from_code(ch))
+        set ci to ci + 1
+
+    # Real link extraction from the original HTML (before tag-stripping) so PageRank
+    # gets a genuine link graph instead of an always-empty list.
+    set links to crawl_extract_links(response and url)
+
+    set ok to map_insert(result and "url" and url)
+    set ok to map_insert(result and "title" and title)
+    set ok to map_insert(result and "body" and body)
+    set ok to map_insert(result and "links" and links)
+    set ok to map_insert(result and "error" and 0)
+    return result
+
+define crawl_spider with index as Map and seed_url as Str returning Int:
+    # Fetch and index a single page
+    set page to crawl_fetch_page(seed_url)
+    set err to map_get_val(page and "error")
+    if err != 0:
+        return 1
+
+    set url to map_get_val(page and "url")
+    set title to map_get_val(page and "title")
+    set body to map_get_val(page and "body")
+    set links to map_get_val(page and "links")
+
+    set ok to crawl_index_page(index and url and title and body and links)
+    return 0

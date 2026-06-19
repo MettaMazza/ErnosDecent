@@ -1,0 +1,842 @@
+# ErnosDecent -- Persistent Storage Layer
+# Component: storage.ep
+# Uses: SQLite for structured data, filesystem for content blobs
+# Status: Production
+
+import "sql"
+import "string"
+import "collections"
+import "os"
+import "fs"
+
+# ================================================================
+# Error codes
+# ================================================================
+
+set STORAGE_ERR_NONE to 0
+set STORAGE_ERR_OPEN_FAILED to 1
+set STORAGE_ERR_EXEC_FAILED to 2
+set STORAGE_ERR_NOT_FOUND to 3
+set STORAGE_ERR_IO to 4
+
+# ================================================================
+# Module-level state
+# ================================================================
+
+set STORAGE_DB to 0
+set STORAGE_DATA_DIR to ""
+
+# ================================================================
+# Initialization
+# ================================================================
+
+define storage_get_default_dir returning Str:
+    set home to get_home_dir()
+    return concat(home and "/.ernosdecent")
+
+define storage_init with data_dir as Str returning Int:
+    set STORAGE_DATA_DIR to data_dir
+
+    # Create data directory structure
+    if file_exists(data_dir) == 0:
+        set ok to create_directory(data_dir)
+
+    set content_dir to concat(data_dir and "/content")
+    if file_exists(content_dir) == 0:
+        set ok to create_directory(content_dir)
+
+    set keys_dir to concat(data_dir and "/keys")
+    if file_exists(keys_dir) == 0:
+        set ok to create_directory(keys_dir)
+
+    set logs_dir to concat(data_dir and "/logs")
+    if file_exists(logs_dir) == 0:
+        set ok to create_directory(logs_dir)
+
+    # Open SQLite database
+    set db_path to concat(data_dir and "/node.db")
+    set STORAGE_DB to sql_open(db_path)
+    if STORAGE_DB == 0:
+        return STORAGE_ERR_OPEN_FAILED
+
+    # D1: lock down the on-disk secrets. node.db holds identity material and the
+    # keys/ dir holds key files — make them owner-only (0600 / 0700) so other local
+    # users cannot read them.
+    set ok to keys_chmod(db_path and 384)
+    set ok to keys_chmod(keys_dir and 448)
+    set ok to keys_chmod(content_dir and 448)
+
+    # Create all tables
+    set ok to storage_create_tables()
+    return STORAGE_ERR_NONE
+
+define storage_create_tables returning Int:
+    # DHT key-value store
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS dht_values (key TEXT PRIMARY KEY, value TEXT NOT NULL, publisher TEXT, stored_at INTEGER, expires_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # DHT routing table (peers)
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS dht_peers (node_id TEXT PRIMARY KEY, address TEXT NOT NULL, port INTEGER NOT NULL, last_seen INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Identity store
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS identity (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Content metadata
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS content_blocks (hash TEXT PRIMARY KEY, content_type TEXT, size INTEGER, created_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Ledger blocks
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS ledger_blocks (block_index INTEGER PRIMARY KEY, prev_hash TEXT, block_hash TEXT, validator TEXT, timestamp INTEGER, tx_count INTEGER, data TEXT);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Ledger UTXO set
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS ledger_utxo (address TEXT NOT NULL, amount INTEGER NOT NULL);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Relay registrations
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS relay_peers (node_id TEXT PRIMARY KEY, public_key TEXT, address TEXT, port INTEGER, registered_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Name registry
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS name_registry (name TEXT PRIMARY KEY, owner_did TEXT NOT NULL, registered_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # GitDec per-repo auto-update config: which repos auto-pull on join, the last
+    # commit we've seen on the watched branch, and a pending-update flag the WebUI
+    # surfaces as a "new update available" badge.
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS gitdec_repo_config (repo_id TEXT PRIMARY KEY, auto_update_enabled INTEGER NOT NULL DEFAULT 0, last_seen_commit TEXT NOT NULL DEFAULT '', update_pending INTEGER NOT NULL DEFAULT 0, updated_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Social events (Nostr)
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS social_events (event_id TEXT PRIMARY KEY, pubkey TEXT, kind INTEGER, content TEXT, sig TEXT, created_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Search index
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS search_pages (url TEXT PRIMARY KEY, title TEXT, body TEXT, indexed_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS search_terms (term TEXT NOT NULL, url TEXT NOT NULL, count INTEGER, PRIMARY KEY (term, url));")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # RAG persistent indexing table
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS rag_chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, document_name TEXT NOT NULL, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, embedding TEXT NOT NULL);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Discord isolated contexts
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS discord_user_contexts (username TEXT PRIMARY KEY, context_history TEXT NOT NULL, updated_at INTEGER NOT NULL);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Reading progress and notes
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS reading_progress (document_name TEXT PRIMARY KEY, current_chunk INTEGER NOT NULL, notes TEXT NOT NULL, updated_at INTEGER NOT NULL);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Conversations table
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS conversations (remote_id TEXT PRIMARY KEY, local_id TEXT, state INTEGER, unread_count INTEGER, updated_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Messages table
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS messages (message_id TEXT PRIMARY KEY, conversation_id TEXT, sender TEXT, recipient TEXT, body TEXT, type INTEGER, state INTEGER, timestamp INTEGER, FOREIGN KEY(conversation_id) REFERENCES conversations(remote_id));")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # DEX Pools table
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS dex_pools (token_a TEXT, token_b TEXT, reserve_a INTEGER, reserve_b INTEGER, PRIMARY KEY (token_a, token_b));")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # DEX Orderbook table
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS dex_orderbook (order_id TEXT PRIMARY KEY, token_a TEXT, token_b TEXT, side TEXT, price INTEGER, amount INTEGER, caller TEXT, created_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Contacts table
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS contacts (did TEXT PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, added_at INTEGER);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Email messages table
+    set ok to sql_execute(STORAGE_DB and "CREATE TABLE IF NOT EXISTS email_messages (msg_id TEXT PRIMARY KEY, from_addr TEXT NOT NULL, to_addr TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL, folder TEXT NOT NULL, is_read INTEGER NOT NULL, timestamp INTEGER NOT NULL);")
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    return STORAGE_ERR_NONE
+
+
+# ================================================================
+# Shutdown
+# ================================================================
+
+define storage_close returning Int:
+    if STORAGE_DB != 0:
+        set ok to sql_close(STORAGE_DB)
+        set STORAGE_DB to 0
+    return STORAGE_ERR_NONE
+
+# ================================================================
+# Generic Key-Value Operations
+# ================================================================
+
+define storage_kv_put with table as Str and key as Str and value as Str returning Int:
+    set escaped_key to string_replace(key and "'" and "''")
+    set escaped_val to string_replace(value and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO " and concat(table and concat(" (key, value) VALUES ('" and concat(escaped_key and concat("', '" and concat(escaped_val and "');"))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_kv_get with table as Str and key as Str returning Str:
+    set escaped_key to string_replace(key and "'" and "''")
+    set sql to concat("SELECT value FROM " and concat(table and concat(" WHERE key = '" and concat(escaped_key and "';"))))
+    set rows to sql_query(STORAGE_DB and sql)
+    set row_count to length_list(rows)
+    if row_count > 0:
+        set first_row to get_list(rows and 0)
+        set val to get_list(first_row and 0)
+        return val
+    return ""
+
+define storage_kv_delete with table as Str and key as Str returning Int:
+    set escaped_key to string_replace(key and "'" and "''")
+    set sql to concat("DELETE FROM " and concat(table and concat(" WHERE key = '" and concat(escaped_key and "';"))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    return STORAGE_ERR_NONE
+
+# ================================================================
+# DHT Persistence
+# ================================================================
+
+define storage_dht_put with key as Str and value as Str and publisher as Str and stored_at as Int and expires_at as Int returning Int:
+    set ek to string_replace(key and "'" and "''")
+    set ev to string_replace(value and "'" and "''")
+    set ep to string_replace(publisher and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO dht_values (key, value, publisher, stored_at, expires_at) VALUES ('" and concat(ek and concat("', '" and concat(ev and concat("', '" and concat(ep and concat("', " and concat(int_to_string(stored_at) and concat(", " and concat(int_to_string(expires_at) and ");"))))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_dht_get with key as Str returning Str:
+    set ek to string_replace(key and "'" and "''")
+    set now to ep_time_now_sec()
+    set sql to concat("SELECT value FROM dht_values WHERE key = '" and concat(ek and concat("' AND (expires_at = 0 OR expires_at > " and concat(int_to_string(now) and ");"))))
+    set rows to sql_query(STORAGE_DB and sql)
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return get_list(first_row and 0)
+    return ""
+
+define storage_dht_delete with key as Str returning Int:
+    set ek to string_replace(key and "'" and "''")
+    set sql to concat("DELETE FROM dht_values WHERE key = '" and concat(ek and "';"))
+    set ok to sql_execute(STORAGE_DB and sql)
+    return STORAGE_ERR_NONE
+
+define storage_dht_put_peer with node_id as Str and address as Str and port as Int returning Int:
+    set en to string_replace(node_id and "'" and "''")
+    set ea to string_replace(address and "'" and "''")
+    set now to ep_time_now_sec()
+    set sql to concat("INSERT OR REPLACE INTO dht_peers (node_id, address, port, last_seen) VALUES ('" and concat(en and concat("', '" and concat(ea and concat("', " and concat(int_to_string(port) and concat(", " and concat(int_to_string(now) and ");"))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_dht_delete_peer with node_id as Str returning Int:
+    set en to string_replace(node_id and "'" and "''")
+    set sql to concat("DELETE FROM dht_peers WHERE node_id = '" and concat(en and "';"))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+# ================================================================
+# Content Persistence (filesystem-backed)
+# ================================================================
+
+# D4: a content hash is used directly as a filename, so it MUST be a real 64-char
+# lowercase SHA-256 hex — never a path that could traverse (`..`/`/`) out of content/.
+define storage_hash_valid with hash as Str returning Int:
+    if string_length(hash) != 64:
+        return 0
+    set allowed to "0123456789abcdef"
+    set i to 0
+    repeat while i < 64:
+        if string_index_of(allowed and substring(hash and i and 1)) < 0:
+            return 0
+        set i to i + 1
+    return 1
+
+define storage_content_put with hash as Str and content as Str and content_type as Str returning Int:
+    if storage_hash_valid(hash) == 0:
+        return STORAGE_ERR_EXEC_FAILED
+    # Write content to file
+    set file_path to concat(STORAGE_DATA_DIR and concat("/content/" and hash))
+    set wr to write_file(file_path and content)
+    if wr != 0:
+        return STORAGE_ERR_EXEC_FAILED
+
+    # Record metadata in SQLite
+    set now to ep_time_now_sec()
+    set size to string_length(content)
+    set eh to string_replace(hash and "'" and "''")
+    set et to string_replace(content_type and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO content_blocks (hash, content_type, size, created_at) VALUES ('" and concat(eh and concat("', '" and concat(et and concat("', " and concat(int_to_string(size) and concat(", " and concat(int_to_string(now) and ");"))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_content_get with hash as Str returning Str:
+    if storage_hash_valid(hash) == 0:
+        return ""
+    set file_path to concat(STORAGE_DATA_DIR and concat("/content/" and hash))
+    if file_exists(file_path) == 0:
+        return ""
+    return read_file(file_path)
+
+define storage_content_has with hash as Str returning Int:
+    if storage_hash_valid(hash) == 0:
+        return 0
+    set file_path to concat(STORAGE_DATA_DIR and concat("/content/" and hash))
+    return file_exists(file_path)
+
+define storage_content_delete with hash as Str returning Int:
+    if storage_hash_valid(hash) == 0:
+        return STORAGE_ERR_NONE
+    set file_path to concat(STORAGE_DATA_DIR and concat("/content/" and hash))
+    if file_exists(file_path):
+        set ok to remove_file(file_path)
+    set eh to string_replace(hash and "'" and "''")
+    set sql to concat("DELETE FROM content_blocks WHERE hash = '" and concat(eh and "';"))
+    set ok to sql_execute(STORAGE_DB and sql)
+    return STORAGE_ERR_NONE
+
+define storage_content_list returning List:
+    set sql to "SELECT hash, content_type, size FROM content_blocks ORDER BY created_at DESC;"
+    return sql_query(STORAGE_DB and sql)
+
+# ================================================================
+# Identity Persistence
+# ================================================================
+
+define storage_identity_save with did_str as Str and signing_pub as Str and signing_sec as Str and enc_pub as Str and enc_sec as Str returning Int:
+    # D1: seal the private keys at rest. If ERNOSDECENT_PASSPHRASE is set they are
+    # encrypted (PBKDF2-600k + secretbox); otherwise stored plaintext but owner-only
+    # (0600, set in storage_init). Public keys + DID are not secret.
+    set id_pass to keys_getenv("ERNOSDECENT_PASSPHRASE")
+    set ok to storage_kv_put("identity" and "did" and did_str)
+    set ok to storage_kv_put("identity" and "signing_pub" and signing_pub)
+    set ok to storage_kv_put("identity" and "signing_sec" and keys_seal_secret(signing_sec and id_pass))
+    set ok to storage_kv_put("identity" and "enc_pub" and enc_pub)
+    set ok to storage_kv_put("identity" and "enc_sec" and keys_seal_secret(enc_sec and id_pass))
+    return STORAGE_ERR_NONE
+
+define storage_identity_load returning Map:
+    set result to create_map()
+    set did_str to storage_kv_get("identity" and "did")
+    if string_length(did_str) == 0:
+        set ok to map_insert(result and "exists" and 0)
+        return result
+
+    set ok to map_insert(result and "exists" and 1)
+    set ok to map_insert(result and "did" and did_str)
+    set id_pass to keys_getenv("ERNOSDECENT_PASSPHRASE")
+    set ok to map_insert(result and "signing_pub" and storage_kv_get("identity" and "signing_pub"))
+    set ok to map_insert(result and "signing_sec" and keys_open_secret(storage_kv_get("identity" and "signing_sec") and id_pass))
+    set ok to map_insert(result and "enc_pub" and storage_kv_get("identity" and "enc_pub"))
+    set ok to map_insert(result and "enc_sec" and keys_open_secret(storage_kv_get("identity" and "enc_sec") and id_pass))
+    return result
+
+define storage_identity_exists returning Int:
+    set did_str to storage_kv_get("identity" and "did")
+    if string_length(did_str) > 0:
+        return 1
+    return 0
+
+# ================================================================
+# Ledger Persistence
+# ================================================================
+
+define storage_ledger_add_block with block_index as Int and prev_hash as Str and block_hash as Str and validator as Str and timestamp as Int and tx_count as Int and data as Str returning Int:
+    set eph to string_replace(prev_hash and "'" and "''")
+    set ebh to string_replace(block_hash and "'" and "''")
+    set ev to string_replace(validator and "'" and "''")
+    set ed to string_replace(data and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO ledger_blocks (block_index, prev_hash, block_hash, validator, timestamp, tx_count, data) VALUES (" and concat(int_to_string(block_index) and concat(", '" and concat(eph and concat("', '" and concat(ebh and concat("', '" and concat(ev and concat("', " and concat(int_to_string(timestamp) and concat(", " and concat(int_to_string(tx_count) and concat(", '" and concat(ed and "');"))))))))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_ledger_get_block_count returning Int:
+    set sql to "SELECT COUNT(*) FROM ledger_blocks;"
+    set rows to sql_query(STORAGE_DB and sql)
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return string_to_int(get_list(first_row and 0))
+    return 0
+
+define storage_ledger_update_balance with address as Str and amount as Int returning Int:
+    set ea to string_replace(address and "'" and "''")
+    # Delete existing entry
+    set sql_del to concat("DELETE FROM ledger_utxo WHERE address = '" and concat(ea and "';"))
+    set ok to sql_execute(STORAGE_DB and sql_del)
+    # Insert new balance
+    if amount > 0:
+        set sql_ins to concat("INSERT INTO ledger_utxo (address, amount) VALUES ('" and concat(ea and concat("', " and concat(int_to_string(amount) and ");"))))
+        set ok to sql_execute(STORAGE_DB and sql_ins)
+    return STORAGE_ERR_NONE
+
+define storage_ledger_get_balance with address as Str returning Int:
+    set ea to string_replace(address and "'" and "''")
+    set sql to concat("SELECT amount FROM ledger_utxo WHERE address = '" and concat(ea and "';"))
+    set rows to sql_query(STORAGE_DB and sql)
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return string_to_int(get_list(first_row and 0))
+    return 0
+
+# ================================================================
+# Name Registry Persistence
+# ================================================================
+
+define storage_name_register with name as Str and owner_did as Str returning Int:
+    set en to string_replace(name and "'" and "''")
+    set ed to string_replace(owner_did and "'" and "''")
+    set now to ep_time_now_sec()
+    set sql to concat("INSERT OR REPLACE INTO name_registry (name, owner_did, registered_at) VALUES ('" and concat(en and concat("', '" and concat(ed and concat("', " and concat(int_to_string(now) and ");"))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_name_resolve with name as Str returning Str:
+    set en to string_replace(name and "'" and "''")
+    set sql to concat("SELECT owner_did FROM name_registry WHERE name = '" and concat(en and "';"))
+    set rows to sql_query(STORAGE_DB and sql)
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return get_list(first_row and 0)
+    return ""
+
+define storage_name_get_by_did with owner_did as Str returning Str:
+    set ed to string_replace(owner_did and "'" and "''")
+    set sql to concat("SELECT name FROM name_registry WHERE owner_did = '" and concat(ed and "' ORDER BY registered_at DESC LIMIT 1;"))
+    set rows to sql_query(STORAGE_DB and sql)
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return get_list(first_row and 0)
+    return ""
+
+# ================================================================
+# GitDec auto-update per-repo config (upserts preserve sibling columns)
+# ================================================================
+
+define storage_gitdec_set_auto_update with repo_id as Str and enabled as Int returning Int:
+    set er to string_replace(repo_id and "'" and "''")
+    set now to int_to_string(ep_time_now_sec())
+    set en to int_to_string(enabled)
+    set sql to concat("INSERT INTO gitdec_repo_config (repo_id, auto_update_enabled, updated_at) VALUES ('" and er)
+    set sql to concat(sql and "', ")
+    set sql to concat(sql and en)
+    set sql to concat(sql and ", ")
+    set sql to concat(sql and now)
+    set sql to concat(sql and ") ON CONFLICT(repo_id) DO UPDATE SET auto_update_enabled=")
+    set sql to concat(sql and en)
+    set sql to concat(sql and ", updated_at=")
+    set sql to concat(sql and now)
+    set sql to concat(sql and ";")
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_gitdec_get_auto_update with repo_id as Str returning Int:
+    set er to string_replace(repo_id and "'" and "''")
+    set sql to concat("SELECT auto_update_enabled FROM gitdec_repo_config WHERE repo_id = '" and concat(er and "';"))
+    set rows to sql_query(STORAGE_DB and sql)
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return string_to_int(get_list(first_row and 0))
+    return 0
+
+define storage_gitdec_set_last_seen with repo_id as Str and commit_hash as Str returning Int:
+    set er to string_replace(repo_id and "'" and "''")
+    set ec to string_replace(commit_hash and "'" and "''")
+    set now to int_to_string(ep_time_now_sec())
+    set sql to concat("INSERT INTO gitdec_repo_config (repo_id, last_seen_commit, updated_at) VALUES ('" and er)
+    set sql to concat(sql and "', '")
+    set sql to concat(sql and ec)
+    set sql to concat(sql and "', ")
+    set sql to concat(sql and now)
+    set sql to concat(sql and ") ON CONFLICT(repo_id) DO UPDATE SET last_seen_commit='")
+    set sql to concat(sql and ec)
+    set sql to concat(sql and "', updated_at=")
+    set sql to concat(sql and now)
+    set sql to concat(sql and ";")
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_gitdec_get_last_seen with repo_id as Str returning Str:
+    set er to string_replace(repo_id and "'" and "''")
+    set sql to concat("SELECT last_seen_commit FROM gitdec_repo_config WHERE repo_id = '" and concat(er and "';"))
+    set rows to sql_query(STORAGE_DB and sql)
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return get_list(first_row and 0)
+    return ""
+
+define storage_gitdec_set_pending with repo_id as Str and pending as Int returning Int:
+    set er to string_replace(repo_id and "'" and "''")
+    set now to int_to_string(ep_time_now_sec())
+    set pn to int_to_string(pending)
+    set sql to concat("INSERT INTO gitdec_repo_config (repo_id, update_pending, updated_at) VALUES ('" and er)
+    set sql to concat(sql and "', ")
+    set sql to concat(sql and pn)
+    set sql to concat(sql and ", ")
+    set sql to concat(sql and now)
+    set sql to concat(sql and ") ON CONFLICT(repo_id) DO UPDATE SET update_pending=")
+    set sql to concat(sql and pn)
+    set sql to concat(sql and ", updated_at=")
+    set sql to concat(sql and now)
+    set sql to concat(sql and ";")
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_gitdec_count_pending returning Int:
+    set rows to sql_query(STORAGE_DB and "SELECT COUNT(*) FROM gitdec_repo_config WHERE update_pending = 1;")
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return string_to_int(get_list(first_row and 0))
+    return 0
+
+define storage_gitdec_list_auto_repos returning List:
+    set result to create_list()
+    set rows to sql_query(STORAGE_DB and "SELECT repo_id FROM gitdec_repo_config WHERE auto_update_enabled = 1;")
+    set n to length_list(rows)
+    set i to 0
+    repeat while i < n:
+        set row to get_list(rows and i)
+        set ok to append_list(result and get_list(row and 0))
+        set i to i + 1
+    return result
+
+# ================================================================
+# Search Index Persistence
+# ================================================================
+
+define storage_search_index_page with url as Str and title as Str and body as Str returning Int:
+    set eu to string_replace(url and "'" and "''")
+    set et to string_replace(title and "'" and "''")
+    set eb to string_replace(body and "'" and "''")
+    set now to ep_time_now_sec()
+    set sql to concat("INSERT OR REPLACE INTO search_pages (url, title, body, indexed_at) VALUES ('" and concat(eu and concat("', '" and concat(et and concat("', '" and concat(eb and concat("', " and concat(int_to_string(now) and ");"))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_search_add_term with term as Str and url as Str and count as Int returning Int:
+    set ete to string_replace(term and "'" and "''")
+    set eu to string_replace(url and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO search_terms (term, url, count) VALUES ('" and concat(ete and concat("', '" and concat(eu and concat("', " and concat(int_to_string(count) and ");"))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+# ================================================================
+# Social Events Persistence
+# ================================================================
+
+define storage_social_put_event with event_id as Str and pubkey as Str and kind as Int and content as Str and sig as Str and created_at as Int returning Int:
+    set ei to string_replace(event_id and "'" and "''")
+    set ep to string_replace(pubkey and "'" and "''")
+    set ec to string_replace(content and "'" and "''")
+    set es to string_replace(sig and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO social_events (event_id, pubkey, kind, content, sig, created_at) VALUES ('" and concat(ei and concat("', '" and concat(ep and concat("', " and concat(int_to_string(kind) and concat(", '" and concat(ec and concat("', '" and concat(es and concat("', " and concat(int_to_string(created_at) and ");"))))))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_social_get_event with event_id as Str returning Str:
+    set ei to string_replace(event_id and "'" and "''")
+    set sql to concat("SELECT content FROM social_events WHERE event_id = '" and concat(ei and "';"))
+    set rows to sql_query(STORAGE_DB and sql)
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return get_list(first_row and 0)
+    return ""
+
+# ================================================================
+# Utility
+# ================================================================
+
+define storage_get_db returning Int:
+    return STORAGE_DB
+
+define storage_get_data_dir returning Str:
+    return STORAGE_DATA_DIR
+
+# ================================================================
+# Discord isolated context management
+# ================================================================
+
+define storage_discord_context_load with username as Str returning Str:
+    set eu to string_replace(username and "'" and "''")
+    set sql to concat("SELECT context_history FROM discord_user_contexts WHERE username = '" and concat(eu and "';"))
+    set rows to sql_query(STORAGE_DB and sql)
+    if length_list(rows) > 0:
+        set first_row to get_list(rows and 0)
+        return get_list(first_row and 0)
+    return ""
+
+define storage_discord_context_save with username as Str and history_json as Str returning Int:
+    set eu to string_replace(username and "'" and "''")
+    set eh to string_replace(history_json and "'" and "''")
+    set now to ep_time_now_sec()
+    set sql to concat("INSERT OR REPLACE INTO discord_user_contexts (username, context_history, updated_at) VALUES ('" and concat(eu and concat("', '" and concat(eh and concat("', " and concat(int_to_string(now) and ");"))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+# ================================================================
+# Messaging Persistence
+# ================================================================
+
+define storage_save_conversation with remote_id as Str and local_id as Str and state as Int and unread_count as Int and updated_at as Int returning Int:
+    set er to string_replace(remote_id and "'" and "''")
+    set el to string_replace(local_id and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO conversations (remote_id, local_id, state, unread_count, updated_at) VALUES ('" and concat(er and concat("', '" and concat(el and concat("', " and concat(int_to_string(state) and concat(", " and concat(int_to_string(unread_count) and concat(", " and concat(int_to_string(updated_at) and ");"))))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_save_message with message_id as Str and conversation_id as Str and sender as Str and recipient as Str and body as Str and type as Int and state as Int and timestamp as Int returning Int:
+    set em to string_replace(message_id and "'" and "''")
+    set ec to string_replace(conversation_id and "'" and "''")
+    set es to string_replace(sender and "'" and "''")
+    set er to string_replace(recipient and "'" and "''")
+    set eb to string_replace(body and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO messages (message_id, conversation_id, sender, recipient, body, type, state, timestamp) VALUES ('" and concat(em and concat("', '" and concat(ec and concat("', '" and concat(es and concat("', '" and concat(er and concat("', '" and concat(eb and concat("', " and concat(int_to_string(type) and concat(", " and concat(int_to_string(state) and concat(", " and concat(int_to_string(timestamp) and ");"))))))))))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_load_conversations returning List:
+    set list to create_list()
+    set sql to "SELECT remote_id, local_id, state, unread_count, updated_at FROM conversations;"
+    set rows to sql_query(STORAGE_DB and sql)
+    set length to length_list(rows)
+    set i to 0
+    repeat while i < length:
+        set row to get_list(rows and i)
+        set conv_map to create_map()
+        set ok to map_insert(conv_map and "remote_id" and get_list(row and 0))
+        set ok to map_insert(conv_map and "local_id" and get_list(row and 1))
+        set ok to map_insert(conv_map and "state" and string_to_int(get_list(row and 2)))
+        set ok to map_insert(conv_map and "unread_count" and string_to_int(get_list(row and 3)))
+        set ok to map_insert(conv_map and "updated_at" and string_to_int(get_list(row and 4)))
+        set ok to append_list(list and conv_map)
+        set i to i + 1
+    return list
+
+define storage_load_messages with conversation_id as Str returning List:
+    set list to create_list()
+    set ec to string_replace(conversation_id and "'" and "''")
+    set sql to concat("SELECT message_id, conversation_id, sender, recipient, body, type, state, timestamp FROM messages WHERE conversation_id = '" and concat(ec and "' ORDER BY timestamp ASC;"))
+    set rows to sql_query(STORAGE_DB and sql)
+    set length to length_list(rows)
+    set i to 0
+    repeat while i < length:
+        set row to get_list(rows and i)
+        set msg_map to create_map()
+        set ok to map_insert(msg_map and "message_id" and get_list(row and 0))
+        set ok to map_insert(msg_map and "conversation_id" and get_list(row and 1))
+        set ok to map_insert(msg_map and "sender" and get_list(row and 2))
+        set ok to map_insert(msg_map and "recipient" and get_list(row and 3))
+        set ok to map_insert(msg_map and "body" and get_list(row and 4))
+        set ok to map_insert(msg_map and "type" and string_to_int(get_list(row and 5)))
+        set ok to map_insert(msg_map and "state" and string_to_int(get_list(row and 6)))
+        set ok to map_insert(msg_map and "timestamp" and string_to_int(get_list(row and 7)))
+        set ok to append_list(list and msg_map)
+        set i to i + 1
+    return list
+
+# ================================================================
+# DEX AMM Persistence
+# ================================================================
+
+define storage_dex_save_pool with token_a as Str and token_b as Str and reserve_a as Int and reserve_b as Int returning Int:
+    set ta to string_replace(token_a and "'" and "''")
+    set tb to string_replace(token_b and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO dex_pools (token_a, token_b, reserve_a, reserve_b) VALUES ('" and concat(ta and concat("', '" and concat(tb and concat("', " and concat(int_to_string(reserve_a) and concat(", " and concat(int_to_string(reserve_b) and ");"))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_dex_load_pools returning List:
+    set list to create_list()
+    set sql to "SELECT token_a, token_b, reserve_a, reserve_b FROM dex_pools;"
+    set rows to sql_query(STORAGE_DB and sql)
+    set length to length_list(rows)
+    set i to 0
+    repeat while i < length:
+        set row to get_list(rows and i)
+        set pool_map to create_map()
+        set ok to map_insert(pool_map and "token_a" and get_list(row and 0))
+        set ok to map_insert(pool_map and "token_b" and get_list(row and 1))
+        set ok to map_insert(pool_map and "reserve_a" and string_to_int(get_list(row and 2)))
+        set ok to map_insert(pool_map and "reserve_b" and string_to_int(get_list(row and 3)))
+        set ok to append_list(list and pool_map)
+        set i to i + 1
+    return list
+
+define storage_dex_save_order with order_id as Str and token_a as Str and token_b as Str and side as Str and price as Int and amount as Int and caller as Str and created_at as Int returning Int:
+    set oid to string_replace(order_id and "'" and "''")
+    set ta to string_replace(token_a and "'" and "''")
+    set tb to string_replace(token_b and "'" and "''")
+    set sd to string_replace(side and "'" and "''")
+    set cl to string_replace(caller and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO dex_orderbook (order_id, token_a, token_b, side, price, amount, caller, created_at) VALUES ('" and concat(oid and concat("', '" and concat(ta and concat("', '" and concat(tb and concat("', '" and concat(sd and concat("', " and concat(int_to_string(price) and concat(", " and concat(int_to_string(amount) and concat(", '" and concat(cl and concat("', " and concat(int_to_string(created_at) and ");"))))))))))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_dex_delete_order with order_id as Str returning Int:
+    set oid to string_replace(order_id and "'" and "''")
+    set sql to concat("DELETE FROM dex_orderbook WHERE order_id = '" and concat(oid and "';"))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_dex_load_orders returning List:
+    set list to create_list()
+    set sql to "SELECT order_id, token_a, token_b, side, price, amount, caller, created_at FROM dex_orderbook;"
+    set rows to sql_query(STORAGE_DB and sql)
+    set length to length_list(rows)
+    set i to 0
+    repeat while i < length:
+        set row to get_list(rows and i)
+        set ord_map to create_map()
+        set ok to map_insert(ord_map and "order_id" and get_list(row and 0))
+        set ok to map_insert(ord_map and "token_a" and get_list(row and 1))
+        set ok to map_insert(ord_map and "token_b" and get_list(row and 2))
+        set ok to map_insert(ord_map and "side" and get_list(row and 3))
+        set ok to map_insert(ord_map and "price" and string_to_int(get_list(row and 4)))
+        set ok to map_insert(ord_map and "amount" and string_to_int(get_list(row and 5)))
+        set ok to map_insert(ord_map and "caller" and get_list(row and 6))
+        set ok to map_insert(ord_map and "created_at" and string_to_int(get_list(row and 7)))
+        set ok to append_list(list and ord_map)
+        set i to i + 1
+    return list
+
+define storage_contact_add with did as Str and name as Str and address as Str and port as Int returning Int:
+    set d to string_replace(did and "'" and "''")
+    set n to string_replace(name and "'" and "''")
+    set a to string_replace(address and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO contacts (did, name, address, port, added_at) VALUES ('" and concat(d and concat("', '" and concat(n and concat("', '" and concat(a and concat("', " and concat(int_to_string(port) and concat(", " and concat(int_to_string(ep_time_now_sec()) and ");"))))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_contact_delete with did as Str returning Int:
+    set d to string_replace(did and "'" and "''")
+    set sql to concat("DELETE FROM contacts WHERE did = '" and concat(d and "';"))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_contact_get_all returning List:
+    set list to create_list()
+    set sql to "SELECT did, name, address, port, added_at FROM contacts;"
+    set rows to sql_query(STORAGE_DB and sql)
+    set length to length_list(rows)
+    set i to 0
+    repeat while i < length:
+        set row to get_list(rows and i)
+        set contact_map to create_map()
+        set ok to map_insert(contact_map and "did" and get_list(row and 0))
+        set ok to map_insert(contact_map and "name" and get_list(row and 1))
+        set ok to map_insert(contact_map and "address" and get_list(row and 2))
+        set ok to map_insert(contact_map and "port" and string_to_int(get_list(row and 3)))
+        set ok to map_insert(contact_map and "added_at" and string_to_int(get_list(row and 4)))
+        set ok to append_list(list and contact_map)
+        set i to i + 1
+    return list
+
+define storage_email_add with msg_id as Str and from_addr as Str and to_addr as Str and subject as Str and body as Str and folder as Str and is_read as Int and timestamp as Int returning Int:
+    set mid to string_replace(msg_id and "'" and "''")
+    set frm to string_replace(from_addr and "'" and "''")
+    set to_a to string_replace(to_addr and "'" and "''")
+    set subj to string_replace(subject and "'" and "''")
+    set bdy to string_replace(body and "'" and "''")
+    set fld to string_replace(folder and "'" and "''")
+    set sql to concat("INSERT OR REPLACE INTO email_messages (msg_id, from_addr, to_addr, subject, body, folder, is_read, timestamp) VALUES ('" and concat(mid and concat("', '" and concat(frm and concat("', '" and concat(to_a and concat("', '" and concat(subj and concat("', '" and concat(bdy and concat("', '" and concat(fld and concat("', " and concat(int_to_string(is_read) and concat(", " and concat(int_to_string(timestamp) and ");"))))))))))))))))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_email_delete with msg_id as Str returning Int:
+    set mid to string_replace(msg_id and "'" and "''")
+    set sql to concat("DELETE FROM email_messages WHERE msg_id = '" and concat(mid and "';"))
+    set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
+    return STORAGE_ERR_NONE
+
+define storage_email_get_all with folder as Str returning List:
+    set list to create_list()
+    set fld to string_replace(folder and "'" and "''")
+    set sql to concat("SELECT msg_id, from_addr, to_addr, subject, body, folder, is_read, timestamp FROM email_messages WHERE folder = '" and concat(fld and "' ORDER BY timestamp DESC;"))
+    set rows to sql_query(STORAGE_DB and sql)
+    set length to length_list(rows)
+    set i to 0
+    repeat while i < length:
+        set row to get_list(rows and i)
+        set email_map to create_map()
+        set ok to map_insert(email_map and "msg_id" and get_list(row and 0))
+        set ok to map_insert(email_map and "from" and get_list(row and 1))
+        set ok to map_insert(email_map and "to" and get_list(row and 2))
+        set ok to map_insert(email_map and "subject" and get_list(row and 3))
+        set ok to map_insert(email_map and "body" and get_list(row and 4))
+        set ok to map_insert(email_map and "folder" and get_list(row and 5))
+        set ok to map_insert(email_map and "is_read" and string_to_int(get_list(row and 6)))
+        set ok to map_insert(email_map and "timestamp" and string_to_int(get_list(row and 7)))
+        set ok to append_list(list and email_map)
+        set i to i + 1
+    return list
+

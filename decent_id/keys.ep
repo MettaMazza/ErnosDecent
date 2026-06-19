@@ -1,0 +1,1057 @@
+# ErnosDecent — Cryptographic Key Management
+# Component: decent_id/keys.ep
+# Provides: Key generation, storage, derivation, encryption, signing, verification
+# Uses: EP stdlib crypto + libsodium bridge with alloc_bytes/str_to_ptr/ptr_to_str
+# Status: Production — OperationTrojanClaude Phase 1
+
+import "crypto"
+import "string"
+# Note: uses builtin Map (map_insert/map_get_val), not collections
+import "fs"
+import "../stdlib/bridge/libsodium"
+
+# ════════════════════════════════════════════════════════════════
+# Constants
+# ════════════════════════════════════════════════════════════════
+
+set KEY_TYPE_SIGNING to 1
+set KEY_TYPE_ENCRYPTION to 2
+
+set KEY_STATUS_ACTIVE to 1
+set KEY_STATUS_REVOKED to 2
+set KEY_STATUS_EXPIRED to 3
+
+set KEYSTORE_MAGIC to "ERNOSDECENT_KEYSTORE_V1"
+
+set ERR_NONE to 0
+set ERR_SODIUM_INIT_FAILED to 1
+set ERR_KEY_GENERATION_FAILED to 2
+set ERR_SIGNING_FAILED to 3
+set ERR_VERIFICATION_FAILED to 4
+set ERR_ENCRYPTION_FAILED to 5
+set ERR_DECRYPTION_FAILED to 6
+set ERR_KEYSTORE_CORRUPT to 7
+set ERR_KEY_NOT_FOUND to 8
+set ERR_KEY_REVOKED to 9
+set ERR_PASSPHRASE_WRONG to 10
+set ERR_FILE_IO to 11
+
+# ════════════════════════════════════════════════════════════════
+# State
+# ════════════════════════════════════════════════════════════════
+
+set SODIUM_READY to 0
+
+# ════════════════════════════════════════════════════════════════
+# Initialization
+# ════════════════════════════════════════════════════════════════
+
+define init_crypto returning Int:
+    if SODIUM_READY == 1:
+        return ERR_NONE
+    set result to sodium_init()
+    if result < 0:
+        display "FATAL: libsodium initialization failed"
+        return ERR_SODIUM_INIT_FAILED
+    set SODIUM_READY to 1
+    return ERR_NONE
+
+# ════════════════════════════════════════════════════════════════
+# Raw buffer ↔ hex conversion
+# Uses libsodium's bin2hex / hex2bin for correctness
+# ════════════════════════════════════════════════════════════════
+
+define raw_to_hex with buf_ptr as Int and buf_len as Int returning Str:
+    set hex_len to buf_len * 2 + 1
+    set hex_ptr to alloc_bytes(hex_len)
+    set ok to sodium_bin2hex(hex_ptr and hex_len and buf_ptr and buf_len)
+    set hex_str to ptr_to_str(hex_ptr)
+    set ok to free_bytes(hex_ptr)
+    return hex_str
+
+define hex_to_raw with hex_str as Str and out_ptr as Int and out_max as Int returning Int:
+    set hex_len to string_length(hex_str)
+    set result to sodium_hex2bin(out_ptr and out_max and hex_str and hex_len and 0 and 0 and 0)
+    return result
+
+# ════════════════════════════════════════════════════════════════
+# Key Generation
+# ════════════════════════════════════════════════════════════════
+
+define generate_signing_keypair:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and err)
+        return result
+
+    set pk_ptr to alloc_bytes(crypto_sign_PUBLICKEYBYTES)
+    set sk_ptr to alloc_bytes(crypto_sign_SECRETKEYBYTES)
+
+    set gen to sodium_sign_keypair(pk_ptr and sk_ptr)
+    if gen != 0:
+        # Key generation failed: do NOT hex-encode and return the (possibly
+        # zero/uninitialised) buffers as a valid key. Fail closed.
+        set ok to sodium_memzero(sk_ptr and crypto_sign_SECRETKEYBYTES)
+        set ok to free_bytes(sk_ptr)
+        set ok to free_bytes(pk_ptr)
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_KEY_GENERATION_FAILED)
+        return result
+
+    set pub_hex to raw_to_hex(pk_ptr and crypto_sign_PUBLICKEYBYTES)
+    set sec_hex to raw_to_hex(sk_ptr and crypto_sign_SECRETKEYBYTES)
+
+    set ok to sodium_memzero(sk_ptr and crypto_sign_SECRETKEYBYTES)
+    set ok to free_bytes(sk_ptr)
+    set ok to free_bytes(pk_ptr)
+
+    set fingerprint to ep_sha256(pub_hex)
+    set fp_short to substring(fingerprint and 0 and 32)
+
+    set result to create_map()
+    set ok to map_insert(result and "type" and KEY_TYPE_SIGNING)
+    set ok to map_insert(result and "public_key" and pub_hex)
+    set ok to map_insert(result and "secret_key" and sec_hex)
+    set ok to map_insert(result and "status" and KEY_STATUS_ACTIVE)
+    set ok to map_insert(result and "algorithm" and "Ed25519")
+    set ok to map_insert(result and "fingerprint" and fp_short)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+define generate_encryption_keypair:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and err)
+        return result
+
+    set pk_ptr to alloc_bytes(crypto_box_PUBLICKEYBYTES)
+    set sk_ptr to alloc_bytes(crypto_box_SECRETKEYBYTES)
+
+    set gen to sodium_box_keypair(pk_ptr and sk_ptr)
+    if gen != 0:
+        # Key generation failed: fail closed rather than returning zero/garbage.
+        set ok to sodium_memzero(sk_ptr and crypto_box_SECRETKEYBYTES)
+        set ok to free_bytes(sk_ptr)
+        set ok to free_bytes(pk_ptr)
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_KEY_GENERATION_FAILED)
+        return result
+
+    set pub_hex to raw_to_hex(pk_ptr and crypto_box_PUBLICKEYBYTES)
+    set sec_hex to raw_to_hex(sk_ptr and crypto_box_SECRETKEYBYTES)
+
+    set ok to sodium_memzero(sk_ptr and crypto_box_SECRETKEYBYTES)
+    set ok to free_bytes(sk_ptr)
+    set ok to free_bytes(pk_ptr)
+
+    set fingerprint to ep_sha256(pub_hex)
+    set fp_short to substring(fingerprint and 0 and 32)
+
+    set result to create_map()
+    set ok to map_insert(result and "type" and KEY_TYPE_ENCRYPTION)
+    set ok to map_insert(result and "public_key" and pub_hex)
+    set ok to map_insert(result and "secret_key" and sec_hex)
+    set ok to map_insert(result and "status" and KEY_STATUS_ACTIVE)
+    set ok to map_insert(result and "algorithm" and "X25519")
+    set ok to map_insert(result and "fingerprint" and fp_short)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+define generate_identity_keypair:
+    set signing to generate_signing_keypair()
+    set sign_err to map_get_val(signing and "error")
+    if sign_err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and sign_err)
+        return result
+
+    set encryption to generate_encryption_keypair()
+    set enc_err to map_get_val(encryption and "error")
+    if enc_err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and enc_err)
+        return result
+
+    set sign_pub to ptr_to_str(map_get_val(signing and "public_key"))
+    set enc_pub to ptr_to_str(map_get_val(encryption and "public_key"))
+    set combined to concat(sign_pub and enc_pub)
+    set identity_hash to ep_sha256(combined)
+
+    set result to create_map()
+    set ok to map_insert(result and "signing" and signing)
+    set ok to map_insert(result and "encryption" and encryption)
+    set ok to map_insert(result and "identity_hash" and identity_hash)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+define generate_symmetric_key:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and err)
+        return result
+
+    set key_ptr to alloc_bytes(crypto_secretbox_KEYBYTES)
+    sodium_secretbox_keygen(key_ptr)
+    set key_hex to raw_to_hex(key_ptr and crypto_secretbox_KEYBYTES)
+    set ok to sodium_memzero(key_ptr and crypto_secretbox_KEYBYTES)
+    set ok to free_bytes(key_ptr)
+
+    set result to create_map()
+    set ok to map_insert(result and "key" and key_hex)
+    set ok to map_insert(result and "algorithm" and "XSalsa20-Poly1305")
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+# ════════════════════════════════════════════════════════════════
+# Signing & Verification
+# ════════════════════════════════════════════════════════════════
+
+define sign_message with message as Str and secret_key_hex as Str:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and err)
+        return result
+
+    if string_length(secret_key_hex) != crypto_sign_SECRETKEYBYTES * 2:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_SIGNING_FAILED)
+        return result
+
+    set sk_ptr to alloc_bytes(crypto_sign_SECRETKEYBYTES)
+    set sig_ptr to alloc_bytes(crypto_sign_BYTES)
+    set siglen_ptr to alloc_bytes(8)
+
+    set ok to hex_to_raw(secret_key_hex and sk_ptr and crypto_sign_SECRETKEYBYTES)
+
+    set msg_ptr to str_to_ptr(message)
+    set msg_len to string_length(message)
+    set sign_result to sodium_sign_detached(sig_ptr and siglen_ptr and msg_ptr and msg_len and sk_ptr)
+
+    set ok to sodium_memzero(sk_ptr and crypto_sign_SECRETKEYBYTES)
+    set ok to free_bytes(sk_ptr)
+    set ok to free_bytes(siglen_ptr)
+
+    if sign_result != 0:
+        set ok to free_bytes(sig_ptr)
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_SIGNING_FAILED)
+        return result
+
+    set sig_hex to raw_to_hex(sig_ptr and crypto_sign_BYTES)
+    set ok to free_bytes(sig_ptr)
+
+    set result to create_map()
+    set ok to map_insert(result and "signature" and sig_hex)
+    set ok to map_insert(result and "message" and message)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+# Cryptographically-secure random hex string of n_bytes (libsodium randombytes_buf).
+# Used for the web password, the IPC auth token, and the WS first-frame token.
+# Returns "" only if the crypto subsystem cannot initialize (caller must fail closed).
+define keys_random_hex with n_bytes as Int returning Str:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        return ""
+    set buf to alloc_bytes(n_bytes)
+    set fn_rand to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    set ok to ep_dlcall2(fn_rand and buf and n_bytes)
+    set hexstr to raw_to_hex(buf and n_bytes)
+    set ok to free_bytes(buf)
+    return hexstr
+
+# Set file permissions via libc chmod(2). mode is decimal (384 = 0600, 448 = 0700).
+# Returns 0 on success. Used to lock down the node DB, keys, and token files at rest.
+define keys_chmod with path as Str and mode as Int returning Int:
+    set libc to ep_dlopen("libSystem.B.dylib")
+    if libc == 0:
+        set libc to ep_dlopen("libc.so.6")
+    if libc == 0:
+        set libc to ep_dlopen("libc.so")
+    if libc == 0:
+        return -1
+    set fn to ep_dlsym(libc and "chmod")
+    if fn == 0:
+        return -1
+    set rc to ep_dlcall2(fn and str_to_ptr(path) and mode)
+    return rc
+
+# Convert an Ed25519 (signing) public key to its X25519 (encryption) public key via
+# libsodium crypto_sign_ed25519_pk_to_curve25519. This lets a peer's encryption key
+# be derived deterministically from the signing key in their DID, so E2E messages
+# need no separate enc-key distribution. Returns hex on success, "" on failure.
+define ed25519_pub_to_x25519 with ed_pub_hex as Str returning Str:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        return ""
+    if string_length(ed_pub_hex) != crypto_sign_PUBLICKEYBYTES * 2:
+        return ""
+    set ed_ptr to alloc_bytes(crypto_sign_PUBLICKEYBYTES)
+    set x_ptr to alloc_bytes(crypto_box_PUBLICKEYBYTES)
+    set ok to hex_to_raw(ed_pub_hex and ed_ptr and crypto_sign_PUBLICKEYBYTES)
+    set fn to ep_dlsym(SODIUM_HANDLE and "crypto_sign_ed25519_pk_to_curve25519")
+    set out to ""
+    if fn != 0:
+        set rc to ep_dlcall2(fn and x_ptr and ed_ptr)
+        if rc == 0:
+            set out to raw_to_hex(x_ptr and crypto_box_PUBLICKEYBYTES)
+    set ok to free_bytes(ed_ptr)
+    set ok to free_bytes(x_ptr)
+    return out
+
+# Convert an Ed25519 secret key to its X25519 secret key
+# (crypto_sign_ed25519_sk_to_curve25519). Returns hex on success, "" on failure.
+define ed25519_sec_to_x25519 with ed_sec_hex as Str returning Str:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        return ""
+    if string_length(ed_sec_hex) != crypto_sign_SECRETKEYBYTES * 2:
+        return ""
+    set ed_ptr to alloc_bytes(crypto_sign_SECRETKEYBYTES)
+    set x_ptr to alloc_bytes(crypto_box_SECRETKEYBYTES)
+    set ok to hex_to_raw(ed_sec_hex and ed_ptr and crypto_sign_SECRETKEYBYTES)
+    set fn to ep_dlsym(SODIUM_HANDLE and "crypto_sign_ed25519_sk_to_curve25519")
+    set out to ""
+    if fn != 0:
+        set rc to ep_dlcall2(fn and x_ptr and ed_ptr)
+        if rc == 0:
+            set out to raw_to_hex(x_ptr and crypto_box_SECRETKEYBYTES)
+    set ok to sodium_memzero(x_ptr and crypto_box_SECRETKEYBYTES)
+    set ok to sodium_memzero(ed_ptr and crypto_sign_SECRETKEYBYTES)
+    set ok to free_bytes(ed_ptr)
+    set ok to free_bytes(x_ptr)
+    return out
+
+# Read an environment variable via libc getenv(3). Returns "" if unset.
+define keys_getenv with name as Str returning Str:
+    set libc to ep_dlopen("libSystem.B.dylib")
+    if libc == 0:
+        set libc to ep_dlopen("libc.so.6")
+    if libc == 0:
+        set libc to ep_dlopen("libc.so")
+    if libc == 0:
+        return ""
+    set fn to ep_dlsym(libc and "getenv")
+    if fn == 0:
+        return ""
+    set rc to ep_dlcall1(fn and str_to_ptr(name))
+    if rc == 0:
+        return ""
+    return ptr_to_str(rc)
+
+# D1 at-rest secret sealing. With a passphrase, encrypts plaintext under a
+# PBKDF2(600k)-derived key (libsodium secretbox) and returns "v1|salt|nonce|cipher"
+# (hex). Without a passphrase, returns "v0|<plaintext>" so the format is uniform and
+# load is symmetric. Decryption is keys_open_secret.
+define keys_seal_secret with plaintext as Str and passphrase as Str returning Str:
+    if string_length(passphrase) == 0:
+        return concat("v0|" and plaintext)
+    set salt to keys_random_hex(16)
+    set kek to keys_pbkdf2_hmac_sha256(passphrase and salt and 600000)
+    set enc to encrypt_symmetric(plaintext and kek)
+    if map_get_val(enc and "error") != 0:
+        return concat("v0|" and plaintext)
+    set ct to ptr_to_str(map_get_val(enc and "ciphertext"))
+    set nn to ptr_to_str(map_get_val(enc and "nonce"))
+    return concat("v1|" and concat(salt and concat("|" and concat(nn and concat("|" and ct)))))
+
+define keys_open_secret with sealed as Str and passphrase as Str returning Str:
+    if string_index_of(sealed and "v0|") == 0:
+        return substring(sealed and 3 and string_length(sealed) - 3)
+    if string_index_of(sealed and "v1|") == 0:
+        set parts to string_split(sealed and "|")
+        if length_list(parts) >= 4:
+            set salt to ptr_to_str(get_list(parts and 1))
+            set nn to ptr_to_str(get_list(parts and 2))
+            set ct to ptr_to_str(get_list(parts and 3))
+            set kek to keys_pbkdf2_hmac_sha256(passphrase and salt and 600000)
+            set dec to decrypt_symmetric(ct and nn and kek)
+            if map_get_val(dec and "error") == 0:
+                return ptr_to_str(map_get_val(dec and "plaintext"))
+        return ""
+    return sealed
+
+define verify_signature with message as Str and signature_hex as Str and public_key_hex as Str returning Int:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        return err
+
+    if string_length(signature_hex) != crypto_sign_BYTES * 2:
+        return ERR_VERIFICATION_FAILED
+    if string_length(public_key_hex) != crypto_sign_PUBLICKEYBYTES * 2:
+        return ERR_VERIFICATION_FAILED
+
+    set sig_ptr to alloc_bytes(crypto_sign_BYTES)
+    set pk_ptr to alloc_bytes(crypto_sign_PUBLICKEYBYTES)
+
+    set ok to hex_to_raw(signature_hex and sig_ptr and crypto_sign_BYTES)
+    set ok to hex_to_raw(public_key_hex and pk_ptr and crypto_sign_PUBLICKEYBYTES)
+
+    set msg_ptr to str_to_ptr(message)
+    set msg_len to string_length(message)
+    set verify_result to sodium_sign_verify_detached(sig_ptr and msg_ptr and msg_len and pk_ptr)
+
+    set ok to free_bytes(sig_ptr)
+    set ok to free_bytes(pk_ptr)
+
+    if verify_result == 0:
+        return ERR_NONE
+    return ERR_VERIFICATION_FAILED
+
+# ════════════════════════════════════════════════════════════════
+# Symmetric Encryption (XSalsa20-Poly1305)
+# ════════════════════════════════════════════════════════════════
+
+define encrypt_symmetric with plaintext as Str and key_hex as Str:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and err)
+        return result
+
+    if string_length(key_hex) != crypto_secretbox_KEYBYTES * 2:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_ENCRYPTION_FAILED)
+        return result
+
+    set msg_len to string_length(plaintext)
+    set cipher_len to msg_len + crypto_secretbox_MACBYTES
+
+    set key_ptr to alloc_bytes(crypto_secretbox_KEYBYTES)
+    set nonce_ptr to alloc_bytes(crypto_secretbox_NONCEBYTES)
+    set cipher_ptr to alloc_bytes(cipher_len)
+
+    set ok to hex_to_raw(key_hex and key_ptr and crypto_secretbox_KEYBYTES)
+    sodium_randombytes_buf(nonce_ptr and crypto_secretbox_NONCEBYTES)
+
+    set msg_ptr to str_to_ptr(plaintext)
+    set enc_result to sodium_secretbox_easy(cipher_ptr and msg_ptr and msg_len and nonce_ptr and key_ptr)
+
+    set nonce_hex to raw_to_hex(nonce_ptr and crypto_secretbox_NONCEBYTES)
+
+    set ok to sodium_memzero(key_ptr and crypto_secretbox_KEYBYTES)
+    set ok to free_bytes(key_ptr)
+
+    if enc_result != 0:
+        set ok to free_bytes(nonce_ptr)
+        set ok to free_bytes(cipher_ptr)
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_ENCRYPTION_FAILED)
+        return result
+
+    set cipher_hex to raw_to_hex(cipher_ptr and cipher_len)
+    set ok to free_bytes(nonce_ptr)
+    set ok to free_bytes(cipher_ptr)
+
+    set result to create_map()
+    set ok to map_insert(result and "ciphertext" and cipher_hex)
+    set ok to map_insert(result and "nonce" and nonce_hex)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+define decrypt_symmetric with ciphertext_hex as Str and nonce_hex as Str and key_hex as Str:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and err)
+        return result
+
+    if string_length(key_hex) != crypto_secretbox_KEYBYTES * 2:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_DECRYPTION_FAILED)
+        return result
+
+    set cipher_byte_len to string_length(ciphertext_hex) / 2
+    if cipher_byte_len < crypto_secretbox_MACBYTES:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_DECRYPTION_FAILED)
+        return result
+
+    set msg_len to cipher_byte_len - crypto_secretbox_MACBYTES
+
+    set key_ptr to alloc_bytes(crypto_secretbox_KEYBYTES)
+    set nonce_ptr to alloc_bytes(crypto_secretbox_NONCEBYTES)
+    set cipher_ptr to alloc_bytes(cipher_byte_len)
+    set msg_ptr to alloc_bytes(msg_len + 1)
+
+    set ok to hex_to_raw(key_hex and key_ptr and crypto_secretbox_KEYBYTES)
+    set ok to hex_to_raw(nonce_hex and nonce_ptr and crypto_secretbox_NONCEBYTES)
+    set ok to hex_to_raw(ciphertext_hex and cipher_ptr and cipher_byte_len)
+
+    set dec_result to sodium_secretbox_open_easy(msg_ptr and cipher_ptr and cipher_byte_len and nonce_ptr and key_ptr)
+
+    set ok to sodium_memzero(key_ptr and crypto_secretbox_KEYBYTES)
+    set ok to free_bytes(key_ptr)
+    set ok to free_bytes(nonce_ptr)
+    set ok to free_bytes(cipher_ptr)
+
+    if dec_result != 0:
+        set ok to free_bytes(msg_ptr)
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_DECRYPTION_FAILED)
+        return result
+
+    set plaintext to ptr_to_str(msg_ptr)
+    set ok to free_bytes(msg_ptr)
+
+    set result to create_map()
+    set ok to map_insert(result and "plaintext" and plaintext)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+# ════════════════════════════════════════════════════════════════
+# Public-Key Encryption (X25519 + XSalsa20-Poly1305)
+# ════════════════════════════════════════════════════════════════
+
+define encrypt_to_recipient with plaintext as Str and recipient_pk_hex as Str and sender_sk_hex as Str:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and err)
+        return result
+
+    if string_length(recipient_pk_hex) != crypto_box_PUBLICKEYBYTES * 2:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_ENCRYPTION_FAILED)
+        return result
+    if string_length(sender_sk_hex) != crypto_box_SECRETKEYBYTES * 2:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_ENCRYPTION_FAILED)
+        return result
+
+    set msg_len to string_length(plaintext)
+    set cipher_len to msg_len + crypto_box_MACBYTES
+
+    set pk_ptr to alloc_bytes(crypto_box_PUBLICKEYBYTES)
+    set sk_ptr to alloc_bytes(crypto_box_SECRETKEYBYTES)
+    set nonce_ptr to alloc_bytes(crypto_box_NONCEBYTES)
+    set cipher_ptr to alloc_bytes(cipher_len)
+
+    set ok to hex_to_raw(recipient_pk_hex and pk_ptr and crypto_box_PUBLICKEYBYTES)
+    set ok to hex_to_raw(sender_sk_hex and sk_ptr and crypto_box_SECRETKEYBYTES)
+    sodium_randombytes_buf(nonce_ptr and crypto_box_NONCEBYTES)
+
+    set msg_ptr to str_to_ptr(plaintext)
+    set enc_result to sodium_box_easy(cipher_ptr and msg_ptr and msg_len and nonce_ptr and pk_ptr and sk_ptr)
+
+    set nonce_hex to raw_to_hex(nonce_ptr and crypto_box_NONCEBYTES)
+
+    set ok to sodium_memzero(sk_ptr and crypto_box_SECRETKEYBYTES)
+    set ok to free_bytes(sk_ptr)
+    set ok to free_bytes(pk_ptr)
+
+    if enc_result != 0:
+        set ok to free_bytes(nonce_ptr)
+        set ok to free_bytes(cipher_ptr)
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_ENCRYPTION_FAILED)
+        return result
+
+    set cipher_hex to raw_to_hex(cipher_ptr and cipher_len)
+    set ok to free_bytes(nonce_ptr)
+    set ok to free_bytes(cipher_ptr)
+
+    set result to create_map()
+    set ok to map_insert(result and "ciphertext" and cipher_hex)
+    set ok to map_insert(result and "nonce" and nonce_hex)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+define decrypt_from_sender with ciphertext_hex as Str and nonce_hex as Str and sender_pk_hex as Str and recipient_sk_hex as Str:
+    set err to init_crypto()
+    if err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and err)
+        return result
+
+    if string_length(sender_pk_hex) != crypto_box_PUBLICKEYBYTES * 2:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_DECRYPTION_FAILED)
+        return result
+    if string_length(recipient_sk_hex) != crypto_box_SECRETKEYBYTES * 2:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_DECRYPTION_FAILED)
+        return result
+
+    set cipher_byte_len to string_length(ciphertext_hex) / 2
+    if cipher_byte_len <= crypto_box_MACBYTES:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_DECRYPTION_FAILED)
+        return result
+
+    set msg_len to cipher_byte_len - crypto_box_MACBYTES
+
+    set pk_ptr to alloc_bytes(crypto_box_PUBLICKEYBYTES)
+    set sk_ptr to alloc_bytes(crypto_box_SECRETKEYBYTES)
+    set nonce_ptr to alloc_bytes(crypto_box_NONCEBYTES)
+    set cipher_ptr to alloc_bytes(cipher_byte_len)
+    set msg_ptr to alloc_bytes(msg_len + 1)
+
+    set ok to hex_to_raw(sender_pk_hex and pk_ptr and crypto_box_PUBLICKEYBYTES)
+    set ok to hex_to_raw(recipient_sk_hex and sk_ptr and crypto_box_SECRETKEYBYTES)
+    set ok to hex_to_raw(nonce_hex and nonce_ptr and crypto_box_NONCEBYTES)
+    set ok to hex_to_raw(ciphertext_hex and cipher_ptr and cipher_byte_len)
+
+    set dec_result to sodium_box_open_easy(msg_ptr and cipher_ptr and cipher_byte_len and nonce_ptr and pk_ptr and sk_ptr)
+
+    set ok to sodium_memzero(sk_ptr and crypto_box_SECRETKEYBYTES)
+    set ok to free_bytes(sk_ptr)
+    set ok to free_bytes(pk_ptr)
+    set ok to free_bytes(nonce_ptr)
+    set ok to free_bytes(cipher_ptr)
+
+    if dec_result != 0:
+        set ok to free_bytes(msg_ptr)
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_DECRYPTION_FAILED)
+        return result
+
+    set plaintext to ptr_to_str(msg_ptr)
+    set ok to free_bytes(msg_ptr)
+
+    set result to create_map()
+    set ok to map_insert(result and "plaintext" and plaintext)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+# ════════════════════════════════════════════════════════════════
+# HKDF — Key Derivation (RFC 5869)
+# ════════════════════════════════════════════════════════════════
+
+define hkdf_extract with salt_hex as Str and ikm_hex as Str returning Str:
+    set prk to hmac_sha256(salt_hex and ikm_hex)
+    return prk
+
+define hkdf_expand with prk_hex as Str and info as Str and output_length as Int returning Str:
+    set combined to concat(prk_hex and info)
+    set block_input to concat(combined and "01")
+    set first_block to ep_sha256(block_input)
+    if output_length <= 32:
+        return substring(first_block and 0 and output_length * 2)
+    set result_str to first_block
+    set last_block to first_block
+    set counter to 2
+    repeat while string_length(result_str) / 2 < output_length:
+        set chain_input to concat(last_block and info)
+        set counter_hex to byte_to_hex(counter)
+        set chain_input to concat(chain_input and counter_hex)
+        set last_block to ep_sha256(chain_input)
+        set result_str to concat(result_str and last_block)
+        set counter to counter + 1
+    return substring(result_str and 0 and output_length * 2)
+
+define derive_key with master_key_hex as Str and purpose as Str and key_index as Int:
+    set index_str to int_to_string(key_index)
+    set info to concat(purpose and ":")
+    set info to concat(info and index_str)
+
+    set salt to ep_sha256("ErnosDecent-HKDF-Salt-v1")
+    set prk to hkdf_extract(salt and master_key_hex)
+    set derived to hkdf_expand(prk and info and 32)
+
+    set result to create_map()
+    set ok to map_insert(result and "derived_key" and derived)
+    set ok to map_insert(result and "purpose" and purpose)
+    set ok to map_insert(result and "index" and key_index)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+# ════════════════════════════════════════════════════════════════
+# Keystore — Encrypted key storage on disk
+# ════════════════════════════════════════════════════════════════
+
+define byte_xor with a as Int and b as Int returning Int:
+    set res to 0
+    set power to 1
+    repeat while power < 256:
+        set bit_a to (a / power) modulo 2
+        set bit_b to (b / power) modulo 2
+        if bit_a != bit_b:
+            set res to res + power
+        set power to power * 2
+    return res
+
+define keys_hmac_sha256 with key_ptr as Int and key_len as Int and data_ptr as Int and data_len as Int and output_ptr as Int returning Int:
+    set state_size to 208
+    set state_ptr to alloc_bytes(state_size)
+
+    set fn_init to ep_dlsym(SODIUM_HANDLE and "crypto_auth_hmacsha256_init")
+    set result to ep_dlcall3(fn_init and state_ptr and key_ptr and key_len)
+    if result != 0:
+        set ok to free_bytes(state_ptr)
+        return result
+
+    set fn_update to ep_dlsym(SODIUM_HANDLE and "crypto_auth_hmacsha256_update")
+    set result to ep_dlcall3(fn_update and state_ptr and data_ptr and data_len)
+    if result != 0:
+        set ok to free_bytes(state_ptr)
+        return result
+
+    set fn_final to ep_dlsym(SODIUM_HANDLE and "crypto_auth_hmacsha256_final")
+    set result to ep_dlcall2(fn_final and state_ptr and output_ptr)
+    set ok to free_bytes(state_ptr)
+    return result
+
+define keys_pbkdf2_hmac_sha256 with passphrase as Str and salt_hex as Str and iterations as Int returning Str:
+    # 1. Prepare passphrase key
+    set pass_ptr to str_to_ptr(passphrase)
+    set pass_len to string_length(passphrase)
+
+    # 2. Parse salt hex to raw bytes
+    set salt_len to string_length(salt_hex) / 2
+    set salt_ptr to alloc_bytes(salt_len)
+    set ok to hex_to_raw(salt_hex and salt_ptr and salt_len)
+
+    # 3. Prepare salt || INT_32_BE(1)
+    set salt_with_int to alloc_bytes(salt_len + 4)
+    set idx to 0
+    repeat while idx < salt_len:
+        set b to peek_byte(salt_ptr and idx)
+        set ok to poke_byte(salt_with_int and idx and b)
+        set idx to idx + 1
+    set ok to poke_byte(salt_with_int and salt_len and 0)
+    set ok to poke_byte(salt_with_int and salt_len + 1 and 0)
+    set ok to poke_byte(salt_with_int and salt_len + 2 and 0)
+    set ok to poke_byte(salt_with_int and salt_len + 3 and 1)
+
+    set u_ptr to alloc_bytes(32)
+    set out_ptr to alloc_bytes(32)
+    set fn_zero to ep_dlsym(SODIUM_HANDLE and "sodium_memzero")
+    set ok to ep_dlcall2(fn_zero and out_ptr and 32)
+
+    # Compute U_1
+    set err to keys_hmac_sha256(pass_ptr and pass_len and salt_with_int and salt_len + 4 and u_ptr)
+    if err != 0:
+        set ok to free_bytes(salt_ptr)
+        set ok to free_bytes(salt_with_int)
+        set ok to free_bytes(u_ptr)
+        set ok to free_bytes(out_ptr)
+        return ""
+
+    # XOR U_1 into out_ptr
+    set idx to 0
+    repeat while idx < 32:
+        set b_u to peek_byte(u_ptr and idx)
+        set ok to poke_byte(out_ptr and idx and b_u)
+        set idx to idx + 1
+
+    # Loop for U_2 .. U_iterations
+    set iter to 2
+    set u_next to alloc_bytes(32)
+    repeat while iter <= iterations:
+        set err to keys_hmac_sha256(pass_ptr and pass_len and u_ptr and 32 and u_next)
+        if err != 0:
+            set ok to free_bytes(salt_ptr)
+            set ok to free_bytes(salt_with_int)
+            set ok to free_bytes(u_ptr)
+            set ok to free_bytes(u_next)
+            set ok to free_bytes(out_ptr)
+            return ""
+        # XOR u_next into out_ptr and copy u_next to u_ptr
+        set idx to 0
+        repeat while idx < 32:
+            set b_un to peek_byte(u_next and idx)
+            set b_out to peek_byte(out_ptr and idx)
+            set xor_val to byte_xor(b_un and b_out)
+            set ok to poke_byte(out_ptr and idx and xor_val)
+            set ok to poke_byte(u_ptr and idx and b_un)
+            set idx to idx + 1
+        set iter to iter + 1
+
+    # Hex encode derived key
+    set derived_hex to raw_to_hex(out_ptr and 32)
+
+    # Clean up memory
+    set ok to ep_dlcall2(fn_zero and u_ptr and 32)
+    set ok to ep_dlcall2(fn_zero and u_next and 32)
+    set ok to ep_dlcall2(fn_zero and out_ptr and 32)
+    set ok to free_bytes(salt_ptr)
+    set ok to free_bytes(salt_with_int)
+    set ok to free_bytes(u_ptr)
+    set ok to free_bytes(u_next)
+    set ok to free_bytes(out_ptr)
+
+    return derived_hex
+
+define keystore_create with passphrase as Str and filepath as Str:
+    set identity to generate_identity_keypair()
+    set id_err to map_get_val(identity and "error")
+    if id_err != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and id_err)
+        return result
+
+    set signing to map_get_val(identity and "signing")
+    set encryption to map_get_val(identity and "encryption")
+
+    # Generate 16-byte random salt
+    set salt_buf to alloc_bytes(16)
+    set fn_rand to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    set ok to ep_dlcall2(fn_rand and salt_buf and 16)
+    set salt_hex to raw_to_hex(salt_buf and 16)
+    set ok to free_bytes(salt_buf)
+
+    # Derive storage key from passphrase via PBKDF2 with 10,000 iterations and random salt
+    set storage_key to keys_pbkdf2_hmac_sha256(passphrase and salt_hex and 600000)
+
+    # Encrypt both secret keys
+    set sign_sk to map_get_val(signing and "secret_key")
+    set sign_enc to encrypt_symmetric(sign_sk and storage_key)
+    if map_get_val(sign_enc and "error") != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_ENCRYPTION_FAILED)
+        return result
+
+    set enc_sk to map_get_val(encryption and "secret_key")
+    set enc_enc to encrypt_symmetric(enc_sk and storage_key)
+    if map_get_val(enc_enc and "error") != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_ENCRYPTION_FAILED)
+        return result
+
+    # Passphrase verification hash — hash(storage_key) so we can check without storing key
+    set verify_hash to ep_sha256(storage_key)
+
+    set identity_hash to map_get_val(identity and "identity_hash")
+    set sign_pub to map_get_val(signing and "public_key")
+    set enc_pub to map_get_val(encryption and "public_key")
+    set sign_fp to map_get_val(signing and "fingerprint")
+    set enc_fp to map_get_val(encryption and "fingerprint")
+
+    # Build flat JSON keystore
+    set sign_ct to map_get_val(sign_enc and "ciphertext")
+    set sign_nc to map_get_val(sign_enc and "nonce")
+    set enc_ct to map_get_val(enc_enc and "ciphertext")
+    set enc_nc to map_get_val(enc_enc and "nonce")
+
+    set j to "{\n"
+    set j to concat(j and f"  \"magic\": \"{KEYSTORE_MAGIC}\",\n")
+    set j to concat(j and "  \"version\": 1,\n")
+    set j to concat(j and f"  \"salt\": \"{salt_hex}\",\n")
+    set j to concat(j and f"  \"identity_hash\": \"{identity_hash}\",\n")
+    set j to concat(j and f"  \"passphrase_verify\": \"{verify_hash}\",\n")
+    set j to concat(j and f"  \"signing_public_key\": \"{sign_pub}\",\n")
+    set j to concat(j and f"  \"signing_fingerprint\": \"{sign_fp}\",\n")
+    set j to concat(j and f"  \"signing_encrypted_sk\": \"{sign_ct}\",\n")
+    set j to concat(j and f"  \"signing_nonce\": \"{sign_nc}\",\n")
+    set j to concat(j and f"  \"encryption_public_key\": \"{enc_pub}\",\n")
+    set j to concat(j and f"  \"encryption_fingerprint\": \"{enc_fp}\",\n")
+    set j to concat(j and f"  \"encryption_encrypted_sk\": \"{enc_ct}\",\n")
+    set j to concat(j and f"  \"encryption_nonce\": \"{enc_nc}\"\n")
+    set j to concat(j and "}")
+
+    set write_ok to file_write(filepath and j)
+    if write_ok < 0:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_FILE_IO)
+        return result
+
+    set result to create_map()
+    set ok to map_insert(result and "identity_hash" and identity_hash)
+    set ok to map_insert(result and "signing_public_key" and sign_pub)
+    set ok to map_insert(result and "encryption_public_key" and enc_pub)
+    set ok to map_insert(result and "signing_fingerprint" and sign_fp)
+    set ok to map_insert(result and "encryption_fingerprint" and enc_fp)
+    set ok to map_insert(result and "filepath" and filepath)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+define keystore_unlock with passphrase as Str and filepath as Str:
+    set file_content to file_read(filepath)
+    if string_length(file_content) == 0:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_FILE_IO)
+        return result
+
+    # Extract salt
+    set salt_hex to json_get_string(file_content and "salt")
+    set storage_key to ""
+    set verify_expected to json_get_string(file_content and "passphrase_verify")
+    set verify_actual to ""
+
+    if string_length(salt_hex) == 0:
+        # A keystore with no salt is corrupt or has been tampered with to force
+        # the weak unsalted-single-SHA256 KDF. Refuse to unlock rather than
+        # silently downgrade the key-derivation function. Fail closed.
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_KEYSTORE_CORRUPT)
+        return result
+
+    set storage_key to keys_pbkdf2_hmac_sha256(passphrase and salt_hex and 600000)
+    set verify_actual to ep_sha256(storage_key)
+
+    if verify_actual equals verify_expected:
+        set pass_ok to 1
+    else:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_PASSPHRASE_WRONG)
+        return result
+
+    # Extract fields
+    set sign_pub to json_get_string(file_content and "signing_public_key")
+    set enc_pub to json_get_string(file_content and "encryption_public_key")
+    set identity_hash to json_get_string(file_content and "identity_hash")
+    set sign_cipher to json_get_string(file_content and "signing_encrypted_sk")
+    set sign_nonce to json_get_string(file_content and "signing_nonce")
+    set enc_cipher to json_get_string(file_content and "encryption_encrypted_sk")
+    set enc_nonce to json_get_string(file_content and "encryption_nonce")
+
+    # Decrypt secret keys
+    set sign_dec to decrypt_symmetric(sign_cipher and sign_nonce and storage_key)
+    if map_get_val(sign_dec and "error") != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_DECRYPTION_FAILED)
+        return result
+
+    set enc_dec to decrypt_symmetric(enc_cipher and enc_nonce and storage_key)
+    if map_get_val(enc_dec and "error") != ERR_NONE:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_DECRYPTION_FAILED)
+        return result
+
+    set result to create_map()
+    set ok to map_insert(result and "signing_secret_key" and map_get_val(sign_dec and "plaintext"))
+    set ok to map_insert(result and "signing_public_key" and sign_pub)
+    set ok to map_insert(result and "encryption_secret_key" and map_get_val(enc_dec and "plaintext"))
+    set ok to map_insert(result and "encryption_public_key" and enc_pub)
+    set ok to map_insert(result and "identity_hash" and identity_hash)
+    set ok to map_insert(result and "error" and ERR_NONE)
+    return result
+
+# ════════════════════════════════════════════════════════════════
+# Shamir's Secret Sharing (3-of-5 threshold)
+# ════════════════════════════════════════════════════════════════
+
+define mod_inverse with n as Int returning Int:
+    set i to 1
+    repeat while i < 257:
+        if (n * i) modulo 257 == 1:
+            return i
+        set i to i + 1
+    return 0
+
+define mod_div with a as Int and b as Int returning Int:
+    set inv to mod_inverse(b)
+    return (a * inv) modulo 257
+
+define mod_sub with a as Int and b as Int returning Int:
+    set diff to (a - b) modulo 257
+    if diff < 0:
+        set diff to diff + 257
+    return diff
+
+define shamir_split_key with hex_secret as Str returning List:
+    set secret_len to string_length(hex_secret) / 2
+    set secret_raw to alloc_bytes(secret_len)
+    set ok to hex_to_raw(hex_secret and secret_raw and secret_len)
+
+    set shares_list to create_list()
+    set share_payloads to create_list()
+
+    set x to 1
+    repeat while x <= 5:
+        set payload to alloc_bytes(secret_len * 2)
+        set ok to append_list(share_payloads and payload)
+        set x to x + 1
+
+    set j to 0
+    repeat while j < secret_len:
+        set s_byte to peek_byte(secret_raw and j)
+
+        set rand_buf to alloc_bytes(2)
+        sodium_randombytes_buf(rand_buf and 2)
+        set a1 to peek_byte(rand_buf and 0)
+        set a2 to peek_byte(rand_buf and 1)
+        set ok to free_bytes(rand_buf)
+
+        set x to 1
+        repeat while x <= 5:
+            set y to (s_byte + a1 * x + a2 * x * x) modulo 257
+            set payload to get_list(share_payloads and (x - 1))
+            set offset to j * 2
+            poke_byte(payload and offset and (y / 256))
+            poke_byte(payload and (offset + 1) and (y modulo 256))
+            set x to x + 1
+
+        set j to j + 1
+
+    set x to 1
+    repeat while x <= 5:
+        set payload to get_list(share_payloads and (x - 1))
+        set payload_hex to raw_to_hex(payload and secret_len * 2)
+        set share_str to f"{x}:{payload_hex}"
+        set ok to append_list(shares_list and share_str)
+        set ok to free_bytes(payload)
+        set x to x + 1
+
+    set ok to free_bytes(secret_raw)
+    free_list(share_payloads)
+    return shares_list
+
+define shamir_reconstruct_key with shares as List returning Str:
+    set shares_count to length_list(shares)
+    if shares_count < 3:
+        return ""
+
+    set share1 to get_list(shares and 0)
+    set share2 to get_list(shares and 1)
+    set share3 to get_list(shares and 2)
+
+    set x1 to get_character(share1 and 0) - 48
+    set x2 to get_character(share2 and 0) - 48
+    set x3 to get_character(share3 and 0) - 48
+
+    set hex1 to substring(share1 and 2 and string_length(share1) - 2)
+    set hex2 to substring(share2 and 2 and string_length(share2) - 2)
+    set hex3 to substring(share3 and 2 and string_length(share3) - 2)
+
+    set payload_len to string_length(hex1) / 2
+    set secret_len to payload_len / 2
+
+    set p1 to alloc_bytes(payload_len)
+    set p2 to alloc_bytes(payload_len)
+    set p3 to alloc_bytes(payload_len)
+
+    set ok to hex_to_raw(hex1 and p1 and payload_len)
+    set ok to hex_to_raw(hex2 and p2 and payload_len)
+    set ok to hex_to_raw(hex3 and p3 and payload_len)
+
+    set reconstructed to alloc_bytes(secret_len)
+
+    set j to 0
+    repeat while j < secret_len:
+        set offset to j * 2
+        set y1 to peek_byte(p1 and offset) * 256 + peek_byte(p1 and (offset + 1))
+        set y2 to peek_byte(p2 and offset) * 256 + peek_byte(p2 and (offset + 1))
+        set y3 to peek_byte(p3 and offset) * 256 + peek_byte(p3 and (offset + 1))
+
+        # Lagrange interpolation term calculations
+        set num1 to (y1 * x2 * x3) modulo 257
+        set den1 to (mod_sub(x2 and x1) * mod_sub(x3 and x1)) modulo 257
+        set term1 to mod_div(num1 and den1)
+
+        set num2 to (y2 * x1 * x3) modulo 257
+        set den2 to (mod_sub(x1 and x2) * mod_sub(x3 and x2)) modulo 257
+        set term2 to mod_div(num2 and den2)
+
+        set num3 to (y3 * x1 * x2) modulo 257
+        set den3 to (mod_sub(x1 and x3) * mod_sub(x2 and x3)) modulo 257
+        set term3 to mod_div(num3 and den3)
+
+        set reconstructed_byte to (term1 + term2 + term3) modulo 257
+        poke_byte(reconstructed and j and reconstructed_byte)
+
+        set j to j + 1
+
+    set reconstructed_hex to raw_to_hex(reconstructed and secret_len)
+
+    set ok to free_bytes(p1)
+    set ok to free_bytes(p2)
+    set ok to free_bytes(p3)
+    set ok to free_bytes(reconstructed)
+
+    return reconstructed_hex

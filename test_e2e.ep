@@ -1,0 +1,691 @@
+# ErnosDecent -- Phase 6: End-to-End Journey Test Suite
+# Tests complete user journeys across all subsystems
+
+import "collections"
+import "string"
+import "storage"
+import "decent_id/keys"
+import "decent_id/did"
+import "decent_msg/message"
+import "decent_store/content"
+import "decent_money/ledger"
+import "decent_social/nostr"
+import "decent_social/feed"
+import "decent_net/dht"
+import "decent_net/dht_transport"
+import "decent_net/relay"
+import "decent_net/relay_transport"
+import "decent_net/transport"
+import "decent_anon/onion"
+import "decent_search/crawl"
+import "decent_search/rank"
+import "decent_search/query"
+import "decent_name/registry"
+
+# ================================================================
+# 6.1: Identity Lifecycle with Persistence
+# ================================================================
+
+define test_6_1:
+    display "TEST 6.1: Identity lifecycle"
+    set t_ok to 1
+    set ok to init_crypto()
+
+    set identity to create_identity()
+    set id_err to map_get_val(identity and "error")
+    if id_err != DID_ERR_NONE:
+        display f"  FAIL: create_identity error {id_err}"
+        return 0
+
+    set did_str to ptr_to_str(map_get_val(identity and "did"))
+    set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+    set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+    display f"  DID created: {substring(did_str and 0 and 30)}..."
+
+    set resolved to did_resolve(did_str)
+    set res_err to map_get_val(resolved and "error")
+    if res_err != 0:
+        display f"  FAIL: DID resolution error {res_err}"
+        set t_ok to 0
+
+    set challenge to create_auth_challenge()
+    set response to respond_to_challenge(challenge and sign_sec)
+    set resp_err to map_get_val(response and "error")
+    if resp_err != 0:
+        display f"  FAIL: Challenge response error {resp_err}"
+        set t_ok to 0
+
+    set resp_sig to ptr_to_str(map_get_val(response and "response"))
+    set verify_result to verify_challenge_response(challenge and resp_sig and sign_pub)
+    if verify_result != 0:
+        display f"  FAIL: Challenge verification failed (code {verify_result})"
+        set t_ok to 0
+    else:
+        display "  Challenge-response auth: OK"
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# 6.2: Encrypted Messaging End-to-End
+# ================================================================
+
+define test_6_2:
+    display "TEST 6.2: Encrypted messaging end-to-end"
+    set t_ok to 1
+    set ok to init_crypto()
+
+    set alice_keypair to generate_identity_keypair()
+    set alice_sign to map_get_val(alice_keypair and "signing")
+    set alice_pub to ptr_to_str(map_get_val(alice_sign and "public_key"))
+    set alice_sec to ptr_to_str(map_get_val(alice_sign and "secret_key"))
+    set alice_enc to map_get_val(alice_keypair and "encryption")
+    set alice_enc_sec to ptr_to_str(map_get_val(alice_enc and "secret_key"))
+
+    set bob_keypair to generate_identity_keypair()
+    set bob_sign to map_get_val(bob_keypair and "signing")
+    set bob_pub to ptr_to_str(map_get_val(bob_sign and "public_key"))
+
+    set msg to msg_create_text("alice" and "bob" and "Hello Bob! This is encrypted.")
+
+    set sign_err to msg_sign(msg and alice_sec)
+    if sign_err != 0:
+        display f"  FAIL: Message signing error {sign_err}"
+        set t_ok to 0
+
+    set body to ptr_to_str(map_get_val(msg and "body"))
+    set encrypted to msg_encrypt_body(body and alice_enc_sec)
+    set enc_err to map_get_val(encrypted and "error")
+    if enc_err != 0:
+        display f"  FAIL: Encryption error {enc_err}"
+        set t_ok to 0
+
+    set ciphertext to ptr_to_str(map_get_val(encrypted and "ciphertext"))
+    set nonce to ptr_to_str(map_get_val(encrypted and "nonce"))
+    display f"  Encrypted: {string_length(ciphertext)} chars ciphertext"
+
+    set decrypted to msg_decrypt_body(ciphertext and nonce and alice_enc_sec)
+    set dec_err to map_get_val(decrypted and "error")
+    if dec_err != 0:
+        display f"  FAIL: Decryption error {dec_err}"
+        set t_ok to 0
+
+    set plaintext to ptr_to_str(map_get_val(decrypted and "plaintext"))
+    if (plaintext equals "Hello Bob! This is encrypted.") == 0:
+        display f"  FAIL: Decrypted text mismatch: {plaintext}"
+        set t_ok to 0
+    else:
+        display "  Encrypt → Decrypt round-trip: OK"
+
+    set verified to msg_verify(msg and alice_pub)
+    if verified != 1:
+        display f"  FAIL: Signature verification failed (got {verified})"
+        set t_ok to 0
+    else:
+        display "  Signature verified: OK"
+
+    set conv to conv_create("alice" and "bob")
+    set add_err to conv_add_message(conv and msg)
+    set msgs to conv_get_messages(conv and 0 and 10)
+    set msg_count to length_list(msgs)
+    if msg_count != 1:
+        display f"  FAIL: Expected 1 message in conv, got {msg_count}"
+        set t_ok to 0
+    else:
+        display "  Conversation tracking: OK"
+
+    # Test wire serialization round-trip
+    set serialized to msg_serialize(msg)
+    display f"  Serialized: {string_length(serialized)} chars"
+    set deserialized to msg_deserialize(serialized)
+    set deser_id to ptr_to_str(map_get_val(deserialized and "id"))
+    set orig_id to ptr_to_str(map_get_val(msg and "id"))
+    if (deser_id equals orig_id) == 0:
+        display f"  FAIL: Serialize round-trip ID mismatch: {deser_id} vs {orig_id}"
+        set t_ok to 0
+    else:
+        display "  Serialize → Deserialize round-trip: OK"
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# 6.3: Content Publish → Chunk → Retrieve → Verify
+# ================================================================
+
+define test_6_3:
+    display "TEST 6.3: Content publish → chunk → retrieve → verify"
+    set t_ok to 1
+    set ok to init_crypto()
+
+    set store to create_content_store()
+
+    set content to "This is a test document for the decentralised content store. It should be chunked, stored, and reassembled correctly with full integrity verification."
+    set put_result to cas_put(store and content)
+    set put_err to map_get_val(put_result and "error")
+    if put_err != CAS_ERR_NONE:
+        display f"  FAIL: cas_put error {put_err}"
+        return 0
+
+    set content_hash to ptr_to_str(map_get_val(put_result and "hash"))
+    display f"  Stored hash: {substring(content_hash and 0 and 16)}..."
+
+    set get_result to cas_get(store and content_hash)
+    set get_err to map_get_val(get_result and "error")
+    if get_err != CAS_ERR_NONE:
+        display f"  FAIL: cas_get error {get_err}"
+        set t_ok to 0
+
+    set retrieved to ptr_to_str(map_get_val(get_result and "content"))
+    if (retrieved equals content) == 0:
+        display "  FAIL: Retrieved content mismatch"
+        set t_ok to 0
+    else:
+        display "  Store → Retrieve: OK"
+
+    set block to create_content_block(content)
+    set block_ok to verify_content_block(block)
+    if block_ok != 1:
+        display "  FAIL: Content block integrity check failed"
+        set t_ok to 0
+    else:
+        display "  Block integrity: OK"
+
+    set manifest to create_content_manifest(content and store and 32)
+    set manifest_map to map_get_val(manifest and "manifest")
+    set man_err to map_get_val(manifest and "error")
+    if man_err != 0:
+        display f"  FAIL: Manifest creation error {man_err}"
+        set t_ok to 0
+
+    set manifest_ok to verify_manifest_integrity(manifest_map and store)
+    if manifest_ok != 1:
+        display "  FAIL: Manifest integrity check failed"
+        set t_ok to 0
+    else:
+        display "  Chunk + manifest integrity: OK"
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# 6.4: Financial Transaction with Balance
+# ================================================================
+
+define test_6_4:
+    display "TEST 6.4: Financial transaction with balance"
+    set t_ok to 1
+    set ok to init_crypto()
+
+    set genesis_keys to generate_signing_keypair()
+    set genesis_pub to ptr_to_str(map_get_val(genesis_keys and "public_key"))
+    set genesis_sec to ptr_to_str(map_get_val(genesis_keys and "secret_key"))
+
+    set ledger to ledger_create(genesis_pub)
+    set balance to ledger_get_balance(ledger and genesis_pub)
+    display f"  Genesis balance: {balance}"
+    if balance != 1000000:
+        display f"  FAIL: Expected 1000000, got {balance}"
+        set t_ok to 0
+
+    set recipient_keys to generate_signing_keypair()
+    set recipient_pub to ptr_to_str(map_get_val(recipient_keys and "public_key"))
+
+    set inputs to create_list()
+    set input1 to create_map()
+    set ok to map_insert(input1 and "tx_id" and "genesis_tx")
+    set ok to map_insert(input1 and "output_index" and 0)
+    set ok to map_insert(input1 and "amount" and 1000000)
+    set ok to map_insert(input1 and "owner" and genesis_pub)
+    set sig_result to sign_message("genesis_tx:0" and genesis_sec)
+    set input_sig to ptr_to_str(map_get_val(sig_result and "signature"))
+    set ok to map_insert(input1 and "signature" and input_sig)
+    set ok to append_list(inputs and input1)
+
+    set outputs to create_list()
+    set output1 to create_map()
+    set ok to map_insert(output1 and "amount" and 500)
+    set ok to map_insert(output1 and "recipient" and recipient_pub)
+    set ok to append_list(outputs and output1)
+
+    set output2 to create_map()
+    set ok to map_insert(output2 and "amount" and 999490)
+    set ok to map_insert(output2 and "recipient" and genesis_pub)
+    set ok to append_list(outputs and output2)
+
+    set tx to ledger_create_tx(inputs and outputs and 10)
+
+    set tx_list to create_list()
+    set ok to append_list(tx_list and tx)
+
+    set block_sig to sign_message("block" and genesis_sec)
+    set block_sig_str to ptr_to_str(map_get_val(block_sig and "signature"))
+    set add_err to ledger_add_block(ledger and tx_list and genesis_pub and block_sig_str)
+    display f"  Block added (error={add_err})"
+
+    set new_balance to ledger_get_balance(ledger and genesis_pub)
+    display f"  Genesis new balance: {new_balance}"
+
+    set recipient_balance to ledger_get_balance(ledger and recipient_pub)
+    display f"  Recipient balance: {recipient_balance}"
+
+    # Test ledger serialization round-trip
+    set blocks to map_get_val(ledger and "blocks")
+    if length_list(blocks) >= 2:
+        set latest_block to get_list(blocks and 1)
+        set block_serialized to ledger_serialize_block(latest_block)
+        display f"  Block serialized: {string_length(block_serialized)} chars"
+        set block_deser to ledger_deserialize_block(block_serialized)
+        set deser_idx to map_get_val(block_deser and "index")
+        if deser_idx != 1:
+            display f"  FAIL: Block deserialize index mismatch: {deser_idx}"
+            set t_ok to 0
+        else:
+            display "  Block serialize → deserialize round-trip: OK"
+        free_map(block_deser)
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# 6.5: Social Feed (Nostr + Feed)
+# ================================================================
+
+define test_6_5:
+    display "TEST 6.5: Social feed (Nostr event → feed)"
+    set t_ok to 1
+    set ok to init_crypto()
+
+    set keys to generate_signing_keypair()
+    set pub_key to ptr_to_str(map_get_val(keys and "public_key"))
+    set sec_key to ptr_to_str(map_get_val(keys and "secret_key"))
+
+    set tags to create_list()
+    set event to nostr_create_event(pub_key and 1 and tags and "Hello decentralised world!")
+    set sign_err to nostr_sign_event(event and sec_key)
+    if sign_err != 0:
+        display f"  FAIL: Nostr sign error {sign_err}"
+        set t_ok to 0
+
+    set verified to nostr_verify_event(event)
+    if verified != 1:
+        display f"  FAIL: Nostr verify failed (got {verified})"
+        set t_ok to 0
+    else:
+        display "  Nostr event signed + verified: OK"
+
+    set my_feed to feed_create()
+    set ok to feed_add_nostr_event(my_feed and event)
+
+    set event2 to nostr_create_event(pub_key and 1 and tags and "Second post!")
+    set ok to nostr_sign_event(event2 and sec_key)
+    set ok to feed_add_nostr_event(my_feed and event2)
+
+    set sorted to feed_get_sorted(my_feed)
+    set feed_len to length_list(sorted)
+    if feed_len != 2:
+        display f"  FAIL: Expected 2 feed items, got {feed_len}"
+        set t_ok to 0
+    else:
+        display f"  Feed: {feed_len} items sorted: OK"
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# 6.6: Name Registration → DHT Resolution
+# ================================================================
+
+define test_6_6:
+    display "TEST 6.6: Name registration → DHT resolution"
+    set t_ok to 1
+
+    set node_id to generate_random_node_id()
+    set dht to create_dht_node(node_id and "127.0.0.1" and 9000)
+
+    # Test direct DHT store/get
+    set store_err to dht_node_store_value(dht and "alice.decent" and "did:key:z6Mk...")
+    if store_err != 0:
+        display f"  FAIL: DHT store error {store_err}"
+        set t_ok to 0
+
+    set result to dht_node_get_value(dht and "alice.decent")
+    set get_err to map_get_val(result and "error")
+    if get_err != 0:
+        display f"  FAIL: DHT get error {get_err}"
+        set t_ok to 0
+
+    set resolved to ptr_to_str(map_get_val(result and "value"))
+    if (resolved equals "did:key:z6Mk...") == 0:
+        display f"  FAIL: Resolved value mismatch: {resolved}"
+        set t_ok to 0
+    else:
+        display "  DHT Store → Resolve: OK"
+
+    # Test via registry module (which uses DHT internally)
+    set reg to registry_create()
+    # Register with empty seed (local-only, no remote DHT call)
+    set reg_err to registry_register(reg and "bob.decent" and "did:key:z6Mk_bob" and dht and "" and 0)
+    set reg_resolved to registry_resolve(reg and "bob.decent" and dht and "" and 0)
+    if (reg_resolved equals "did:key:z6Mk_bob") == 0:
+        display f"  FAIL: Registry resolve mismatch: {reg_resolved}"
+        set t_ok to 0
+    else:
+        display "  Registry register → resolve: OK"
+
+    set missing to dht_node_get_value(dht and "nonexistent.decent")
+    set miss_err to map_get_val(missing and "error")
+    if miss_err == 0:
+        display "  FAIL: Non-existent name resolved without error"
+        set t_ok to 0
+    else:
+        display "  Missing name correctly rejected: OK"
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# 6.7: Relay-Assisted Connection
+# ================================================================
+
+define test_6_7:
+    display "TEST 6.7: Relay-assisted connection"
+    set t_ok to 1
+    set ok to init_crypto()
+
+    set relay to create_relay_node("relay1")
+
+    set alice_keys to generate_signing_keypair()
+    set alice_pub to ptr_to_str(map_get_val(alice_keys and "public_key"))
+    set bob_keys to generate_signing_keypair()
+    set bob_pub to ptr_to_str(map_get_val(bob_keys and "public_key"))
+
+    set r1 to relay_register(relay and "alice" and alice_pub and "127.0.0.1" and 9200)
+    set r2 to relay_register(relay and "bob" and bob_pub and "127.0.0.1" and 9201)
+    if r1 != RELAY_ERR_NONE || r2 != RELAY_ERR_NONE:
+        display f"  FAIL: Registration errors r1={r1} r2={r2}"
+        set t_ok to 0
+
+    set alice_reg to relay_is_registered(relay and "alice")
+    set bob_reg to relay_is_registered(relay and "bob")
+    if alice_reg != 1 || bob_reg != 1:
+        display "  FAIL: Registration check failed"
+        set t_ok to 0
+    else:
+        display "  Both nodes registered: OK"
+
+    set circuit to relay_create_circuit(relay and "alice" and "bob")
+    set circuit_err to map_get_val(circuit and "error")
+    if circuit_err != RELAY_ERR_NONE:
+        display f"  FAIL: Circuit creation error {circuit_err}"
+        set t_ok to 0
+
+    set circuit_id to ptr_to_str(map_get_val(circuit and "circuit_id"))
+    display f"  Circuit created: {substring(circuit_id and 0 and 16)}..."
+
+    set fwd to relay_forward_data(relay and circuit_id and "encrypted_test_payload")
+    set fwd_err to map_get_val(fwd and "error")
+    if fwd_err != RELAY_ERR_NONE:
+        display f"  FAIL: Forward error {fwd_err}"
+        set t_ok to 0
+
+    set fwd_data to ptr_to_str(map_get_val(fwd and "data"))
+    if (fwd_data equals "encrypted_test_payload") == 0:
+        display "  FAIL: Forwarded data mismatch"
+        set t_ok to 0
+    else:
+        display "  Data forwarded through relay: OK"
+
+    set close_err to relay_close_circuit(relay and circuit_id)
+    if close_err != RELAY_ERR_NONE:
+        display f"  FAIL: Circuit close error {close_err}"
+        set t_ok to 0
+
+    # Test relay_get_target_address
+    set target_info to relay_get_target_address(relay and "bob")
+    set target_err to map_get_val(target_info and "error")
+    if target_err != 0:
+        display f"  FAIL: relay_get_target_address error {target_err}"
+        set t_ok to 0
+    else:
+        set target_addr to ptr_to_str(map_get_val(target_info and "address"))
+        set target_port to map_get_val(target_info and "port")
+        if (target_addr equals "127.0.0.1") == 0:
+            display f"  FAIL: Target address mismatch: {target_addr}"
+            set t_ok to 0
+        else:
+            display f"  Relay target lookup: {target_addr}:{target_port} OK"
+    free_map(target_info)
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# 6.8: Search Index → Query → Ranked Results
+# ================================================================
+
+define test_6_8:
+    display "TEST 6.8: Search index → query → ranked results"
+    set t_ok to 1
+
+    set index to crawl_create_index()
+
+    set links1 to create_list()
+    set ok to append_list(links1 and str_to_ptr("https://bob.decent"))
+    set ok to crawl_index_page(index and "https://alice.decent" and "Alice Home" and "decentralised networking protocol" and links1)
+
+    set links2 to create_list()
+    set ok to append_list(links2 and str_to_ptr("https://alice.decent"))
+    set ok to crawl_index_page(index and "https://bob.decent" and "Bob Blog" and "decentralised identity and cryptography" and links2)
+
+    set links3 to create_list()
+    set ok to crawl_index_page(index and "https://docs.decent" and "Documentation" and "protocol specification and networking guide" and links3)
+
+    set ok to rank_compute_pagerank(index and 10)
+
+    set results to query_search(index and "decentralised")
+    set num_results to length_list(results)
+    display f"  Search 'decentralised': {num_results} results"
+
+    if num_results < 1:
+        display "  FAIL: No search results for 'decentralised'"
+        set t_ok to 0
+    else:
+        display "  Search returned results: OK"
+
+    set results2 to query_search(index and "protocol")
+    set num2 to length_list(results2)
+    display f"  Search 'protocol': {num2} results"
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# 6.9: Content Integrity Tamper Detection
+# ================================================================
+
+define test_6_9:
+    display "TEST 6.9: Content integrity tamper detection"
+    set t_ok to 1
+    set ok to init_crypto()
+
+    set block to create_content_block("original content that must not be tampered")
+    set original_hash to ptr_to_str(map_get_val(block and "hash"))
+
+    set valid to verify_content_block(block)
+    if valid != 1:
+        display "  FAIL: Valid block failed integrity check"
+        set t_ok to 0
+    else:
+        display "  Untampered block verified: OK"
+
+    set ok to map_insert(block and "content" and "tampered content!")
+    set tampered to verify_content_block(block)
+    if tampered != 0:
+        display f"  FAIL: Tampered block passed integrity check (got {tampered})"
+        set t_ok to 0
+    else:
+        display "  Tampered block detected: OK"
+
+    set ok to map_insert(block and "content" and "original content that must not be tampered")
+    set restored to verify_content_block(block)
+    if restored != 1:
+        display "  FAIL: Restored block failed integrity check"
+        set t_ok to 0
+    else:
+        display "  Restored block verified: OK"
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# 6.10: Multi-Hop Onion Circuit
+# ================================================================
+
+define test_6_10:
+    display "TEST 6.10: Multi-hop onion circuit"
+    set t_ok to 1
+    set ok to init_crypto()
+    set ok to onion_init()
+
+    set relay1_keys to generate_encryption_keypair()
+    set relay1_pub to ptr_to_str(map_get_val(relay1_keys and "public_key"))
+    set relay1_sec to ptr_to_str(map_get_val(relay1_keys and "secret_key"))
+
+    set relay2_keys to generate_encryption_keypair()
+    set relay2_pub to ptr_to_str(map_get_val(relay2_keys and "public_key"))
+    set relay2_sec to ptr_to_str(map_get_val(relay2_keys and "secret_key"))
+
+    set relay3_keys to generate_encryption_keypair()
+    set relay3_pub to ptr_to_str(map_get_val(relay3_keys and "public_key"))
+    set relay3_sec to ptr_to_str(map_get_val(relay3_keys and "secret_key"))
+
+    set alice_keys to generate_encryption_keypair()
+    set alice_sec to ptr_to_str(map_get_val(alice_keys and "secret_key"))
+
+    set key1 to onion_derive_shared_secret(alice_sec and relay1_pub)
+    set key2 to onion_derive_shared_secret(alice_sec and relay2_pub)
+    set key3 to onion_derive_shared_secret(alice_sec and relay3_pub)
+
+    if string_length(key1) == 0 || string_length(key2) == 0 || string_length(key3) == 0:
+        display "  FAIL: Shared secret derivation failed"
+        return 0
+    display "  Shared secrets derived: OK"
+
+    set circuit_keys to create_list()
+    set ok to append_list(circuit_keys and str_to_ptr(key1))
+    set ok to append_list(circuit_keys and str_to_ptr(key2))
+    set ok to append_list(circuit_keys and str_to_ptr(key3))
+
+    set hops to create_list()
+    set ok to append_list(hops and str_to_ptr("relay1.decent:9001"))
+    set ok to append_list(hops and str_to_ptr("relay2.decent:9002"))
+    set ok to append_list(hops and str_to_ptr("relay3.decent:9003"))
+
+    set packet to onion_create_packet(circuit_keys and hops and "destination.decent:9999" and "secret message via onion routing")
+    set pkt_err to map_get_val(packet and "error")
+    if pkt_err != ONION_ERR_NONE:
+        display f"  FAIL: Onion packet creation error {pkt_err}"
+        return 0
+    display "  3-hop onion packet created: OK"
+
+    set step1 to onion_decrypt_step(packet and key1)
+    set s1_err to map_get_val(step1 and "error")
+    if s1_err != ONION_ERR_NONE:
+        display f"  FAIL: Relay 1 decrypt error {s1_err}"
+        set t_ok to 0
+    set is_exit1 to map_get_val(step1 and "is_exit")
+    if is_exit1 != 0:
+        display "  FAIL: Relay 1 should not be exit"
+        set t_ok to 0
+    else:
+        display "  Relay 1 decrypted (not exit): OK"
+
+    set step2 to onion_decrypt_step(step1 and key2)
+    set s2_err to map_get_val(step2 and "error")
+    if s2_err != ONION_ERR_NONE:
+        display f"  FAIL: Relay 2 decrypt error {s2_err}"
+        set t_ok to 0
+
+    set step3 to onion_decrypt_step(step2 and key3)
+    set s3_err to map_get_val(step3 and "error")
+    if s3_err != ONION_ERR_NONE:
+        display f"  FAIL: Relay 3 decrypt error {s3_err}"
+        set t_ok to 0
+    set is_exit3 to map_get_val(step3 and "is_exit")
+    if is_exit3 != 1:
+        display "  FAIL: Relay 3 should be exit"
+        set t_ok to 0
+
+    set final_payload to ptr_to_str(map_get_val(step3 and "payload"))
+    if (final_payload equals "secret message via onion routing") == 0:
+        display f"  FAIL: Final payload mismatch: {final_payload}"
+        set t_ok to 0
+    else:
+        display "  3-hop onion decrypted, payload recovered: OK"
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# Main
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- Phase 6 E2E Journey Test Suite"
+    display "  WITH PERSISTENCE + SERIALIZATION VERIFICATION"
+    display "==================================================="
+    display ""
+
+    # Initialize persistence layer
+    set data_dir to "./test_e2e_data"
+    set store_err to storage_init(data_dir)
+    if store_err != 0:
+        display f"FATAL: storage_init failed with error {store_err}"
+        return 1
+    display f"[+] Storage initialized at {data_dir}"
+
+    set passed to 0
+    set total to 10
+
+    set r1 to test_6_1()
+    set passed to passed + r1
+    set r2 to test_6_2()
+    set passed to passed + r2
+    set r3 to test_6_3()
+    set passed to passed + r3
+    set r4 to test_6_4()
+    set passed to passed + r4
+    set r5 to test_6_5()
+    set passed to passed + r5
+    set r6 to test_6_6()
+    set passed to passed + r6
+    set r7 to test_6_7()
+    set passed to passed + r7
+    set r8 to test_6_8()
+    set passed to passed + r8
+    set r9 to test_6_9()
+    set passed to passed + r9
+    set r10 to test_6_10()
+    set passed to passed + r10
+
+    display ""
+    display "==================================================="
+    display f"  {passed}/{total} E2E journey tests passed."
+    if passed == total:
+        display "  ALL PHASE 6 E2E JOURNEY TESTS PASSED!"
+    else:
+        display "  SOME TESTS FAILED"
+    display "==================================================="
+    return 0

@@ -1,0 +1,380 @@
+# ErnosPlain Rebuild of ErnOS Agent Task Scheduler
+# Component: decent_agent/scheduler.ep
+
+import "fs"
+import "os"
+import "json"
+import "collections"
+import "string"
+import "prompt"
+import "tools"
+import "memory"
+import "react_loop"
+import "../logging"
+
+external define cast_borrow_to_map with b returning Map
+
+define cast_int_to_str with val as Int returning Str:
+    set s to concat("" and ptr_to_str(val))
+    return s
+
+
+# JSON escaping helper
+define scheduler_json_escape with s as Str returning Str:
+    set len to string_length(s)
+    set result_list to create_list()
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(s and i)
+        if ch == 34: # "
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 34)
+        else:
+            if ch == 92: # \
+                set ok to append_list(result_list and 92)
+                set ok to append_list(result_list and 92)
+            else:
+                if ch == 10: # \n
+                    set ok to append_list(result_list and 92)
+                    set ok to append_list(result_list and 110)
+                else:
+                    if ch == 13: # \r
+                        set ok to append_list(result_list and 92)
+                        set ok to append_list(result_list and 114)
+                    else:
+                        if ch == 9: # \t
+                            set ok to append_list(result_list and 92)
+                            set ok to append_list(result_list and 116)
+                        else:
+                            set ok to append_list(result_list and ch)
+        set i to i + 1
+    set escaped to string_from_list(result_list)
+    free_list(result_list)
+    return escaped
+
+# Load jobs list
+define scheduler_load returning List:
+    set jobs_list to create_list()
+    set has_autonomy to 0
+    set has_token_rot to 0
+    set has_cert_rot to 0
+
+    if file_exists("config/scheduler_jobs.json") == 1:
+        set content to read_file("config/scheduler_jobs.json")
+        set root to json_parse(content)
+        if root != 0:
+            set raw_list to get_json_value(root)
+            set len to length_list(raw_list)
+            set i to 0
+            repeat while i < len:
+                set item_node to get_list(raw_list and i)
+                
+                set id_node to get_json_object_value(item_node and "id")
+                set name_node to get_json_object_value(item_node and "name")
+                set inst_node to get_json_object_value(item_node and "instruction")
+                set stype_node to get_json_object_value(item_node and "schedule_type")
+                set sval_node to get_json_object_value(item_node and "schedule_value")
+                set last_node to get_json_object_value(item_node and "last_run")
+                set en_node to get_json_object_value(item_node and "enabled")
+
+                set job_map to create_map()
+                if id_node != 0:
+                    set id_val to get_json_value(id_node)
+                    set ok to map_insert(job_map and "id" and id_val)
+                    if id_val equals "autonomy":
+                        set has_autonomy to 1
+                    if id_val equals "token_rotation":
+                        set has_token_rot to 1
+                    if id_val equals "cert_rotation":
+                        set has_cert_rot to 1
+                if name_node != 0:
+                    set ok to map_insert(job_map and "name" and get_json_value(name_node))
+                if inst_node != 0:
+                    set ok to map_insert(job_map and "instruction" and get_json_value(inst_node))
+                if stype_node != 0:
+                    set ok to map_insert(job_map and "schedule_type" and get_json_value(stype_node))
+                if sval_node != 0:
+                    set ok to map_insert(job_map and "schedule_value" and get_json_value(sval_node))
+                if last_node != 0:
+                    set ok to map_insert(job_map and "last_run" and get_json_value(last_node))
+                if en_node != 0:
+                    set ok to map_insert(job_map and "enabled" and get_json_value(en_node))
+
+                set ok to append_list(jobs_list and job_map)
+                set i to i + 1
+
+    set modified to 0
+    if has_autonomy == 0:
+        set autonomy_job to create_map()
+        set ok to map_insert(autonomy_job and "id" and "autonomy")
+        set ok to map_insert(autonomy_job and "name" and "Autonomy")
+        set ok to map_insert(autonomy_job and "instruction" and "This is your autonomous time. Act freely, making your own choices. You may use all available tools. Review your memory, consolidate lessons, run diagnostics, organise knowledge, explore your capabilities, or work on any goals you have set for yourself. Report what you accomplished.")
+        set ok to map_insert(autonomy_job and "schedule_type" and "idle")
+        set ok to map_insert(autonomy_job and "schedule_value" and "300")
+        set ok to map_insert(autonomy_job and "last_run" and "0")
+        set ok to map_insert(autonomy_job and "enabled" and "0")
+        set ok to append_list(jobs_list and autonomy_job)
+        set modified to 1
+
+    if has_token_rot == 0:
+        set token_rot_job to create_map()
+        set ok to map_insert(token_rot_job and "id" and "token_rotation")
+        set ok to map_insert(token_rot_job and "name" and "Session Token Rotation")
+        set ok to map_insert(token_rot_job and "instruction" and "Rotate session tokens and purge expired ones")
+        set ok to map_insert(token_rot_job and "schedule_type" and "interval")
+        set ok to map_insert(token_rot_job and "schedule_value" and "3600")
+        set ok to map_insert(token_rot_job and "last_run" and "0")
+        set ok to map_insert(token_rot_job and "enabled" and "1")
+        set ok to append_list(jobs_list and token_rot_job)
+        set modified to 1
+
+    if has_cert_rot == 0:
+        set cert_rot_job to create_map()
+        set ok to map_insert(cert_rot_job and "id" and "cert_rotation")
+        set ok to map_insert(cert_rot_job and "name" and "Certificate Rotation")
+        set ok to map_insert(cert_rot_job and "instruction" and "Renew step-ca intermediate certificates")
+        set ok to map_insert(cert_rot_job and "schedule_type" and "interval")
+        set ok to map_insert(cert_rot_job and "schedule_value" and "86400")
+        set ok to map_insert(cert_rot_job and "last_run" and "0")
+        set ok to map_insert(cert_rot_job and "enabled" and "1")
+        set ok to append_list(jobs_list and cert_rot_job)
+        set modified to 1
+
+    if modified == 1:
+        set ok to scheduler_save(jobs_list)
+
+    return jobs_list
+
+# Save jobs list
+define scheduler_save with jobs_list as List returning Int:
+    set json_str to "[\n"
+    set len to length_list(jobs_list)
+    set i to 0
+    repeat while i < len:
+        set job_map to get_list(jobs_list and i)
+        set id_val to cast_int_to_str(map_get_val(job_map and "id"))
+        set name_val to cast_int_to_str(map_get_val(job_map and "name"))
+        set inst_val to cast_int_to_str(map_get_val(job_map and "instruction"))
+        set stype_val to cast_int_to_str(map_get_val(job_map and "schedule_type"))
+        set sval_val to cast_int_to_str(map_get_val(job_map and "schedule_value"))
+        set last_val to cast_int_to_str(map_get_val(job_map and "last_run"))
+        set en_val to cast_int_to_str(map_get_val(job_map and "enabled"))
+
+        set json_str to concat(json_str and "  {\n")
+        set json_str to concat(json_str and f"    \"id\": \"{scheduler_json_escape(id_val)}\",\n")
+        set json_str to concat(json_str and f"    \"name\": \"{scheduler_json_escape(name_val)}\",\n")
+        set json_str to concat(json_str and f"    \"instruction\": \"{scheduler_json_escape(inst_val)}\",\n")
+        set json_str to concat(json_str and f"    \"schedule_type\": \"{scheduler_json_escape(stype_val)}\",\n")
+        set json_str to concat(json_str and f"    \"schedule_value\": \"{scheduler_json_escape(sval_val)}\",\n")
+        set json_str to concat(json_str and f"    \"last_run\": \"{scheduler_json_escape(last_val)}\",\n")
+        set json_str to concat(json_str and f"    \"enabled\": \"{scheduler_json_escape(en_val)}\"\n")
+        
+        if i < len - 1:
+            set json_str to concat(json_str and "  },\n")
+        else:
+            set json_str to concat(json_str and "  }\n")
+        set i to i + 1
+    set json_str to concat(json_str and "]")
+    set ok to write_file("config/scheduler_jobs.json" and json_str)
+    return 0
+
+# Check if job is due
+define scheduler_is_due with job as Map and now_epoch as Int and last_activity as Int returning Int:
+    set enabled_str to cast_int_to_str(map_get_val(job and "enabled"))
+    if enabled_str equals "0":
+        return 0
+
+    set stype to cast_int_to_str(map_get_val(job and "schedule_type"))
+    set sval_str to cast_int_to_str(map_get_val(job and "schedule_value"))
+    set last_run_str to cast_int_to_str(map_get_val(job and "last_run"))
+    set last_run to string_to_int(last_run_str)
+
+    if stype equals "once":
+        set target_time to string_to_int(sval_str)
+        if now_epoch >= target_time and last_run == 0:
+            return 1
+
+    if stype equals "interval":
+        set interval_secs to string_to_int(sval_str)
+        if last_run == 0:
+            return 1
+        if now_epoch - last_run >= interval_secs:
+            return 1
+
+    if stype equals "idle":
+        set idle_secs to string_to_int(sval_str)
+        if now_epoch - last_activity >= idle_secs:
+            if last_run == 0 or else now_epoch - last_run >= idle_secs:
+                return 1
+
+    return 0
+
+define perform_token_rotation returning Int:
+    log_info("scheduler" and "Running background session token rotation / cleanup...")
+    set home to get_home_dir()
+    set sess_dir to concat(home and "/.ernosdecent/auth_sessions")
+    if file_exists(sess_dir) == 0:
+        return 0
+        
+    set files to list_directory(sess_dir)
+    set len to length_list(files)
+    set now to ep_time_now_sec()
+    set i to 0
+    set cleaned_count to 0
+    
+    repeat while i < len:
+        set filename to get_list(files and i)
+        if string_contains(filename and ".json") == 1:
+            set filepath to concat(sess_dir and concat("/" and filename))
+            set content to read_file(filepath)
+            if string_length(content) > 0:
+                set root to json_parse(content)
+                if root != 0:
+                    set exp_node to get_json_object_value(root and "expires_at")
+                    if exp_node != 0:
+                        set expires_at to get_json_value(exp_node)
+                        if now >= expires_at:
+                            # Expired! Delete file
+                            set ok to fs_delete_file(filepath)
+                            set cleaned_count to cleaned_count + 1
+        set i to i + 1
+        
+    free_list(files)
+    if cleaned_count > 0:
+        log_info("scheduler" and f"Cleaned up {cleaned_count} expired session tokens.")
+    return 0
+
+define perform_cert_rotation returning Int:
+    log_info("scheduler" and "Running step-ca intermediate certificate auto-renewal check...")
+    set cert_path to "/persist/step-ca/certs/intermediate_ca.crt"
+    set key_path to "/persist/step-ca/secrets/intermediate_ca_key"
+    if file_exists(cert_path) == 1:
+        log_info("scheduler" and f"step-ca intermediate certificate found at {cert_path}. Checking renewal...")
+        set cmd to f"step ca renew --force --daemon {cert_path} {key_path}"
+        set res to run_command(cmd)
+        log_info("scheduler" and concat("step ca renew output: " and res))
+    else:
+        log_info("scheduler" and "No step-ca intermediate certificate found. Skipping cert rotation.")
+    return 0
+
+# Background execute job task
+define scheduler_execute_job with job_id as Str and instruction as Str and model as Map and memory as Map and tools as Map and ctx as Map returning Int:
+    if job_id equals "token_rotation":
+        set ok to perform_token_rotation()
+    else:
+        if job_id equals "cert_rotation":
+            set ok to perform_cert_rotation()
+        else:
+            log_info("scheduler" and concat("Executing background scheduled job: " and instruction))
+            set agent_resp to react_run(model and memory and tools and ctx and instruction)
+            log_info("scheduler" and concat("Job completed, response: " and agent_resp))
+    
+    # Reload jobs, record last_run, and save
+    set jobs_list to scheduler_load()
+    set len to length_list(jobs_list)
+    set i to 0
+    set found to 0
+    repeat while i < len:
+        set job_map to get_list(jobs_list and i)
+        set id_val to cast_int_to_str(map_get_val(job_map and "id"))
+        if id_val equals job_id:
+            set now_epoch to ep_time_now_sec()
+            set ok to map_insert(job_map and "last_run" and int_to_string(now_epoch))
+            set found to 1
+        set i to i + 1
+    if found == 1:
+        set ok to scheduler_save(jobs_list)
+    
+    free_list(jobs_list)
+    
+    set active_jobs to 0
+    if map_contains(ctx and "active_jobs") == 1:
+        set active_jobs to map_get_val(ctx and "active_jobs")
+    if active_jobs > 0:
+        set ok to map_insert(ctx and "active_jobs" and active_jobs - 1)
+        
+    return 0
+
+define get_total_ram_gb returning Int:
+    set ram_gb to 8
+    set sys_res to run_command("sysctl -n hw.memsize 2>/dev/null")
+    if string_length(sys_res) > 0:
+        set bytes to string_to_int(sys_res)
+        if bytes > 0:
+            return bytes / 1073741824
+    set mem_res to run_command("grep MemTotal /proc/meminfo 2>/dev/null")
+    if string_length(mem_res) > 0:
+        set clean_digits to ""
+        set len to string_length(mem_res)
+        set i to 0
+        repeat while i < len:
+            set ch to get_character(mem_res and i)
+            if ch >= 48 and ch <= 57:
+                set clean_digits to concat(clean_digits and substring(mem_res and i and 1))
+            set i to i + 1
+        if string_length(clean_digits) > 0:
+            set kb to string_to_int(clean_digits)
+            if kb > 0:
+                return kb / 1048576
+    return ram_gb
+
+# Background tick loop
+define scheduler_tick_loop with model as Map and memory as Map and tools as Map and ctx as Map returning Int:
+    log_info("scheduler" and "Starting background task scheduler ticker loop.")
+    
+    set ram_gb to get_total_ram_gb()
+    set ok to map_insert(ctx and "system_ram_gb" and ram_gb)
+    
+    set profile to "low"
+    if ram_gb >= 128:
+        set profile to "extreme"
+    else if ram_gb >= 64:
+        set profile to "high"
+    else if ram_gb >= 32:
+        set profile to "standard"
+    
+    set ok to map_insert(ctx and "resource_profile" and profile)
+    log_info("scheduler" and f"System RAM: {ram_gb} GB -> Profile: {profile}")
+    
+    repeat while 1 == 1:
+        # Sleep for 1 second (1000 ms)
+        set ok to sleep_ms(1000)
+        
+        set now_epoch to ep_time_now_sec()
+        
+        # Check last activity
+        set last_activity to now_epoch
+        if map_contains(ctx and "last_user_activity") == 1:
+            set last_activity_str to cast_int_to_str(map_get_val(ctx and "last_user_activity"))
+            set last_activity to string_to_int(last_activity_str)
+            
+        set jobs_list to scheduler_load()
+        set len to length_list(jobs_list)
+        set i to 0
+        repeat while i < len:
+            set job_map to get_list(jobs_list and i)
+            set is_due to scheduler_is_due(job_map and now_epoch and last_activity)
+            if is_due == 1:
+                set active_jobs to 0
+                if map_contains(ctx and "active_jobs") == 1:
+                    set active_jobs to map_get_val(ctx and "active_jobs")
+                
+                set run_job to 1
+                if profile equals "low" and active_jobs >= 1:
+                    set run_job to 0
+                    
+                if run_job == 1:
+                    set job_id to cast_int_to_str(map_get_val(job_map and "id"))
+                    set inst_val to cast_int_to_str(map_get_val(job_map and "instruction"))
+                    
+                    # Mark as running/last_run immediately in this thread to avoid multiple dispatches
+                    set ok to map_insert(job_map and "last_run" and int_to_string(now_epoch))
+                    set ok to scheduler_save(jobs_list)
+                    
+                    set ok to map_insert(ctx and "active_jobs" and active_jobs + 1)
+                    # Spawn job execution thread
+                    spawn scheduler_execute_job(job_id and inst_val and cast_borrow_to_map(model) and cast_borrow_to_map(memory) and cast_borrow_to_map(tools) and cast_borrow_to_map(ctx))
+            set i to i + 1
+            
+        free_list(jobs_list)
+    return 0

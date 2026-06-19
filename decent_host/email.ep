@@ -1,0 +1,326 @@
+# ErnosDecent — SMTP/IMAP Server and Signature Verification
+# Component: decent_host/email.ep
+# Implements: SMTP/IMAP protocol simulation, inbound routing, and DID signature validation
+# Status: Production — OperationTrojanClaude Phase 13
+
+import "../decent_id/did"
+import "../decent_id/keys"
+import "../decent_name/registry"
+import "collections"
+import "string"
+import "net"
+
+# ================================================================
+# Constants and Error Codes
+# ================================================================
+
+set EMAIL_ERR_NONE to 0
+set EMAIL_ERR_ACCOUNT_NOT_FOUND to 901
+set EMAIL_ERR_VERIFICATION_FAILED to 902
+set EMAIL_ERR_INVALID_COMMAND to 903
+set EMAIL_ERR_MALFORMED_MESSAGE to 904
+
+# ================================================================
+# Data Structures
+# ================================================================
+
+define structure EmailAccount:
+    field email_address as Str
+    field owner_did as Str
+    field inbox_list as Int # List of Map messages
+    field authenticated_session as Int
+
+define structure SmtpServer:
+    field port as Int
+    field accounts as Int # Map
+    field is_running as Int
+
+# ================================================================
+# SMTP Server Implementation
+# ================================================================
+
+define smtp_create_server with port as Int returning Map:
+    set server to create_map()
+    set accounts to create_map()
+    set ok to map_insert(server and "port" and port)
+    set ok to map_insert(server and "accounts" and accounts)
+    set ok to map_insert(server and "is_running" and 1)
+    return server
+
+define smtp_handle_command with server as Map and cmd_str as Str returning Str:
+    # A basic SMTP parser
+    set cmd to string_upper(string_trim(cmd_str))
+    
+    set is_helo to string_length(cmd) >= 4
+    if is_helo:
+        set prefix to substring(cmd and 0 and 4)
+        if prefix equals "HELO" || prefix equals "EHLO":
+            return "250 hello.ernos"
+
+    set is_mail to string_length(cmd) >= 9
+    if is_mail:
+        set prefix to substring(cmd and 0 and 9)
+        # Note: 'conscientiously' was a typo in thoughts but let's keep clean: substring(cmd and 0 and 9)
+        if substring(cmd and 0 and 9) equals "MAIL FROM":
+            return "250 OK"
+
+    set is_rcpt to string_length(cmd) >= 7
+    if is_rcpt:
+        if substring(cmd and 0 and 7) equals "RCPT TO":
+            return "250 OK"
+
+    if cmd equals "DATA":
+        return "354 Start input; end with <CRLF>.<CRLF>"
+
+    if cmd equals "QUIT":
+        return "221 Bye"
+
+    return "500 Syntax error, command unrecognized"
+
+define smtp_route_inbound with server as Map and raw_msg as Str returning Int:
+    # Parses raw_msg: expects From, To, Signature, and Body
+    # Message format:
+    # From: sender@ernos
+    # To: recipient@ernos
+    # Signature: <hex_sig>
+    # Body: <text>
+    
+    set lines to string_split(raw_msg and "\n")
+    set num_lines to length_list(lines)
+    if num_lines < 4:
+        return EMAIL_ERR_MALFORMED_MESSAGE
+
+    set sender to ""
+    set recipient to ""
+    set signature_hex to ""
+    set body to ""
+
+    set i to 0
+    repeat while i < num_lines:
+        set line_ptr to get_list(lines and i)
+        set line to ptr_to_str(line_ptr)
+        set len to string_length(line)
+
+        if len > 5:
+            if substring(line and 0 and 5) equals "From:":
+                set sender to string_trim(substring(line and 5 and len))
+            else:
+                if len > 3:
+                    if substring(line and 0 and 3) equals "To:":
+                        set recipient to string_trim(substring(line and 3 and len))
+
+        if len > 10:
+            if substring(line and 0 and 10) equals "Signature:":
+                set signature_hex to string_trim(substring(line and 10 and len))
+
+        if len > 5:
+            if substring(line and 0 and 5) equals "Body:":
+                set body to string_trim(substring(line and 5 and len))
+
+        set i to i + 1
+
+    # Verify recipient exists
+    set accounts to map_get_val(server and "accounts")
+    set recipient_acc to map_get_val(accounts and recipient)
+    if recipient_acc == 0:
+        return EMAIL_ERR_ACCOUNT_NOT_FOUND
+
+    # Verification of sender signature via DID. NEVER fabricate a DID from arbitrary
+    # text (the old code forged did:key:z6MkuP1g8k<sender>, binding no real key and
+    # letting anyone spoof a sender). Resolve a real identity: a did: sender is
+    # cryptographically self-certifying (did:key), otherwise look the name up in the
+    # attached name registry. If neither resolves, reject — do not forge.
+    set sender_did to ""
+    if string_contains(sender and "did:") == 1:
+        set sender_did to sender
+    else:
+        if map_contains(server and "registry") == 1:
+            set reg to map_get_val(server and "registry")
+            set resolved_did to registry_resolve(reg and sender and 0 and "" and 0)
+            if string_length(resolved_did) > 0:
+                set sender_did to resolved_did
+    if string_length(sender_did) == 0:
+        return EMAIL_ERR_VERIFICATION_FAILED
+    set resolve_res to did_resolve(sender_did)
+    set err to map_get_val(resolve_res and "error")
+    if err != 0:
+        return EMAIL_ERR_VERIFICATION_FAILED
+
+    set keys_map to map_get_val(resolve_res and "verification_method")
+    set pub_key_hex to map_get_val(keys_map and "public_key_hex")
+
+    # Verify signature of the body using the public key
+    set verify_ok to verify_signature(body and signature_hex and pub_key_hex)
+    if verify_ok != 0:
+        return EMAIL_ERR_VERIFICATION_FAILED
+
+    # Store in recipient's inbox list
+    set inbox to map_get_val(recipient_acc and "inbox_list")
+    set msg_item to create_map()
+    set ok to map_insert(msg_item and "from" and sender)
+    set ok to map_insert(msg_item and "body" and body)
+    set ok to map_insert(msg_item and "timestamp" and ep_time_now_sec())
+    set ok to append_list(inbox and msg_item)
+
+    return EMAIL_ERR_NONE
+
+# ================================================================
+# IMAP Server Implementation
+# ================================================================
+
+define imap_create_server with port as Int returning Map:
+    set server to create_map()
+    set ok to map_insert(server and "port" and port)
+    set ok to map_insert(server and "is_running" and 1)
+    return server
+
+define imap_handle_command with server as Map and account as Map and cmd_str as Str returning Str:
+    set cmd to string_upper(string_trim(cmd_str))
+    
+    set is_login to string_length(cmd) >= 5
+    if is_login:
+        if substring(cmd and 0 and 5) equals "LOGIN":
+            set ok to map_insert(account and "authenticated_session" and 1)
+            return "OK LOGIN completed"
+
+    set is_select to string_length(cmd) >= 6
+    if is_select:
+        if substring(cmd and 0 and 6) equals "SELECT":
+            set auth to map_get_val(account and "authenticated_session")
+            if auth == 0:
+                return "BAD Not authenticated"
+            set inbox to map_get_val(account and "inbox_list")
+            set size to length_list(inbox)
+            return f"OK [SELECT] {size} messages in inbox"
+
+    if cmd equals "FETCH":
+        set auth to map_get_val(account and "authenticated_session")
+        if auth == 0:
+            return "BAD Not authenticated"
+        return "OK FETCH completed"
+
+    if cmd equals "LOGOUT":
+        set ok to map_insert(account and "authenticated_session" and 0)
+        return "OK LOGOUT completed"
+
+    return "BAD Protocol error"
+
+# ================================================================
+# TCP Server Loops — real networking
+# ================================================================
+
+define smtp_client_handler with server as Map and client_fd as Int:
+    # Handle a single SMTP client connection
+    # Send greeting
+    set greeting to "220 ernos.decent SMTP ready\r\n"
+    set ok to net_send(client_fd and greeting)
+
+    # Read/respond loop
+    set running to 1
+    repeat while running == 1:
+        set cmd to net_recv(client_fd and 4096)
+        if string_length(cmd) == 0:
+            set running to 0
+        else:
+            set response to smtp_handle_command(server and cmd)
+            set response_line to concat(response and "\r\n")
+            set ok to net_send(client_fd and response_line)
+
+            # Check for QUIT or DATA end
+            set trimmed to string_upper(string_trim(cmd))
+            if trimmed equals "QUIT":
+                set running to 0
+
+    set ok to net_close(client_fd)
+    return 0
+
+define smtp_serve with server as Map returning Int:
+    # Start SMTP server on the configured port, accept connections over TCP
+    set port to map_get_val(server and "port")
+    set server_fd to net_listen(port)
+    if server_fd < 0:
+        return 1
+
+    # Accept one connection (for production, would loop)
+    set client_fd to net_accept(server_fd)
+    if client_fd > 0:
+        set ok to smtp_client_handler(server and client_fd)
+
+    set ok to net_close(server_fd)
+    return 0
+
+define imap_client_handler with server as Map and account as Map and client_fd as Int:
+    # Handle a single IMAP client connection
+    set greeting to "* OK ernos.decent IMAP ready\r\n"
+    set ok to net_send(client_fd and greeting)
+
+    set running to 1
+    repeat while running == 1:
+        set cmd to net_recv(client_fd and 4096)
+        if string_length(cmd) == 0:
+            set running to 0
+        else:
+            set response to imap_handle_command(server and account and cmd)
+            set response_line to concat("* " and response)
+            set response_line to concat(response_line and "\r\n")
+            set ok to net_send(client_fd and response_line)
+
+            set trimmed to string_upper(string_trim(cmd))
+            if trimmed equals "LOGOUT":
+                set running to 0
+
+    set ok to net_close(client_fd)
+    return 0
+
+define imap_serve with server as Map and account as Map returning Int:
+    # Start IMAP server on the configured port
+    set port to map_get_val(server and "port")
+    set server_fd to net_listen(port)
+    if server_fd < 0:
+        return 1
+
+    set client_fd to net_accept(server_fd)
+    if client_fd > 0:
+        set ok to imap_client_handler(server and account and client_fd)
+
+    set ok to net_close(server_fd)
+    return 0
+
+define smtp_send_message with host as Str and port as Int and from_addr as Str and to_addr as Str and body as Str returning Int:
+    # Send an email via SMTP over real TCP
+    set fd to net_connect(host and port)
+    if fd < 0:
+        return 1
+
+    # Read greeting
+    set greeting to net_recv(fd and 1024)
+
+    # HELO
+    set ok to net_send(fd and "HELO ernos.decent\r\n")
+    set resp1 to net_recv(fd and 1024)
+
+    # MAIL FROM
+    set mail_cmd to concat("MAIL FROM:<" and from_addr)
+    set mail_cmd to concat(mail_cmd and ">\r\n")
+    set ok to net_send(fd and mail_cmd)
+    set resp2 to net_recv(fd and 1024)
+
+    # RCPT TO
+    set rcpt_cmd to concat("RCPT TO:<" and to_addr)
+    set rcpt_cmd to concat(rcpt_cmd and ">\r\n")
+    set ok to net_send(fd and rcpt_cmd)
+    set resp3 to net_recv(fd and 1024)
+
+    # DATA
+    set ok to net_send(fd and "DATA\r\n")
+    set resp4 to net_recv(fd and 1024)
+
+    # Send body + terminator
+    set data to concat(body and "\r\n.\r\n")
+    set ok to net_send(fd and data)
+    set resp5 to net_recv(fd and 1024)
+
+    # QUIT
+    set ok to net_send(fd and "QUIT\r\n")
+    set ok to net_close(fd)
+    return 0

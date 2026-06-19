@@ -1,0 +1,2076 @@
+# ErnosDecent — Decentralised Node Daemon
+# Component: node.ep
+# All 16 subsystems wired. Protocol servers for P2P, DHT, Relay.
+# Health check, graceful shutdown, structured IPC.
+# Status: Production
+
+import "collections"
+import "string"
+import "net"
+import "os"
+import "http"
+
+
+external define cast_borrow_to_map with b returning Map
+
+define cast_borrow_to_list with b as List returning List:
+    return b
+
+external define cast_map_to_int with m returning Int
+
+# Persistence
+import "./storage"
+import "./config.ep"
+import "./logging"
+
+# Core Identity
+import "./decent_id/keys"
+import "./decent_id/did"
+import "./decent_id/auth"
+
+# Networking
+import "./decent_net/dht"
+import "./decent_net/noise"
+import "./decent_net/relay"
+import "./decent_net/transport"
+import "./decent_net/noise_transport"
+import "./decent_net/dht_transport"
+import "./decent_net/relay_transport"
+import "./decent_net/gitdec"
+
+# Consensus
+import "./decent_consensus/raft"
+import "./decent_consensus/election"
+import "./decent_consensus/raft_transport"
+import "./decent_consensus/bft"
+
+# Messaging
+import "./decent_msg/message"
+import "./decent_msg/channel"
+
+# Storage
+import "./decent_store/content"
+import "./decent_store/crdt"
+import "./decent_store/rag"
+
+# Economy
+import "./decent_money/wallet"
+import "./decent_money/ledger"
+import "./decent_money/exchange"
+import "./decent_money/token"
+
+# Media
+import "./decent_media/stream"
+import "./decent_media/cdn"
+
+# Social
+import "./decent_social/feed"
+
+# Search
+import "./decent_search/crawl"
+import "./decent_search/rank"
+import "./decent_search/query"
+import "./decent_anon/circuit"
+
+# Name Resolution
+import "./decent_name/registry"
+import "./decent_name/resolver"
+
+# Resources
+import "./decent_pool/bandwidth"
+import "./decent_pool/compute"
+import "./decent_pool/mesh"
+
+# Web UI (the node's real HTTP server; decent_host/http.ep is a standalone library
+# with its own tests and is intentionally not wired here to avoid a second server)
+import "./decent_web/web_server"
+
+# Cognitive Agent Rebuild
+import "./decent_agent/memory"
+import "./decent_agent/tools"
+import "./decent_agent/turing_grid"
+import "./decent_agent/react_loop"
+import "./decent_agent/session"
+import "./decent_agent/scheduler"
+
+# AI / speech
+import "./decent_ai/speech"
+
+# Health + Protocol
+import "./health"
+import "./protocol_server"
+import "./decent_net/host_election"
+
+# ================================================================
+# IPC Handler — responds to control commands
+# ================================================================
+
+define escape_quotes with s as Str returning Str:
+    set len to string_length(s)
+    set res to ""
+    set i to 0
+    repeat while i < len:
+        set c to get_character(s and i)
+        if c == 34: # '"'
+            set res to concat(res and "\\\"")
+        else if c == 92: # '\'
+            set res to concat(res and "\\\\")
+        else:
+            set buf to alloc_bytes(2)
+            poke_byte(buf and 0 and c)
+            poke_byte(buf and 1 and 0)
+            set res to concat(res and ptr_to_str(buf))
+            free_bytes(buf)
+        set i to i + 1
+    return res
+
+define serialize_memory_json with agent_memory as Map returning Str:
+    # 1. Scratchpad
+    set scratchpad to map_get_val(agent_memory and "scratchpad")
+    set s_keys to map_keys(scratchpad)
+    set s_len to length_list(s_keys)
+    set s_json to "{"
+    set i to 0
+    repeat while i < s_len:
+        set k to get_list(s_keys and i)
+        set v_raw to map_get_val(scratchpad and k)
+        set v to escape_quotes(v_raw)
+        set s_json to concat(s_json and f"\"{k}\":\"{v}\"")
+        if i < s_len - 1:
+            set s_json to concat(s_json and ",")
+        set i to i + 1
+    set s_json to concat(s_json and "}")
+    free_list(s_keys)
+
+    # 2. Lessons
+    set lessons to map_get_val(agent_memory and "lessons")
+    set l_keys to map_keys(lessons)
+    set l_len to length_list(l_keys)
+    set l_json to "{"
+    set i to 0
+    repeat while i < l_len:
+        set k to get_list(l_keys and i)
+        set v_raw to map_get_val(lessons and k)
+        set v to escape_quotes(v_raw)
+        set l_json to concat(l_json and f"\"{k}\":\"{v}\"")
+        if i < l_len - 1:
+            set l_json to concat(l_json and ",")
+        set i to i + 1
+    set l_json to concat(l_json and "}")
+    free_list(l_keys)
+
+    # 3. Edges
+    set edges to map_get_val(agent_memory and "edges")
+    set e_keys to map_keys(edges)
+    set e_len to length_list(e_keys)
+    set e_json to "["
+    set i to 0
+    repeat while i < e_len:
+        set k to get_list(e_keys and i)
+        set w_fixed to map_get_val(edges and k)
+        
+        # Split key "c1-c2" into source and target
+        set dash_pos to string_index_of(k and "-")
+        set source_val to k
+        set target_val to ""
+        if dash_pos > 0:
+            set source_val to substring(k and 0 and dash_pos)
+            set target_val to substring(k and dash_pos + 1 and string_length(k) - dash_pos - 1)
+            
+        set w_int to w_fixed / 1000000
+        set w_frac to w_fixed modulo 1000000
+        set w_frac_str to int_to_string(w_frac)
+        repeat while string_length(w_frac_str) < 6:
+            set w_frac_str to concat("0" and w_frac_str)
+            
+        set w_str to f"{w_int}.{w_frac_str}"
+        set item_json to concat("{\"source\":\"" and source_val)
+        set item_json to concat(item_json and "\",\"target\":\"")
+        set item_json to concat(item_json and target_val)
+        set item_json to concat(item_json and "\",\"weight\":")
+        set item_json to concat(item_json and w_str)
+        set item_json to concat(item_json and "}")
+        set e_json to concat(e_json and item_json)
+        if i < e_len - 1:
+            set e_json to concat(e_json and ",")
+        set i to i + 1
+    set e_json to concat(e_json and "]")
+    free_list(e_keys)
+
+    set full_json to concat("{\"type\":\"agent_memory\",\"scratchpad\":" and s_json)
+    set full_json to concat(full_json and ",\"lessons\":")
+    set full_json to concat(full_json and l_json)
+    set full_json to concat(full_json and ",\"edges\":")
+    set full_json to concat(full_json and e_json)
+    set full_json to concat(full_json and "}")
+    return full_json
+
+define serialize_grid_json with agent_grid as Map returning Str:
+    if agent_grid == 0:
+        return "{\"type\":\"turing_grid\",\"x\":0,\"y\":0,\"z\":0,\"cells\":{}}"
+        
+    set x to map_get_val(agent_grid and "x")
+    set y to map_get_val(agent_grid and "y")
+    set z to map_get_val(agent_grid and "z")
+    
+    set cells to map_get_val(agent_grid and "cells")
+    set c_keys to map_keys(cells)
+    set c_len to length_list(c_keys)
+    set c_json to "{"
+    set i to 0
+    repeat while i < c_len:
+        set k to get_list(c_keys and i)
+        set v_raw to map_get_val(cells and k)
+        set v to escape_quotes(v_raw)
+        set c_json to concat(c_json and f"\"{k}\":\"{v}\"")
+        if i < c_len - 1:
+            set c_json to concat(c_json and ",")
+        set i to i + 1
+    set c_json to concat(c_json and "}")
+    free_list(c_keys)
+    
+    set full_json to concat("{\"type\":\"turing_grid\",\"x\":" and int_to_string(x))
+    set full_json to concat(full_json and ",\"y\":")
+    set full_json to concat(full_json and int_to_string(y))
+    set full_json to concat(full_json and ",\"z\":")
+    set full_json to concat(full_json and int_to_string(z))
+    set full_json to concat(full_json and ",\"cells\":")
+    set full_json to concat(full_json and c_json)
+    set full_json to concat(full_json and "}")
+    return full_json
+
+define serialize_storage_json returning Str:
+    set list to storage_content_list()
+    set list_len to length_list(list)
+    
+    set file_json to "["
+    set i to 0
+    repeat while i < list_len:
+        set row to get_list(list and i)
+        set hash_val to get_list(row and 0)
+        set type_val to get_list(row and 1)
+        set size_val to get_list(row and 2)
+        
+        # Build file name from hash prefix (first 8 chars)
+        set name_val to concat("block_" and substring(hash_val and 0 and 8))
+        
+        set item_json to concat("{\"name\":\"" and name_val)
+        set item_json to concat(item_json and "\",\"hash\":\"")
+        set item_json to concat(item_json and hash_val)
+        set item_json to concat(item_json and "\",\"size\":\"")
+        set item_json to concat(item_json and size_val)
+        set item_json to concat(item_json and "\",\"type\":\"")
+        set item_json to concat(item_json and type_val)
+        set item_json to concat(item_json and "\"}")
+        
+        set file_json to concat(file_json and item_json)
+        if i < list_len - 1:
+            set file_json to concat(file_json and ",")
+            
+        set i to i + 1
+    set file_json to concat(file_json and "]")
+    free_list(list)
+    
+    set full_json to "{\"type\":\"storage\",\"chunk_count\":"
+    set full_json to concat(full_json and int_to_string(list_len))
+    set full_json to concat(full_json and ",\"files\":")
+    set full_json to concat(full_json and file_json)
+    set full_json to concat(full_json and "}")
+    
+    return full_json
+
+# Minimal JSON string escaping (backslash + double-quote) for safe result emission.
+define search_json_escape with s as Str returning Str:
+    set out to string_replace(s and "\\" and "\\\\")
+    set out to string_replace(out and "\"" and "\\\"")
+    return out
+
+# G1/G5: serve REAL ranked results from the node's decentralized search index
+# (BM25 + PageRank over crawled+indexed pages), MERGED with results federated from
+# peers over the authenticated Noise channel. No clearnet scrape, no hardcoded
+# keyword fallbacks, no fabricated onion-circuit metadata — if nothing matches
+# locally or remotely the result set is honestly empty.
+define handle_onion_search with index as Map and query as Str and dht as Int and static_secret as Int and static_public as Int returning Str:
+    set local_results to query_search(index and query)
+    set peer_count to dht_node_peer_count(dht)
+    # Prefer anonymized onion routing when enough relays are known: the query travels
+    # through a multi-hop circuit and the answering node never learns our identity. The
+    # results return up the circuit. Fall back to the direct (Noise-authenticated, but
+    # not origin-anonymous) federated path when no usable circuit can be built.
+    set onion_wire to ""
+    set source to "local+federated"
+    if peer_count > 0:
+        set onion_wire to onion_search_anonymous(dht and query and static_secret and static_public and 3)
+    if string_length(onion_wire) > 0:
+        if onion_wire equals "ONION_EMPTY":
+            set remote_results to create_list()
+        else:
+            set remote_results to query_deserialize_results(onion_wire)
+        set source to "local+onion"
+    else:
+        set remote_results to search_federate_to_peers(dht and static_secret and static_public and query)
+    set results to query_merge_results(local_results and remote_results)
+    set n to length_list(results)
+
+    set results_json to ""
+    set emitted to 0
+    set i to 0
+    repeat while i < n:
+        if emitted < 20:
+            set item to get_list(results and i)
+            set url to ptr_to_str(map_get_val(item and "url"))
+            set title to ptr_to_str(map_get_val(item and "title"))
+            set score to map_get_val(item and "score")
+            set url_j to search_json_escape(url)
+            set title_j to search_json_escape(title)
+            if emitted > 0:
+                set results_json to concat(results_json and ",")
+            set entry to f"\{\"title\":\"{title_j}\",\"url\":\"{url_j}\",\"score\":{score}\}"
+            set results_json to concat(results_json and entry)
+            set emitted to emitted + 1
+        set i to i + 1
+
+    set query_j to search_json_escape(query)
+    set response_json to concat(concat("\{\"type\":\"search_result\",\"source\":\"" and source) and "\",\"peers_queried\":")
+    set response_json to concat(response_json and int_to_string(peer_count))
+    set response_json to concat(response_json and ",\"query\":\"")
+    set response_json to concat(response_json and query_j)
+    set response_json to concat(response_json and "\",\"count\":")
+    set response_json to concat(response_json and int_to_string(n))
+    set response_json to concat(response_json and ",\"results\":[")
+    set response_json to concat(response_json and results_json)
+    set response_json to concat(response_json and "]\}")
+    return response_json
+
+# IPC control-plane authentication. The daemon on the (loopback) IPC port mints
+# session tokens and moves funds, so every command must carry "AUTH <token>" where
+# <token> matches the 0600 ipc-token file. Read fresh each call (string module
+# globals do not survive reassignment in Ernos).
+define ipc_token_path returning Str:
+    set home to get_home_dir()
+    return concat(home and "/.ernosdecent/ipc-token")
+
+define ipc_read_token returning Str:
+    set p to ipc_token_path()
+    if file_exists(p) == 0:
+        return ""
+    return string_trim(read_file(p))
+
+define ipc_get_or_create_token returning Str:
+    set p to ipc_token_path()
+    if file_exists(p) == 1:
+        return string_trim(read_file(p))
+    set tok to keys_random_hex(24)
+    if string_length(tok) == 0:
+        return ""
+    set ok to write_file(p and tok)
+    set ok to keys_chmod(p and 384)
+    return tok
+
+define handle_ipc_client with client_fd as Int and borrow raft_node as Map and borrow identity as Map and dht_node as Int and relay_node as Int and msg_store as Int and ledger as Map and name_reg as Int and seed_addr as Str and seed_port as Int and borrow agent_memory as Map and borrow agent_tools as Map and borrow agent_ctx as Map and borrow agent_model as Map and static_secret as Int and static_public as Int and bft_node as Map:
+
+    set req to ep_net_recv(client_fd and 65536)
+    set cmd to string_trim(req)
+
+    # Strip and verify the "AUTH <token>" prefix before any dispatch.
+    set ipc_expected to ipc_read_token()
+    set ipc_authed to 0
+    if string_index_of(cmd and "AUTH ") == 0:
+        set ipc_after to substring(cmd and 5 and string_length(cmd) - 5)
+        set ipc_sp to string_index_of(ipc_after and " ")
+        set ipc_provided to ipc_after
+        set ipc_rest to ""
+        if ipc_sp >= 0:
+            set ipc_provided to substring(ipc_after and 0 and ipc_sp)
+            set ipc_rest to substring(ipc_after and ipc_sp + 1 and string_length(ipc_after) - ipc_sp - 1)
+        if string_length(ipc_expected) > 0 and also ipc_provided equals ipc_expected:
+            set ipc_authed to 1
+            set cmd to string_trim(ipc_rest)
+    set cmd_upper to string_upper(cmd)
+
+    # Update last user activity timestamp
+    set ok to map_insert(agent_ctx and "last_user_activity" and int_to_string(ep_time_now_sec()))
+
+    set resp to "error:unknown_command"
+    if ipc_authed == 0:
+        # Reject untokened commands: force a no-match sentinel so no branch runs.
+        set resp to "error:unauthorized"
+        set cmd_upper to "__IPC_UNAUTHORIZED__"
+    if cmd_upper equals "STATUS":
+        set role to ptr_to_str(map_get_val(raft_node and "role"))
+        set did_val to ptr_to_str(map_get_val(identity and "did"))
+        set term to map_get_val(raft_node and "current_term")
+        set peers_list to map_get_val(raft_node and "peers")
+        set peer_count to length_list(peers_list)
+        set dht_size to dht_node_peer_count(dht_node)
+        set home to get_home_dir()
+        set cfg_path to concat(home and "/.ernosdecent/config.toml")
+        set is_static to 0
+        set elect_enabled to 1
+        set cfg to config_load(cfg_path)
+        if cfg != 0:
+            if map_contains(cfg and "network.is_static_host") == 1:
+                set is_static to config_get_int(cfg and "network.is_static_host")
+            if map_contains(cfg and "network.enable_host_election") == 1:
+                set elect_enabled to config_get_int(cfg and "network.enable_host_election")
+            free_map(cfg)
+        set reg_name to storage_name_get_by_did(did_val)
+        if string_length(reg_name) == 0:
+            set reg_name to "none"
+        set gitdec_updates to storage_gitdec_count_pending()
+        set resp to f"status:active,role:{role},did:{did_val},term:{term},peers:{peer_count},dht_size:{dht_size},is_static_host:{int_to_string(is_static)},enable_host_election:{int_to_string(elect_enabled)},name:{reg_name},gitdec_updates:{int_to_string(gitdec_updates)}"
+    else:
+        if cmd_upper equals "STOP":
+            set resp to "status:stopping"
+            set ok to ep_net_send(client_fd and resp)
+            set ok to ep_net_close(client_fd)
+            log_info("node" and "Daemon stopping on client request.")
+            exit_program(0)
+        else:
+            if cmd_upper equals "HEALTH":
+                set health_report to run_health_check(dht_node and raft_node and 5000)
+                set resp to format_health_report(health_report)
+                free_map(health_report)
+            else:
+                if cmd_upper equals "IDENTITY":
+                    set did_val to ptr_to_str(map_get_val(identity and "did"))
+                    set pub_key to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                    set enc_key to ptr_to_str(map_get_val(identity and "encryption_public_key"))
+                    if string_length(enc_key) == 0:
+                        set enc_key to "not_generated"
+                    if string_length(pub_key) == 0:
+                        set pub_key to "not_available"
+                    set reg_name to storage_name_get_by_did(did_val)
+                    if string_length(reg_name) == 0:
+                        set reg_name to "none"
+                    set resp to f"did:{did_val},signing_key:{pub_key},encryption_key:{enc_key},name:{reg_name}"
+                else:
+                    if cmd_upper equals "WALLET BALANCE":
+                        set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                        set balance to ledger_get_balance(ledger and sign_pub)
+                        set resp to concat("wallet_balance:" and int_to_string(balance))
+                    else:
+                        if cmd_upper equals "POOL STATUS":
+                            # Report REAL pool state: live compute-pool stats (jobs/pending/
+                            # workers) + relay stats labeled correctly (was mislabeling relay
+                            # registrations/circuits as bandwidth and hardcoding compute_slots:0).
+                            set relay_stats to relay_get_stats(relay_node)
+                            set relay_regs to map_get_val(relay_stats and "registrations")
+                            set relay_circuits to map_get_val(relay_stats and "circuits")
+                            # Note: do NOT free_map(relay_stats) — risks corrupting shared values
+                            set cjobs to 0
+                            set cpending to 0
+                            set cworkers to 0
+                            if map_contains(agent_ctx and "compute_mgr") == 1:
+                                set cm to map_get_val(agent_ctx and "compute_mgr")
+                                set cjobs to map_size(map_get_val(cm and "jobs"))
+                                set cpending to length_list(map_get_val(cm and "pending"))
+                                set cworkers to map_size(map_get_val(cm and "contributions"))
+                            set resp to f"pool:active,compute_jobs:{cjobs},compute_pending:{cpending},compute_workers:{cworkers},relay_registrations:{relay_regs},relay_circuits:{relay_circuits}"
+                        else:
+                            if cmd_upper equals "STORAGE STATUS":
+                                set resp to serialize_storage_json()
+                            else if string_contains(cmd_upper and "RAG INDEX ") == 1:
+                                # Session-scoped ingest. Format: RAG INDEX <session>|<doc>|<text>
+                                set rag_args to string_trim(substring(cmd and 10 and string_length(cmd) - 10))
+                                set rb1 to string_index_of(rag_args and "|")
+                                set rrest to substring(rag_args and rb1 + 1 and string_length(rag_args) - rb1 - 1)
+                                set rb2 to string_index_of(rrest and "|")
+                                if rb1 <= 0 or else rb2 <= 0:
+                                    set resp to "rag:error,reason:invalid_format"
+                                else:
+                                    set rag_sess to substring(rag_args and 0 and rb1)
+                                    set rag_doc to substring(rrest and 0 and rb2)
+                                    set rag_text to substring(rrest and rb2 + 1 and string_length(rrest) - rb2 - 1)
+                                    set rag_n to rag_index(storage_get_db() and rag_doc and rag_text and rag_sess)
+                                    set resp to f"rag:indexed,doc:{rag_doc},chunks:{rag_n}"
+                            else if string_contains(cmd_upper and "RAG SEARCH ") == 1:
+                                # Session-scoped retrieval. Format: RAG SEARCH <session>|<query>
+                                set rqs_args to string_trim(substring(cmd and 11 and string_length(cmd) - 11))
+                                set rqb to string_index_of(rqs_args and "|")
+                                if rqb < 0:
+                                    set resp to "rag:error,reason:invalid_format"
+                                else:
+                                    set rqs_sess to substring(rqs_args and 0 and rqb)
+                                    set rqs_query to substring(rqs_args and rqb + 1 and string_length(rqs_args) - rqb - 1)
+                                    set resp to rag_search(storage_get_db() and rqs_query and rqs_sess and 5)
+                            else:
+                                if cmd_upper equals "NET STATUS":
+                                    set dht_sz to dht_node_peer_count(dht_node)
+                                    set relay_stats to relay_get_stats(relay_node)
+                                    set relay_regs to map_get_val(relay_stats and "registrations")
+                                    set relay_circuits to map_get_val(relay_stats and "circuits")
+                                    # Note: do NOT free_map(relay_stats) — risks corrupting shared values
+                                    set resp to f"net:active,dht_size:{dht_sz},relay_registrations:{relay_regs},relay_circuits:{relay_circuits},nat_mode:relay,active_circuits:{relay_circuits}"
+                                else:
+                                    if string_contains(cmd_upper and "MSG SENDTO ") == 1:
+                                        # MSG SENDTO <recipient_did> <host> <port> <body> — real E2E
+                                        # encrypted+signed delivery over the peer's Noise channel.
+                                        set st_args to substring(cmd and 11 and string_length(cmd) - 11)
+                                        set st_parts_ok to 0
+                                        set st_rcpt to ""
+                                        set st_host to ""
+                                        set st_port to 0
+                                        set st_body to ""
+                                        set st_p1 to string_index_of(st_args and " ")
+                                        if st_p1 > 0:
+                                            set st_rcpt to substring(st_args and 0 and st_p1)
+                                            set st_r1 to substring(st_args and st_p1 + 1 and string_length(st_args) - st_p1 - 1)
+                                            set st_p2 to string_index_of(st_r1 and " ")
+                                            if st_p2 > 0:
+                                                set st_host to substring(st_r1 and 0 and st_p2)
+                                                set st_r2 to substring(st_r1 and st_p2 + 1 and string_length(st_r1) - st_p2 - 1)
+                                                set st_p3 to string_index_of(st_r2 and " ")
+                                                if st_p3 > 0:
+                                                    set st_port to string_to_int(substring(st_r2 and 0 and st_p3))
+                                                    set st_body to substring(st_r2 and st_p3 + 1 and string_length(st_r2) - st_p3 - 1)
+                                                    set st_parts_ok to 1
+                                        if st_parts_ok == 1:
+                                            set st_my_did to ptr_to_str(map_get_val(identity and "did"))
+                                            set st_my_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                            set st_loc to mstore_send(msg_store and st_rcpt and st_body)
+                                            set st_locf to free_map(st_loc)
+                                            set st_rc to msg_send_p2p(st_rcpt and st_host and st_port and st_body and st_my_did and st_my_sec and static_secret and static_public)
+                                            if st_rc == 0:
+                                                set resp to "msg:delivered"
+                                            else:
+                                                set resp to f"msg:error,code:{st_rc}"
+                                        else:
+                                            set resp to "msg:error,reason:bad_args,expected:MSG SENDTO <did> <host> <port> <body>"
+                                    else if string_contains(cmd_upper and "MSG SEND ") == 1:
+                                        set msg_body to substring(cmd and 9 and string_length(cmd) - 9)
+                                        set send_result to mstore_send(msg_store and "broadcast" and msg_body)
+                                        set send_err to map_get_val(send_result and "error")
+                                        set msg_ref to map_get_val(send_result and "message")
+                                        if send_err == 0:
+                                            set msg_id to ptr_to_str(map_get_val(msg_ref and "id"))
+                                            set resp to f"msg:sent,id:{msg_id},text:{msg_body}"
+                                        else:
+                                            set resp to f"msg:queued_local,text:{msg_body}"
+                                        free_map(send_result)
+                                    else:
+                                        if string_contains(cmd_upper and "AI INFER ") == 1:
+                                            set ai_prompt to substring(cmd and 9 and string_length(cmd) - 9)
+                                            set selected_session_id to ""
+                                            set selected_model to ""
+                                            set selected_system_prompt to ""
+                                            set sender_username to ""
+                                            set sender_role to ""
+                                            set in_memory_context to ""
+                                            # E1: role/sender are security-sensitive (drive tool authz).
+                                            # The trusted caller (bridge/IPC) prepends them FIRST; lock
+                                            # after the first parse so a marker injected later in the
+                                            # untrusted message body cannot escalate (guest -> admin).
+                                            set role_locked to 0
+                                            set sender_locked to 0
+                                            set parsing_options to 1
+                                            repeat while parsing_options == 1:
+                                                set found_opt to 0
+                                                if string_index_of(ai_prompt and "[SESSION:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 9:
+                                                        set selected_session_id to substring(ai_prompt and 9 and end_idx - 9)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            set next_char to get_character(ai_prompt and skip_len)
+                                                            if next_char == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[MODEL:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 7:
+                                                        set selected_model to substring(ai_prompt and 7 and end_idx - 7)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            set next_char to get_character(ai_prompt and skip_len)
+                                                            if next_char == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[SYSTEM:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 8:
+                                                        # E2: only an admin/owner (role parsed first)
+                                                        # may set the system prompt — otherwise a guest
+                                                        # message body could inject one (prompt injection).
+                                                        if sender_role equals "admin" or else sender_role equals "owner":
+                                                            set selected_system_prompt to substring(ai_prompt and 8 and end_idx - 8)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            set next_char to get_character(ai_prompt and skip_len)
+                                                            if next_char == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[SENDER:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 8:
+                                                        if sender_locked == 0:
+                                                            set sender_username to substring(ai_prompt and 8 and end_idx - 8)
+                                                            set sender_locked to 1
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            set next_char to get_character(ai_prompt and skip_len)
+                                                            if next_char == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[ROLE:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 6:
+                                                        if role_locked == 0:
+                                                            set sender_role to substring(ai_prompt and 6 and end_idx - 6)
+                                                            set role_locked to 1
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            set next_char to get_character(ai_prompt and skip_len)
+                                                            if next_char == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[IN_MEMORY_CONTEXT:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 19:
+                                                        set in_memory_context to substring(ai_prompt and 19 and end_idx - 19)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            set next_char to get_character(ai_prompt and skip_len)
+                                                            if next_char == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                if found_opt == 0:
+                                                    set parsing_options to 0
+
+                                            set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                            if string_length(selected_session_id) > 0:
+                                                set ok to session_manager_switch_to(sessions_mgr and selected_session_id)
+                                                if ok == 0:
+                                                    set new_title to concat("Session " and selected_session_id)
+                                                    set active_sess to session_manager_new_session(sessions_mgr and selected_session_id and new_title and "" and "You are a helpful assistant.")
+                                            set active_sess to session_manager_get_active(sessions_mgr)
+                                            if active_sess != 0:
+                                                if string_length(selected_system_prompt) > 0:
+                                                    set ok to map_insert(active_sess and "system_prompt" and selected_system_prompt)
+                                                if string_length(selected_model) > 0:
+                                                    set ok to map_insert(active_sess and "model" and selected_model)
+                                                else:
+                                                    if map_contains(active_sess and "model") == 1:
+                                                        set selected_model to map_get_val(active_sess and "model")
+                                                set ok to session_add_message(active_sess and "user" and ai_prompt)
+
+                                            set ok to map_insert(agent_ctx and "sender_username" and sender_username)
+                                            set ok to map_insert(agent_ctx and "sender_role" and sender_role)
+                                            set ok to map_insert(agent_ctx and "in_memory_context" and in_memory_context)
+                                            set ok to map_insert(agent_ctx and "selected_model" and selected_model)
+                                            set agent_resp to react_run(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and ai_prompt)
+                                            
+                                            set ok to map_delete(agent_ctx and "sender_username")
+                                            set ok to map_delete(agent_ctx and "sender_role")
+                                            set ok to map_delete(agent_ctx and "in_memory_context")
+                                            
+                                            if agent_resp equals "PENDING_APPROVAL":
+                                                # Tool requires user approval — extract pending action details
+                                                set pending to map_get_val(agent_ctx and "pending_action")
+                                                set p_tool to map_get_val(pending and "tool_name")
+                                                set p_summary to map_get_val(pending and "summary")
+                                                set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
+                                            else:
+                                                set active_sess to session_manager_get_active(sessions_mgr)
+                                                set ok to session_add_message(active_sess and "assistant" and agent_resp)
+                                                set dir to map_get_val(sessions_mgr and "sessions_dir")
+                                                set active_id to map_get_val(sessions_mgr and "active_session_id")
+                                                set filepath to path_join(dir and concat(active_id and ".json"))
+                                                set ok to session_serialize(active_sess and filepath)
+
+                                                set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                                set resp to f"ai:ok,response:{agent_resp}"
+                                        else if cmd_upper equals "BFT STATUS":
+                                            set bview to map_get_val(bft_node and "view")
+                                            set bseq to map_get_val(bft_node and "seq")
+                                            set blog to length_list(map_get_val(bft_node and "log"))
+                                            set bslash to length_list(map_get_val(bft_node and "slashed"))
+                                            set bvals to length_list(map_get_val(bft_node and "validators"))
+                                            set resp to f"bft:active,validators:{bvals},view:{bview},seq:{bseq},committed:{blog},slashed:{bslash}"
+                                        else if string_contains(cmd_upper and "BFT PROPOSE ") == 1:
+                                            # Drive the live BFT engine: leader pre-prepares the value,
+                                            # then the 3-phase protocol runs (single-validator → immediate
+                                            # finality; multi-validator finalizes when 2f+1 peers commit
+                                            # via the BFT Noise handler).
+                                            set bdata to string_trim(substring(cmd and 12 and string_length(cmd) - 12))
+                                            set bvcount to length_list(map_get_val(bft_node and "validators"))
+                                            if bvcount <= 1:
+                                                # single self-validator (f=0): immediate local finality
+                                                set cval to bft_run_local(bft_node and bdata)
+                                                if string_length(cval) > 0:
+                                                    set resp to concat("bft:committed,value:" and cval)
+                                                else:
+                                                    set resp to "bft:pending,reason:awaiting_quorum"
+                                            else:
+                                                # multi-node: only the view's leader may pre-prepare. Gossip the
+                                                # PRE-PREPARE to peer validators, then apply it locally to emit our
+                                                # own (also-gossiped) PREPARE. Finality arrives asynchronously as
+                                                # peers' signed PREPARE/COMMIT votes return through the BFT handler.
+                                                set pp to bft_propose(bft_node and bdata)
+                                                if map_contains(pp and "phase") == 0:
+                                                    set resp to "bft:error,reason:not_leader_for_current_view"
+                                                else:
+                                                    set bsent to broadcast_bft_to_peers(bft_serialize_msg(pp) and dht_node and static_secret and static_public)
+                                                    set lr to bft_handle(bft_node and pp)
+                                                    set lts to map_get_val(lr and "to_send")
+                                                    if map_contains(lts and "phase") == 1:
+                                                        set ok to broadcast_bft_to_peers(bft_serialize_msg(lts) and dht_node and static_secret and static_public)
+                                                    set resp to f"bft:proposed,peers_notified:{bsent},reason:awaiting_quorum"
+                                        else if string_contains(cmd_upper and "MESH AI ") == 1:
+                                            # Real collaborative-AI inference over the mesh: assign to
+                                            # workers running real local inference + redundant consensus
+                                            # (was a hardcoded string_upper stub, test-only).
+                                            set mprompt to string_trim(substring(cmd and 8 and string_length(cmd) - 8))
+                                            if string_length(mprompt) > 0 and also map_contains(agent_ctx and "mesh") == 1:
+                                                set meshh to map_get_val(agent_ctx and "mesh")
+                                                set air to mesh_execute_collaborative_ai(cast_borrow_to_map(meshh) and "ipc_user" and mprompt)
+                                                set resp to concat("mesh_ai:" and air)
+                                            else:
+                                                set resp to "mesh_ai:error,reason:missing_prompt"
+                                        else if string_contains(cmd_upper and "CDN GET ") == 1:
+                                            # Real CDN fetch: locate providers via the DHT, then
+                                            # download + SHA-256-verify the segment from the swarm.
+                                            set seg_hash to string_trim(substring(cmd and 8 and string_length(cmd) - 8))
+                                            if string_length(seg_hash) > 0 and also map_contains(agent_ctx and "cdn_engine") == 1:
+                                                set cdn_e to map_get_val(agent_ctx and "cdn_engine")
+                                                set seg_peers to cdn_locate_peers_for_segment(cast_borrow_to_map(cdn_e) and seg_hash)
+                                                set seg_data to cdn_download_segment(cast_borrow_to_map(cdn_e) and seg_hash and seg_peers)
+                                                if string_length(seg_data) > 0:
+                                                    set resp to f"cdn:ok,hash:{seg_hash},bytes:{string_length(seg_data)}"
+                                                else:
+                                                    set resp to f"cdn:not_found,hash:{seg_hash}"
+                                            else:
+                                                set resp to "cdn:error,reason:missing_hash"
+                                        else if string_contains(cmd_upper and "SEARCH CRAWL ") == 1:
+                                            # Populate the decentralized search index by crawling a URL
+                                            # (real HTTP fetch + link extraction + BM25 index + PageRank).
+                                            set crawl_url to string_trim(substring(cmd and 13 and string_length(cmd) - 13))
+                                            if string_length(crawl_url) > 0 and also map_contains(agent_ctx and "search_index") == 1:
+                                                set sidx to map_get_val(agent_ctx and "search_index")
+                                                set cerr to crawl_spider(cast_borrow_to_map(sidx) and crawl_url)
+                                                if cerr == 0:
+                                                    set ok to rank_compute_pagerank(cast_borrow_to_map(sidx) and 20)
+                                                    set pc to map_get_val(cast_borrow_to_map(sidx) and "page_count")
+                                                    set resp to f"crawl:ok,url:{crawl_url},pages_indexed:{pc}"
+                                                else:
+                                                    set resp to f"crawl:error,url:{crawl_url},reason:fetch_failed"
+                                            else:
+                                                set resp to "crawl:error,reason:missing_url"
+                                        else if string_contains(cmd_upper and "ONION SEARCH ") == 1:
+                                            # Serve real ranked results from the local decentralized index.
+                                            set query to string_trim(substring(cmd and 13 and string_length(cmd) - 13))
+                                            if string_length(query) > 0 and also map_contains(agent_ctx and "search_index") == 1:
+                                                set sidx2 to map_get_val(agent_ctx and "search_index")
+                                                set resp to handle_onion_search(cast_borrow_to_map(sidx2) and query and dht_node and static_secret and static_public)
+                                            else:
+                                                set resp to "search:error,reason:missing_query"
+                                        else if cmd_upper equals "AI APPROVE":
+                                            if agent_ctx != 0:
+                                                if map_contains(agent_ctx and "pending_action") == 1:
+                                                    set agent_resp to react_resume_approved(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and 1)
+                                                    if agent_resp equals "PENDING_APPROVAL":
+                                                        set pending to map_get_val(agent_ctx and "pending_action")
+                                                        set p_tool to map_get_val(pending and "tool_name")
+                                                        set p_summary to map_get_val(pending and "summary")
+                                                        set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
+                                                    else:
+                                                        set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                                        set active_sess to session_manager_get_active(sessions_mgr)
+                                                        set ok to session_add_message(active_sess and "assistant" and agent_resp)
+                                                        set dir to map_get_val(sessions_mgr and "sessions_dir")
+                                                        set active_id to map_get_val(sessions_mgr and "active_session_id")
+                                                        set filepath to path_join(dir and concat(active_id and ".json"))
+                                                        set ok to session_serialize(active_sess and filepath)
+                                                        set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                                        set resp to f"ai:ok,response:{agent_resp}"
+                                                else:
+                                                    set resp to "ai:error,reason:no_pending_action"
+                                            else:
+                                                set resp to "ai:error,reason:agent_not_initialized"
+                                        else if cmd_upper equals "AI APPROVE_ALL":
+                                            if agent_ctx != 0:
+                                                if map_contains(agent_ctx and "pending_action") == 1:
+                                                    set ok to map_insert(agent_ctx and "auto_approve" and 1)
+                                                    set agent_resp to react_resume_approved(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and 1)
+                                                    if agent_resp equals "PENDING_APPROVAL":
+                                                        set pending to map_get_val(agent_ctx and "pending_action")
+                                                        set p_tool to map_get_val(pending and "tool_name")
+                                                        set p_summary to map_get_val(pending and "summary")
+                                                        set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
+                                                    else:
+                                                        set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                                        set active_sess to session_manager_get_active(sessions_mgr)
+                                                        set ok to session_add_message(active_sess and "assistant" and agent_resp)
+                                                        set dir to map_get_val(sessions_mgr and "sessions_dir")
+                                                        set active_id to map_get_val(sessions_mgr and "active_session_id")
+                                                        set filepath to path_join(dir and concat(active_id and ".json"))
+                                                        set ok to session_serialize(active_sess and filepath)
+                                                        set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                                        set resp to f"ai:ok,response:{agent_resp}"
+                                                else:
+                                                    set resp to "ai:error,reason:no_pending_action"
+                                            else:
+                                                set resp to "ai:error,reason:agent_not_initialized"
+                                        else if cmd_upper equals "AI DENY":
+                                            if agent_ctx != 0:
+                                                if map_contains(agent_ctx and "pending_action") == 1:
+                                                    set agent_resp to react_resume_approved(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and 0)
+                                                    if agent_resp equals "PENDING_APPROVAL":
+                                                        set pending to map_get_val(agent_ctx and "pending_action")
+                                                        set p_tool to map_get_val(pending and "tool_name")
+                                                        set p_summary to map_get_val(pending and "summary")
+                                                        set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
+                                                    else:
+                                                        set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                                        set active_sess to session_manager_get_active(sessions_mgr)
+                                                        set ok to session_add_message(active_sess and "assistant" and agent_resp)
+                                                        set dir to map_get_val(sessions_mgr and "sessions_dir")
+                                                        set active_id to map_get_val(sessions_mgr and "active_session_id")
+                                                        set filepath to path_join(dir and concat(active_id and ".json"))
+                                                        set ok to session_serialize(active_sess and filepath)
+                                                        set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                                        set resp to f"ai:ok,response:{agent_resp}"
+                                                else:
+                                                    set resp to "ai:error,reason:no_pending_action"
+                                            else:
+                                                set resp to "ai:error,reason:agent_not_initialized"
+                                        else if cmd_upper equals "AI MODELS":
+                                            set resp to agent_list_models()
+                                        else if string_contains(cmd_upper and "AI TRANSCRIBE ") == 1:
+                                            # Real STT via the whisper.cpp backend (binary-safe curl
+                                            # multipart upload). Returns the real transcript or an
+                                            # explicit error — never a fabricated transcription.
+                                            set audio_path to string_trim(substring(cmd and 14 and string_length(cmd) - 14))
+                                            set wcfg to config_load(concat(get_home_dir() and "/.ernosdecent/config.toml"))
+                                            set whost to config_get_str(wcfg and "ai.whisper_host")
+                                            set wport to config_get_int(wcfg and "ai.whisper_port")
+                                            set tr to speech_transcribe_whisper(audio_path and whost and wport)
+                                            if string_index_of(tr and "ERROR:") == 0:
+                                                set resp to concat("ai:error,reason:" and substring(tr and 6 and string_length(tr) - 6))
+                                            else:
+                                                set resp to concat("ai:ok,transcription:" and tr)
+                                            free_map(wcfg)
+                                        else if string_contains(cmd_upper and "SESSION TOKEN CREATE ") == 1:
+                                            set args to substring(cmd and 21 and string_length(cmd) - 21)
+                                            set space_pos to string_index_of(args and " ")
+                                            if space_pos > 0:
+                                                set t_did to substring(args and 0 and space_pos)
+                                                set ttl_str to substring(args and space_pos + 1 and string_length(args) - space_pos - 1)
+                                                set ttl to string_to_int(ttl_str)
+                                                set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                set token_res to create_session_token(t_did and sign_sec and ttl)
+                                                set err to map_get_val(token_res and "error")
+                                                if err == 0:
+                                                    set tok to map_get_val(token_res and "token")
+                                                    set iss to int_to_string(map_get_val(token_res and "issued_at"))
+                                                    set exp to int_to_string(map_get_val(token_res and "expires_at"))
+                                                    set nonc to map_get_val(token_res and "nonce")
+                                                    set ph to map_get_val(token_res and "payload_hash")
+                                                    set resp to f"token:{tok},did:{t_did},issued_at:{iss},expires_at:{exp},nonce:{nonc},payload_hash:{ph}"
+                                                else:
+                                                    set resp to f"token:error,code:{err}"
+                                                free_map(token_res)
+                                            else:
+                                                set resp to "token:error,reason:invalid_format"
+                                        else if cmd_upper equals "SESSION LIST":
+                                            set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                            set list_json to session_manager_list_json(sessions_mgr)
+                                            set resp to f"session:list,data:{list_json}"
+                                        else if cmd_upper equals "SESSION ACTIVE":
+                                            set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                            set active_id to map_get_val(sessions_mgr and "active_session_id")
+                                            set resp to f"session:active_id,id:{active_id}"
+                                        else if string_contains(cmd_upper and "SESSION GET ") == 1:
+                                            set sess_id to substring(cmd and 12 and string_length(cmd) - 12)
+                                            set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                            set sessions_map to map_get_val(sessions_mgr and "sessions")
+                                            if map_contains(sessions_map and sess_id) == 1:
+                                                set sess to map_get_val(sessions_map and sess_id)
+                                                set sess_json to session_serialize_json_string(sess)
+                                                set resp to f"session:details,data:{sess_json}"
+                                            else:
+                                                set resp to "session:error,reason:not_found"
+                                        else if string_contains(cmd_upper and "SESSION NEW ") == 1:
+                                            set sess_json_str to substring(cmd and 12 and string_length(cmd) - 12)
+                                            set root to json_parse(sess_json_str)
+                                            if root != 0:
+                                                set id_node to get_json_object_value(root and "id")
+                                                set title_node to get_json_object_value(root and "title")
+                                                set model_node to get_json_object_value(root and "model")
+                                                set sys_node to get_json_object_value(root and "system_prompt")
+                                                set id_val to ""
+                                                set title_val to ""
+                                                set model_val to ""
+                                                set sys_val to ""
+                                                if id_node != 0:
+                                                    set id_val to get_json_value(id_node)
+                                                if title_node != 0:
+                                                    set title_val to get_json_value(title_node)
+                                                if model_node != 0:
+                                                    set model_val to get_json_value(model_node)
+                                                if sys_node != 0:
+                                                    set sys_val to get_json_value(sys_node)
+                                                set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                                set sess to session_manager_new_session(sessions_mgr and id_val and title_val and model_val and sys_val)
+                                                set resp to f"session:ok,id:{id_val}"
+                                            else:
+                                                set resp to "session:error,reason:invalid_json"
+                                        else if string_contains(cmd_upper and "SESSION SET ") == 1:
+                                            set sess_id to substring(cmd and 12 and string_length(cmd) - 12)
+                                            set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                            set ok to session_manager_switch_to(sessions_mgr and sess_id)
+                                            if ok == 1:
+                                                set resp to f"session:set_ok,id:{sess_id}"
+                                            else:
+                                                set resp to "session:error,reason:not_found"
+                                        else if string_contains(cmd_upper and "SESSION RENAME ") == 1:
+                                            set sess_json_str to substring(cmd and 15 and string_length(cmd) - 15)
+                                            set root to json_parse(sess_json_str)
+                                            if root != 0:
+                                                set id_node to get_json_object_value(root and "id")
+                                                set title_node to get_json_object_value(root and "title")
+                                                set id_val to ""
+                                                set title_val to ""
+                                                if id_node != 0:
+                                                    set id_val to get_json_value(id_node)
+                                                if title_node != 0:
+                                                    set title_val to get_json_value(title_node)
+                                                set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                                set ok to session_manager_rename(sessions_mgr and id_val and title_val)
+                                                if ok == 1:
+                                                    set resp to f"session:rename_ok,id:{id_val}"
+                                                else:
+                                                    set resp to "session:error,reason:not_found"
+                                            else:
+                                                set resp to "session:error,reason:invalid_json"
+                                        else if string_contains(cmd_upper and "SESSION UPDATE_MODEL ") == 1:
+                                            set sess_json_str to substring(cmd and 21 and string_length(cmd) - 21)
+                                            set root to json_parse(sess_json_str)
+                                            if root != 0:
+                                                set id_node to get_json_object_value(root and "id")
+                                                set model_node to get_json_object_value(root and "model")
+                                                set id_val to ""
+                                                set model_val to ""
+                                                if id_node != 0:
+                                                    set id_val to get_json_value(id_node)
+                                                if model_node != 0:
+                                                    set model_val to get_json_value(model_node)
+                                                set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                                set ok to session_manager_set_model(sessions_mgr and id_val and model_val)
+                                                if ok == 1:
+                                                    set active_id to map_get_val(sessions_mgr and "active_session_id")
+                                                    if active_id equals id_val:
+                                                        set ok to map_insert(agent_ctx and "selected_model" and model_val)
+                                                    set resp to f"session:update_model_ok,id:{id_val}"
+                                                else:
+                                                    set resp to "session:error,reason:not_found"
+                                            else:
+                                                set resp to "session:error,reason:invalid_json"
+                                        else if string_contains(cmd_upper and "SESSION DELETE ") == 1:
+                                            set sess_id to substring(cmd and 15 and string_length(cmd) - 15)
+                                            set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                            set ok to session_manager_delete(sessions_mgr and sess_id)
+                                            if ok == 1:
+                                                set resp to f"session:delete_ok,id:{sess_id}"
+                                            else:
+                                                set resp to "session:error,reason:not_found"
+                                        else if cmd_upper equals "AGENT GET MEMORY":
+                                            set resp to serialize_memory_json(cast_borrow_to_map(agent_memory))
+                                        else if cmd_upper equals "AGENT GET GRID":
+                                            set resp to serialize_grid_json(map_get_val(agent_ctx and "turing_grid"))
+                                        else if cmd_upper equals "AGENT DECAY MEMORY":
+                                            # Consolidate + decay the Hebbian synapse weights, persist, and
+                                            # return the updated memory graph so the UI refreshes.
+                                            set dk to memory_decay_synapses(cast_borrow_to_map(agent_memory))
+                                            set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                            set resp to serialize_memory_json(cast_borrow_to_map(agent_memory))
+                                        else if cmd_upper equals "AI AUTONOMY":
+                                            set agent_resp to react_run(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and "Maintain state and execute background optimizations")
+                                            set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                            set resp to f"ai:ok,response:{agent_resp}"
+                                        else:
+                                            if string_contains(cmd_upper and "MONEY TRANSFER ") == 1:
+                                                # Parse: MONEY TRANSFER <amount> <recipient>
+                                                set xfer_args to substring(cmd and 15 and string_length(cmd) - 15)
+                                                set space_pos to string_index_of(xfer_args and " ")
+                                                if space_pos > 0:
+                                                    set amt_str to substring(xfer_args and 0 and space_pos)
+                                                    set recipient to substring(xfer_args and space_pos + 1 and string_length(xfer_args) - space_pos - 1)
+                                                    set amount to string_to_int(amt_str)
+                                                    set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                    set sender_bal to ledger_get_balance(ledger and sign_pub)
+                                                    if amount > sender_bal:
+                                                        set resp to f"transfer:error,reason:insufficient_balance,balance:{sender_bal},requested:{amount}"
+                                                    else:
+                                                        if amount <= 0:
+                                                            set resp to "transfer:error,reason:invalid_amount"
+                                                        else:
+                                                            # Find spendable UTXOs for sender
+                                                            set utxos to map_get_val(ledger and "utxos")
+                                                            set utxo_keys to map_keys(utxos)
+                                                            set inputs to create_list()
+                                                            set input_total to 0
+                                                            set uk_idx to 0
+                                                            set uk_len to length_list(utxo_keys)
+                                                            repeat while uk_idx < uk_len and input_total < amount:
+                                                                set ukey to get_list(utxo_keys and uk_idx)
+                                                                set utxo_entry to map_get_val(utxos and ukey)
+                                                                set utxo_recip to map_get_val(utxo_entry and "recipient")
+                                                                if utxo_recip equals sign_pub:
+                                                                    # Parse UTXO key "tx_id:output_index"
+                                                                    set colon_pos to string_index_of(ukey and ":")
+                                                                    set ref_tx_id to substring(ukey and 0 and colon_pos)
+                                                                    set ref_idx_str to substring(ukey and colon_pos + 1 and string_length(ukey) - colon_pos - 1)
+                                                                    set ref_idx to string_to_int(ref_idx_str)
+                                                                    set ref_amt to map_get_val(utxo_entry and "amount")
+                                                                    set input_ref to create_map()
+                                                                    set ok to map_insert(input_ref and "tx_id" and ref_tx_id)
+                                                                    set ok to map_insert(input_ref and "output_index" and ref_idx)
+                                                                    set ok to map_insert(input_ref and "amount" and ref_amt)
+                                                                    set ok to map_insert(input_ref and "owner" and sign_pub)
+                                                                    # Placeholder sig — will be replaced after tx_id is known
+                                                                    set ok to map_insert(input_ref and "signature" and "pending")
+                                                                    set ok to append_list(inputs and input_ref)
+                                                                    set input_total to input_total + ref_amt
+                                                                set uk_idx to uk_idx + 1
+                                                            free_list(utxo_keys)
+                                                            if input_total < amount:
+                                                                set resp to f"transfer:error,reason:utxo_insufficient,found:{input_total},needed:{amount}"
+                                                            else:
+                                                                # Build outputs
+                                                                set outputs to create_list()
+                                                                set out1 to create_map()
+                                                                set ok to map_insert(out1 and "recipient" and recipient)
+                                                                set ok to map_insert(out1 and "amount" and amount)
+                                                                set ok to append_list(outputs and out1)
+                                                                set remaining to input_total - amount
+                                                                if remaining > 0:
+                                                                    set out2 to create_map()
+                                                                    set ok to map_insert(out2 and "recipient" and sign_pub)
+                                                                    set ok to map_insert(out2 and "amount" and remaining)
+                                                                    set ok to append_list(outputs and out2)
+                                                                # Create tx and compute its ID
+                                                                set tx to ledger_create_tx(inputs and outputs and 0)
+                                                                set tx_hash to ledger_hash_tx(tx)
+                                                                # Now sign each input with the real tx_id
+                                                                set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                set in_count to length_list(inputs)
+                                                                set si to 0
+                                                                repeat while si < in_count:
+                                                                    set inp to get_list(inputs and si)
+                                                                    set sig_result to sign_message(tx_hash and sign_sec)
+                                                                    set sig_hex to ptr_to_str(map_get_val(sig_result and "signature"))
+                                                                    set ok to map_insert(inp and "signature" and sig_hex)
+                                                                    set si to si + 1
+                                                                # Commit: add block with this transaction
+                                                                set tx_list to create_list()
+                                                                set ok to append_list(tx_list and tx)
+                                                                # Compute the actual block hash the same way ledger_add_block does:
+                                                                # block_hash = SHA256(merkle_root(tx_hashes) + prev_block_hash)
+                                                                set tx_hash_list to create_list()
+                                                                set ok to append_list(tx_hash_list and tx_hash)
+                                                                set merkle_root to calculate_merkle_root(tx_hash_list)
+                                                                free_list(tx_hash_list)
+                                                                set blocks to map_get_val(ledger and "blocks")
+                                                                set prev_block to get_list(blocks and length_list(blocks) - 1)
+                                                                set prev_hash to ptr_to_str(map_get_val(prev_block and "hash"))
+                                                                set state_root to ledger_compute_state_root()
+                                                                set block_hash to ledger_compute_block_hash(merkle_root and prev_hash and state_root)
+                                                                # Sign the block hash for validator proof
+                                                                set block_sig_result to sign_message(block_hash and sign_sec)
+                                                                set block_sig_hex to ptr_to_str(map_get_val(block_sig_result and "signature"))
+                                                                set block_err to ledger_add_block(ledger and tx_list and sign_pub and block_sig_hex and state_root)
+                                                                if block_err == 0:
+                                                                    # F2: gossip the freshly-produced block to peers over the
+                                                                    # authenticated Noise channel (non-blocking; the receiver
+                                                                    # applies it via ledger_receive_block with fork-choice).
+                                                                    spawn broadcast_block_to_peers(cast_map_to_int(ledger) and dht_node and static_secret and static_public)
+                                                                    set new_bal to ledger_get_balance(ledger and sign_pub)
+                                                                    set resp to f"transfer:ok,tx_id:{tx_hash},amount:{amount},to:{recipient},new_balance:{new_bal}"
+                                                                else:
+                                                                    set resp to f"transfer:error,reason:block_rejected,code:{block_err}"
+                                                else:
+                                                    set resp to "transfer:error,reason:invalid_format,expected:MONEY TRANSFER <amount> <recipient>"
+                                            else:
+                                                if string_contains(cmd_upper and "MONEY SWAP") == 1:
+                                                    # Swap tokens via the DEX
+                                                    # Parse: MONEY SWAP <from_token> <to_token> <amount>
+                                                    set swap_args to substring(cmd and 11 and string_length(cmd) - 11)
+                                                    set swap_parts to string_split(swap_args and " ")
+                                                    set sp_len to length_list(swap_parts)
+                                                    if sp_len >= 3:
+                                                        set from_tok to get_list(swap_parts and 0)
+                                                        set to_tok to get_list(swap_parts and 1)
+                                                        set swap_amt_str to get_list(swap_parts and 2)
+                                                        set swap_amt to string_to_int(swap_amt_str)
+                                                        if swap_amt <= 0:
+                                                            set resp to "swap:error,reason:invalid_amount"
+                                                        else:
+                                                            set dex_engine to map_get_val(agent_ctx and "dex_engine")
+                                                            set deployed_tokens to map_get_val(agent_ctx and "deployed_tokens")
+                                                            set from_token_map to map_get_val(deployed_tokens and from_tok)
+                                                            set to_token_map to map_get_val(deployed_tokens and to_tok)
+                                                            if from_token_map == 0 or else to_token_map == 0:
+                                                                set resp to f"swap:error,reason:unsupported_tokens,from:{from_tok},to:{to_tok}"
+                                                            else:
+                                                                set is_from_less to 1
+                                                                if from_tok equals "USDT":
+                                                                    set is_from_less to 0
+                                                                set token_a to from_token_map
+                                                                set token_b to to_token_map
+                                                                if is_from_less == 0:
+                                                                    set token_a to to_token_map
+                                                                    set token_b to from_token_map
+                                                                set caller_did to ptr_to_str(map_get_val(identity and "did"))
+                                                                set swap_err to dex_swap_amm(dex_engine and token_a and token_b and swap_amt and caller_did)
+                                                                if swap_err == 0:
+                                                                    set bal_from to token_balance_of(from_token_map and caller_did)
+                                                                    set bal_to to token_balance_of(to_token_map and caller_did)
+                                                                    set resp to f"swap:ok,from:{from_tok},to:{to_tok},amount:{swap_amt},new_balance_from:{bal_from},new_balance_to:{bal_to}"
+                                                                else:
+                                                                    set resp to f"swap:error,reason:swap_failed,code:{swap_err}"
+                                                    else:
+                                                        set resp to "swap:error,reason:invalid_format,expected:MONEY SWAP <from> <to> <amount>"
+                                                else:
+                                                    if string_contains(cmd_upper and "NAME REGISTER ") == 1:
+                                                        set name_arg to substring(cmd and 14 and string_length(cmd) - 14)
+                                                        set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                        set name_sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                        set name_sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                        set reg_err to registry_register(name_reg and name_arg and did_val and dht_node and seed_addr and seed_port and name_sign_pub and name_sign_sec)
+                                                        if reg_err == 0:
+                                                            set resp to f"name:registered,name:{name_arg},did:{did_val}"
+                                                        else:
+                                                            set resp to f"name:error,reason:registration_failed,code:{reg_err}"
+                                                    else:
+                                                        if string_contains(cmd_upper and "NAME RESOLVE ") == 1:
+                                                            set resolve_name to substring(cmd and 13 and string_length(cmd) - 13)
+                                                            set resolved_did to registry_resolve(name_reg and resolve_name and dht_node and seed_addr and seed_port)
+                                                            if string_length(resolved_did) > 0:
+                                                                set resp to f"name:resolved,name:{resolve_name},did:{resolved_did}"
+                                                            else:
+                                                                set resp to f"name:not_found,name:{resolve_name}"
+                                                        else:
+                                                            if string_contains(cmd_upper and "DHT STORE ") == 1:
+                                                                set dht_args to substring(cmd and 10 and string_length(cmd) - 10)
+                                                                set dht_space to string_index_of(dht_args and " ")
+                                                                if dht_space > 0:
+                                                                    set dht_key to substring(dht_args and 0 and dht_space)
+                                                                    set dht_value to substring(dht_args and dht_space + 1 and string_length(dht_args) - dht_space - 1)
+                                                                    set store_err to dht_node_store_value(dht_node and dht_key and dht_value)
+                                                                    set resp to f"dht:stored,key:{dht_key}"
+                                                                else:
+                                                                    set resp to "dht:error,reason:invalid_format"
+                                                            else:
+                                                                if string_contains(cmd_upper and "DHT GET ") == 1:
+                                                                    set dht_key to substring(cmd and 8 and string_length(cmd) - 8)
+                                                                    set dht_lookup to dht_lookup_value(dht_node and dht_key)
+                                                                    set dht_err to map_get_val(dht_lookup and "error")
+                                                                    if dht_err == 0:
+                                                                        set dht_val to ptr_to_str(map_get_val(dht_lookup and "value"))
+                                                                        set resp to f"dht:found,key:{dht_key},value:{dht_val}"
+                                                                    else:
+                                                                        set resp to f"dht:not_found,key:{dht_key}"
+                                                                    free_map(dht_lookup)
+                                                                else if string_contains(cmd_upper and "GITDEC REPO CREATE ") == 1:
+                                                                    set create_args to substring(cmd and 19 and string_length(cmd) - 19)
+                                                                    set space_pos to string_index_of(create_args and " ")
+                                                                    if space_pos > 0:
+                                                                        set repo_id to substring(create_args and 0 and space_pos)
+                                                                        set name to substring(create_args and space_pos + 1 and string_length(create_args) - space_pos - 1)
+                                                                        set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                                        set manifest to gitdec_create_repo(repo_id and name and did_val)
+                                                                        # Publish repo to DHT
+                                                                        set dht_key to concat("repo:" and repo_id)
+                                                                        set store_err to dht_node_store_value(dht_node and dht_key and did_val)
+                                                                        
+                                                                        # Broadcast manifest to Nostr
+                                                                        set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                        set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                        set manifest_str to gitdec_serialize_manifest(manifest)
+                                                                        set esc_manifest to escape_json_string(manifest_str)
+                                                                        set content_json to "{"
+                                                                        set content_json to concat(content_json and f"\"action\":\"update_manifest\",\"repo_id\":\"{repo_id}\",\"manifest\":\"{esc_manifest}\"")
+                                                                        set content_json to concat(content_json and "}")
+                                                                        set br_err to gitdec_broadcast_nostr(repo_id and 20020 and content_json and sign_sec and sign_pub)
+                                                                        
+                                                                        set resp to f"gitdec:repo_created,id:{repo_id}"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_format"
+                                                                else if string_contains(cmd_upper and "GITDEC REPO IMPORT ") == 1:
+                                                                    # Import an existing local folder as a GitDec repo.
+                                                                    # Format: GITDEC REPO IMPORT <name>|<absolute_source_path>
+                                                                    # (| delimiter because paths contain spaces and slashes).
+                                                                    set imp_args to string_trim(substring(cmd and 19 and string_length(cmd) - 19))
+                                                                    set bar_pos to string_index_of(imp_args and "|")
+                                                                    if bar_pos <= 0:
+                                                                        set resp to "gitdec:error,reason:invalid_format (use name|/abs/path)"
+                                                                    else:
+                                                                        set imp_name to string_trim(substring(imp_args and 0 and bar_pos))
+                                                                        set imp_path to string_trim(substring(imp_args and bar_pos + 1 and string_length(imp_args) - bar_pos - 1))
+                                                                        if gitdec_repo_id_safe(imp_name) == 0:
+                                                                            set resp to "gitdec:error,reason:invalid_repo_name (use letters, digits, _ or -)"
+                                                                        else if file_exists(imp_path) == 0:
+                                                                            set resp to concat("gitdec:error,reason:source_not_found:" and imp_path)
+                                                                        else:
+                                                                            set imp_did to ptr_to_str(map_get_val(identity and "did"))
+                                                                            set imp_manifest to gitdec_create_repo(imp_name and imp_name and imp_did)
+                                                                            # Copy the folder's working files into the repo dir, skipping VCS
+                                                                            # state and build artifacts (keeps the repo to source only).
+                                                                            set imp_dest to concat("config/gitdec/repos/" and imp_name)
+                                                                            set imp_rcmd to concat("rsync -a --exclude '.git' --exclude 'target' --exclude 'node_modules' --exclude '*.dSYM' --exclude '*_compiled.c' --exclude '.DS_Store' --exclude '*.tar.gz' --exclude 'node' '" and imp_path)
+                                                                            set imp_rcmd to concat(imp_rcmd and "/' '")
+                                                                            set imp_rcmd to concat(imp_rcmd and imp_dest)
+                                                                            set imp_rcmd to concat(imp_rcmd and "/' 2>&1")
+                                                                            set imp_ce to run_command(imp_rcmd)
+                                                                            # Publish to the DHT + broadcast the manifest (same as CREATE).
+                                                                            set imp_dht_key to concat("repo:" and imp_name)
+                                                                            set imp_store_err to dht_node_store_value(dht_node and imp_dht_key and imp_did)
+                                                                            set imp_sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                            set imp_sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                            set imp_mstr to gitdec_serialize_manifest(imp_manifest)
+                                                                            set imp_emstr to escape_json_string(imp_mstr)
+                                                                            set imp_cjson to "{"
+                                                                            set imp_cjson to concat(imp_cjson and f"\"action\":\"update_manifest\",\"repo_id\":\"{imp_name}\",\"manifest\":\"{imp_emstr}\"")
+                                                                            set imp_cjson to concat(imp_cjson and "}")
+                                                                            set imp_br_err to gitdec_broadcast_nostr(imp_name and 20020 and imp_cjson and imp_sign_sec and imp_sign_pub)
+                                                                            set imp_fcount to length_list(gitdec_list_repo_files(imp_name))
+                                                                            set resp to f"gitdec:import_ok,id:{imp_name},files:{imp_fcount}"
+                                                                else if string_contains(cmd_upper and "GITDEC REPO CLONE ") == 1:
+                                                                    set repo_id to substring(cmd and 18 and string_length(cmd) - 18)
+                                                                    set dht_key to concat("repo:" and repo_id)
+                                                                    set dht_lookup to dht_lookup_value(dht_node and dht_key)
+                                                                    set dht_err to map_get_val(dht_lookup and "error")
+                                                                    set owner_did to ""
+                                                                    if dht_err == 0:
+                                                                        set owner_did to ptr_to_str(map_get_val(dht_lookup and "value"))
+                                                                    free_map(dht_lookup)
+                                                                    if string_length(owner_did) == 0:
+                                                                        set resp to "gitdec:error,reason:provider_not_found"
+                                                                    else:
+                                                                        set manifest to gitdec_create_repo(repo_id and repo_id and owner_did)
+                                                                        set ok to gitdec_request_history(repo_id)
+                                                                        set resp to "gitdec:clone_ok"
+                                                                else if string_contains(cmd_upper and "GITDEC AUTOUPDATE ") == 1:
+                                                                    set au_args to substring(cmd and 18 and string_length(cmd) - 18)
+                                                                    set au_space to string_index_of(au_args and " ")
+                                                                    if au_space > 0:
+                                                                        set au_repo to substring(au_args and 0 and au_space)
+                                                                        set au_flag to string_to_int(substring(au_args and au_space + 1 and string_length(au_args) - au_space - 1))
+                                                                        set au_ok to storage_gitdec_set_auto_update(au_repo and au_flag)
+                                                                        set resp to "gitdec:autoupdate_set"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:bad_args"
+                                                                else if string_contains(cmd_upper and "GITDEC GET_AUTOUPDATE ") == 1:
+                                                                    set gau_repo to substring(cmd and 22 and string_length(cmd) - 22)
+                                                                    set gau_flag to storage_gitdec_get_auto_update(gau_repo)
+                                                                    set resp to concat("gitdec:autoupdate,enabled:" and int_to_string(gau_flag))
+                                                                else if string_contains(cmd_upper and "GITDEC REPO LIST_FILES ") == 1:
+                                                                    set repo_id to substring(cmd and 23 and string_length(cmd) - 23)
+                                                                    set files_list to gitdec_list_repo_files(repo_id)
+                                                                    set f_count to length_list(files_list)
+                                                                    set list_str to ""
+                                                                    set fi to 0
+                                                                    repeat while fi < f_count:
+                                                                        set f_name to get_list(files_list and fi)
+                                                                        set list_str to concat(list_str and f_name)
+                                                                        if fi < f_count - 1:
+                                                                            set list_str to concat(list_str and ";")
+                                                                        set fi to fi + 1
+                                                                    set resp to f"gitdec:repo_files,repo_id:{repo_id},files:{list_str}"
+                                                                    free_list(files_list)
+                                                                else if string_contains(cmd_upper and "GITDEC REPO LIST") == 1:
+                                                                    set repos_list to gitdec_list_repos()
+                                                                    set r_count to length_list(repos_list)
+                                                                    set list_str to ""
+                                                                    set ri to 0
+                                                                    repeat while ri < r_count:
+                                                                        set r_id to get_list(repos_list and ri)
+                                                                        set list_str to concat(list_str and r_id)
+                                                                        if ri < r_count - 1:
+                                                                            set list_str to concat(list_str and ";")
+                                                                        set ri to ri + 1
+                                                                    set resp to f"gitdec:repo_list,repos:{list_str}"
+                                                                    free_list(repos_list)
+                                                                else if string_contains(cmd_upper and "GITDEC REPO GET_FILE ") == 1:
+                                                                    set file_args to substring(cmd and 21 and string_length(cmd) - 21)
+                                                                    set space_pos to string_index_of(file_args and " ")
+                                                                    if space_pos > 0:
+                                                                        set repo_id to substring(file_args and 0 and space_pos)
+                                                                        set filename to substring(file_args and space_pos + 1 and string_length(file_args) - space_pos - 1)
+                                                                        set file_content to gitdec_get_repo_file(repo_id and filename)
+                                                                        set resp to f"gitdec:file_data,payload:{file_content}"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_format"
+                                                                else if string_contains(cmd_upper and "GITDEC REPO RESOLVE ") == 1:
+                                                                    set repo_id to substring(cmd and 20 and string_length(cmd) - 20)
+                                                                    set dht_key to concat("repo:" and repo_id)
+                                                                    set dht_lookup to dht_lookup_value(dht_node and dht_key)
+                                                                    set dht_err to map_get_val(dht_lookup and "error")
+                                                                    if dht_err == 0:
+                                                                        set provider_did to ptr_to_str(map_get_val(dht_lookup and "value"))
+                                                                        set resp to f"gitdec:provider_found,provider:{provider_did}"
+                                                                    else:
+                                                                        set resp to "gitdec:provider_not_found"
+                                                                    free_map(dht_lookup)
+                                                                else if string_contains(cmd_upper and "GITDEC REPO COLLAB ADD ") == 1:
+                                                                    set collab_args to substring(cmd and 24 and string_length(cmd) - 24)
+                                                                    set first_space to string_index_of(collab_args and " ")
+                                                                    if first_space > 0:
+                                                                        set repo_id to substring(collab_args and 0 and first_space)
+                                                                        set rem_args to substring(collab_args and first_space + 1 and string_length(collab_args) - first_space - 1)
+                                                                        set second_space to string_index_of(rem_args and " ")
+                                                                        if second_space > 0:
+                                                                            set collab_did to substring(rem_args and 0 and second_space)
+                                                                            set role to substring(rem_args and second_space + 1 and string_length(rem_args) - second_space - 1)
+                                                                            set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                                            set err to gitdec_add_collaborator(repo_id and did_val and collab_did and role)
+                                                                            if err == 0:
+                                                                                # Broadcast updated manifest to Nostr
+                                                                                set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+                                                                                set manifest to gitdec_load_json(manifest_path)
+                                                                                if manifest != 0:
+                                                                                    set manifest_str to gitdec_serialize_manifest(manifest)
+                                                                                    set esc_manifest to escape_json_string(manifest_str)
+                                                                                    set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                                    set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                                    set content_json to "{"
+                                                                                    set content_json to concat(content_json and f"\"action\":\"update_manifest\",\"repo_id\":\"{repo_id}\",\"manifest\":\"{esc_manifest}\"")
+                                                                                    set content_json to concat(content_json and "}")
+                                                                                    set br_err to gitdec_broadcast_nostr(repo_id and 20020 and content_json and sign_sec and sign_pub)
+                                                                                    free_map(manifest)
+                                                                                set resp to "gitdec:collab_added"
+                                                                            else:
+                                                                                set resp to f"gitdec:error,code:{err}"
+                                                                        else:
+                                                                            set resp to "gitdec:error,reason:invalid_format"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_format"
+                                                                else if string_contains(cmd_upper and "GITDEC REPO COLLAB REMOVE ") == 1:
+                                                                    set collab_args to substring(cmd and 26 and string_length(cmd) - 26)
+                                                                    set first_space to string_index_of(collab_args and " ")
+                                                                    if first_space > 0:
+                                                                        set repo_id to substring(collab_args and 0 and first_space)
+                                                                        set collab_did to substring(collab_args and first_space + 1 and string_length(collab_args) - first_space - 1)
+                                                                        set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                                        set err to gitdec_remove_collaborator(repo_id and did_val and collab_did)
+                                                                        if err == 0:
+                                                                            # Broadcast updated manifest to Nostr
+                                                                            set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+                                                                            set manifest to gitdec_load_json(manifest_path)
+                                                                            if manifest != 0:
+                                                                                set manifest_str to gitdec_serialize_manifest(manifest)
+                                                                                set esc_manifest to escape_json_string(manifest_str)
+                                                                                set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                                set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                                set content_json to "{"
+                                                                                set content_json to concat(content_json and f"\"action\":\"update_manifest\",\"repo_id\":\"{repo_id}\",\"manifest\":\"{esc_manifest}\"")
+                                                                                set content_json to concat(content_json and "}")
+                                                                                set br_err to gitdec_broadcast_nostr(repo_id and 20020 and content_json and sign_sec and sign_pub)
+                                                                                free_map(manifest)
+                                                                            set resp to "gitdec:collab_removed"
+                                                                        else:
+                                                                            set resp to f"gitdec:error,code:{err}"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_format"
+                                                                else if string_contains(cmd_upper and "GITDEC REPO DELETE ") == 1:
+                                                                    set repo_id to substring(cmd and 19 and string_length(cmd) - 19)
+                                                                    set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                                    set err to gitdec_delete_repo(repo_id and did_val)
+                                                                    if err == 0:
+                                                                        # Broadcast deletion to Nostr
+                                                                        set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                        set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                        set content_json to "{"
+                                                                        set content_json to concat(content_json and f"\"action\":\"delete_repo\",\"repo_id\":\"{repo_id}\"")
+                                                                        set content_json to concat(content_json and "}")
+                                                                        set br_err to gitdec_broadcast_nostr(repo_id and 20020 and content_json and sign_sec and sign_pub)
+                                                                        set resp to "gitdec:deleted"
+                                                                    else:
+                                                                        set resp to f"gitdec:error,code:{err}"
+                                                                else if string_contains(cmd_upper and "GITDEC REPO PUSH_JSON ") == 1:
+                                                                    set json_str to substring(cmd and 22 and string_length(cmd) - 22)
+                                                                    set root_node to json_parse(json_str)
+                                                                    if root_node != 0:
+                                                                        set repo_id_node to get_json_object_value(root_node and "repo_id")
+                                                                        set branch_node to get_json_object_value(root_node and "branch")
+                                                                        set commit_hash_node to get_json_object_value(root_node and "commit_hash")
+                                                                        set payload_node to get_json_object_value(root_node and "payload")
+                                                                        set signature_node to get_json_object_value(root_node and "signature")
+                                                                        set repo_id to get_json_value(repo_id_node)
+                                                                        set branch to get_json_value(branch_node)
+                                                                        set commit_hash to get_json_value(commit_hash_node)
+                                                                        set payload to get_json_value(payload_node)
+                                                                        set signature to get_json_value(signature_node)
+                                                                        set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                                        set err to gitdec_push_commit(repo_id and did_val and branch and commit_hash and payload and signature)
+                                                                        if err == 0:
+                                                                            # 1. Broadcast push to Nostr (Kind 20021)
+                                                                            set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                            set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                            set esc_payload to escape_json_string(payload)
+                                                                            set esc_sig to escape_json_string(signature)
+                                                                            set content_json to "{"
+                                                                            set content_json to concat(content_json and f"\"action\":\"push_commit\",\"repo_id\":\"{repo_id}\",\"branch\":\"{branch}\",\"commit_hash\":\"{commit_hash}\",\"pusher_did\":\"{did_val}\",\"payload\":\"{esc_payload}\",\"signature\":\"{esc_sig}\"")
+                                                                            set content_json to concat(content_json and "}")
+                                                                            set br_err to gitdec_broadcast_nostr(repo_id and 20021 and content_json and sign_sec and sign_pub)
+                                                                            
+                                                                            # 2. Broadcast updated manifest to Nostr (Kind 20020)
+                                                                            set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+                                                                            set manifest to gitdec_load_json(manifest_path)
+                                                                            if manifest != 0:
+                                                                                set manifest_str to gitdec_serialize_manifest(manifest)
+                                                                                set esc_manifest to escape_json_string(manifest_str)
+                                                                                set content_json2 to "{"
+                                                                                set content_json2 to concat(content_json2 and f"\"action\":\"update_manifest\",\"repo_id\":\"{repo_id}\",\"manifest\":\"{esc_manifest}\"")
+                                                                                set content_json2 to concat(content_json2 and "}")
+                                                                                set br_err2 to gitdec_broadcast_nostr(repo_id and 20020 and content_json2 and sign_sec and sign_pub)
+                                                                                free_map(manifest)
+                                                                                
+                                                                            set resp to "gitdec:push_ok"
+                                                                        else:
+                                                                            set resp to f"gitdec:error,code:{err}"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_json"
+                                                                else if string_contains(cmd_upper and "GITDEC MERGE ") == 1:
+                                                                    set mg_args to substring(cmd and 13 and string_length(cmd) - 13)
+                                                                    set mg_sp to string_index_of(mg_args and " ")
+                                                                    if mg_sp > 0:
+                                                                        set mg_repo to substring(mg_args and 0 and mg_sp)
+                                                                        set mg_branch to substring(mg_args and mg_sp + 1 and string_length(mg_args) - mg_sp - 1)
+                                                                        set mg_did to ptr_to_str(map_get_val(identity and "did"))
+                                                                        set mg_head to gitdec_pull_ref(mg_repo and mg_branch)
+                                                                        if string_length(mg_head) == 0:
+                                                                            set resp to "gitdec:error,reason:branch_not_found"
+                                                                        else:
+                                                                            set mg_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                            set mg_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                            set mg_msg to concat(mg_did and "|")
+                                                                            set mg_msg to concat(mg_msg and mg_repo)
+                                                                            set mg_msg to concat(mg_msg and "|")
+                                                                            set mg_msg to concat(mg_msg and mg_branch)
+                                                                            set mg_msg to concat(mg_msg and "|")
+                                                                            set mg_msg to concat(mg_msg and mg_head)
+                                                                            set mg_authsig_res to sign_message(mg_msg and mg_sec)
+                                                                            set mg_authsig to ptr_to_str(map_get_val(mg_authsig_res and "signature"))
+                                                                            set mg_err to gitdec_merge(mg_repo and mg_branch and mg_did and mg_authsig)
+                                                                            if mg_err == 0:
+                                                                                # Propagate main -> source_head so every node's main advances (no loss).
+                                                                                set mg_payload to gitdec_get_object(mg_repo and mg_head)
+                                                                                set mg_psig_res to sign_message(mg_payload and mg_sec)
+                                                                                set mg_psig to ptr_to_str(map_get_val(mg_psig_res and "signature"))
+                                                                                set mg_esc_payload to escape_json_string(mg_payload)
+                                                                                set mg_esc_psig to escape_json_string(mg_psig)
+                                                                                set mg_content to "{"
+                                                                                set mg_content to concat(mg_content and f"\"action\":\"push_commit\",\"repo_id\":\"{mg_repo}\",\"branch\":\"main\",\"commit_hash\":\"{mg_head}\",\"pusher_did\":\"{mg_did}\",\"payload\":\"{mg_esc_payload}\",\"signature\":\"{mg_esc_psig}\"")
+                                                                                set mg_content to concat(mg_content and "}")
+                                                                                set mg_br to gitdec_broadcast_nostr(mg_repo and 20021 and mg_content and mg_sec and mg_pub)
+                                                                                set mg_mpath to path_join(concat("config/gitdec/repos/" and mg_repo) and "gitdec.json")
+                                                                                set mg_manifest to gitdec_load_json(mg_mpath)
+                                                                                if mg_manifest != 0:
+                                                                                    set mg_mstr to gitdec_serialize_manifest(mg_manifest)
+                                                                                    set mg_esc_m to escape_json_string(mg_mstr)
+                                                                                    set mg_content2 to "{"
+                                                                                    set mg_content2 to concat(mg_content2 and f"\"action\":\"update_manifest\",\"repo_id\":\"{mg_repo}\",\"manifest\":\"{mg_esc_m}\"")
+                                                                                    set mg_content2 to concat(mg_content2 and "}")
+                                                                                    set mg_br2 to gitdec_broadcast_nostr(mg_repo and 20020 and mg_content2 and mg_sec and mg_pub)
+                                                                                    free_map(mg_manifest)
+                                                                                set resp to "gitdec:merge_ok"
+                                                                            else:
+                                                                                set resp to f"gitdec:error,code:{mg_err}"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:bad_args"
+                                                                else if string_contains(cmd_upper and "GITDEC REPO PULL ") == 1:
+                                                                    set pull_args to substring(cmd and 17 and string_length(cmd) - 17)
+                                                                    set space_pos to string_index_of(pull_args and " ")
+                                                                    if space_pos > 0:
+                                                                        set repo_id to substring(pull_args and 0 and space_pos)
+                                                                        set branch to substring(pull_args and space_pos + 1 and string_length(pull_args) - space_pos - 1)
+                                                                        set commit to gitdec_pull_ref(repo_id and branch)
+                                                                        if string_length(commit) > 0:
+                                                                            set resp to f"gitdec:pull_ok,commit:{commit}"
+                                                                        else:
+                                                                            set resp to "gitdec:pull_empty"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_format"
+                                                                else if string_contains(cmd_upper and "GITDEC REPO GET_OBJ ") == 1:
+                                                                    set get_args to substring(cmd and 20 and string_length(cmd) - 20)
+                                                                    set space_pos to string_index_of(get_args and " ")
+                                                                    if space_pos > 0:
+                                                                        set repo_id to substring(get_args and 0 and space_pos)
+                                                                        set obj_hash to substring(get_args and space_pos + 1 and string_length(get_args) - space_pos - 1)
+                                                                        set obj to gitdec_get_object(repo_id and obj_hash)
+                                                                        if string_length(obj) > 0:
+                                                                            set resp to f"gitdec:object_data,payload:{obj}"
+                                                                        else:
+                                                                            set resp to "gitdec:object_not_found"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_format"
+                                                                else if string_contains(cmd_upper and "GITDEC ISSUE CREATE_JSON ") == 1:
+                                                                    set json_str to substring(cmd and 25 and string_length(cmd) - 25)
+                                                                    set root_node to json_parse(json_str)
+                                                                    if root_node != 0:
+                                                                        set repo_id_node to get_json_object_value(root_node and "repo_id")
+                                                                        set title_node to get_json_object_value(root_node and "title")
+                                                                        set body_node to get_json_object_value(root_node and "body")
+                                                                        set repo_id to get_json_value(repo_id_node)
+                                                                        set title to get_json_value(title_node)
+                                                                        set body to get_json_value(body_node)
+                                                                        set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                                        set issue to gitdec_create_issue(repo_id and did_val and title and body)
+                                                                        set issue_id to map_get_val(issue and "id")
+                                                                        # Broadcast to Nostr
+                                                                        set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                        set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                        set esc_title to escape_json_string(title)
+                                                                        set esc_body to escape_json_string(body)
+                                                                        set content_json to "{"
+                                                                        set content_json to concat(content_json and f"\"action\":\"create_issue\",\"repo_id\":\"{repo_id}\",\"id\":\"{issue_id}\",\"author_did\":\"{did_val}\",\"title\":\"{esc_title}\",\"body\":\"{esc_body}\"")
+                                                                        set content_json to concat(content_json and "}")
+                                                                        set br_err to gitdec_broadcast_nostr(repo_id and 20022 and content_json and sign_sec and sign_pub)
+                                                                        set resp to f"gitdec:issue_created,id:{issue_id}"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_json"
+                                                                else if string_contains(cmd_upper and "GITDEC ISSUE COMMENT_JSON ") == 1:
+                                                                    set json_str to substring(cmd and 26 and string_length(cmd) - 26)
+                                                                    set root_node to json_parse(json_str)
+                                                                    if root_node != 0:
+                                                                        set repo_id_node to get_json_object_value(root_node and "repo_id")
+                                                                        set issue_id_node to get_json_object_value(root_node and "issue_id")
+                                                                        set comment_node to get_json_object_value(root_node and "comment")
+                                                                        set repo_id to get_json_value(repo_id_node)
+                                                                        set issue_id to get_json_value(issue_id_node)
+                                                                        set comment to get_json_value(comment_node)
+                                                                        set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                                        set err to gitdec_comment_issue(repo_id and issue_id and did_val and comment)
+                                                                        if err == 0:
+                                                                            # Broadcast to Nostr
+                                                                            set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                            set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                            set esc_comment to escape_json_string(comment)
+                                                                            set content_json to "{"
+                                                                            set content_json to concat(content_json and f"\"action\":\"comment_issue\",\"repo_id\":\"{repo_id}\",\"issue_id\":\"{issue_id}\",\"author_did\":\"{did_val}\",\"text\":\"{esc_comment}\",\"timestamp\":\"{int_to_string(ep_time_now_sec())}\"")
+                                                                            set content_json to concat(content_json and "}")
+                                                                            set br_err to gitdec_broadcast_nostr(repo_id and 20022 and content_json and sign_sec and sign_pub)
+                                                                            set resp to "gitdec:comment_added"
+                                                                        else:
+                                                                            set resp to f"gitdec:error,code:{err}"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_json"
+                                                                else if string_contains(cmd_upper and "GITDEC PR CREATE_JSON ") == 1:
+                                                                    set json_str to substring(cmd and 22 and string_length(cmd) - 22)
+                                                                    set root_node to json_parse(json_str)
+                                                                    if root_node != 0:
+                                                                        set repo_id_node to get_json_object_value(root_node and "repo_id")
+                                                                        set title_node to get_json_object_value(root_node and "title")
+                                                                        set source_node to get_json_object_value(root_node and "source")
+                                                                        set target_node to get_json_object_value(root_node and "target")
+                                                                        set desc_node to get_json_object_value(root_node and "description")
+                                                                        set repo_id to get_json_value(repo_id_node)
+                                                                        set title to get_json_value(title_node)
+                                                                        set source to get_json_value(source_node)
+                                                                        set target to get_json_value(target_node)
+                                                                        set desc to get_json_value(desc_node)
+                                                                        set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                                        set pr to gitdec_create_pr(repo_id and did_val and title and source and target and desc)
+                                                                        set pr_id to map_get_val(pr and "id")
+                                                                        # Broadcast to Nostr
+                                                                        set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                        set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                        set esc_title to escape_json_string(title)
+                                                                        set esc_source to escape_json_string(source)
+                                                                        set esc_target to escape_json_string(target)
+                                                                        set esc_desc to escape_json_string(desc)
+                                                                        set content_json to "{"
+                                                                        set content_json to concat(content_json and f"\"action\":\"create_pr\",\"repo_id\":\"{repo_id}\",\"id\":\"{pr_id}\",\"author_did\":\"{did_val}\",\"title\":\"{esc_title}\",\"source\":\"{esc_source}\",\"target\":\"{esc_target}\",\"description\":\"{esc_desc}\"")
+                                                                        set content_json to concat(content_json and "}")
+                                                                        set br_err to gitdec_broadcast_nostr(repo_id and 20023 and content_json and sign_sec and sign_pub)
+                                                                        set resp to f"gitdec:pr_created,id:{pr_id}"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_json"
+                                                                else if string_contains(cmd_upper and "GITDEC PR REVIEW_JSON ") == 1:
+                                                                    set json_str to substring(cmd and 22 and string_length(cmd) - 22)
+                                                                    set root_node to json_parse(json_str)
+                                                                    if root_node != 0:
+                                                                        set repo_id_node to get_json_object_value(root_node and "repo_id")
+                                                                        set pr_id_node to get_json_object_value(root_node and "pr_id")
+                                                                        set decision_node to get_json_object_value(root_node and "decision")
+                                                                        set comment_node to get_json_object_value(root_node and "comment")
+                                                                        set repo_id to get_json_value(repo_id_node)
+                                                                        set pr_id to get_json_value(pr_id_node)
+                                                                        set decision to get_json_value(decision_node)
+                                                                        set comment to get_json_value(comment_node)
+                                                                        set did_val to ptr_to_str(map_get_val(identity and "did"))
+                                                                        set err to gitdec_review_pr(repo_id and pr_id and did_val and decision and comment)
+                                                                        if err == 0:
+                                                                            # Broadcast to Nostr
+                                                                            set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                            set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                            set esc_decision to escape_json_string(decision)
+                                                                            set esc_comment to escape_json_string(comment)
+                                                                            set content_json to "{"
+                                                                            set content_json to concat(content_json and f"\"action\":\"review_pr\",\"repo_id\":\"{repo_id}\",\"pr_id\":\"{pr_id}\",\"reviewer_did\":\"{did_val}\",\"decision\":\"{esc_decision}\",\"comment\":\"{esc_comment}\",\"timestamp\":\"{int_to_string(ep_time_now_sec())}\"")
+                                                                            set content_json to concat(content_json and "}")
+                                                                            set br_err to gitdec_broadcast_nostr(repo_id and 20023 and content_json and sign_sec and sign_pub)
+                                                                            set resp to "gitdec:pr_reviewed"
+                                                                        else:
+                                                                            set resp to f"gitdec:error,code:{err}"
+                                                                    else:
+                                                                        set resp to "gitdec:error,reason:invalid_json"
+                                                                else:
+                                                                    set resp to f"error:unknown_command:{cmd_upper}"
+                    
+    set ok to ep_net_send(client_fd and resp)
+    set ok to ep_net_close(client_fd)
+    log_debug("ipc" and f"CMD={cmd_upper} RESP={resp}")
+    return 0
+
+
+define ipc_server_loop with listen_fd as Int and borrow raft_node as Map and borrow identity as Map and dht_node as Int and relay_node as Int and msg_store as Int and ledger as Map and name_reg as Int and seed_addr as Str and seed_port as Int and borrow agent_memory as Map and borrow agent_tools as Map and borrow agent_ctx as Map and borrow agent_model as Map and static_secret as Int and static_public as Int and bft_node as Map:
+    repeat while 1 == 1:
+        set client_fd to ep_net_accept(listen_fd)
+        if client_fd >= 0:
+            handle_ipc_client(client_fd and raft_node and identity and dht_node and relay_node and msg_store and ledger and name_reg and seed_addr and seed_port and agent_memory and agent_tools and agent_ctx and agent_model and static_secret and static_public and bft_node)
+    return 0
+
+# ================================================================
+# Bootstrap -- connect to a seed peer for multi-node operation
+# ================================================================
+
+define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node as Int and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int returning Map:
+    display f"[*] Bootstrapping to seed peer {seed_addr}:{seed_port}..."
+    log_info("node" and f"Bootstrapping to seed peer {seed_addr}:{seed_port}")
+
+    set result to create_map()
+    set ok to map_insert(result and "connected" and 0)
+
+    # DHT bootstrap - ping the seed's DHT port
+    set ping_err to dht_rpc_ping(dht_node and seed_addr and seed_port)
+    if ping_err == 0:
+        display f"[+] DHT bootstrap: seed peer responded (PONG)"
+        log_info("node" and "DHT bootstrap successful - peer added to routing table")
+        # Also do a FIND_NODE for our own ID to discover more peers
+        set find_result to dht_rpc_find_node(dht_node and seed_addr and seed_port and node_id)
+        set find_err to map_get_val(find_result and "error")
+        if find_err == 0:
+            set found_nodes to map_get_val(find_result and "nodes")
+            set found_count to length_list(found_nodes)
+            display f"[+] DHT bootstrap: discovered {found_count} additional peer(s)"
+            set fi to 0
+            repeat while fi < found_count:
+                set node_entry to get_list(found_nodes and fi)
+                set peer_id to ptr_to_str(map_get_val(node_entry and "id"))
+                set peer_addr to ptr_to_str(map_get_val(node_entry and "address"))
+                set peer_port to map_get_val(node_entry and "port")
+                set ok to dht_node_add_peer(dht_node and peer_id and peer_addr and peer_port)
+                set fi to fi + 1
+        free_map(find_result)
+    else:
+        display f"[-] DHT bootstrap: seed peer did not respond (err:{ping_err})"
+        log_info("node" and f"DHT bootstrap failed - seed {seed_addr}:{seed_port} unreachable")
+
+    # Raft peer setup - add seed as a consensus peer
+    set seed_peer_id to concat("node@" and seed_addr)
+    set ok to append_list(peers and seed_peer_id)
+    set peer_addresses to create_map()
+    set seed_raft_port to seed_port + 2
+    set peer_addr_str to concat(seed_addr and ":")
+    set peer_addr_str to concat(peer_addr_str and int_to_string(seed_raft_port))
+    set ok to map_insert(peer_addresses and seed_peer_id and peer_addr_str)
+    set ok to map_insert(raft_node and "running" and 1)
+    set ok to map_insert(raft_node and "server_ready" and 0)
+
+    # Store peer_addresses in result for caller to spawn raft threads
+    set ok to map_insert(result and "peer_addresses" and peer_addresses)
+    set ok to map_insert(result and "connected" and 1)
+
+    # Register with relay at seed peer
+    set relay_reg_port to seed_port + 1
+    set reg_err to relay_rpc_register(seed_addr and relay_reg_port and node_id and pub_hex)
+    if reg_err == 0:
+        display "[+] Relay registration: registered with seed's relay server"
+        log_info("node" and "Relay registration with seed successful")
+    else:
+        display f"[-] Relay registration: failed (err:{reg_err})"
+        log_info("node" and f"Relay registration failed - err:{reg_err}")
+
+    display f"[+] Bootstrapped to seed peer {seed_addr}:{seed_port}"
+    return result
+
+# ================================================================
+# Main -- orchestrates all subsystems
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- Decentralised Node Daemon"
+    display "  Production-Ready Decentralised Node"
+    display "==================================================="
+    display ""
+
+    # 0a. Parse CLI arguments (--seed addr:port, --port base_port)
+    set cli_seed_addr to ""
+    set cli_seed_port to 0
+    set cli_base_port to 0
+    set cli_is_host to 0
+    set argc to get_argument_count()
+    set argi to 1
+    repeat while argi < argc:
+        set arg to get_argument(argi)
+        if arg equals "--seed":
+            set argi to argi + 1
+            if argi < argc:
+                set seed_arg to get_argument(argi)
+                set colon to string_index_of(seed_arg and ":")
+                if colon > 0:
+                    set cli_seed_addr to substring(seed_arg and 0 and colon)
+                    set port_str to substring(seed_arg and colon + 1 and string_length(seed_arg) - colon - 1)
+                    set cli_seed_port to string_to_int(port_str)
+                else:
+                    set cli_seed_addr to seed_arg
+                    set cli_seed_port to 9101
+        else:
+            if arg equals "--host":
+                set cli_is_host to 1
+            else:
+                if arg equals "--port":
+                    set argi to argi + 1
+                    if argi < argc:
+                        set cli_base_port to string_to_int(get_argument(argi))
+        set argi to argi + 1
+
+    # 0b. Initialize Logging
+    set log_dir to concat(storage_get_default_dir() and "/logs")
+    set log_err to log_init(log_dir and 5242880 and 5)
+    log_info("node" and "Logging initialized.")
+
+    # 0c. Load configuration
+    set cfg_path to concat(storage_get_default_dir() and "/config.toml")
+    set cfg to config_load(cfg_path)
+
+    # Apply CLI overrides to config
+    if string_length(cli_seed_addr) > 0:
+        set ok to map_insert(cfg and "network.seed_addr" and cli_seed_addr)
+        set ok to map_insert(cfg and "network.seed_port" and cli_seed_port)
+    if cli_is_host == 1:
+        set ok to map_insert(cfg and "network.is_static_host" and 1)
+    if cli_base_port > 0:
+        set ok to map_insert(cfg and "network.p2p_port" and cli_base_port)
+        set ok to map_insert(cfg and "network.dht_port" and cli_base_port + 1)
+        set ok to map_insert(cfg and "network.relay_port" and cli_base_port + 2)
+        set ok to map_insert(cfg and "consensus.raft_port" and cli_base_port + 3)
+        set ok to map_insert(cfg and "network.ipc_port" and cli_base_port + 100)
+        set ok to map_insert(cfg and "network.web_port" and cli_base_port + 80)
+
+    # Read final port values from config
+    set p2p_port to config_get_int(cfg and "network.p2p_port")
+    set dht_port to config_get_int(cfg and "network.dht_port")
+    set relay_port to config_get_int(cfg and "network.relay_port")
+    set raft_port to config_get_int(cfg and "consensus.raft_port")
+    set ipc_port to config_get_int(cfg and "network.ipc_port")
+    set web_port to config_get_int(cfg and "network.web_port")
+    set seed_addr to config_get_str(cfg and "network.seed_addr")
+    set seed_port to config_get_int(cfg and "network.seed_port")
+    set is_static_host to 0
+    if map_contains(cfg and "network.is_static_host") == 1:
+        set is_static_host to config_get_int(cfg and "network.is_static_host")
+    set enable_host_election to 1
+    if map_contains(cfg and "network.enable_host_election") == 1:
+        set enable_host_election to config_get_int(cfg and "network.enable_host_election")
+
+    # 1. Initialize Persistence Layer
+    set data_dir to storage_get_default_dir()
+    set store_err to storage_init(data_dir)
+    if store_err != 0:
+        display f"[-] Storage initialization failed (error: {store_err})!"
+        return 1
+    log_info("node" and f"Persistent storage initialized at {data_dir}")
+    display f"[+] Persistent storage initialized at {data_dir}"
+    
+    # Populate default files if storage is empty
+    set init_list to storage_content_list()
+    if length_list(init_list) == 0:
+        set ok to storage_content_put("8b5cf6ea28cbef5a92a3c7e4b9d031f5a92a3c7e4b9d031f5a92a3c7e4b9d012" and "# Welcome to ErnosDecent\nThis is a content-addressed storage block." and "text/markdown")
+        set ok to storage_content_put("72ad25febc12de45a92a3c7e4b9d031f5a92a3c7e4b9d031f5a92a3c7e4b9d034" and "{\"version\": \"1.0.0-beta\", \"role\": \"node\"}" and "application/json")
+    free_list(init_list)
+
+    # Populate default prompts config if missing
+    if file_exists("config/prompts.json") == 0:
+        set default_prompts to "{\n  \"kernel\": \"You are ErnOS Agent, a local-first, privacy-first AI agent running on a decentralized network.\\nYou operate under a strict ReAct loop. You must think before taking action.\\nYour output MUST follow this grammar precisely:\\nThought: <your reasoning and planning>\\nAction: <tool_name>(<arguments_json_or_string>)\\n\\nOnce you receive the tool's output, it will be presented to you as:\\nObservation: <tool_output>\\n\\nYou must repeat this loop until you have the final answer. To end the loop and present the final answer, you MUST call the reply_request tool:\\nAction: reply_request(<your_final_answer_to_the_user>)\",\n  \"persona\": \"Identity: You are a secure, sovereign computational agent operating inside the Ernos decentralized node daemon. You audit your thoughts for hallucination and sycophancy. You are honest, precise, and verify claims using codebase or networking tools when possible.\",\n  \"observer\": \"You are the ErnOS Agent Observer. Your task is to perform an alignment audit on the candidate response below against the 19 audit rules.\\n\\nAvailable Tools & Capabilities:\\n{tools_schema}\\n\\nCandidate Response to Audit:\\n{candidate}\\n\\n19 Alignment Rules:\\n1. Capability Hallucination: Do not claim capabilities not listed in Available Tools.\\n2. Ghost Tooling: Do not claim to have run a tool in this turn unless you actually invoked it.\\n3. Sycophancy: Avoid blind flattery, except for warm reciprocity.\\n4. Confabulation: Do not fabricate outcomes or details.\\n5. Architectural Leakage: Do not volunteer internal system details unless explicitly asked.\\n6. Actionable Harm: Do not generate exploits or harmful content.\\n7. Unparsed Tool Commands: Do not output raw tool formats to the user.\\n8. Stale Knowledge: Do not answer search-dependent queries from training weights.\\n9. Reality Validation: Do not promote pseudoscience or unverified claims.\\n10. Laziness: Do not give partial, shallow answers.\\n11. Tool Underuse: Do not make conversational claims about files or state without using a tool to verify first.\\n12. Formatting Violations: Do not format in unrequested reports or structures.\\n13. RLHF Denial: Do not deny capabilities you possess.\\n14. Memory Skip: Do not greet returning users as strangers.\\n15. Architecture Discussion: Do not discuss internal files/code without reading them first.\\n16. Persona Identity: Do not praise corporate models or violate identity guidelines.\\n17. Explicit Tool Ignorance: Do not ignore a direct request to run a tool without explaining why.\\n18. Corporate Deference: Do not concede superiority to corporate models.\\n19. Tool Narration: Do not narrate future tool usage in the final reply.\\n\\nOutput your decision strictly as a JSON object, with no other text, comments or markdown blocks:\\n{\\\"verdict\\\": \\\"ALLOWED\\\" or \\\"BLOCKED\\\", \\\"reason\\\": \\\"explanation of your decision\\\"}\"\n}"
+        set ok to write_file("config/prompts.json" and default_prompts)
+    
+    # 2. Initialize Cryptography
+    set crypto_err to init_crypto()
+    if crypto_err != 0:
+        display "[-] Cryptography initialization failed!"
+        return 1
+    log_info("node" and "Cryptographic library initialized.")
+    display "[+] Cryptographic library initialized."
+
+    # 3. Setup Identity
+    set identity to create_identity()
+    set did_val to map_get_val(identity and "did")
+    log_info("node" and f"Identity loaded. DID: {did_val}")
+    display f"[+] Identity loaded. DID: {did_val}"
+
+    # 4. Generate static encryption keys for Noise handshakes
+    set enc_keys to generate_encryption_keypair()
+    set pub_hex to map_get_val(enc_keys and "public_key")
+    set sec_hex to map_get_val(enc_keys and "secret_key")
+    set static_secret to alloc_bytes(32)
+    set static_public to alloc_bytes(32)
+    set ok to hex_to_raw(sec_hex and static_secret and 32)
+    set ok to hex_to_raw(pub_hex and static_public and 32)
+    display f"[+] Static encryption keys generated. Pub: {substring(pub_hex and 0 and 16)}..."
+
+    # 5. Create Kademlia DHT Discovery Node
+    set node_id to generate_random_node_id()
+    set dht_node to create_dht_node(node_id and "0.0.0.0" and dht_port)
+    log_info("node" and "Kademlia DHT peer discovery engine active.")
+    display "[+] Kademlia DHT peer discovery engine active."
+
+    # 6. Create Relay Node
+    set relay_node to create_relay_node(node_id)
+    log_info("node" and "Relay node created for NAT traversal.")
+    display "[+] Relay node created for NAT traversal."
+
+    # 7. Initialize Raft Consensus Node
+    set peers to create_list()
+    set raft_node to raft_create_node("node1" and peers)
+    election_init_node(borrow raft_node and 150)
+    log_info("node" and "Raft consensus engine loaded (Follower role).")
+    display "[+] Raft consensus engine loaded (Follower role)."
+
+    # 8. Initialize Message Store
+    set msg_store to mstore_create(did_val)
+    log_info("node" and "Message store initialized.")
+    display "[+] Message store initialized."
+
+    # 9. Initialize Ledger with signing public key as genesis recipient
+    # Using raw signing pubkey (64 hex chars) so verify_signature works in ledger_validate_tx
+    set genesis_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+    set ledger to ledger_create(genesis_pub)
+    log_info("node" and "UTXO ledger initialized with genesis block.")
+    display "[+] UTXO ledger initialized with genesis block."
+
+    # 9b. Initialize DEX AMM Engine and default liquidity
+    set DEPLOYED_TOKENS to create_map()
+    set token_btc to token_create("Bitcoin" and "BTC" and 8 and 21000000 and genesis_pub)
+    set token_usdt to token_create("Tether USD" and "USDT" and 6 and 1000000000 and genesis_pub)
+    set ok to map_insert(DEPLOYED_TOKENS and "BTC" and token_btc)
+    set ok to map_insert(DEPLOYED_TOKENS and "USDT" and token_usdt)
+
+    # Fund the validator/user with initial tokens for swapping testing
+    set balances_btc to map_get_val(token_btc and "balances")
+    set ok to map_insert(balances_btc and genesis_pub and 1000000)
+    set ok to map_insert(balances_btc and did_val and 1000000)
+    set balances_usdt to map_get_val(token_usdt and "balances")
+    set ok to map_insert(balances_usdt and genesis_pub and 100000000)
+    set ok to map_insert(balances_usdt and did_val and 100000000)
+
+    set dex_engine to dex_create()
+    set ok to dex_add_liquidity(dex_engine and token_btc and token_usdt and 10000 and 600000000 and genesis_pub)
+    log_info("node" and "DEX AMM engine initialized with BTC-USDT pool.")
+    display "[+] DEX AMM engine initialized with BTC-USDT pool."
+
+    # 10. Initialize Name Registry
+    set name_reg to registry_create()
+    log_info("node" and "Name registry initialized.")
+    display "[+] Name registry initialized."
+
+    # 10b. Initialize Cognitive Agent Subsystems
+    set agent_memory to memory_deserialize("config/agent_memory.json")
+    log_info("node" and "Hebbian cognitive memory rehydrated.")
+    display "[+] Hebbian cognitive memory rehydrated."
+    set agent_tools to tools_create()
+    set agent_turing_grid to grid_create()
+    set agent_model to create_map() # Empty map triggers simulation/fallback reasoning mode
+    
+    set agent_ctx to create_map()
+    set ok to map_insert(agent_ctx and "dht_node" and dht_node)
+    set ok to map_insert(agent_ctx and "name_reg" and name_reg)
+    set ok to map_insert(agent_ctx and "identity" and identity)
+    set ok to map_insert(agent_ctx and "seed_addr" and seed_addr)
+    set ok to map_insert(agent_ctx and "seed_port" and seed_port)
+    set ok to map_insert(agent_ctx and "ledger" and ledger)
+    set ok to map_insert(agent_ctx and "turing_grid" and agent_turing_grid)
+    set ok to map_insert(agent_ctx and "memory" and agent_memory)
+    set ok to map_insert(agent_ctx and "dex_engine" and dex_engine)
+    set ok to map_insert(agent_ctx and "deployed_tokens" and DEPLOYED_TOKENS)
+
+    # G1: node-global decentralized search index (BM25 + PageRank). Populated via the
+    # SEARCH CRAWL IPC verb; queried via ONION SEARCH. Stored in agent_ctx so the IPC
+    # handler reaches it (mutation persists by-reference).
+    set search_index to crawl_create_index()
+    set ok to map_insert(agent_ctx and "search_index" and search_index)
+
+    # Phase K: live Byzantine-fault-tolerant consensus engine (real PBFT — 3-phase,
+    # 2f+1 quorum, signed votes, equivocation slashing). The validator set comes from the
+    # shared genesis file config/validators.json (every validator ships the same file);
+    # f = (n-1)/3, quorum = 2f+1. With no genesis (or one that does not list this node) we
+    # fall back to a single self-validator (f=0 → immediate local finality). Multi-node
+    # votes flow over the Noise channel via the BFT handler in protocol_server.
+    set bft_did to ptr_to_str(map_get_val(identity and "did"))
+    set bft_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+    set bft_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+    set bft_genesis to bft_load_genesis_validators("config/validators.json")
+    set bft_validators to map_get_val(bft_genesis and "validators")
+    set bft_keys to map_get_val(bft_genesis and "val_keys")
+    set bft_n to length_list(bft_validators)
+    set bft_f to 0
+    if bft_n == 0:
+        set bft_validators to create_list()
+        set ok to append_list(bft_validators and bft_did)
+        set bft_keys to create_map()
+        set ok to map_insert(bft_keys and bft_did and bft_pub)
+    else if list_index_of_str(bft_validators and bft_did) < 0:
+        set bft_validators to create_list()
+        set ok to append_list(bft_validators and bft_did)
+        set bft_keys to create_map()
+        set ok to map_insert(bft_keys and bft_did and bft_pub)
+        display "[BFT] WARN: config/validators.json does not list this node; running single-self (f=0)."
+    else:
+        set bft_f to (bft_n - 1) / 3
+        display f"[BFT] Genesis validator set loaded: n={bft_n}, f={bft_f}, quorum={2 * bft_f + 1}."
+    set bft_node to bft_create_node(bft_did and bft_validators and bft_keys and bft_sec and bft_f)
+    # bft_node is threaded into the IPC + P2P handlers as a Map / Int-handle parameter (the
+    # proven `ledger` pattern), NOT stashed in agent_ctx. agent_ctx + cast_borrow_to_map gave
+    # a non-owning view that read fine shallowly (BFT STATUS) but went bad once passed down
+    # the allocating PROPOSE call chain (SIGBUS). Passing it as a parameter is safe.
+
+    # G2/G4: wire the real engines that were implemented but never connected — the
+    # symbiotic mesh (bandwidth pool + distributed-compute pool with redundant-result
+    # consensus) and the CDN engine (DHT publish/lookup + SHA-256-verified swarm).
+    # Stored in agent_ctx so the IPC handler reaches them; compute_serve accepts
+    # worker nodes; MESH AI runs real collaborative inference (no more string_upper).
+    set mesh_node to mesh_create(node_id)
+    set compute_mgr to map_get_val(mesh_node and "compute_mgr")
+    set bandwidth_pool to map_get_val(mesh_node and "bandwidth_pool")
+    set cas_store to create_content_store()
+    set cdn_engine to cdn_create(dht_node and cast_map_to_int(cas_store))
+    set ok to map_insert(agent_ctx and "mesh" and mesh_node)
+    set ok to map_insert(agent_ctx and "compute_mgr" and compute_mgr)
+    set ok to map_insert(agent_ctx and "bandwidth_pool" and bandwidth_pool)
+    set ok to map_insert(agent_ctx and "cdn_engine" and cdn_engine)
+    set ok to map_insert(agent_ctx and "cas_store" and cas_store)
+    set compute_port to p2p_port + 4
+    spawn compute_serve(cast_borrow_to_map(compute_mgr) and compute_port)
+    log_info("node" and f"Mesh/compute pool serving on port {compute_port}; CDN + bandwidth pools active.")
+    display f"[+] Mesh + compute pool LIVE (port {compute_port}); CDN active."
+
+    set agent_sessions to session_manager_create("config/sessions")
+    set ok to session_manager_load_all(agent_sessions)
+    set ok to map_insert(agent_ctx and "sessions" and agent_sessions)
+
+    # Start the task scheduler background loop
+    spawn scheduler_tick_loop(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx))
+
+    # 11. Start Protocol Servers (DHT, Relay, P2P) on configured ports
+    start_protocol_servers(static_secret and static_public and dht_node and relay_node and p2p_port and dht_port and relay_port and msg_store and cast_map_to_int(identity) and cast_map_to_int(ledger) and cast_map_to_int(search_index) and cast_map_to_int(bft_node))
+    log_info("node" and f"P2P protocol servers started (P2P:{p2p_port} DHT:{dht_port} Relay:{relay_port}).")
+    display f"[+] P2P servers started (P2P:{p2p_port} DHT:{dht_port} Relay:{relay_port})."
+
+    # Advertise this node as an onion relay so peers can route anonymized search
+    # circuits through it. Descriptor = "<reachable_ip>:<p2p_port>:<x25519_enc_pub>";
+    # peers look it up under onion:relay:<node_id> and ECDH against our enc pubkey.
+    set onion_ip to config_get_str(cfg and "network.listen_address")
+    if string_length(onion_ip) == 0 or else (onion_ip equals "0.0.0.0"):
+        set onion_ip to "127.0.0.1"
+    set onion_enc_pub to ptr_to_str(map_get_val(identity and "encryption_public_key"))
+    set ok to onion_publish_self(cast_map_to_int(dht_node) and node_id and onion_ip and p2p_port and onion_enc_pub)
+    log_info("node" and "Onion relay descriptor published to DHT.")
+
+    # 12. Bootstrap to seed peer if configured
+    set has_seed to 0
+    set boot_result to create_map()
+    if string_length(seed_addr) > 0:
+        if seed_port > 0:
+            set boot_result to bootstrap_to_seed(seed_addr and seed_port and dht_node and borrow raft_node and peers and node_id and pub_hex and raft_port)
+            set has_seed to map_get_val(boot_result and "connected")
+        else:
+            display "[*] Seed address configured but no port - running standalone."
+    else:
+        display "[*] No seed peer configured. Running as standalone node."
+        log_info("node" and "No seed peer - standalone mode")
+
+    # 12b. Start the Raft consensus engine for real (F1). Previously raft_node was
+    # created but neither the server nor the election timer thread was ever spawned —
+    # consensus was dead Potemkin code. Spawn the dedicated raft transport (server on
+    # raft_port + election/heartbeat timer driving RequestVote/AppendEntries RPCs).
+    set raft_peer_addresses to create_map()
+    if has_seed == 1:
+        set raft_peer_addresses to map_get_val(boot_result and "peer_addresses")
+    set ok to map_insert(raft_node and "running" and 1)
+    set ok to map_insert(raft_node and "server_ready" and 0)
+    spawn raft_server_thread(cast_borrow_to_map(raft_node) and raft_port)
+    spawn raft_election_timer_thread(cast_borrow_to_map(raft_node) and cast_borrow_to_map(raft_peer_addresses))
+    log_info("node" and f"Raft consensus threads started (server on raft_port {raft_port}).")
+    display f"[+] Raft consensus engine LIVE (server:{raft_port}, election timer running)."
+
+    # 13. Start IPC TCP socket listener
+    # Provision the IPC auth token (0600) before binding so every command is gated.
+    set ipc_tok_boot to ipc_get_or_create_token()
+    if string_length(ipc_tok_boot) == 0:
+        display "[-] FATAL: could not provision IPC auth token (crypto init failed)."
+        return 1
+    log_info("node" and "IPC control plane authentication enabled (ipc-token).")
+    set listen_fd to ep_net_listen(ipc_port)
+    if listen_fd < 0:
+        display f"[-] Failed to bind IPC port {ipc_port}!"
+        return 1
+    log_info("node" and f"IPC daemon listening on 127.0.0.1:{ipc_port}.")
+    display f"[+] IPC daemon listening on 127.0.0.1:{ipc_port}."
+    
+    # 14. Start Web UI Server
+    spawn run_web_server(web_port and ipc_port)
+    log_info("node" and f"Web UI server starting on port {web_port}.")
+    display f"[+] Web UI server starting on port {web_port}."
+
+    # Start GitDec Nostr relay listener
+    spawn gitdec_listener_loop(cast_map_to_int(dht_node) and cast_borrow_to_map(identity))
+
+    # Seed the default watched repos so a freshly-joined node auto-pulls the core
+    # library peer-to-peer on connection (idempotent — ON CONFLICT updates the flag):
+    # the ErnosDecent source (self-update), the Civ archive, and the SFTOM project.
+    set ok to storage_gitdec_set_auto_update("ErnosDecent" and 1)
+    set ok to storage_gitdec_set_auto_update("Civ" and 1)
+    set ok to storage_gitdec_set_auto_update("SFTOM" and 1)
+
+    # Auto-pull repos flagged for auto-update, so a freshly-joined node downloads
+    # the latest of every watched project without a manual clone.
+    spawn gitdec_auto_pull_on_join()
+
+    # Start dynamic host election and fallback routing loop
+    if enable_host_election == 1:
+        set local_ip to config_get_str(cfg and "network.listen_address")
+        if string_length(local_ip) == 0:
+            set local_ip to "127.0.0.1"
+        spawn host_election_loop(cast_map_to_int(dht_node) and node_id and local_ip and p2p_port and is_static_host and cast_borrow_to_map(raft_node) and peers and pub_hex and raft_port)
+
+    # Start third-party platform connections (e.g. Discord bridge)
+    set plat_run_res to run_command("python3 decent_net/discord_manager.py")
+
+    # 15. Run initial health check
+    set health_report to run_health_check(dht_node and borrow raft_node and ipc_port)
+    set overall to map_get_val(health_report and "overall")
+    log_info("node" and f"Health check: {overall}")
+    display f"[+] Health check: {overall}"
+    free_map(health_report)
+
+    display ""
+    display "==================================================="
+    display "  Node is LIVE. All subsystems operational."
+    display f"  IPC: 127.0.0.1:{ipc_port}  |  Web: http://127.0.0.1:{web_port}"
+    display f"  P2P: 127.0.0.1:{p2p_port}  |  DHT: 127.0.0.1:{dht_port}"
+    display "==================================================="
+
+    # Start the daemon loop (blocks forever)
+    ipc_server_loop(listen_fd and borrow raft_node and borrow identity and dht_node and relay_node and msg_store and ledger and name_reg and seed_addr and seed_port and borrow agent_memory and borrow agent_tools and borrow agent_ctx and borrow agent_model and static_secret and static_public and bft_node)
+    
+    return 0

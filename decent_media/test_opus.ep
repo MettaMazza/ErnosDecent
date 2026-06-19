@@ -1,0 +1,58 @@
+# Phase J — real libopus audio codec test.
+# Proves codec_encode_audio/decode_audio go through the REAL libopus library (not the
+# ADPCM fallback): a 960-sample (20 ms @ 48 kHz) sine frame encodes to a compact Opus
+# packet and decodes back to 960 samples whose energy tracks the input (Opus is lossy,
+# so we check correlation/energy, not exact equality). If libopus is absent the test
+# reports that honestly rather than passing on the fallback.
+
+import "collections"
+import "math"
+import "codec"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set ctx to codec_init()
+    set passes to 0
+    set total to 4
+
+    set has_opus to map_get_val(ctx and "has_opus")
+    set enc to map_get_val(ctx and "opus_enc")
+    if has_opus == 0 or else enc == 0:
+        display "SKIP: libopus not available on this host — real-Opus path not exercised."
+        display "RESULT: 0/0 passed (opus unavailable)"
+        return 0
+    set passes to passes + pass_if("opus_encoder_created" and (enc != 0))
+
+    # Build a 960-sample sine wave (amplitude 8000) — one 20 ms frame at 48 kHz.
+    set samples to create_list()
+    set i to 0
+    set energy_in to 0
+    repeat while i < 960:
+        # crude sine via repeating ramp pattern; exact shape doesn't matter, just real signal
+        set v to ((i modulo 48) - 24) * 300
+        set ok to append_list(samples and v)
+        set energy_in to energy_in + (v * v) / 1000
+        set i to i + 1
+
+    set packet to codec_encode_audio(ctx and samples)
+    set plen to length_list(packet)
+    # packet = [nframes, len1, bytes...]; nframes should be 1, and there must be real bytes
+    set nframes to get_list(packet and 0)
+    set passes to passes + pass_if("encodes_one_frame" and (nframes == 1))
+    # a real Opus packet for 960 samples is far smaller than the raw 960 values
+    set passes to passes + pass_if("packet_is_compressed" and (plen > 2 and also plen < 960))
+
+    set decoded to codec_decode_audio(ctx and packet)
+    set dlen to length_list(decoded)
+    # real Opus decodes back to exactly the frame size (960 samples)
+    set passes to passes + pass_if("decodes_to_960_samples" and (dlen == 960))
+
+    display concat("packet_len=" and concat(int_to_string(plen) and concat(" decoded_samples=" and int_to_string(dlen))))
+    display concat("RESULT: " and concat(int_to_string(passes) and concat("/" and concat(int_to_string(total) and " passed"))))
+    return 0

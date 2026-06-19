@@ -1,0 +1,131 @@
+# Phase K BFT negative-control harness: 4 validators (f=1, n=4, quorum=2f+1=3).
+# Proves: (1) honest 3-phase run commits the proposed value on every node;
+# (2) a sub-quorum (2 votes) does NOT commit — the safety/quorum guarantee;
+# (3) signed-message verification rejects a forged/unknown sender;
+# (4) an equivocating validator (two digests for the same view/seq) is slashed.
+
+import "string"
+import "collections"
+import "../decent_id/keys"
+import "bft"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set ok to init_crypto()
+    set passes to 0
+
+    # --- build a 4-validator set with real Ed25519 keypairs ---
+    set validators to create_list()
+    set ok to append_list(validators and "v0")
+    set ok to append_list(validators and "v1")
+    set ok to append_list(validators and "v2")
+    set ok to append_list(validators and "v3")
+    set secs to create_list()
+    set val_keys to create_map()
+    set i to 0
+    repeat while i < 4:
+        set kp to generate_signing_keypair()
+        set ok to append_list(secs and ptr_to_str(map_get_val(kp and "public_key")))
+        set ok to set_list(secs and i and ptr_to_str(map_get_val(kp and "secret_key")))
+        set ok to map_insert(val_keys and ptr_to_str(get_list(validators and i)) and ptr_to_str(map_get_val(kp and "public_key")))
+        set i to i + 1
+
+    # nodes
+    set nodes to create_list()
+    set i to 0
+    repeat while i < 4:
+        set nd to bft_create_node(ptr_to_str(get_list(validators and i)) and validators and val_keys and ptr_to_str(get_list(secs and i)) and 1)
+        set ok to append_list(nodes and nd)
+        set i to i + 1
+
+    # --- (1) honest 3-phase run ---
+    # leader (v0) proposes; collect each node's PREPARE; broadcast; collect COMMITs; broadcast.
+    set pp to bft_propose(get_list(nodes and 0) and "BLOCK_A")
+    set prepares to create_list()
+    set i to 0
+    repeat while i < 4:
+        set r to bft_handle(get_list(nodes and i) and pp)
+        set ok to append_list(prepares and map_get_val(r and "to_send"))
+        set i to i + 1
+    # broadcast all PREPAREs to all nodes; collect COMMITs emitted at quorum
+    set commits to create_list()
+    set i to 0
+    repeat while i < 4:
+        set j to 0
+        repeat while j < 4:
+            set r to bft_handle(get_list(nodes and i) and get_list(prepares and j))
+            if map_get_val(r and "result") == BFT_PREPARED:
+                set ok to append_list(commits and map_get_val(r and "to_send"))
+            set j to j + 1
+        set i to i + 1
+    # broadcast all COMMITs to all nodes
+    set commit_count to 0
+    set i to 0
+    repeat while i < 4:
+        set j to 0
+        repeat while j < length_list(commits):
+            set r to bft_handle(get_list(nodes and i) and get_list(commits and j))
+            if map_get_val(r and "result") == BFT_COMMITTED:
+                set commit_count to commit_count + 1
+            set j to j + 1
+        set i to i + 1
+    # every honest node committed exactly once → log has BLOCK_A, seq advanced
+    set all_committed to 1
+    set i to 0
+    repeat while i < 4:
+        set lg to map_get_val(get_list(nodes and i) and "log")
+        if length_list(lg) != 1:
+            set all_committed to 0
+        else:
+            if (ptr_to_str(get_list(lg and 0)) equals "BLOCK_A") == 0:
+                set all_committed to 0
+        set i to i + 1
+    set passes to passes + pass_if("honest_run_commits_on_all_nodes" and all_committed)
+    set passes to passes + pass_if("commit_fired_4_nodes" and (commit_count == 4))
+
+    # --- (3) forged/unknown sender rejected ---
+    set fnode to bft_create_node("vX" and validators and val_keys and ptr_to_str(get_list(secs and 0)) and 1)
+    set forged to bft_make_msg(fnode and BFT_PHASE_PREPARE and 0 and 5 and bft_digest("X") and "")
+    set rr to bft_handle(get_list(nodes and 1) and forged)
+    set passes to passes + pass_if("unknown_sender_rejected" and (map_get_val(rr and "result") == BFT_ERR_NOT_VALIDATOR))
+
+    # --- (2) sub-quorum does NOT commit (fresh nodes, seq=5) ---
+    set safenode to bft_create_node("v0" and validators and val_keys and ptr_to_str(get_list(secs and 0)) and 1)
+    set d to bft_digest("BLOCK_B")
+    # feed only 2 distinct PREPAREs (quorum is 3) → must NOT reach PREPARED
+    set p_v1 to bft_make_msg(get_list(nodes and 1) and BFT_PHASE_PREPARE and 0 and 5 and d and "")
+    set p_v2 to bft_make_msg(get_list(nodes and 2) and BFT_PHASE_PREPARE and 0 and 5 and d and "")
+    set r1 to bft_handle(safenode and p_v1)
+    set r2 to bft_handle(safenode and p_v2)
+    set no_premature to 1
+    if map_get_val(r1 and "result") == BFT_PREPARED:
+        set no_premature to 0
+    if map_get_val(r2 and "result") == BFT_PREPARED:
+        set no_premature to 0
+    set passes to passes + pass_if("subquorum_does_not_prepare" and no_premature)
+    # third distinct PREPARE reaches quorum → PREPARED
+    set p_v3 to bft_make_msg(get_list(nodes and 3) and BFT_PHASE_PREPARE and 0 and 5 and d and "")
+    set r3 to bft_handle(safenode and p_v3)
+    set passes to passes + pass_if("quorum_reaches_prepared" and (map_get_val(r3 and "result") == BFT_PREPARED))
+
+    # --- (4) equivocation slashing ---
+    set enode to bft_create_node("v0" and validators and val_keys and ptr_to_str(get_list(secs and 0)) and 1)
+    set e1 to bft_make_msg(get_list(nodes and 1) and BFT_PHASE_PREPARE and 0 and 9 and bft_digest("BLOCK_X") and "")
+    set e2 to bft_make_msg(get_list(nodes and 1) and BFT_PHASE_PREPARE and 0 and 9 and bft_digest("BLOCK_Y") and "")
+    set er1 to bft_handle(enode and e1)
+    set er2 to bft_handle(enode and e2)
+    set slashed to map_get_val(enode and "slashed")
+    set was_slashed to 0
+    if map_get_val(er2 and "result") == BFT_EQUIVOCATION:
+        if list_index_of_str(slashed and "v1") >= 0:
+            set was_slashed to 1
+    set passes to passes + pass_if("equivocator_detected_and_slashed" and was_slashed)
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/6 passed"))
+    return 0

@@ -1,0 +1,914 @@
+# ErnosDecent -- Smart Contract virtual Machine
+# Component: decent_money/contracts.ep
+# Implements: Persistent storage, variable evaluation, instruction interpretation, gas-metering, and state rollbacks
+# Status: Production -- OperationTrojanClaude Phase 8
+
+import "string"
+import "collections"
+
+# ================================================================
+# Constants and Error Codes
+# ================================================================
+
+set CONTRACT_ERR_NONE to 0
+set CONTRACT_ERR_OUT_OF_GAS to 910
+set CONTRACT_ERR_REVERTED to 911
+set CONTRACT_ERR_INVALID_INSTRUCTION to 912
+set CONTRACT_ERR_DIVISION_BY_ZERO to 913
+# Max CALL/DELEGATECALL nesting. The VM recurses on the native C stack and each
+# frame is large (~125KB), so this is bounded well below what an 8MB stack permits
+# (verified: 64 overflows, 16 is safe with >4x margin). Caps native recursion so a
+# self-/cyclic-calling contract reverts instead of crashing the node.
+set CONTRACT_MAX_CALL_DEPTH to 16
+
+# ================================================================
+# Helper Functions
+# ================================================================
+
+# Clone a map for state rollback capability
+define contract_clone_map with src as Map returning Map:
+    set dest to create_map()
+    set keys to map_keys(src)
+    set len to length_list(keys)
+    set i to 0
+    repeat while i < len:
+        set k to get_list(keys and i)
+        set v to map_get_val(src and k)
+        set ok to map_insert(dest and k and v)
+        set i to i + 1
+    free_list(keys)
+    set keys to 0
+    return dest
+
+# Evaluate variable or string literal
+define contract_eval_val with val_str as Str and locals as Map and storage as Map returning Str:
+    if map_contains(locals and val_str) == 1:
+        return map_get_val(locals and val_str)
+    if map_contains(storage and val_str) == 1:
+        return map_get_val(storage and val_str)
+    
+    # Strip quotes if it's a string literal
+    set len to string_length(val_str)
+    if len > 1:
+        set first_char to get_character(val_str and 0)
+        set last_char to get_character(val_str and len - 1)
+        if first_char == 34: # double quote
+            if last_char == 34:
+                return substring(val_str and 1 and len - 2)
+    return val_str
+
+# Evaluate to integer
+define contract_eval_int with val_str as Str and locals as Map and storage as Map returning Int:
+    set evaluated to contract_eval_val(val_str and locals and storage)
+    return string_to_int(evaluated)
+
+define contract_tokenize with s as Str returning List:
+    set tokens to create_list()
+    set current to create_list()
+    set len to string_length(s)
+    set in_quotes to 0
+    set i to 0
+    repeat while i < len:
+        set c to get_character(s and i)
+        if c == 34: # double quote
+            set in_quotes to 1 - in_quotes
+            set ok to append_list(current and c)
+        else:
+            if c == 32: # space
+                if in_quotes == 1:
+                    set ok to append_list(current and c)
+                else:
+                    if length_list(current) > 0:
+                        set token_str to string_from_list(current)
+                        set ok to append_list(tokens and token_str)
+                        set current to create_list()
+            else:
+                set ok to append_list(current and c)
+        set i to i + 1
+        
+    if length_list(current) > 0:
+        set token_str to string_from_list(current)
+        set ok to append_list(tokens and token_str)
+        
+    return tokens
+
+# ================================================================
+# Smart Contract Initialization
+# ================================================================
+
+set DEPLOYED_CONTRACTS to 0
+
+define contracts_init returning Int:
+    if DEPLOYED_CONTRACTS == 0:
+        set DEPLOYED_CONTRACTS to create_map()
+    return 0
+
+define contract_create with code_str as Str and owner_did as Str and max_gas as Int returning Map:
+    set ok to contracts_init()
+    
+    set contract_id to concat("contract_" and int_to_string(ep_random_int(100000 and 999999)))
+    set contract to create_map()
+    set ok to map_insert(contract and "id" and contract_id)
+    set ok to map_insert(contract and "code" and code_str)
+    set ok to map_insert(contract and "owner" and owner_did)
+    
+    set storage to create_map()
+    set ok to map_insert(contract and "storage" and storage)
+    set ok to map_insert(contract and "balance" and "0")
+    
+    set events to create_list()
+    set ok to map_insert(contract and "events" and events)
+    set ok to map_insert(contract and "max_gas" and max_gas)
+    
+    set values_list to create_list()
+    set ok to map_insert(contract and "values_list" and values_list)
+    
+    set ok to append_list(values_list and storage)
+    set ok to append_list(values_list and events)
+    
+    # Store in global registry
+    set ok to map_insert(DEPLOYED_CONTRACTS and contract_id and contract)
+
+    return contract
+
+# Deregister a contract from DEPLOYED_CONTRACTS *before* freeing it, so a later
+# SEND_BAL/CALL referencing its id cannot dereference a freed map (use-after-free).
+# Always use this instead of free_map() on a deployed contract.
+define contract_destroy with contract as Map returning Int:
+    if contract == 0:
+        return 0
+    set rc to contracts_init()
+    set cid to ptr_to_str(map_get_val(contract and "id"))
+    if map_contains(DEPLOYED_CONTRACTS and cid) == 1:
+        set ok to map_delete(DEPLOYED_CONTRACTS and cid)
+    set ok to free_map(contract)
+    return 0
+
+# ================================================================
+# Virtual Machine Execution Engine
+# ================================================================
+
+define contract_call with contract as Map and entrypoint as Str and args as List and caller_did as Str and gas_limit as Int returning Map:
+    return contract_call_d(contract and entrypoint and args and caller_did and gas_limit and 0)
+
+# Depth-aware contract execution. call_depth bounds native recursion so that a self-
+# or cyclically-CALLing contract cannot overflow the C stack and crash the whole node
+# (verified SIGSEGV before this guard). Returns a REVERTED result on overflow.
+define contract_call_d with contract as Map and entrypoint as Str and args as List and caller_did as Str and gas_limit as Int and call_depth as Int returning Map:
+    if call_depth > CONTRACT_MAX_CALL_DEPTH:
+        set dresult to create_map()
+        set ok to map_insert(dresult and "status" and CONTRACT_ERR_REVERTED)
+        set ok to map_insert(dresult and "gas_used" and 0)
+        set ok to map_insert(dresult and "error" and "call depth limit exceeded")
+        set ok to map_insert(dresult and "retval" and 0)
+        return dresult
+    # Set up result map
+    set result to create_map()
+    
+    # Create gc_guard_list list to register it in the GC roots
+    set gc_guard_list to create_list()
+    
+    # Add contract and args to gc_guard_list
+    set ok to append_list(gc_guard_list and contract)
+    set ok to append_list(gc_guard_list and args)
+    
+    set code_str to map_get_val(contract and "code")
+    set ok to append_list(gc_guard_list and code_str)
+    set storage to map_get_val(contract and "storage")
+    set ok to append_list(gc_guard_list and storage)
+    set events_list to map_get_val(contract and "events")
+    set ok to append_list(gc_guard_list and events_list)
+    set values_list to map_get_val(contract and "values_list")
+    set ok to append_list(gc_guard_list and values_list)
+    
+    # Create clone of storage for transaction rollback
+    set storage_backup to contract_clone_map(storage)
+    set ok to append_list(gc_guard_list and storage_backup)
+    
+    # Initialize VM environments
+    set locals to create_map()
+    set ok to append_list(gc_guard_list and locals)
+    
+    # Push entrypoint arguments into locals (arg0, arg1, arg2...)
+    set args_len to length_list(args)
+    set i to 0
+    repeat while i < args_len:
+        set arg_name to concat("arg" and int_to_string(i))
+        set ok to append_list(gc_guard_list and arg_name)
+        set arg_val to get_list(args and i)
+        set ok to append_list(gc_guard_list and arg_val)
+        set ok to map_insert(locals and arg_name and arg_val)
+        set i to i + 1
+        
+    # Split code by lines
+    set raw_lines to split(code_str and "\n")
+    set ok to append_list(gc_guard_list and raw_lines)
+    set raw_len to length_list(raw_lines)
+    
+    set clean_lines to create_list()
+    set ok to append_list(gc_guard_list and clean_lines)
+    set idx to 0
+    repeat while idx < raw_len:
+        set raw_line to get_list(raw_lines and idx)
+        set trimmed to string_trim(raw_line)
+        set ok to append_list(gc_guard_list and trimmed)
+        set tlen to string_length(trimmed)
+        if tlen > 0:
+            set first_ch to get_character(trimmed and 0)
+            if first_ch != 35: # skip '#' comment lines
+                set ok to append_list(clean_lines and trimmed)
+        set idx to idx + 1
+        
+    set line_count to length_list(clean_lines)
+    
+    # Pre-scan for labels with gas metering
+    set labels to create_map()
+    set ok to append_list(gc_guard_list and labels)
+    set l_idx to 0
+    set pre_scan_gas to 0
+    repeat while l_idx < line_count:
+        set line_str to get_list(clean_lines and l_idx)
+        set line_len to string_length(line_str)
+        set line_gas to (line_len / 10) + 1
+        set pre_scan_gas to pre_scan_gas + line_gas
+        
+        set line_tokens to contract_tokenize(line_str)
+        set ok to append_list(gc_guard_list and line_tokens)
+        if length_list(line_tokens) > 1:
+            set op to get_list(line_tokens and 0)
+            if op equals "LABEL":
+                set label_name to get_list(line_tokens and 1)
+                set ok to append_list(gc_guard_list and label_name)
+                set ok to map_insert(labels and label_name and l_idx)
+        set l_idx to l_idx + 1
+
+    if pre_scan_gas > gas_limit:
+        set ok to map_insert(result and "status" and CONTRACT_ERR_OUT_OF_GAS)
+        set ok to map_insert(result and "gas_used" and pre_scan_gas)
+        set ok to map_insert(result and "error" and "Out of gas during label pre-scan")
+        set ok to map_insert(result and "gc_guard" and gc_guard_list)
+        return result
+        
+    # Determine starting program counter (PC)
+    set pc to 0
+    if string_length(entrypoint) > 0:
+        if map_contains(labels and entrypoint) == 1:
+            set pc to map_get_val(labels and entrypoint) + 1
+            
+    # VM loop state
+    set gas_used to pre_scan_gas
+    set status to CONTRACT_ERR_NONE
+    set error_msg to ""
+    set retval to ""
+    set call_events to create_list()
+    set ok to append_list(gc_guard_list and call_events)
+    
+    set halted to 0
+    repeat while pc < line_count:
+        if halted == 1:
+            set pc to line_count # break loop
+        else:
+            set line_str to get_list(clean_lines and pc)
+            set line_len to string_length(line_str)
+            set token_gas to (line_len / 10) + 1
+            set gas_used to gas_used + token_gas
+            
+            set tokens_len to 0
+            if gas_used > gas_limit:
+                set status to CONTRACT_ERR_OUT_OF_GAS
+                set error_msg to "Out of gas during instruction decoding"
+                set ok to append_list(gc_guard_list and error_msg)
+                set halted to 1
+            else:
+                set tokens to contract_tokenize(line_str)
+                set ok to append_list(gc_guard_list and tokens)
+                set tokens_len to length_list(tokens)
+            
+            if tokens_len == 0:
+                set pc to pc + 1
+            else:
+                set op to get_list(tokens and 0)
+                
+                # Instruction decoding & gas calculations
+                if op equals "SET":
+                    # SET key val
+                    set gas_used to gas_used + 20
+                    if gas_used > gas_limit:
+                        set status to CONTRACT_ERR_OUT_OF_GAS
+                        set error_msg to "Out of gas during SET execution"
+                        set ok to append_list(gc_guard_list and error_msg)
+                        set halted to 1
+                    else:
+                        if tokens_len < 3:
+                            set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                            set error_msg to "Invalid arguments for SET"
+                            set ok to append_list(gc_guard_list and error_msg)
+                            set halted to 1
+                        else:
+                            set key to get_list(tokens and 1)
+                            set val_token to get_list(tokens and 2)
+                            set val_eval to contract_eval_val(val_token and locals and storage)
+                            set ok to append_list(gc_guard_list and val_eval)
+                            set ok to map_insert(storage and key and val_eval)
+                            set ok to append_list(values_list and val_eval)
+                            
+                else:
+                    if op equals "LOAD":
+                        # LOAD key dest
+                        set gas_used to gas_used + 5
+                        if gas_used > gas_limit:
+                            set status to CONTRACT_ERR_OUT_OF_GAS
+                            set error_msg to "Out of gas during LOAD execution"
+                            set ok to append_list(gc_guard_list and error_msg)
+                            set halted to 1
+                        else:
+                            if tokens_len < 3:
+                                set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                set error_msg to "Invalid arguments for LOAD"
+                                set ok to append_list(gc_guard_list and error_msg)
+                                set halted to 1
+                            else:
+                                set key to get_list(tokens and 1)
+                                set dest to get_list(tokens and 2)
+                                set val to ""
+                                if map_contains(storage and key) == 1:
+                                    set val to map_get_val(storage and key)
+                                set ok to append_list(gc_guard_list and val)
+                                set ok to map_insert(locals and dest and val)
+                                
+                    else:
+                        if op equals "LET":
+                            # LET dest val
+                            set gas_used to gas_used + 2
+                            if gas_used > gas_limit:
+                                set status to CONTRACT_ERR_OUT_OF_GAS
+                                set error_msg to "Out of gas during LET execution"
+                                set ok to append_list(gc_guard_list and error_msg)
+                                set halted to 1
+                            else:
+                                if tokens_len < 3:
+                                    set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                    set error_msg to "Invalid arguments for LET"
+                                    set ok to append_list(gc_guard_list and error_msg)
+                                    set halted to 1
+                                else:
+                                    set dest to get_list(tokens and 1)
+                                    set val_token to get_list(tokens and 2)
+                                    set val_eval to contract_eval_val(val_token and locals and storage)
+                                    set ok to append_list(gc_guard_list and val_eval)
+                                    set ok to map_insert(locals and dest and val_eval)
+                                    
+                        else:
+                            if op equals "ADD":
+                                # ADD dest src1 src2
+                                set gas_used to gas_used + 3
+                                if gas_used > gas_limit:
+                                    set status to CONTRACT_ERR_OUT_OF_GAS
+                                    set error_msg to "Out of gas during ADD execution"
+                                    set ok to append_list(gc_guard_list and error_msg)
+                                    set halted to 1
+                                else:
+                                    if tokens_len < 4:
+                                        set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                        set error_msg to "Invalid arguments for ADD"
+                                        set ok to append_list(gc_guard_list and error_msg)
+                                        set halted to 1
+                                    else:
+                                        set dest to get_list(tokens and 1)
+                                        set s1 to get_list(tokens and 2)
+                                        set s2 to get_list(tokens and 3)
+                                        set v1 to contract_eval_int(s1 and locals and storage)
+                                        set v2 to contract_eval_int(s2 and locals and storage)
+                                        set op_res to int_to_string(v1 + v2)
+                                        set ok to append_list(gc_guard_list and op_res)
+                                        set ok to map_insert(locals and dest and op_res)
+                                        
+                            else:
+                                if op equals "SUB":
+                                    # SUB dest src1 src2
+                                    set gas_used to gas_used + 3
+                                    if gas_used > gas_limit:
+                                        set status to CONTRACT_ERR_OUT_OF_GAS
+                                        set error_msg to "Out of gas during SUB execution"
+                                        set ok to append_list(gc_guard_list and error_msg)
+                                        set halted to 1
+                                    else:
+                                        if tokens_len < 4:
+                                            set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                            set error_msg to "Invalid arguments for SUB"
+                                            set ok to append_list(gc_guard_list and error_msg)
+                                            set halted to 1
+                                        else:
+                                            set dest to get_list(tokens and 1)
+                                            set s1 to get_list(tokens and 2)
+                                            set s2 to get_list(tokens and 3)
+                                            set v1 to contract_eval_int(s1 and locals and storage)
+                                            set v2 to contract_eval_int(s2 and locals and storage)
+                                            set op_res to int_to_string(v1 - v2)
+                                            set ok to append_list(gc_guard_list and op_res)
+                                            set ok to map_insert(locals and dest and op_res)
+                                            
+                                else:
+                                    if op equals "MUL":
+                                        # MUL dest src1 src2
+                                        set gas_used to gas_used + 3
+                                        if gas_used > gas_limit:
+                                            set status to CONTRACT_ERR_OUT_OF_GAS
+                                            set error_msg to "Out of gas during MUL execution"
+                                            set ok to append_list(gc_guard_list and error_msg)
+                                            set halted to 1
+                                        else:
+                                            if tokens_len < 4:
+                                                set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                set error_msg to "Invalid arguments for MUL"
+                                                set ok to append_list(gc_guard_list and error_msg)
+                                                set halted to 1
+                                            else:
+                                                set dest to get_list(tokens and 1)
+                                                set s1 to get_list(tokens and 2)
+                                                set s2 to get_list(tokens and 3)
+                                                set v1 to contract_eval_int(s1 and locals and storage)
+                                                set v2 to contract_eval_int(s2 and locals and storage)
+                                                set op_res to int_to_string(v1 * v2)
+                                                set ok to append_list(gc_guard_list and op_res)
+                                                set ok to map_insert(locals and dest and op_res)
+                                                
+                                    else:
+                                        if op equals "DIV":
+                                            # DIV dest src1 src2
+                                            set gas_used to gas_used + 3
+                                            if gas_used > gas_limit:
+                                                set status to CONTRACT_ERR_OUT_OF_GAS
+                                                set error_msg to "Out of gas during DIV execution"
+                                                set ok to append_list(gc_guard_list and error_msg)
+                                                set halted to 1
+                                            else:
+                                                if tokens_len < 4:
+                                                    set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                    set error_msg to "Invalid arguments for DIV"
+                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                    set halted to 1
+                                                else:
+                                                    set dest to get_list(tokens and 1)
+                                                    set s1 to get_list(tokens and 2)
+                                                    set s2 to get_list(tokens and 3)
+                                                    set v1 to contract_eval_int(s1 and locals and storage)
+                                                    set v2 to contract_eval_int(s2 and locals and storage)
+                                                    if v2 == 0:
+                                                        set status to CONTRACT_ERR_DIVISION_BY_ZERO
+                                                        set error_msg to "Division by zero"
+                                                        set ok to append_list(gc_guard_list and error_msg)
+                                                        set halted to 1
+                                                    else:
+                                                        set op_res to int_to_string(v1 / v2)
+                                                        set ok to append_list(gc_guard_list and op_res)
+                                                        set ok to map_insert(locals and dest and op_res)
+                                                        
+                                        else:
+                                            if op equals "EQ":
+                                                # EQ dest src1 src2
+                                                set gas_used to gas_used + 3
+                                                if gas_used > gas_limit:
+                                                    set status to CONTRACT_ERR_OUT_OF_GAS
+                                                    set error_msg to "Out of gas during EQ execution"
+                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                    set halted to 1
+                                                else:
+                                                    if tokens_len < 4:
+                                                        set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                        set error_msg to "Invalid arguments for EQ"
+                                                        set ok to append_list(gc_guard_list and error_msg)
+                                                        set halted to 1
+                                                    else:
+                                                        set dest to get_list(tokens and 1)
+                                                        set s1 to get_list(tokens and 2)
+                                                        set s2 to get_list(tokens and 3)
+                                                        set v1_val to contract_eval_val(s1 and locals and storage)
+                                                        set v2_val to contract_eval_val(s2 and locals and storage)
+                                                        set res_eq to 0
+                                                        if v1_val equals v2_val:
+                                                            set res_eq to 1
+                                                        set op_res to int_to_string(res_eq)
+                                                        set ok to append_list(gc_guard_list and op_res)
+                                                        set ok to map_insert(locals and dest and op_res)
+                                                        
+                                            else:
+                                                if op equals "LT":
+                                                    # LT dest src1 src2
+                                                    set gas_used to gas_used + 3
+                                                    if gas_used > gas_limit:
+                                                        set status to CONTRACT_ERR_OUT_OF_GAS
+                                                        set error_msg to "Out of gas during LT execution"
+                                                        set ok to append_list(gc_guard_list and error_msg)
+                                                        set halted to 1
+                                                    else:
+                                                        if tokens_len < 4:
+                                                            set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                            set error_msg to "Invalid arguments for LT"
+                                                            set ok to append_list(gc_guard_list and error_msg)
+                                                            set halted to 1
+                                                        else:
+                                                            set dest to get_list(tokens and 1)
+                                                            set s1 to get_list(tokens and 2)
+                                                            set s2 to get_list(tokens and 3)
+                                                            set v1 to contract_eval_int(s1 and locals and storage)
+                                                            set v2 to contract_eval_int(s2 and locals and storage)
+                                                            set res_lt to 0
+                                                            if v1 < v2:
+                                                                set res_lt to 1
+                                                            set op_res to int_to_string(res_lt)
+                                                            set ok to append_list(gc_guard_list and op_res)
+                                                            set ok to map_insert(locals and dest and op_res)
+                                                            
+                                                else:
+                                                    if op equals "GT":
+                                                        # GT dest src1 src2
+                                                        set gas_used to gas_used + 3
+                                                        if gas_used > gas_limit:
+                                                            set status to CONTRACT_ERR_OUT_OF_GAS
+                                                            set error_msg to "Out of gas during GT execution"
+                                                            set ok to append_list(gc_guard_list and error_msg)
+                                                            set halted to 1
+                                                        else:
+                                                            if tokens_len < 4:
+                                                                set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                set error_msg to "Invalid arguments for GT"
+                                                                set ok to append_list(gc_guard_list and error_msg)
+                                                                set halted to 1
+                                                            else:
+                                                                set dest to get_list(tokens and 1)
+                                                                set s1 to get_list(tokens and 2)
+                                                                set s2 to get_list(tokens and 3)
+                                                                set v1 to contract_eval_int(s1 and locals and storage)
+                                                                set v2 to contract_eval_int(s2 and locals and storage)
+                                                                set res_gt to 0
+                                                                if v1 > v2:
+                                                                    set res_gt to 1
+                                                                set op_res to int_to_string(res_gt)
+                                                                set ok to append_list(gc_guard_list and op_res)
+                                                                set ok to map_insert(locals and dest and op_res)
+                                                                
+                                                    else:
+                                                        if op equals "IF":
+                                                            # IF cond_var label
+                                                            set gas_used to gas_used + 2
+                                                            if gas_used > gas_limit:
+                                                                set status to CONTRACT_ERR_OUT_OF_GAS
+                                                                set error_msg to "Out of gas during IF execution"
+                                                                set ok to append_list(gc_guard_list and error_msg)
+                                                                set halted to 1
+                                                            else:
+                                                                if tokens_len < 3:
+                                                                    set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                    set error_msg to "Invalid arguments for IF"
+                                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                                    set halted to 1
+                                                                else:
+                                                                    set cond_var to get_list(tokens and 1)
+                                                                    set dest_label to get_list(tokens and 2)
+                                                                    set cond_val to contract_eval_int(cond_var and locals and storage)
+                                                                    if cond_val != 0:
+                                                                        if map_contains(labels and dest_label) == 1:
+                                                                            set pc to map_get_val(labels and dest_label)
+                                                                        else:
+                                                                            set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                            set error_msg to "Target label not found"
+                                                                            set ok to append_list(gc_guard_list and error_msg)
+                                                                            set halted to 1
+                                                                            
+                                                        else:
+                                                            if op equals "GOTO":
+                                                                # GOTO label
+                                                                set gas_used to gas_used + 2
+                                                                if gas_used > gas_limit:
+                                                                    set status to CONTRACT_ERR_OUT_OF_GAS
+                                                                    set error_msg to "Out of gas during GOTO execution"
+                                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                                    set halted to 1
+                                                                else:
+                                                                    if tokens_len < 2:
+                                                                        set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                        set error_msg to "Invalid arguments for GOTO"
+                                                                        set ok to append_list(gc_guard_list and error_msg)
+                                                                        set halted to 1
+                                                                    else:
+                                                                        set dest_label to get_list(tokens and 1)
+                                                                        if map_contains(labels and dest_label) == 1:
+                                                                            set pc to map_get_val(labels and dest_label)
+                                                                        else:
+                                                                            set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                            set error_msg to "Target label not found"
+                                                                            set ok to append_list(gc_guard_list and error_msg)
+                                                                            set halted to 1
+                                                                            
+                                                            else:
+                                                                if op equals "LABEL":
+                                                                    # LABEL label_name
+                                                                    set gas_used to gas_used + 1 # No-op cost
+                                                                    
+                                                                else:
+                                                                    if op equals "LOG":
+                                                                        # LOG event_name val
+                                                                        set gas_used to gas_used + 10
+                                                                        if gas_used > gas_limit:
+                                                                            set status to CONTRACT_ERR_OUT_OF_GAS
+                                                                            set error_msg to "Out of gas during LOG execution"
+                                                                            set ok to append_list(gc_guard_list and error_msg)
+                                                                            set halted to 1
+                                                                        else:
+                                                                            if tokens_len < 3:
+                                                                                set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                                set error_msg to "Invalid arguments for LOG"
+                                                                                set ok to append_list(gc_guard_list and error_msg)
+                                                                                set halted to 1
+                                                                            else:
+                                                                                set ev_name to get_list(tokens and 1)
+                                                                                set ev_arg_token to get_list(tokens and 2)
+                                                                                set op_res to contract_eval_val(ev_arg_token and locals and storage)
+                                                                                set ok to append_list(gc_guard_list and op_res)
+                                                                                
+                                                                                set ev_map to create_map()
+                                                                                set ok to append_list(gc_guard_list and ev_map)
+                                                                                set ok to map_insert(ev_map and "name" and ev_name)
+                                                                                set ok to map_insert(ev_map and "data" and op_res)
+                                                                                set ok to map_insert(ev_map and "timestamp" and ep_time_now_sec())
+                                                                                set ok to append_list(call_events and ev_map)
+                                                                                set ok to append_list(values_list and ev_name)
+                                                                                set ok to append_list(values_list and op_res)
+                                                                                
+                                                                    else:
+                                                                        if op equals "CALLER":
+                                                                            # CALLER dest
+                                                                            set gas_used to gas_used + 2
+                                                                            if gas_used > gas_limit:
+                                                                                set status to CONTRACT_ERR_OUT_OF_GAS
+                                                                                set error_msg to "Out of gas during CALLER execution"
+                                                                                set ok to append_list(gc_guard_list and error_msg)
+                                                                                set halted to 1
+                                                                            else:
+                                                                                if tokens_len < 2:
+                                                                                    set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                                    set error_msg to "Invalid arguments for CALLER"
+                                                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                                                    set halted to 1
+                                                                                else:
+                                                                                    set dest_var to get_list(tokens and 1)
+                                                                                    set ok to map_insert(locals and dest_var and caller_did)
+                                                                                    
+                                                                        else:
+                                                                            if op equals "REVERT":
+                                                                                # REVERT reason
+                                                                                set gas_used to gas_used + 1
+                                                                                set status to CONTRACT_ERR_REVERTED
+                                                                                if tokens_len > 1:
+                                                                                    set error_msg to get_list(tokens and 1)
+                                                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                                                else:
+                                                                                    set error_msg to "Execution reverted"
+                                                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                                                set halted to 1
+                                                                                
+                                                                            else:
+                                                                                if op equals "GET_BAL":
+                                                                                    set gas_used to gas_used + 2
+                                                                                    if gas_used > gas_limit:
+                                                                                        set status to CONTRACT_ERR_OUT_OF_GAS
+                                                                                        set error_msg to "Out of gas during GET_BAL"
+                                                                                        set ok to append_list(gc_guard_list and error_msg)
+                                                                                        set halted to 1
+                                                                                    else:
+                                                                                        if tokens_len < 2:
+                                                                                            set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                                            set error_msg to "Invalid arguments for GET_BAL"
+                                                                                            set ok to append_list(gc_guard_list and error_msg)
+                                                                                            set halted to 1
+                                                                                        else:
+                                                                                            set dest_var to get_list(tokens and 1)
+                                                                                            set bal to 0
+                                                                                            if map_contains(contract and "balance") == 1:
+                                                                                                set bal to string_to_int(ptr_to_str(map_get_val(contract and "balance")))
+                                                                                            set ok to map_insert(locals and dest_var and int_to_string(bal))
+                                                                                            
+                                                                                else:
+                                                                                    if op equals "SEND_BAL":
+                                                                                        set gas_used to gas_used + 10
+                                                                                        if gas_used > gas_limit:
+                                                                                            set status to CONTRACT_ERR_OUT_OF_GAS
+                                                                                            set error_msg to "Out of gas during SEND_BAL"
+                                                                                            set ok to append_list(gc_guard_list and error_msg)
+                                                                                            set halted to 1
+                                                                                        else:
+                                                                                            if tokens_len < 3:
+                                                                                                set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                                                set error_msg to "Invalid arguments for SEND_BAL"
+                                                                                                set ok to append_list(gc_guard_list and error_msg)
+                                                                                                set halted to 1
+                                                                                            else:
+                                                                                                set rec_id to contract_eval_val(get_list(tokens and 1) and locals and storage)
+                                                                                                set amt to contract_eval_int(get_list(tokens and 2) and locals and storage)
+                                                                                                set current_bal to 0
+                                                                                                if map_contains(contract and "balance") == 1:
+                                                                                                    set current_bal to string_to_int(ptr_to_str(map_get_val(contract and "balance")))
+                                                                                                if amt < 1 or else current_bal < amt:
+                                                                                                    set status to CONTRACT_ERR_REVERTED
+                                                                                                    set error_msg to "SEND_BAL amount must be positive and within balance"
+                                                                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                                                                    set halted to 1
+                                                                                                else:
+                                                                                                    # Resolve recipient BEFORE debiting so a missing recipient
+                                                                                                    # reverts instead of silently burning the sender's coins.
+                                                                                                    set ok to contracts_init()
+                                                                                                    set rec_contract to map_get_val(DEPLOYED_CONTRACTS and rec_id)
+                                                                                                    if rec_contract == 0:
+                                                                                                        set status to CONTRACT_ERR_REVERTED
+                                                                                                        set error_msg to concat("SEND_BAL recipient not found: " and rec_id)
+                                                                                                        set ok to append_list(gc_guard_list and error_msg)
+                                                                                                        set halted to 1
+                                                                                                    else:
+                                                                                                        set rec_bal to string_to_int(ptr_to_str(map_get_val(rec_contract and "balance")))
+                                                                                                        if rec_bal > 9223372036854775807 - amt:
+                                                                                                            set status to CONTRACT_ERR_REVERTED
+                                                                                                            set error_msg to "SEND_BAL would overflow recipient balance"
+                                                                                                            set ok to append_list(gc_guard_list and error_msg)
+                                                                                                            set halted to 1
+                                                                                                        else:
+                                                                                                            set ok to map_insert(contract and "balance" and int_to_string(current_bal - amt))
+                                                                                                            set ok to map_insert(rec_contract and "balance" and int_to_string(rec_bal + amt))
+                                                                                                        
+                                                                                    else:
+                                                                                        if op equals "CALL":
+                                                                                            set gas_used to gas_used + 50
+                                                                                            if gas_used > gas_limit:
+                                                                                                set status to CONTRACT_ERR_OUT_OF_GAS
+                                                                                                set error_msg to "Out of gas during CALL"
+                                                                                                set ok to append_list(gc_guard_list and error_msg)
+                                                                                                set halted to 1
+                                                                                            else:
+                                                                                                if tokens_len < 4:
+                                                                                                    set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                                                    set error_msg to "Invalid arguments for CALL"
+                                                                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                                                                    set halted to 1
+                                                                                                else:
+                                                                                                    set target_id to contract_eval_val(get_list(tokens and 1) and locals and storage)
+                                                                                                    set entry_point to contract_eval_val(get_list(tokens and 2) and locals and storage)
+                                                                                                    set dest_var to get_list(tokens and 3)
+                                                                                                    
+                                                                                                    set sub_args to create_list()
+                                                                                                    set ok to append_list(gc_guard_list and sub_args)
+                                                                                                    set arg_i to 4
+                                                                                                    repeat while arg_i < tokens_len:
+                                                                                                        set val_token to get_list(tokens and arg_i)
+                                                                                                        set val_eval to contract_eval_val(val_token and locals and storage)
+                                                                                                        set ok to append_list(sub_args and val_eval)
+                                                                                                        set arg_i to arg_i + 1
+                                                                                                        
+                                                                                                    set ok to contracts_init()
+                                                                                                    set target_contract to map_get_val(DEPLOYED_CONTRACTS and target_id)
+                                                                                                    if target_contract == 0:
+                                                                                                        set status to CONTRACT_ERR_REVERTED
+                                                                                                        set error_msg to concat("Target contract not found: " and target_id)
+                                                                                                        set ok to append_list(gc_guard_list and error_msg)
+                                                                                                        set halted to 1
+                                                                                                    else:
+                                                                                                        set rem_gas to gas_limit - gas_used
+                                                                                                        set my_id to map_get_val(contract and "id")
+                                                                                                        set call_res to contract_call_d(target_contract and entry_point and sub_args and my_id and rem_gas and call_depth + 1)
+                                                                                                        set ok to append_list(gc_guard_list and call_res)
+                                                                                                        
+                                                                                                        set sub_status to map_get_val(call_res and "status")
+                                                                                                        set sub_gas_used to map_get_val(call_res and "gas_used")
+                                                                                                        set gas_used to gas_used + sub_gas_used
+                                                                                                        
+                                                                                                        if sub_status != CONTRACT_ERR_NONE:
+                                                                                                            set status to sub_status
+                                                                                                            set error_msg to map_get_val(call_res and "error")
+                                                                                                            set halted to 1
+                                                                                                        else:
+                                                                                                            set sub_retval to map_get_val(call_res and "retval")
+                                                                                                            set ok to map_insert(locals and dest_var and sub_retval)
+                                                                                                            
+                                                                                        else:
+                                                                                            if op equals "DELEGATECALL":
+                                                                                                set gas_used to gas_used + 50
+                                                                                                if gas_used > gas_limit:
+                                                                                                    set status to CONTRACT_ERR_OUT_OF_GAS
+                                                                                                    set error_msg to "Out of gas during DELEGATECALL"
+                                                                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                                                                    set halted to 1
+                                                                                                else:
+                                                                                                    if tokens_len < 4:
+                                                                                                        set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                                                        set error_msg to "Invalid arguments for DELEGATECALL"
+                                                                                                        set ok to append_list(gc_guard_list and error_msg)
+                                                                                                        set halted to 1
+                                                                                                    else:
+                                                                                                        set target_id to contract_eval_val(get_list(tokens and 1) and locals and storage)
+                                                                                                        set entry_point to contract_eval_val(get_list(tokens and 2) and locals and storage)
+                                                                                                        set dest_var to get_list(tokens and 3)
+                                                                                                        
+                                                                                                        set sub_args to create_list()
+                                                                                                        set ok to append_list(gc_guard_list and sub_args)
+                                                                                                        set arg_i to 4
+                                                                                                        repeat while arg_i < tokens_len:
+                                                                                                            set val_token to get_list(tokens and arg_i)
+                                                                                                            set val_eval to contract_eval_val(val_token and locals and storage)
+                                                                                                            set ok to append_list(sub_args and val_eval)
+                                                                                                            set arg_i to arg_i + 1
+                                                                                                            
+                                                                                                        set ok to contracts_init()
+                                                                                                        set target_contract to map_get_val(DEPLOYED_CONTRACTS and target_id)
+                                                                                                        if target_contract == 0:
+                                                                                                            set status to CONTRACT_ERR_REVERTED
+                                                                                                            set error_msg to concat("Target contract not found: " and target_id)
+                                                                                                            set ok to append_list(gc_guard_list and error_msg)
+                                                                                                            set halted to 1
+                                                                                                        else:
+                                                                                                            set temp_contract to create_map()
+                                                                                                            set ok to append_list(gc_guard_list and temp_contract)
+                                                                                                            set ok to map_insert(temp_contract and "id" and map_get_val(contract and "id"))
+                                                                                                            set ok to map_insert(temp_contract and "code" and map_get_val(target_contract and "code"))
+                                                                                                            set ok to map_insert(temp_contract and "owner" and map_get_val(contract and "owner"))
+                                                                                                            set ok to map_insert(temp_contract and "storage" and storage)
+                                                                                                            set ok to map_insert(temp_contract and "balance" and int_to_string(string_to_int(ptr_to_str(map_get_val(contract and "balance")))))
+                                                                                                            set ok to map_insert(temp_contract and "events" and events_list)
+                                                                                                            set ok to map_insert(temp_contract and "values_list" and values_list)
+                                                                                                            
+                                                                                                            set rem_gas to gas_limit - gas_used
+                                                                                                            set call_res to contract_call_d(temp_contract and entry_point and sub_args and caller_did and rem_gas and call_depth + 1)
+                                                                                                            set ok to append_list(gc_guard_list and call_res)
+                                                                                                            
+                                                                                                            set sub_status to map_get_val(call_res and "status")
+                                                                                                            set sub_gas_used to map_get_val(call_res and "gas_used")
+                                                                                                            set gas_used to gas_used + sub_gas_used
+                                                                                                            
+                                                                                                            if sub_status != CONTRACT_ERR_NONE:
+                                                                                                                set status to sub_status
+                                                                                                                set error_msg to map_get_val(call_res and "error")
+                                                                                                                set halted to 1
+                                                                                                            else:
+                                                                                                                set sub_retval to map_get_val(call_res and "retval")
+                                                                                                                set ok to map_insert(locals and dest_var and sub_retval)
+                                                                                                                
+                                                                                            else:
+                                                                                                if op equals "RETURN":
+                                                                                                    # RETURN val
+                                                                                                    set gas_used to gas_used + 1
+                                                                                                    if tokens_len > 1:
+                                                                                                        set ret_token to get_list(tokens and 1)
+                                                                                                        set retval to contract_eval_val(ret_token and locals and storage)
+                                                                                                        set ok to append_list(gc_guard_list and retval)
+                                                                                                    set halted to 1
+                                                                                                    
+                                                                                                else:
+                                                                                                    # Unknown instruction
+                                                                                                    set status to CONTRACT_ERR_INVALID_INSTRUCTION
+                                                                                                    set error_msg to concat("Unknown instruction: " and op)
+                                                                                                    set ok to append_list(gc_guard_list and error_msg)
+                                                                                                    set halted to 1
+
+                
+                set pc to pc + 1 # increment PC
+                
+    # Process final status
+    set ok to map_insert(result and "status" and status)
+    set ok to map_insert(result and "gas_used" and gas_used)
+    
+    if status == CONTRACT_ERR_NONE:
+        # Success! Commit changes to events map and keep storage changes
+        set events_len to length_list(call_events)
+        set m to 0
+        repeat while m < events_len:
+            set ev to get_list(call_events and m)
+            set ok to append_list(events_list and ev)
+            set m to m + 1
+        set ok to map_insert(result and "retval" and retval)
+    else:
+        # Failure! Rollback storage to backup state
+        # Clear storage and copy backup back
+        set st_keys to map_keys(storage)
+        set st_keys_len to length_list(st_keys)
+        set n to 0
+        repeat while n < st_keys_len:
+            set key_del to get_list(st_keys and n)
+            map_delete(storage and key_del)
+            set n to n + 1
+        free_list(st_keys)
+        set st_keys to 0
+        
+        # Copy backup
+        set back_keys to map_keys(storage_backup)
+        set back_keys_len to length_list(back_keys)
+        set p to 0
+        repeat while p < back_keys_len:
+            set back_key to get_list(back_keys and p)
+            set back_val to map_get_val(storage_backup and back_key)
+            set ok to map_insert(storage and back_key and back_val)
+            set p to p + 1
+        free_list(back_keys)
+        set back_keys to 0
+        
+        set ok to map_insert(result and "error" and error_msg)
+        
+    set ok to map_insert(result and "gc_guard" and gc_guard_list)
+    return result

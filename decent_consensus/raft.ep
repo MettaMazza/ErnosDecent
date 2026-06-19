@@ -1,0 +1,192 @@
+# ErnosDecent — Raft Consensus State Machine
+# Component: decent_consensus/raft.ep
+# Implements: Raft node creation, RequestVote RPC handler, and AppendEntries RPC handler
+# Status: Production — OperationTrojanClaude Phase 13
+
+import "collections"
+import "string"
+import "./state"
+
+# ================================================================
+# Constants and Error Codes
+# ================================================================
+
+set RAFT_ROLE_FOLLOWER to "follower"
+set RAFT_ROLE_CANDIDATE to "candidate"
+set RAFT_ROLE_LEADER to "leader"
+
+# ================================================================
+# Data Structures
+# ================================================================
+
+define structure RaftNode:
+    field node_id as Str
+    field current_term as Int
+    field voted_for as Str
+    field log as Int # List of LogEntry maps
+    field commit_index as Int
+    field last_applied as Int
+    field role as Str
+    field peers as Int # List of Str
+    field match_index as Int # Map (peer_id -> Int)
+    field next_index as Int # Map (peer_id -> Int)
+
+# ================================================================
+# Node Initialisation
+# ================================================================
+
+define raft_create_node with id as Str and peers as List returning Map:
+    set node to create_map()
+    set log_list to create_list()
+    set match_map to create_map()
+    set next_map to create_map()
+
+    set ok to map_insert(node and "node_id" and id)
+    set ok to map_insert(node and "current_term" and 0)
+    set ok to map_insert(node and "voted_for" and "")
+    set ok to map_insert(node and "log" and log_list)
+    set ok to map_insert(node and "commit_index" and 0)
+    set ok to map_insert(node and "last_applied" and 0)
+    set ok to map_insert(node and "role" and RAFT_ROLE_FOLLOWER)
+    set ok to map_insert(node and "peers" and peers)
+    set ok to map_insert(node and "match_index" and match_map)
+    set ok to map_insert(node and "next_index" and next_map)
+
+    # Initialize next_index for all peers to 1, match_index to 0
+    set num_peers to length_list(peers)
+    set i to 0
+    repeat while i < num_peers:
+        set peer_ptr to get_list(peers and i)
+        set peer_id to ptr_to_str(peer_ptr)
+        set ok to map_insert(match_map and peer_id and 0)
+        set ok to map_insert(next_map and peer_id and 1)
+        set i to i + 1
+
+    return node
+
+# ================================================================
+# RequestVote RPC Handler
+# ================================================================
+
+define raft_handle_request_vote with borrow node as Map and term as Int and candidate_id as Str and last_log_index as Int and last_log_term as Int returning Map:
+    set result to create_map()
+    
+    set current_term to map_get_val(node and "current_term")
+    set voted_for to map_get_val(node and "voted_for")
+
+    # 1. Reply false if term < current_term
+    if term < current_term:
+        set ok to map_insert(result and "term" and current_term)
+        set ok to map_insert(result and "vote_granted" and 0)
+        return result
+
+    # 2. If term > current_term, update term and transition to follower
+    if term > current_term:
+        set ok to map_insert(node and "current_term" and term)
+        set ok to map_insert(node and "voted_for" and "")
+        set ok to map_insert(node and "role" and RAFT_ROLE_FOLLOWER)
+        set current_term to term
+        set voted_for to ""
+
+    # Check if candidate's log is up-to-date
+    set log to map_get_val(node and "log")
+    set local_log_len to length_list(log)
+    set local_last_term to 0
+    if local_log_len > 0:
+        set last_entry to get_list(log and local_log_len - 1)
+        set local_last_term to map_get_val(last_entry and "term")
+
+    set log_ok to 0
+    if last_log_term > local_last_term:
+        set log_ok to 1
+    else:
+        if last_log_term == local_last_term:
+            if last_log_index >= local_log_len:
+                set log_ok to 1
+
+    # 3. Grant vote if voted_for is null/candidate and log is up-to-date
+    set has_voted to string_length(voted_for)
+    if (has_voted == 0 || voted_for equals candidate_id) && log_ok == 1:
+        set ok to map_insert(node and "voted_for" and candidate_id)
+        set ok to map_insert(result and "term" and current_term)
+        set ok to map_insert(result and "vote_granted" and 1)
+        return result
+
+    set ok to map_insert(result and "term" and current_term)
+    set ok to map_insert(result and "vote_granted" and 0)
+    return result
+
+# ================================================================
+# AppendEntries RPC Handler
+# ================================================================
+
+define raft_handle_append_entries with borrow node as Map and term as Int and leader_id as Str and prev_log_index as Int and prev_log_term as Int and entries as List and leader_commit as Int returning Map:
+    set result to create_map()
+
+    set current_term to map_get_val(node and "current_term")
+
+    # 1. Reply false if term < current_term
+    if term < current_term:
+        set ok to map_insert(result and "term" and current_term)
+        set ok to map_insert(result and "success" and 0)
+        return result
+
+    # 2. Update term and transition to follower if leader term is newer or equal
+    if term > current_term || (term == current_term && (map_get_val(node and "role") equals RAFT_ROLE_FOLLOWER) == 0):
+        set ok to map_insert(node and "current_term" and term)
+        set ok to map_insert(node and "voted_for" and "")
+        set ok to map_insert(node and "role" and RAFT_ROLE_FOLLOWER)
+        set current_term to term
+
+    set node_log to map_get_val(node and "log")
+    set local_log_len to length_list(node_log)
+
+    # 3. Reply false if log doesn't contain entry at prev_log_index matching prev_log_term
+    if prev_log_index > 0:
+        if prev_log_index > local_log_len:
+            set ok to map_insert(result and "term" and current_term)
+            set ok to map_insert(result and "success" and 0)
+            return result
+
+        set prev_entry to get_list(node_log and prev_log_index - 1)
+        set term_at_prev to map_get_val(prev_entry and "term")
+        if term_at_prev != prev_log_term:
+            set ok to map_insert(result and "term" and current_term)
+            set ok to map_insert(result and "success" and 0)
+            return result
+
+    # 4. Append entries and resolve conflicts
+    set num_entries to length_list(entries)
+    set j to 0
+    repeat while j < num_entries:
+        set entry to get_list(entries and j)
+        set entry_idx to map_get_val(entry and "index")
+        
+        # Conflict check
+        set current_log to map_get_val(node and "log")
+        if entry_idx <= length_list(current_log):
+            set existing to get_list(current_log and entry_idx - 1)
+            set existing_term to map_get_val(existing and "term")
+            set new_term to map_get_val(entry and "term")
+            if existing_term != new_term:
+                # Truncate log from entry_idx onwards via state_rollback_log (includes state machine undo)
+                set rollback_err to state_rollback_log(node and entry_idx)
+                set current_log_truncated to map_get_val(node and "log")
+                set ok to append_list(current_log_truncated and entry)
+        else:
+            set ok to append_list(current_log and entry)
+        set j to j + 1
+
+    # 5. Update commit_index
+    if leader_commit > map_get_val(node and "commit_index"):
+        set last_new_entry_index to prev_log_index + length_list(entries)
+        set min_commit to leader_commit
+        if last_new_entry_index < min_commit:
+            set min_commit to last_new_entry_index
+        set current_commit to map_get_val(node and "commit_index")
+        if min_commit > current_commit:
+            set ok to map_insert(node and "commit_index" and min_commit)
+
+    set ok to map_insert(result and "term" and current_term)
+    set ok to map_insert(result and "success" and 1)
+    return result

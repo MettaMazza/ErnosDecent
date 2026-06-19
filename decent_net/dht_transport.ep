@@ -1,0 +1,565 @@
+# ErnosDecent -- DHT-over-Transport Bridge
+# Component: decent_net/dht_transport.ep
+# Wires the existing DHT (in-memory maps) to real TCP via transport layer
+# Handles serialization of DHT messages and outbound RPC
+# Status: Production
+
+import "transport"
+import "dht"
+import "string"
+import "collections"
+import "../decent_id/keys"
+import "../decent_id/did"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set DHT_NET_ERR_NONE to 0
+set DHT_NET_ERR_SEND_FAILED to 961
+set DHT_NET_ERR_RECV_FAILED to 962
+set DHT_NET_ERR_TIMEOUT to 963
+set DHT_NET_ERR_BAD_RESPONSE to 964
+
+# ================================================================
+# Serialization: Node lists to/from wire format
+# Format for a single node: "id|addr|port"
+# Format for node list: "id|addr|port;id|addr|port;..."
+# ================================================================
+
+define dht_serialize_node_list with nodes as Int returning Str:
+    # Serialize a list of node maps into a wire-safe string
+    set count to length_list(nodes)
+    set result to ""
+    set i to 0
+    repeat while i < count:
+        set node to get_list(nodes and i)
+        set node_id to map_get_val(node and "id")
+        set node_addr to map_get_val(node and "address")
+        set node_port to map_get_val(node and "port")
+        if i > 0:
+            set result to concat(result and ";")
+        set result to concat(result and node_id)
+        set result to concat(result and "|")
+        set result to concat(result and node_addr)
+        set result to concat(result and "|")
+        set result to concat(result and int_to_string(node_port))
+        set i to i + 1
+    return result
+
+define dht_deserialize_node_list with data as Str returning Int:
+    # Parse "id|addr|port;id|addr|port;..." into a list of maps
+    set result to create_list()
+    if string_length(data) == 0:
+        return result
+
+    set entries to string_split(data and ";")
+    set entry_count to length_list(entries)
+    set i to 0
+    repeat while i < entry_count:
+        set entry to get_list(entries and i)
+        if string_length(entry) > 0:
+            set parts to string_split(entry and "|")
+            set part_count to length_list(parts)
+            if part_count >= 3:
+                set node_id to get_list(parts and 0)
+                set node_addr to get_list(parts and 1)
+                set node_port_str to get_list(parts and 2)
+                set node_port to string_to_int(node_port_str)
+                set node to create_map()
+                set ok to map_insert(node and "id" and node_id)
+                set ok to map_insert(node and "address" and node_addr)
+                set ok to map_insert(node and "port" and node_port)
+                set ok to append_list(result and node)
+            free_list(parts)
+        set i to i + 1
+    free_list(entries)
+    return result
+
+# ================================================================
+# Outbound RPC: Send DHT messages over TCP and receive replies
+# ================================================================
+
+define dht_evict_and_add_async with dht as Int and oldest_id as Str and oldest_addr as Str and oldest_port as Int and new_id as Str and new_addr as Str and new_port as Int returning Int:
+    # Ping the oldest node
+    set ping_err to dht_rpc_ping(dht and oldest_addr and oldest_port)
+    if ping_err != 0:
+        # PING failed! The oldest node is stale.
+        # Remove it from the routing table
+        set rt to map_get_val(dht and "routing_table")
+        set removed to routing_table_remove(rt and oldest_id)
+        
+        # Now add the new node (it should fit now!)
+        set ok to dht_node_add_peer(dht and new_id and new_addr and new_port)
+    return 0
+
+define dht_add_peer_with_eviction with dht as Int and peer_id as Str and peer_addr as Str and peer_port as Int returning Int:
+    set result to dht_node_add_peer(dht and peer_id and peer_addr and peer_port)
+    if result == DHT_ERR_BUCKET_FULL:
+        set oldest to dht_node_get_oldest_bucket_node(dht and peer_id)
+        if oldest != 0:
+            set oldest_id to ptr_to_str(map_get_val(oldest and "id"))
+            set oldest_addr to ptr_to_str(map_get_val(oldest and "address"))
+            set oldest_port to map_get_val(oldest and "port")
+            spawn dht_evict_and_add_async(dht and oldest_id and oldest_addr and oldest_port and peer_id and peer_addr and peer_port)
+    return result
+
+define dht_rpc_ping with dht as Int and address as Str and port as Int returning Int:
+    # Send PING to a remote peer, wait for PONG
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        return DHT_NET_ERR_SEND_FAILED
+
+    set my_id to map_get_val(dht and "id")
+    set my_addr to ptr_to_str(map_get_val(dht and "address"))
+    set my_port to map_get_val(dht and "port")
+    set payload to concat(my_id and ",")
+    set payload to concat(payload and my_addr)
+    set payload to concat(payload and ",")
+    set payload to concat(payload and int_to_string(my_port))
+    set err to transport_send(conn and MSG_TYPE_DHT_PING and payload)
+    if err != TRANSPORT_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        return DHT_NET_ERR_SEND_FAILED
+
+    set resp to transport_recv(conn)
+    set recv_err to map_get_val(resp and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        free_map(resp)
+        transport_close(conn)
+        free_map(conn)
+        return DHT_NET_ERR_RECV_FAILED
+
+    set msg_type to map_get_val(resp and "msg_type")
+    set sender_id to map_get_val(resp and "payload")
+    free_map(resp)
+
+    if msg_type equals "DHT_PONG":
+        # Add peer to routing table
+        set ok to dht_add_peer_with_eviction(dht and sender_id and address and port)
+
+    transport_close(conn)
+    free_map(conn)
+    return DHT_NET_ERR_NONE
+
+define dht_rpc_find_node with dht as Int and address as Str and port as Int and target_id as Str returning Int:
+    # Send FIND_NODE, get back closest nodes
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        set result to create_map()
+        set ok to map_insert(result and "error" and DHT_NET_ERR_SEND_FAILED)
+        set ok to map_insert(result and "nodes" and create_list())
+        return result
+
+    set my_id to map_get_val(dht and "id")
+    set my_addr to ptr_to_str(map_get_val(dht and "address"))
+    set my_port to map_get_val(dht and "port")
+    set payload to concat(my_id and ",")
+    set payload to concat(payload and my_addr)
+    set payload to concat(payload and ",")
+    set payload to concat(payload and int_to_string(my_port))
+    set payload to concat(payload and ",")
+    set payload to concat(payload and target_id)
+    set err to transport_send(conn and MSG_TYPE_DHT_FIND_NODE and payload)
+    if err != TRANSPORT_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        set result to create_map()
+        set ok to map_insert(result and "error" and DHT_NET_ERR_SEND_FAILED)
+        set ok to map_insert(result and "nodes" and create_list())
+        return result
+
+    set resp to transport_recv(conn)
+    set recv_err to map_get_val(resp and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        free_map(resp)
+        transport_close(conn)
+        free_map(conn)
+        set result to create_map()
+        set ok to map_insert(result and "error" and DHT_NET_ERR_RECV_FAILED)
+        set ok to map_insert(result and "nodes" and create_list())
+        return result
+
+    set msg_type to map_get_val(resp and "msg_type")
+    set resp_payload to map_get_val(resp and "payload")
+    free_map(resp)
+    transport_close(conn)
+    free_map(conn)
+
+    set result to create_map()
+    if msg_type equals "DHT_FIND_NODE_RESP":
+        set nodes to dht_deserialize_node_list(resp_payload)
+        set ok to map_insert(result and "nodes" and nodes)
+        set ok to map_insert(result and "error" and DHT_NET_ERR_NONE)
+    else:
+        set ok to map_insert(result and "nodes" and create_list())
+        set ok to map_insert(result and "error" and DHT_NET_ERR_BAD_RESPONSE)
+    return result
+
+define dht_rpc_store with dht as Int and address as Str and port as Int and key as Str and value as Str returning Int:
+    # Send STORE to a remote peer
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        return DHT_NET_ERR_SEND_FAILED
+
+    set payload to concat(key and ",")
+    set payload to concat(payload and value)
+    set err to transport_send(conn and MSG_TYPE_DHT_STORE and payload)
+    if err != TRANSPORT_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        return DHT_NET_ERR_SEND_FAILED
+
+    set resp to transport_recv(conn)
+    set recv_err to map_get_val(resp and "error")
+    free_map(resp)
+    transport_close(conn)
+    free_map(conn)
+
+    if recv_err != TRANSPORT_ERR_NONE:
+        return DHT_NET_ERR_RECV_FAILED
+    return DHT_NET_ERR_NONE
+
+# Signed STORE for ownership records ("repo:" / "name:" → owner DID). Signs key||value
+# with the publisher's Ed25519 key and sends "key,value,pubkey,sig" so the receiving
+# node can verify the storer holds the key and the value is its derived DID.
+define dht_rpc_store_signed with dht as Int and address as Str and port as Int and key as Str and value as Str and pub_hex as Str and sec_hex as Str returning Int:
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        return DHT_NET_ERR_SEND_FAILED
+
+    set sig_res to sign_message(concat(key and value) and sec_hex)
+    set sig_hex to ptr_to_str(map_get_val(sig_res and "signature"))
+
+    set payload to concat(key and ",")
+    set payload to concat(payload and value)
+    set payload to concat(payload and ",")
+    set payload to concat(payload and pub_hex)
+    set payload to concat(payload and ",")
+    set payload to concat(payload and sig_hex)
+    set err to transport_send(conn and MSG_TYPE_DHT_STORE and payload)
+    if err != TRANSPORT_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        return DHT_NET_ERR_SEND_FAILED
+
+    set resp to transport_recv(conn)
+    set recv_err to map_get_val(resp and "error")
+    free_map(resp)
+    transport_close(conn)
+    free_map(conn)
+
+    if recv_err != TRANSPORT_ERR_NONE:
+        return DHT_NET_ERR_RECV_FAILED
+    return DHT_NET_ERR_NONE
+
+define dht_rpc_find_value with dht as Int and address as Str and port as Int and key as Str returning Map:
+    # Send FIND_VALUE to a remote peer
+    set result to create_map()
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        set ok to map_insert(result and "error" and DHT_NET_ERR_SEND_FAILED)
+        set ok to map_insert(result and "found" and 0)
+        return result
+
+    set err to transport_send(conn and MSG_TYPE_DHT_FIND_VALUE and key)
+    if err != TRANSPORT_ERR_NONE:
+        transport_close(conn)
+        free_map(conn)
+        set ok to map_insert(result and "error" and DHT_NET_ERR_SEND_FAILED)
+        set ok to map_insert(result and "found" and 0)
+        return result
+
+    set resp to transport_recv(conn)
+    set recv_err to map_get_val(resp and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        free_map(resp)
+        transport_close(conn)
+        free_map(conn)
+        set ok to map_insert(result and "error" and DHT_NET_ERR_RECV_FAILED)
+        set ok to map_insert(result and "found" and 0)
+        return result
+
+    set msg_type to map_get_val(resp and "msg_type")
+    set resp_payload to map_get_val(resp and "payload")
+    free_map(resp)
+    transport_close(conn)
+    free_map(conn)
+
+    if msg_type equals "DHT_FIND_VALUE_RESP":
+        # Payload format: "found,value" or "notfound"
+        if string_contains(resp_payload and "found,") == 1:
+            set val_start to 6
+            set val_len to string_length(resp_payload) - val_start
+            set value to substring(resp_payload and val_start and val_len)
+            set ok to map_insert(result and "found" and 1)
+            set ok to map_insert(result and "value" and value)
+            set ok to map_insert(result and "error" and DHT_NET_ERR_NONE)
+        else:
+            set ok to map_insert(result and "found" and 0)
+            set ok to map_insert(result and "error" and DHT_NET_ERR_NONE)
+    else:
+        set ok to map_insert(result and "found" and 0)
+        set ok to map_insert(result and "error" and DHT_NET_ERR_BAD_RESPONSE)
+    return result
+
+# ================================================================
+# Inbound: Handle incoming DHT messages from TCP
+# This function runs server-side, accepting transport frames and
+# dispatching to the existing DHT logic
+# ================================================================
+
+define dht_handle_transport_message with dht as Int and conn as Map returning Int:
+    # Read one message from the transport, process it, send reply
+    set frame to transport_recv(conn)
+    set recv_err to map_get_val(frame and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        free_map(frame)
+        return DHT_NET_ERR_RECV_FAILED
+
+    set msg_type to map_get_val(frame and "msg_type")
+    set payload to map_get_val(frame and "payload")
+    free_map(frame)
+
+    set my_id to map_get_val(dht and "id")
+
+    if msg_type equals "DHT_PING":
+        # Payload = "sender_id,sender_address,sender_port" or "sender_id"
+        set sender_id to payload
+        set sender_addr to "unknown"
+        set sender_port to 0
+        if string_contains(payload and ",") == 1:
+            set parts to string_split(payload and ",")
+            set sender_id to ptr_to_str(get_list(parts and 0))
+            set sender_addr to ptr_to_str(get_list(parts and 1))
+            set sender_port to string_to_int(ptr_to_str(get_list(parts and 2)))
+            free_list(parts)
+        set ok to dht_add_peer_with_eviction(dht and sender_id and sender_addr and sender_port)
+        set err to transport_send(conn and MSG_TYPE_DHT_PONG and my_id)
+        return err
+
+    if msg_type equals "DHT_FIND_NODE":
+        # Payload = "sender_id,sender_address,sender_port,target_id" or "sender_id,target_id"
+        set parts to string_split(payload and ",")
+        set parts_len to length_list(parts)
+        set sender_id to ptr_to_str(get_list(parts and 0))
+        set sender_addr to "unknown"
+        set sender_port to 0
+        set target_id to ""
+        if parts_len >= 4:
+            set sender_addr to ptr_to_str(get_list(parts and 1))
+            set sender_port to string_to_int(ptr_to_str(get_list(parts and 2)))
+            set target_id to ptr_to_str(get_list(parts and 3))
+        else:
+            set target_id to ptr_to_str(get_list(parts and 1))
+        free_list(parts)
+        set ok to dht_add_peer_with_eviction(dht and sender_id and sender_addr and sender_port)
+        set closest to dht_node_find_closest(dht and target_id and 8)
+        set serialized to dht_serialize_node_list(closest)
+        set err to transport_send(conn and MSG_TYPE_DHT_FIND_NODE_RESP and serialized)
+        return err
+
+    if msg_type equals "DHT_STORE":
+        # Payload = "key,value"  OR signed  "key,value,pubkey_hex,signature_hex".
+        set parts to string_split(payload and ",")
+        if length_list(parts) < 2:
+            free_list(parts)
+            set err to transport_send(conn and MSG_TYPE_DHT_STORE_RESP and "error:bad_payload")
+            return err
+        set key to ptr_to_str(get_list(parts and 0))
+        set value to ptr_to_str(get_list(parts and 1))
+        set s_pubkey to ""
+        set s_sig to ""
+        if length_list(parts) >= 4:
+            set s_pubkey to ptr_to_str(get_list(parts and 2))
+            set s_sig to ptr_to_str(get_list(parts and 3))
+        free_list(parts)
+
+        # Bound the key length (the validator exists in security.ep; inline here to
+        # avoid a cross-module dep on the hot path).
+        if string_length(key) == 0 or else string_length(key) > 1024:
+            set err to transport_send(conn and MSG_TYPE_DHT_STORE_RESP and "error:bad_key")
+            return err
+
+        # Ownership records ("repo:" / "name:" → owner DID) MUST be signed: the
+        # signature proves the storer holds the key, and the stored DID must be the
+        # one derived from that key — so an attacker cannot front-run a claim with a
+        # forged owner DID. Other keys may be unsigned (content-addressed / routing).
+        set is_ownership to 0
+        if string_index_of(key and "repo:") == 0 or else string_index_of(key and "name:") == 0:
+            set is_ownership to 1
+
+        if is_ownership == 1:
+            if string_length(s_pubkey) == 0 or else string_length(s_sig) == 0:
+                set err to transport_send(conn and MSG_TYPE_DHT_STORE_RESP and "error:unsigned_ownership_record")
+                return err
+            if verify_signature(concat(key and value) and s_sig and s_pubkey) != 0:
+                set err to transport_send(conn and MSG_TYPE_DHT_STORE_RESP and "error:bad_signature")
+                return err
+            set expected_did to create_did_key_from_ed25519(s_pubkey)
+            if value equals expected_did:
+                # C7: store the SIGNED BUNDLE "owner_did|pubkey|sig" so a resolver can
+                # cryptographically verify the record on read (not just trust the value
+                # a peer hands back on FIND_VALUE). did/pubkey/sig are hex/did:key — no '|'.
+                set bundle to concat(value and concat("|" and concat(s_pubkey and concat("|" and s_sig))))
+                set ok to dht_node_store_value(dht and key and bundle)
+            else:
+                set err to transport_send(conn and MSG_TYPE_DHT_STORE_RESP and "error:did_mismatch")
+                return err
+        else:
+            # Optional signature on non-ownership keys: if supplied, it must verify.
+            if string_length(s_pubkey) > 0 and also string_length(s_sig) > 0:
+                if verify_signature(concat(key and value) and s_sig and s_pubkey) != 0:
+                    set err to transport_send(conn and MSG_TYPE_DHT_STORE_RESP and "error:bad_signature")
+                    return err
+            set ok to dht_node_store_value(dht and key and value)
+        set err to transport_send(conn and MSG_TYPE_DHT_STORE_RESP and "ok")
+        return err
+
+    if msg_type equals "DHT_FIND_VALUE":
+        # Payload = "key"
+        set key to payload
+        set lookup to dht_node_get_value(dht and key)
+        set lookup_err to map_get_val(lookup and "error")
+        if lookup_err == 0:
+            set value to map_get_val(lookup and "value")
+            set resp to concat("found," and value)
+            set err to transport_send(conn and MSG_TYPE_DHT_FIND_VALUE_RESP and resp)
+        else:
+            set err to transport_send(conn and MSG_TYPE_DHT_FIND_VALUE_RESP and "notfound")
+        free_map(lookup)
+        return err
+
+    # Unknown message type
+    set err to transport_send(conn and "ERROR" and "unknown_dht_message")
+    return DHT_NET_ERR_BAD_RESPONSE
+
+# ================================================================
+# DHT Server Loop — listens for incoming DHT RPC requests
+# ================================================================
+
+define dht_server_loop with dht as Int and listen_port as Int returning Int:
+    set listener to transport_listen(listen_port)
+    set listen_err to map_get_val(listener and "error")
+    if listen_err != TRANSPORT_ERR_NONE:
+        free_map(listener)
+        return DHT_NET_ERR_SEND_FAILED
+
+    repeat while 1 == 1:
+        set conn to transport_accept(listener)
+        set accept_err to map_get_val(conn and "error")
+        if accept_err == TRANSPORT_ERR_NONE:
+            set ok to dht_handle_transport_message(dht and conn)
+            transport_close(conn)
+        free_map(conn)
+
+    return DHT_NET_ERR_NONE
+
+define dht_lookup_node with dht as Int and target_id as Str returning Int:
+    # 1. Get the closest nodes from the local routing table
+    set closest to dht_node_find_closest(dht and target_id and 8)
+    set visited to create_map()
+    
+    set round to 0
+    set progress to 1
+    repeat while round < 3 && progress == 1:
+        set progress to 0
+        set count to length_list(closest)
+        set i to 0
+        set next_queries to create_list()
+        repeat while i < count:
+            set node_item to get_list(closest and i)
+            set nid to ptr_to_str(map_get_val(node_item and "id"))
+            if map_contains(visited and nid) == 0:
+                set ok to append_list(next_queries and node_item)
+                set ok to map_insert(visited and nid and 1)
+            set i to i + 1
+            
+        set nq_count to length_list(next_queries)
+        if nq_count > 0:
+            set qi to 0
+            repeat while qi < nq_count:
+                set qnode to get_list(next_queries and qi)
+                set qid to ptr_to_str(map_get_val(qnode and "id"))
+                set qaddr to ptr_to_str(map_get_val(qnode and "address"))
+                set qport to map_get_val(qnode and "port")
+                
+                # Query the node
+                set find_res to dht_rpc_find_node(dht and qaddr and qport and target_id)
+                set err to map_get_val(find_res and "error")
+                if err == 0:
+                    set nodes to map_get_val(find_res and "nodes")
+                    set nc to length_list(nodes)
+                    set ni to 0
+                    repeat while ni < nc:
+                        set rnode to get_list(nodes and ni)
+                        set r_id to ptr_to_str(map_get_val(rnode and "id"))
+                        set r_addr to ptr_to_str(map_get_val(rnode and "address"))
+                        set r_port to map_get_val(rnode and "port")
+                        
+                        # Add to local routing table
+                        set ok to dht_add_peer_with_eviction(dht and r_id and r_addr and r_port)
+                        set progress to 1
+                        set ni to ni + 1
+                free_map(find_res)
+                set qi to qi + 1
+            
+            # Refresh closest list from routing table (to incorporate newly added peers)
+            set closest to dht_node_find_closest(dht and target_id and 8)
+        set round to round + 1
+    return closest
+
+define dht_lookup_value with dht as Int and key as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "found" and 0)
+    set ok to map_insert(result and "value" and "")
+    set ok to map_insert(result and "error" and 503)
+
+    # First check local value store
+    set local_res to dht_node_get_value(dht and key)
+    set local_err to map_get_val(local_res and "error")
+    if local_err == 0:
+        set val to map_get_val(local_res and "value")
+        set ok to map_insert(result and "found" and 1)
+        set ok to map_insert(result and "value" and val)
+        set ok to map_insert(result and "error" and 0)
+        free_map(local_res)
+        return result
+    free_map(local_res)
+
+    # 1. Do a recursive node lookup for key's hash
+    set target_id to ep_sha256(key)
+    set closest_nodes to dht_lookup_node(dht and target_id)
+    
+    # 2. Query each of those closest nodes
+    set count to length_list(closest_nodes)
+    set i to 0
+    repeat while i < count:
+        set node_item to get_list(closest_nodes and i)
+        set qaddr to ptr_to_str(map_get_val(node_item and "address"))
+        set qport to map_get_val(node_item and "port")
+        
+        set find_res to dht_rpc_find_value(dht and qaddr and qport and key)
+        set found to map_get_val(find_res and "found")
+        if found == 1:
+            set val to map_get_val(find_res and "value")
+            set ok to map_insert(result and "found" and 1)
+            set ok to map_insert(result and "value" and val)
+            set ok to map_insert(result and "error" and 0)
+            free_map(find_res)
+            return result
+        free_map(find_res)
+        set i to i + 1
+        
+    return result

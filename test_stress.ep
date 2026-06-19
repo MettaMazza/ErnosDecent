@@ -1,0 +1,423 @@
+# ErnosDecent -- Phase 5: Stress Testing Suite
+# Tests concurrent operations, crash resilience, rapid connections,
+# malformed input handling, and Raft under load.
+
+import "collections"
+import "string"
+import "decent_consensus/raft"
+import "decent_consensus/election"
+import "decent_consensus/state"
+import "decent_consensus/raft_transport"
+
+# ================================================================
+# Test 5.1: Rapid Map Operations + Channel Concurrency
+# ================================================================
+
+define channel_worker with ch as Int and worker_id as Int:
+    set i to 0
+    repeat while i < 100:
+        send worker_id * 1000 + i to ch
+        set i to i + 1
+    return 0
+
+define test_5_1:
+    display "TEST 5.1: Rapid map ops + channel concurrency (10 threads)"
+    set t_ok to 1
+
+    # Part A: Rapid single-thread map stress (1000 inserts + lookups)
+    set m to create_map()
+    set i to 0
+    repeat while i < 1000:
+        set key to concat("k" and int_to_string(i))
+        set ok to map_insert(m and key and i)
+        set i to i + 1
+
+    set size to map_size(m)
+    display f"  Map: {size} entries inserted"
+    if size != 1000:
+        display f"  FAIL: Expected 1000 entries, got {size}"
+        set t_ok to 0
+
+    # Verify random lookups
+    set v500 to map_get_val(m and "k500")
+    set v999 to map_get_val(m and "k999")
+    if v500 != 500 || v999 != 999:
+        display f"  FAIL: Lookup mismatch v500={v500} v999={v999}"
+        set t_ok to 0
+
+    # Part B: 10 concurrent threads sending via channels
+    set ch to create_channel()
+    spawn channel_worker(ch and 0)
+    spawn channel_worker(ch and 1)
+    spawn channel_worker(ch and 2)
+    spawn channel_worker(ch and 3)
+    spawn channel_worker(ch and 4)
+    spawn channel_worker(ch and 5)
+    spawn channel_worker(ch and 6)
+    spawn channel_worker(ch and 7)
+    spawn channel_worker(ch and 8)
+    spawn channel_worker(ch and 9)
+
+    # Collect 1000 messages
+    set received to 0
+    repeat while received < 1000:
+        set val to receive from ch
+        set received to received + 1
+
+    display f"  Channels: {received} messages received from 10 threads"
+    if received != 1000:
+        display f"  FAIL: Expected 1000 messages, got {received}"
+        set t_ok to 0
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# Test 5.2: Persistence Under Simulated Crash
+# ================================================================
+
+define test_5_2:
+    display "TEST 5.2: State machine persistence under rapid writes"
+    set t_ok to 1
+
+    # Create a Raft node with state machine and apply many entries rapidly
+    set peers to create_list()
+    set ok to append_list(peers and str_to_ptr("node2"))
+    set node to raft_create_node("stressnode" and peers)
+    set ok to map_insert(node and "state_machine" and create_map())
+
+    set log to map_get_val(node and "log")
+    set i to 0
+    repeat while i < 200:
+        set entry to create_map()
+        set ok to map_insert(entry and "term" and 1)
+        set ok to map_insert(entry and "index" and i + 1)
+        set cmd to concat("SET key" and int_to_string(i))
+        set cmd to concat(cmd and "=val")
+        set cmd to concat(cmd and int_to_string(i))
+        set ok to map_insert(entry and "command" and cmd)
+        set ok to append_list(log and entry)
+        set i to i + 1
+
+    # Apply all 200 entries
+    set i to 0
+    repeat while i < 200:
+        set entry to get_list(log and i)
+        set err to state_apply_log(borrow node and entry)
+        set i to i + 1
+
+    set sm to map_get_val(node and "state_machine")
+    set sm_size to map_size(sm)
+    display f"  State machine entries: {sm_size}"
+
+    if sm_size != 200:
+        display f"  FAIL: Expected 200 entries, got {sm_size}"
+        set t_ok to 0
+
+    # Verify a few random entries
+    set v0 to ptr_to_str(map_get_val(sm and "key0"))
+    set v99 to ptr_to_str(map_get_val(sm and "key99"))
+    set v199 to ptr_to_str(map_get_val(sm and "key199"))
+    if (v0 equals "val0") == 0:
+        display f"  FAIL: key0 = {v0}, expected val0"
+        set t_ok to 0
+    if (v99 equals "val99") == 0:
+        display f"  FAIL: key99 = {v99}, expected val99"
+        set t_ok to 0
+    if (v199 equals "val199") == 0:
+        display f"  FAIL: key199 = {v199}, expected val199"
+        set t_ok to 0
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# Test 5.3: 500 Rapid TCP Connections
+# ================================================================
+
+define rapid_connect_worker with port as Int and count as Int:
+    set i to 0
+    set success to 0
+    repeat while i < count:
+        set conn to ep_net_connect("127.0.0.1" and port)
+        if conn > 0:
+            set ok to ep_net_send(conn and "PING")
+            set ok to ep_net_close(conn)
+            set success to success + 1
+        set i to i + 1
+    return success
+
+define test_5_3:
+    display "TEST 5.3: 500 rapid TCP connections"
+    set t_ok to 1
+
+    # Start a simple Raft server node as connection target
+    set peers to create_list()
+    set ok to append_list(peers and str_to_ptr("dummy"))
+    set node to raft_create_node("conntest" and peers)
+    election_init_node(borrow node and 999999)
+    set pa to create_map()
+    set ok to map_insert(pa and "dummy" and "127.0.0.1:19999")
+    set ok to map_insert(node and "peer_addresses" and pa)
+    set ok to map_insert(node and "running" and 1)
+    set ok to map_insert(node and "server_ready" and 0)
+
+    # Store in cluster map to avoid moved-value error
+    set cluster to create_map()
+    set ok to map_insert(cluster and "node" and node)
+    set r1 to map_get_val(cluster and "node")
+
+    spawn raft_server_thread(r1 and 19600)
+    set ok to ep_sleep_ms(200)
+
+    # Spawn 5 threads each doing 100 connections = 500 total
+    spawn rapid_connect_worker(19600 and 100)
+    spawn rapid_connect_worker(19600 and 100)
+    spawn rapid_connect_worker(19600 and 100)
+    spawn rapid_connect_worker(19600 and 100)
+    spawn rapid_connect_worker(19600 and 100)
+
+    set ok to ep_sleep_ms(3000)
+
+    # Server should still be running
+    set r1_check to map_get_val(cluster and "node")
+    set running to map_get_val(r1_check and "running")
+    if running == 1:
+        display "  Server survived 500 connections"
+    else:
+        display "  FAIL: Server crashed under load"
+        set t_ok to 0
+
+    set ok to map_insert(r1_check and "running" and 0)
+    set ok to ep_sleep_ms(100)
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# Test 5.4: Malformed Input Handling
+# ================================================================
+
+define test_5_4:
+    display "TEST 5.4: Malformed input handling"
+    set t_ok to 1
+
+    # Test deserializer with various malformed inputs
+    set r1 to raft_deserialize_message("")
+    set err1 to map_get_val(r1 and "error")
+    if err1 != 1:
+        display "  FAIL: Empty string not rejected"
+        set t_ok to 0
+
+    set r2 to raft_deserialize_message("GARBAGE")
+    set err2 to map_get_val(r2 and "error")
+    # Should parse but have unknown type (no crash)
+    display f"  Garbage input: error={err2}"
+
+    set r3 to raft_deserialize_message("RV|")
+    set err3 to map_get_val(r3 and "error")
+    if err3 != 1:
+        display "  FAIL: Truncated RV not rejected"
+        set t_ok to 0
+
+    set r4 to raft_deserialize_message("AE|1|leader|0|0|0|")
+    set err4 to map_get_val(r4 and "error")
+    if err4 != 0:
+        display "  FAIL: Valid AE with empty entries rejected"
+        set t_ok to 0
+
+    set r5 to raft_deserialize_message("RVR|not_a_number|1|sender")
+    set err5 to map_get_val(r5 and "error")
+    # string_to_int of non-number should return 0, not crash
+    set term5 to map_get_val(r5 and "term")
+    display f"  Non-numeric term: parsed as {term5}"
+
+    # Test with extremely long input
+    set big to "RV|1|"
+    set i to 0
+    repeat while i < 100:
+        set big to concat(big and "AAAAAAAAAA")
+        set i to i + 1
+    set big to concat(big and "|0|0")
+    set r6 to raft_deserialize_message(big)
+    set err6 to map_get_val(r6 and "error")
+    if err6 != 0:
+        display "  FAIL: Long candidate_id rejected"
+        set t_ok to 0
+    else:
+        display "  Long input (1000+ chars): OK"
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# Test 5.5: Raft Under Load — rapid proposals to leader
+# ================================================================
+
+define setup_3node_cluster with base_port as Int returning Map:
+    set peers1 to create_list()
+    set ok to append_list(peers1 and str_to_ptr("node2"))
+    set ok to append_list(peers1 and str_to_ptr("node3"))
+    set n1 to raft_create_node("node1" and peers1)
+    election_init_node(borrow n1 and 500)
+    set pa1 to create_map()
+    set ok to map_insert(pa1 and "node2" and concat("127.0.0.1:" and int_to_string(base_port + 1)))
+    set ok to map_insert(pa1 and "node3" and concat("127.0.0.1:" and int_to_string(base_port + 2)))
+    set ok to map_insert(n1 and "peer_addresses" and pa1)
+    set ok to map_insert(n1 and "running" and 1)
+    set ok to map_insert(n1 and "server_ready" and 0)
+
+    set peers2 to create_list()
+    set ok to append_list(peers2 and str_to_ptr("node1"))
+    set ok to append_list(peers2 and str_to_ptr("node3"))
+    set n2 to raft_create_node("node2" and peers2)
+    election_init_node(borrow n2 and 1500)
+    set pa2 to create_map()
+    set ok to map_insert(pa2 and "node1" and concat("127.0.0.1:" and int_to_string(base_port)))
+    set ok to map_insert(pa2 and "node3" and concat("127.0.0.1:" and int_to_string(base_port + 2)))
+    set ok to map_insert(n2 and "peer_addresses" and pa2)
+    set ok to map_insert(n2 and "running" and 1)
+    set ok to map_insert(n2 and "server_ready" and 0)
+
+    set peers3 to create_list()
+    set ok to append_list(peers3 and str_to_ptr("node1"))
+    set ok to append_list(peers3 and str_to_ptr("node2"))
+    set n3 to raft_create_node("node3" and peers3)
+    election_init_node(borrow n3 and 1500)
+    set pa3 to create_map()
+    set ok to map_insert(pa3 and "node1" and concat("127.0.0.1:" and int_to_string(base_port)))
+    set ok to map_insert(pa3 and "node2" and concat("127.0.0.1:" and int_to_string(base_port + 1)))
+    set ok to map_insert(n3 and "peer_addresses" and pa3)
+    set ok to map_insert(n3 and "running" and 1)
+    set ok to map_insert(n3 and "server_ready" and 0)
+
+    set cluster to create_map()
+    set ok to map_insert(cluster and "node1" and n1)
+    set ok to map_insert(cluster and "node2" and n2)
+    set ok to map_insert(cluster and "node3" and n3)
+    return cluster
+
+define test_5_5:
+    display "TEST 5.5: Raft under load — 20 rapid proposals"
+    set t_ok to 1
+    set base_port to 19700
+
+    set cluster to setup_3node_cluster(base_port)
+    set r1 to map_get_val(cluster and "node1")
+    set r2 to map_get_val(cluster and "node2")
+    set r3 to map_get_val(cluster and "node3")
+
+    # Start servers + election
+    spawn raft_server_thread(r1 and base_port)
+    spawn raft_server_thread(r2 and base_port + 1)
+    spawn raft_server_thread(r3 and base_port + 2)
+    set ok to ep_sleep_ms(200)
+
+    set rp1 to map_get_val(r1 and "peer_addresses")
+    set rp2 to map_get_val(r2 and "peer_addresses")
+    set rp3 to map_get_val(r3 and "peer_addresses")
+    spawn raft_election_timer_thread(r1 and rp1)
+    spawn raft_election_timer_thread(r2 and rp2)
+    spawn raft_election_timer_thread(r3 and rp3)
+
+    # Wait for election
+    set ok to ep_sleep_ms(3000)
+
+    set role1 to ptr_to_str(map_get_val(r1 and "role"))
+    if (role1 equals RAFT_ROLE_LEADER) == 0:
+        display "  FAIL: node1 not elected leader"
+        set ok to map_insert(r1 and "running" and 0)
+        set ok to map_insert(r2 and "running" and 0)
+        set ok to map_insert(r3 and "running" and 0)
+        return 0
+
+    set leader_term to map_get_val(r1 and "current_term")
+    display f"  Leader: node1 (term {leader_term})"
+
+    # Submit 20 proposals rapidly via TCP
+    set i to 0
+    set propose_ok to 0
+    repeat while i < 20:
+        set cmd to concat("SET stress" and int_to_string(i))
+        set cmd to concat(cmd and "=value")
+        set cmd to concat(cmd and int_to_string(i))
+        set wire to raft_serialize_client_propose(cmd)
+        set resp to raft_send_rpc("127.0.0.1" and base_port and wire)
+        set rpc_err to map_get_val(resp and "error")
+        if rpc_err == RAFT_TRANSPORT_ERR_NONE:
+            set propose_ok to propose_ok + 1
+        set i to i + 1
+
+    display f"  Proposals accepted: {propose_ok}/20"
+    if propose_ok < 15:
+        display "  FAIL: Too many proposals rejected"
+        set t_ok to 0
+
+    # Wait for replication (multiple heartbeat cycles)
+    set ok to ep_sleep_ms(3000)
+
+    set log1 to length_list(map_get_val(r1 and "log"))
+    set log2 to length_list(map_get_val(r2 and "log"))
+    set log3 to length_list(map_get_val(r3 and "log"))
+    display f"  Log lengths: node1={log1} node2={log2} node3={log3}"
+
+    if log1 < 15:
+        display f"  FAIL: Leader log too short ({log1})"
+        set t_ok to 0
+
+    set commit1 to map_get_val(r1 and "commit_index")
+    display f"  Leader commit_index: {commit1}"
+
+    # Check state machine
+    set sm to map_get_val(r1 and "state_machine")
+    if sm != 0:
+        set sm_size to map_size(sm)
+        display f"  Leader state machine entries: {sm_size}"
+
+    # Cleanup
+    set ok to map_insert(r1 and "running" and 0)
+    set ok to map_insert(r2 and "running" and 0)
+    set ok to map_insert(r3 and "running" and 0)
+    set ok to ep_sleep_ms(200)
+
+    if t_ok == 1:
+        display "  PASS"
+    return t_ok
+
+# ================================================================
+# Main: Run All Stress Tests
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- Phase 5 Stress Test Suite"
+    display "==================================================="
+    display ""
+
+    set passed to 0
+    set total to 5
+
+    set r1 to test_5_1()
+    set passed to passed + r1
+    set r2 to test_5_2()
+    set passed to passed + r2
+    set r3 to test_5_3()
+    set passed to passed + r3
+    set r4 to test_5_4()
+    set passed to passed + r4
+    set r5 to test_5_5()
+    set passed to passed + r5
+
+    display ""
+    display "==================================================="
+    display f"  {passed}/{total} Stress tests passed."
+    if passed == total:
+        display "  ALL PHASE 5 STRESS TESTS PASSED!"
+    else:
+        display "  SOME TESTS FAILED"
+    display "==================================================="
+    return 0

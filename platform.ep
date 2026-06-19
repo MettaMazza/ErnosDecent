@@ -1,0 +1,166 @@
+# ErnosDecent -- Platform Abstraction Layer
+# Component: platform.ep
+# Provides OS-specific library loading with fallback paths
+# Supports: macOS (arm64, x86_64), Linux (x86_64, arm64), Windows
+# Status: Production
+
+import "string"
+import "collections"
+
+# ================================================================
+# Platform Detection
+# ================================================================
+
+set PLATFORM_MACOS to 1
+set PLATFORM_LINUX to 2
+set PLATFORM_WINDOWS to 3
+set PLATFORM_UNKNOWN to 0
+
+define detect_platform returning Int:
+    set os to ep_os_name()
+    if os equals "macos":
+        return PLATFORM_MACOS
+    if os equals "linux":
+        return PLATFORM_LINUX
+    if os equals "windows":
+        return PLATFORM_WINDOWS
+    return PLATFORM_UNKNOWN
+
+define platform_name with platform as Int returning Str:
+    if platform == PLATFORM_MACOS:
+        return "macOS"
+    if platform == PLATFORM_LINUX:
+        return "Linux"
+    if platform == PLATFORM_WINDOWS:
+        return "Windows"
+    return "Unknown"
+
+define platform_os_string returning Str:
+    return ep_os_name()
+
+# ================================================================
+# Library Loading — tries all known paths per platform
+# ================================================================
+
+define load_libsodium returning Int:
+    # macOS paths (arm64 + x86_64)
+    set h to ep_dlopen("libsodium.dylib")
+    if h != 0:
+        return h
+    set h to ep_dlopen("/opt/homebrew/lib/libsodium.dylib")
+    if h != 0:
+        return h
+    set h to ep_dlopen("/usr/local/lib/libsodium.dylib")
+    if h != 0:
+        return h
+    set h to ep_dlopen("/opt/homebrew/Cellar/libsodium/1.0.20/lib/libsodium.dylib")
+    if h != 0:
+        return h
+
+    # Linux paths
+    set h to ep_dlopen("libsodium.so")
+    if h != 0:
+        return h
+    set h to ep_dlopen("libsodium.so.26")
+    if h != 0:
+        return h
+    set h to ep_dlopen("libsodium.so.23")
+    if h != 0:
+        return h
+    set h to ep_dlopen("/usr/lib/x86_64-linux-gnu/libsodium.so")
+    if h != 0:
+        return h
+    set h to ep_dlopen("/usr/lib/aarch64-linux-gnu/libsodium.so")
+    if h != 0:
+        return h
+
+    # Windows paths
+    set h to ep_dlopen("libsodium.dll")
+    if h != 0:
+        return h
+    set h to ep_dlopen("sodium.dll")
+    if h != 0:
+        return h
+
+    return 0
+
+define load_libc returning Int:
+    # macOS
+    set h to ep_dlopen("libSystem.B.dylib")
+    if h != 0:
+        return h
+
+    # Linux
+    set h to ep_dlopen("libc.so.6")
+    if h != 0:
+        return h
+    set h to ep_dlopen("libc.so")
+    if h != 0:
+        return h
+
+    # Windows
+    set h to ep_dlopen("msvcrt.dll")
+    if h != 0:
+        return h
+    set h to ep_dlopen("ucrtbase.dll")
+    if h != 0:
+        return h
+
+    return 0
+
+define load_libcrypto returning Int:
+    # macOS
+    set h to ep_dlopen("libcrypto.dylib")
+    if h != 0:
+        return h
+    set h to ep_dlopen("/opt/homebrew/lib/libcrypto.dylib")
+    if h != 0:
+        return h
+    set h to ep_dlopen("/usr/local/opt/openssl/lib/libcrypto.dylib")
+    if h != 0:
+        return h
+
+    # Linux
+    set h to ep_dlopen("libcrypto.so")
+    if h != 0:
+        return h
+    set h to ep_dlopen("libcrypto.so.3")
+    if h != 0:
+        return h
+    set h to ep_dlopen("libcrypto.so.1.1")
+    if h != 0:
+        return h
+
+    # Windows
+    set h to ep_dlopen("libcrypto-3-x64.dll")
+    if h != 0:
+        return h
+
+    return 0
+
+# ================================================================
+# Platform info report
+# ================================================================
+
+define get_platform_info returning Map:
+    set info to create_map()
+    set platform to detect_platform()
+    set ok to map_insert(info and "platform" and platform)
+    set ok to map_insert(info and "platform_name" and platform_name(platform))
+
+    set sodium to load_libsodium()
+    set ok to map_insert(info and "sodium_available" and 1)
+    if sodium == 0:
+        set ok to map_insert(info and "sodium_available" and 0)
+
+    set libc to load_libc()
+    set ok to map_insert(info and "libc_available" and 1)
+    if libc == 0:
+        set ok to map_insert(info and "libc_available" and 0)
+
+    set crypto to load_libcrypto()
+    set ok to map_insert(info and "libcrypto_available" and 1)
+    if crypto == 0:
+        set ok to map_insert(info and "libcrypto_available" and 0)
+
+    return info

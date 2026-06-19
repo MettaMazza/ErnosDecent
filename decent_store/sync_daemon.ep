@@ -1,0 +1,171 @@
+# ErnosDecent -- CRDT Sync Daemon
+# Component: decent_store/sync_daemon.ep
+
+import "crdt"
+import "string"
+import "collections"
+import "../decent_net/transport"
+
+define sync_store_serialize with store as Map returning Str:
+    set keys to map_keys(store)
+    set count to length_list(keys)
+    set s to ""
+    set i to 0
+    repeat while i < count:
+        set k to ptr_to_str(get_list(keys and i))
+        set reg to map_get_val(store and k)
+        set val to map_get_val(reg and "value")
+        set ts to map_get_val(reg and "timestamp")
+        set writer to map_get_val(reg and "writer")
+        
+        set s to concat(s and k)
+        set s to concat(s and "|")
+        set s to concat(s and val)
+        set s to concat(s and "|")
+        set s to concat(s and int_to_string(ts))
+        set s to concat(s and "|")
+        set s to concat(s and writer)
+        
+        if i < count - 1:
+            set s to concat(s and ";")
+        set i to i + 1
+    free_list(keys)
+    return s
+
+define sync_store_deserialize with s as Str returning Map:
+    set store to create_map()
+    if string_length(s) == 0:
+        return store
+    set items to string_split(s and ";")
+    set len to length_list(items)
+    set i to 0
+    repeat while i < len:
+        set item to ptr_to_str(get_list(items and i))
+        set parts to string_split(item and "|")
+        if length_list(parts) == 4:
+            set k to ptr_to_str(get_list(parts and 0))
+            set val to ptr_to_str(get_list(parts and 1))
+            set ts to string_to_int(ptr_to_str(get_list(parts and 2)))
+            set writer to ptr_to_str(get_list(parts and 3))
+            
+            set reg to lww_create(writer and val)
+            set ok to map_insert(reg and "timestamp" and ts)
+            set ok to map_insert(store and k and reg)
+        free_list(parts)
+        set i to i + 1
+    free_list(items)
+    return store
+
+define sync_store_merge_all with local_store as Map and remote_store as Map returning Int:
+    set r_keys to map_keys(remote_store)
+    set r_count to length_list(r_keys)
+    set i to 0
+    repeat while i < r_count:
+        set k to ptr_to_str(get_list(r_keys and i))
+        set remote_reg to map_get_val(remote_store and k)
+        
+        if map_contains(local_store and k) == 1:
+            set local_reg to map_get_val(local_store and k)
+            set ok to lww_merge(local_reg and remote_reg)
+        else:
+            set val to map_get_val(remote_reg and "value")
+            set ts to map_get_val(remote_reg and "timestamp")
+            set writer to map_get_val(remote_reg and "writer")
+            set new_reg to lww_create(writer and val)
+            set ok to map_insert(new_reg and "timestamp" and ts)
+            set ok to map_insert(local_store and k and new_reg)
+        set i to i + 1
+    free_list(r_keys)
+    return 0
+
+define sync_handle_push_payload with payload as Str and local_clock as Map and local_store as Map returning Str:
+    set parts to string_split(payload and "#")
+    if length_list(parts) != 2:
+        free_list(parts)
+        return ""
+        
+    set remote_clock_str to ptr_to_str(get_list(parts and 0))
+    set remote_store_str to ptr_to_str(get_list(parts and 1))
+    free_list(parts)
+    
+    set remote_clock to vector_clock_deserialize(remote_clock_str)
+    set remote_store to sync_store_deserialize(remote_store_str)
+    
+    # Compare clocks
+    set cmp to vector_clock_compare(local_clock and remote_clock)
+    
+    # Merge remote state
+    set ok to sync_store_merge_all(local_store and remote_store)
+    set ok to vector_clock_merge(local_clock and remote_clock)
+    
+    # If remote clock was not dominating, reply with our updates
+    if cmp == VC_COMP_DOMINATING or else cmp == VC_COMP_CONCURRENT:
+        set my_clock_str to vector_clock_serialize(local_clock)
+        set my_store_str to sync_store_serialize(local_store)
+        return concat(my_clock_str and concat("#" and my_store_str))
+        
+    return "ok"
+
+define sync_client_run with address as Str and port as Int and local_clock as Map and local_store as Map returning Int:
+    set conn to transport_connect_with_retry(address and port and 3 and 1)
+    set err to map_get_val(conn and "error")
+    if err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        return 1
+        
+    set my_clock_str to vector_clock_serialize(local_clock)
+    set my_store_str to sync_store_serialize(local_store)
+    set req_payload to concat(my_clock_str and concat("#" and my_store_str))
+    
+    set ok to transport_send(conn and "SYNC_PUSH" and req_payload)
+    
+    set resp to transport_recv(conn)
+    set resp_err to map_get_val(resp and "error")
+    if resp_err == TRANSPORT_ERR_NONE:
+        set msg_type to map_get_val(resp and "msg_type")
+        set payload to map_get_val(resp and "payload")
+        
+        if msg_type equals "SYNC_PUSH":
+            if payload equals "ok" == 0:
+                set parts to string_split(payload and "#")
+                if length_list(parts) == 2:
+                    set remote_clock_str to ptr_to_str(get_list(parts and 0))
+                    set remote_store_str to ptr_to_str(get_list(parts and 1))
+                    
+                    set remote_clock to vector_clock_deserialize(remote_clock_str)
+                    set remote_store to sync_store_deserialize(remote_store_str)
+                    
+                    set ok to sync_store_merge_all(local_store and remote_store)
+                    set ok to vector_clock_merge(local_clock and remote_clock)
+                free_list(parts)
+                
+    free_map(resp)
+    set ok to transport_close(conn)
+    free_map(conn)
+    return 0
+
+define sync_server_handle_once with server_conn as Map and local_clock as Map and local_store as Map returning Int:
+    set conn to transport_accept(server_conn)
+    set err to map_get_val(conn and "error")
+    if err != TRANSPORT_ERR_NONE:
+        free_map(conn)
+        return 1
+        
+    set req to transport_recv(conn)
+    set req_err to map_get_val(req and "error")
+    if req_err == TRANSPORT_ERR_NONE:
+        set msg_type to map_get_val(req and "msg_type")
+        set payload to map_get_val(req and "payload")
+        
+        if msg_type equals "SYNC_PUSH":
+            set reply_payload to sync_handle_push_payload(payload and local_clock and local_store)
+            if string_length(reply_payload) > 0:
+                if reply_payload equals "ok":
+                    set ok to transport_send(conn and "SYNC_PUSH" and "ok")
+                else:
+                    set ok to transport_send(conn and "SYNC_PUSH" and reply_payload)
+                    
+    free_map(req)
+    set ok to transport_close(conn)
+    free_map(conn)
+    return 0

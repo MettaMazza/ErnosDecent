@@ -1,0 +1,309 @@
+# ErnosDecent -- Unified Transport Layer
+# Component: decent_net/transport.ep
+# Implements: Length-prefixed message framing over TCP with Noise encryption
+# Wire format: "<length>\n<msg_type>:<payload>" where length is ASCII decimal
+# Status: Production
+
+import "string"
+import "net"
+import "collections"
+import "sync"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set TRANSPORT_ERR_NONE to 0
+set TRANSPORT_ERR_CONNECT_FAILED to 901
+set TRANSPORT_ERR_LISTEN_FAILED to 902
+set TRANSPORT_ERR_SEND_FAILED to 903
+set TRANSPORT_ERR_RECV_FAILED to 904
+set TRANSPORT_ERR_PEER_DISCONNECTED to 905
+set TRANSPORT_ERR_MALFORMED_FRAME to 906
+set TRANSPORT_ERR_ACCEPT_FAILED to 907
+
+set TRANSPORT_MAX_MESSAGE_SIZE to 1048576
+
+# Message types for the wire protocol
+set MSG_TYPE_DHT_PING to "DHT_PING"
+set MSG_TYPE_DHT_PONG to "DHT_PONG"
+set MSG_TYPE_DHT_FIND_NODE to "DHT_FIND_NODE"
+set MSG_TYPE_DHT_FIND_NODE_RESP to "DHT_FIND_NODE_RESP"
+set MSG_TYPE_DHT_STORE to "DHT_STORE"
+set MSG_TYPE_DHT_STORE_RESP to "DHT_STORE_RESP"
+set MSG_TYPE_DHT_FIND_VALUE to "DHT_FIND_VALUE"
+set MSG_TYPE_DHT_FIND_VALUE_RESP to "DHT_FIND_VALUE_RESP"
+set MSG_TYPE_NOISE_HANDSHAKE to "NOISE_HS"
+set MSG_TYPE_NOISE_TRANSPORT to "NOISE_TR"
+set MSG_TYPE_RELAY_REQUEST to "RELAY_REQ"
+set MSG_TYPE_RELAY_DATA to "RELAY_DATA"
+set MSG_TYPE_CONSENSUS to "CONSENSUS"
+set MSG_TYPE_MSG_DELIVER to "MSG_DELIVER"
+
+# ================================================================
+# Connection Management
+# ================================================================
+
+define transport_connect with address as Str and port as Int returning Map:
+    # Establish a TCP connection and return a connection handle
+    set result to create_map()
+    set fd to ep_net_connect(address and port)
+    if fd < 0:
+        set ok to map_insert(result and "error" and TRANSPORT_ERR_CONNECT_FAILED)
+        set ok to map_insert(result and "fd" and 0 - 1)
+        return result
+    set lock to create_mutex()
+    set ok to map_insert(result and "lock" and lock)
+    set ok to map_insert(result and "error" and TRANSPORT_ERR_NONE)
+    set ok to map_insert(result and "fd" and fd)
+    set ok to map_insert(result and "address" and address)
+    set ok to map_insert(result and "port" and port)
+    set ok to map_insert(result and "connected" and 1)
+    return result
+
+define transport_connect_with_retry with address as Str and port as Int and max_retries as Int and delay_sec as Int returning Map:
+    set retries to 0
+    set conn to transport_connect(address and port)
+    set err to map_get_val(conn and "error")
+    
+    repeat while err != TRANSPORT_ERR_NONE and retries < max_retries:
+        set backoff to delay_sec
+        set power to 0
+        repeat while power < retries:
+            set backoff to backoff * 2
+            set power to power + 1
+            
+        display f"[Transport] Connection failed to {address}:{port}. Retrying in {backoff} seconds..."
+        set ok to ep_sleep_ms(backoff * 1000)
+        
+        free_map(conn)
+        
+        set conn to transport_connect(address and port)
+        set err to map_get_val(conn and "error")
+        set retries to retries + 1
+        
+    return conn
+
+define transport_listen with port as Int returning Map:
+    # Start listening for incoming TCP connections
+    set result to create_map()
+    set fd to ep_net_listen(port)
+    if fd < 0:
+        set ok to map_insert(result and "error" and TRANSPORT_ERR_LISTEN_FAILED)
+        set ok to map_insert(result and "fd" and 0 - 1)
+        return result
+    set ok to map_insert(result and "error" and TRANSPORT_ERR_NONE)
+    set ok to map_insert(result and "fd" and fd)
+    set ok to map_insert(result and "port" and port)
+    return result
+
+define transport_accept with listener as Map returning Map:
+    # Accept an incoming connection
+    set listen_fd to map_get_val(listener and "fd")
+    set result to create_map()
+    set client_fd to ep_net_accept(listen_fd)
+    if client_fd < 0:
+        set ok to map_insert(result and "error" and TRANSPORT_ERR_ACCEPT_FAILED)
+        set ok to map_insert(result and "fd" and 0 - 1)
+        return result
+    set lock to create_mutex()
+    set ok to map_insert(result and "lock" and lock)
+    set ok to map_insert(result and "error" and TRANSPORT_ERR_NONE)
+    set ok to map_insert(result and "fd" and client_fd)
+    set ok to map_insert(result and "connected" and 1)
+    return result
+
+define transport_close with conn as Map returning Int:
+    set lock to map_get_val(conn and "lock")
+    if lock != 0:
+        set ok to lock_mutex(lock)
+    set fd to map_get_val(conn and "fd")
+    if fd >= 0:
+        set ok to ep_net_close(fd)
+        set ok to map_insert(conn and "connected" and 0)
+    if lock != 0:
+        set ok to unlock_mutex(lock)
+    return TRANSPORT_ERR_NONE
+
+# ================================================================
+# Framed Message Send/Receive
+# Wire format: "<decimal_length>\n<msg_type>:<payload>"
+# The length covers everything after the newline (msg_type:payload)
+# ================================================================
+
+define transport_send with conn as Map and msg_type as Str and payload as Str returning Int:
+    # Build the framed message: "<length>\n<msg_type>:<payload>"
+    set lock to map_get_val(conn and "lock")
+    if lock != 0:
+        set ok to lock_mutex(lock)
+    set fd to map_get_val(conn and "fd")
+    set connected to map_get_val(conn and "connected")
+    if fd < 0 || connected == 0:
+        if lock != 0:
+            set ok to unlock_mutex(lock)
+        return TRANSPORT_ERR_SEND_FAILED
+
+    # Build inner content: "msg_type:payload"
+    set inner to concat(msg_type and ":")
+    set inner to concat(inner and payload)
+
+    # Build frame: "<length>\n<inner>"
+    set inner_len to string_length(inner)
+    set len_str to int_to_string(inner_len)
+    set frame to concat(len_str and "\n")
+    set frame to concat(frame and inner)
+
+    set send_result to ep_net_send(fd and frame)
+    if lock != 0:
+        set ok to unlock_mutex(lock)
+    if send_result < 0:
+        return TRANSPORT_ERR_SEND_FAILED
+    return TRANSPORT_ERR_NONE
+
+define transport_recv with conn as Map returning Map:
+    # Receive a framed message. Returns map with "msg_type", "payload", "error"
+    set result to create_map()
+    set lock to map_get_val(conn and "lock")
+    if lock != 0:
+        set ok to lock_mutex(lock)
+    set fd to map_get_val(conn and "fd")
+    set connected to map_get_val(conn and "connected")
+    if fd < 0 || connected == 0:
+        set ok to map_insert(result and "error" and TRANSPORT_ERR_RECV_FAILED)
+        if lock != 0:
+            set ok to unlock_mutex(lock)
+        return result
+    if lock != 0:
+        set ok to unlock_mutex(lock)
+
+    # Read the length prefix character by character until newline
+    set len_str to ""
+    set reading_len to 1
+    set max_digits to 10
+    set digits_read to 0
+    repeat while reading_len == 1:
+        set ch to ep_net_recv(fd and 1)
+        if string_length(ch) == 0:
+            set ok to map_insert(result and "error" and TRANSPORT_ERR_PEER_DISCONNECTED)
+            return result
+        if ch equals "\n":
+            set reading_len to 0
+        else:
+            set len_str to concat(len_str and ch)
+            set digits_read to digits_read + 1
+            if digits_read > max_digits:
+                set ok to map_insert(result and "error" and TRANSPORT_ERR_MALFORMED_FRAME)
+                return result
+
+    if string_length(len_str) == 0:
+        set ok to map_insert(result and "error" and TRANSPORT_ERR_MALFORMED_FRAME)
+        return result
+
+    set payload_len to string_to_int(len_str)
+    if payload_len <= 0:
+        set ok to map_insert(result and "error" and TRANSPORT_ERR_MALFORMED_FRAME)
+        return result
+    if payload_len > TRANSPORT_MAX_MESSAGE_SIZE:
+        set ok to map_insert(result and "error" and TRANSPORT_ERR_MALFORMED_FRAME)
+        return result
+
+    # Read the exact payload
+    set raw to ep_net_recv_bytes(fd and payload_len)
+    if string_length(raw) == 0:
+        set ok to map_insert(result and "error" and TRANSPORT_ERR_PEER_DISCONNECTED)
+        return result
+
+    # Parse "msg_type:payload" — find first colon
+    set colon_pos to 0 - 1
+    set scan_i to 0
+    set raw_len to string_length(raw)
+    repeat while scan_i < raw_len:
+        set c to get_character(raw and scan_i)
+        if c == 58:
+            if colon_pos < 0:
+                set colon_pos to scan_i
+        set scan_i to scan_i + 1
+
+    if colon_pos < 0:
+        set ok to map_insert(result and "error" and TRANSPORT_ERR_MALFORMED_FRAME)
+        return result
+
+    set msg_type to substring(raw and 0 and colon_pos)
+    set payload_start to colon_pos + 1
+    set payload_size to raw_len - payload_start
+    set payload to ""
+    if payload_size > 0:
+        set payload to substring(raw and payload_start and payload_size)
+
+    set ok to map_insert(result and "error" and TRANSPORT_ERR_NONE)
+    set ok to map_insert(result and "msg_type" and msg_type)
+    set ok to map_insert(result and "payload" and payload)
+    return result
+
+# ================================================================
+# Convenience: Send and receive typed messages
+# ================================================================
+
+define transport_send_dht_ping with conn as Map and sender_id as Str returning Int:
+    return transport_send(conn and MSG_TYPE_DHT_PING and sender_id)
+
+define transport_send_dht_pong with conn as Map and sender_id as Str returning Int:
+    return transport_send(conn and MSG_TYPE_DHT_PONG and sender_id)
+
+define transport_send_dht_find_node with conn as Map and sender_id as Str and target_id as Str returning Int:
+    set payload to concat(sender_id and ",")
+    set payload to concat(payload and target_id)
+    return transport_send(conn and MSG_TYPE_DHT_FIND_NODE and payload)
+
+define transport_send_dht_store with conn as Map and key as Str and value as Str returning Int:
+    set payload to concat(key and ",")
+    set payload to concat(payload and value)
+    return transport_send(conn and MSG_TYPE_DHT_STORE and payload)
+
+define transport_send_dht_find_value with conn as Map and key as Str returning Int:
+    return transport_send(conn and MSG_TYPE_DHT_FIND_VALUE and key)
+
+define transport_send_consensus with conn as Map and msg as Str returning Int:
+    return transport_send(conn and MSG_TYPE_CONSENSUS and msg)
+
+define transport_send_message with conn as Map and msg as Str returning Int:
+    return transport_send(conn and MSG_TYPE_MSG_DELIVER and msg)
+
+set RTC_MUTEX to 0
+set pending_rtc_signals to 0
+
+define rtc_queue_incoming_signal with plaintext as Str returning Int:
+    if RTC_MUTEX == 0:
+        set RTC_MUTEX to create_mutex()
+    if pending_rtc_signals == 0:
+        set pending_rtc_signals to create_list()
+        
+    lock_mutex(RTC_MUTEX)
+    set ok to append_list(pending_rtc_signals and plaintext)
+    unlock_mutex(RTC_MUTEX)
+    return 0
+
+define rtc_poll_signals returning Str:
+    if RTC_MUTEX == 0:
+        set RTC_MUTEX to create_mutex()
+    if pending_rtc_signals == 0:
+        set pending_rtc_signals to create_list()
+        
+    lock_mutex(RTC_MUTEX)
+    set length to length_list(pending_rtc_signals)
+    set result_json to "["
+    set i to 0
+    repeat while i < length:
+        set signal_str to ptr_to_str(get_list(pending_rtc_signals and i))
+        set result_json to concat(result_json and signal_str)
+        if i < length - 1:
+            set result_json to concat(result_json and ",")
+        set i to i + 1
+    set result_json to concat(result_json and "]")
+    
+    # Clear the list
+    free_list(pending_rtc_signals)
+    set pending_rtc_signals to create_list()
+    
+    unlock_mutex(RTC_MUTEX)
+    return result_json

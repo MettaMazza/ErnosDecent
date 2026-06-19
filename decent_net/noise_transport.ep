@@ -1,0 +1,257 @@
+# ErnosDecent -- Noise-over-Transport Bridge
+# Component: decent_net/noise_transport.ep
+# Performs Noise_XX handshake over a TCP transport connection
+# After handshake: encrypts/decrypts all messages via Noise session keys
+# Status: Production
+
+import "transport"
+import "noise"
+import "string"
+import "collections"
+import "../decent_id/keys"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set NOISE_NET_ERR_NONE to 0
+set NOISE_NET_ERR_HANDSHAKE_FAILED to 951
+set NOISE_NET_ERR_SEND_FAILED to 952
+set NOISE_NET_ERR_RECV_FAILED to 953
+set NOISE_NET_ERR_ENCRYPT_FAILED to 954
+set NOISE_NET_ERR_DECRYPT_FAILED to 955
+
+# ================================================================
+# Noise Session -- wraps a transport connection + Noise handshake state
+# ================================================================
+
+define noise_session_create with conn as Map and hs as Int returning Map:
+    set session to create_map()
+    set ok to map_insert(session and "conn" and conn)
+    set ok to map_insert(session and "hs" and hs)
+    set ok to map_insert(session and "error" and NOISE_NET_ERR_NONE)
+    return session
+
+# ================================================================
+# Initiator Handshake -- connect to peer and complete Noise_XX
+# ================================================================
+
+define noise_net_handshake_initiate with conn as Map and static_secret_ptr as Int and static_public_ptr as Int returning Map:
+    # Perform full Noise_XX handshake as initiator over transport conn
+    set result to create_map()
+
+    # Initialize handshake state
+    set hs to noise_handshake_init(NOISE_ROLE_INITIATOR and static_secret_ptr and static_public_ptr)
+    set init_err to map_get_val(hs and "error")
+    if init_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_HANDSHAKE_FAILED)
+        return result
+
+    # Step 1: Write message 1 (-> e)
+    set msg1_result to noise_xx_write_message1(hs)
+    set msg1_err to map_get_val(msg1_result and "error")
+    if msg1_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_HANDSHAKE_FAILED)
+        free_map(msg1_result)
+        return result
+
+    set msg1_hex to map_get_val(msg1_result and "message")
+    set send_err to transport_send(conn and MSG_TYPE_NOISE_HANDSHAKE and msg1_hex)
+    free_map(msg1_result)
+    if send_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_SEND_FAILED)
+        return result
+
+    # Step 2: Read message 2 (<- e, ee, s, es)
+    set msg2_frame to transport_recv(conn)
+    set recv_err to map_get_val(msg2_frame and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_RECV_FAILED)
+        free_map(msg2_frame)
+        return result
+
+    set msg2_hex to map_get_val(msg2_frame and "payload")
+    set read2_result to noise_xx_read_message2(hs and msg2_hex)
+    free_map(msg2_frame)
+    set read2_err to map_get_val(read2_result and "error")
+    free_map(read2_result)
+    if read2_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_HANDSHAKE_FAILED)
+        return result
+
+    # Step 3: Write message 3 (-> s, se) + split
+    set msg3_result to noise_xx_write_message3(hs)
+    set msg3_err to map_get_val(msg3_result and "error")
+    if msg3_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_HANDSHAKE_FAILED)
+        free_map(msg3_result)
+        return result
+
+    set msg3_hex to map_get_val(msg3_result and "message")
+    set send_err to transport_send(conn and MSG_TYPE_NOISE_HANDSHAKE and msg3_hex)
+    free_map(msg3_result)
+    if send_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_SEND_FAILED)
+        return result
+
+    # Handshake complete — create session
+    set session to noise_session_create(conn and hs)
+    set ok to map_insert(result and "session" and session)
+    set ok to map_insert(result and "error" and NOISE_NET_ERR_NONE)
+    set ok to map_insert(result and "remote_static" and noise_get_remote_static(hs))
+    return result
+
+# ================================================================
+# Responder Handshake -- accept and complete Noise_XX
+# ================================================================
+
+define noise_net_handshake_respond with conn as Map and static_secret_ptr as Int and static_public_ptr as Int returning Map:
+    # Perform full Noise_XX handshake as responder over transport conn
+    set result to create_map()
+
+    set hs to noise_handshake_init(NOISE_ROLE_RESPONDER and static_secret_ptr and static_public_ptr)
+    set init_err to map_get_val(hs and "error")
+    if init_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_HANDSHAKE_FAILED)
+        return result
+
+    # Step 1: Read message 1 (<- e)
+    set msg1_frame to transport_recv(conn)
+    set recv_err to map_get_val(msg1_frame and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_RECV_FAILED)
+        free_map(msg1_frame)
+        return result
+
+    set msg1_hex to map_get_val(msg1_frame and "payload")
+    set read1_result to noise_xx_read_message1(hs and msg1_hex)
+    free_map(msg1_frame)
+    set read1_err to map_get_val(read1_result and "error")
+    free_map(read1_result)
+    if read1_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_HANDSHAKE_FAILED)
+        return result
+
+    # Step 2: Write message 2 (-> e, ee, s, es)
+    set msg2_result to noise_xx_write_message2(hs)
+    set msg2_err to map_get_val(msg2_result and "error")
+    if msg2_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_HANDSHAKE_FAILED)
+        free_map(msg2_result)
+        return result
+
+    set msg2_hex to map_get_val(msg2_result and "message")
+    set send_err to transport_send(conn and MSG_TYPE_NOISE_HANDSHAKE and msg2_hex)
+    free_map(msg2_result)
+    if send_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_SEND_FAILED)
+        return result
+
+    # Step 3: Read message 3 (<- s, se) + split
+    set msg3_frame to transport_recv(conn)
+    set recv_err to map_get_val(msg3_frame and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_RECV_FAILED)
+        free_map(msg3_frame)
+        return result
+
+    set msg3_hex to map_get_val(msg3_frame and "payload")
+    set read3_result to noise_xx_read_message3(hs and msg3_hex)
+    free_map(msg3_frame)
+    set read3_err to map_get_val(read3_result and "error")
+    free_map(read3_result)
+    if read3_err != NOISE_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_HANDSHAKE_FAILED)
+        return result
+
+    # Handshake complete
+    set session to noise_session_create(conn and hs)
+    set ok to map_insert(result and "session" and session)
+    set ok to map_insert(result and "error" and NOISE_NET_ERR_NONE)
+    set ok to map_insert(result and "remote_static" and noise_get_remote_static(hs))
+    return result
+
+# ================================================================
+# Encrypted Send/Receive -- post-handshake
+# ================================================================
+
+define noise_net_send with session as Map and msg_type as Str and plaintext as Str returning Int:
+    # Encrypt plaintext with Noise session keys, send over transport
+    set hs to map_get_val(session and "hs")
+    set conn to map_get_val(session and "conn")
+
+    set enc_result to noise_transport_encrypt(hs and plaintext)
+    set enc_err to map_get_val(enc_result and "error")
+    if enc_err != NOISE_ERR_NONE:
+        free_map(enc_result)
+        return NOISE_NET_ERR_ENCRYPT_FAILED
+
+    set ciphertext_hex to map_get_val(enc_result and "ciphertext")
+    free_map(enc_result)
+
+    # Send as NOISE_TR:<msg_type>|<ciphertext_hex>
+    set wire_payload to concat(msg_type and "|")
+    set wire_payload to concat(wire_payload and ciphertext_hex)
+    set send_err to transport_send(conn and MSG_TYPE_NOISE_TRANSPORT and wire_payload)
+    if send_err != TRANSPORT_ERR_NONE:
+        return NOISE_NET_ERR_SEND_FAILED
+    return NOISE_NET_ERR_NONE
+
+define noise_net_recv with session as Map returning Map:
+    # Receive encrypted message, decrypt with Noise session keys
+    set result to create_map()
+    set hs to map_get_val(session and "hs")
+    set conn to map_get_val(session and "conn")
+
+    set frame to transport_recv(conn)
+    set recv_err to map_get_val(frame and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_RECV_FAILED)
+        free_map(frame)
+        return result
+
+    set wire_payload to map_get_val(frame and "payload")
+    free_map(frame)
+
+    # Parse "msg_type|ciphertext_hex"
+    set pipe_pos to 0 - 1
+    set wp_len to string_length(wire_payload)
+    set si to 0
+    repeat while si < wp_len:
+        set c to get_character(wire_payload and si)
+        if c == 124:
+            if pipe_pos < 0:
+                set pipe_pos to si
+        set si to si + 1
+
+    if pipe_pos < 0:
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_DECRYPT_FAILED)
+        return result
+
+    set msg_type to substring(wire_payload and 0 and pipe_pos)
+    set ct_start to pipe_pos + 1
+    set ct_len to wp_len - ct_start
+    set ciphertext_hex to substring(wire_payload and ct_start and ct_len)
+
+    set dec_result to noise_transport_decrypt(hs and ciphertext_hex)
+    set dec_err to map_get_val(dec_result and "error")
+    if dec_err != NOISE_ERR_NONE:
+        free_map(dec_result)
+        set ok to map_insert(result and "error" and NOISE_NET_ERR_DECRYPT_FAILED)
+        return result
+
+    set plaintext to map_get_val(dec_result and "plaintext")
+    free_map(dec_result)
+
+    set ok to map_insert(result and "error" and NOISE_NET_ERR_NONE)
+    set ok to map_insert(result and "msg_type" and msg_type)
+    set ok to map_insert(result and "plaintext" and plaintext)
+    return result
+
+# ================================================================
+# Close session
+# ================================================================
+
+define noise_net_close with session as Map returning Int:
+    set conn to map_get_val(session and "conn")
+    return transport_close(conn)

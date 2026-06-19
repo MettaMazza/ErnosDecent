@@ -1,0 +1,184 @@
+# ErnosDecent — Onion Routing
+# Component: decent_anon/onion.ep
+# Implements: Multi-hop layered onion packet encryption and decryption
+# Status: Production — OperationTrojanClaude Phase 11
+
+import "../decent_id/keys"
+import "../decent_id/sodium_ffi"
+import "string"
+import "../decent_net/transport"
+
+# ================================================================
+# Initialization
+# ================================================================
+
+set ONION_ERR_NONE to 0
+set ONION_ERR_INIT_FAILED to 1
+set ONION_ERR_CRYPTO_FAILED to 2
+set ONION_ERR_MALFORMED_PACKET to 3
+
+define onion_init returning Int:
+    set ok to ffi_sodium_init()
+    if ok < 0:
+        return ONION_ERR_INIT_FAILED
+    return ONION_ERR_NONE
+
+# ================================================================
+# Cryptographic Shared Secret Derivation
+# ================================================================
+
+define onion_derive_shared_secret with secret_key_hex as Str and public_key_hex as Str returning Str:
+    set lib to sodium_ffi_load()
+    set fn to ep_dlsym(lib and "crypto_scalarmult")
+    if fn == 0:
+        return ""
+
+    set q_ptr to alloc_bytes(32)
+    set n_ptr to alloc_bytes(32)
+    set p_ptr to alloc_bytes(32)
+
+    set ok to hex_to_raw(secret_key_hex and n_ptr and 32)
+    set ok to hex_to_raw(public_key_hex and p_ptr and 32)
+
+    # q = n * p
+    set result to ep_dlcall3(fn and q_ptr and n_ptr and p_ptr)
+
+    set shared_secret_hex to ""
+    if result == 0:
+        set shared_secret_hex to raw_to_hex(q_ptr and 32)
+
+    set ok to ffi_memzero(n_ptr and 32)
+    set ok to free_bytes(n_ptr)
+    set ok to free_bytes(p_ptr)
+    set ok to free_bytes(q_ptr)
+
+    return shared_secret_hex
+
+# ================================================================
+# Onion Packet Construction (Encryption)
+# ================================================================
+
+define onion_create_packet with circuit_keys as List and hops as List and final_destination as Str and payload as Str returning Map:
+    set num_hops to length_list(hops)
+    if num_hops == 0:
+        set result to create_map()
+        set ok to map_insert(result and "error" and ONION_ERR_MALFORMED_PACKET)
+        return result
+
+    set current_payload to payload
+    set current_next to final_destination
+    set current_nonce to ""
+    set is_exit to 1
+
+    set idx to num_hops - 1
+    repeat while idx >= 0:
+        set layer_json to ""
+        if is_exit == 1:
+            set layer_json to f"\{\"next\":\"{current_next}\",\"payload\":\"{current_payload}\",\"is_exit\":1\}"
+        else:
+            set layer_json to f"\{\"next\":\"{current_next}\",\"ciphertext\":\"{current_payload}\",\"nonce\":\"{current_nonce}\",\"is_exit\":0\}"
+
+        set key_ptr to get_list(circuit_keys and idx)
+        set key_hex to ptr_to_str(key_ptr)
+
+        set enc_res to encrypt_symmetric(layer_json and key_hex)
+        set err to map_get_val(enc_res and "error")
+        if err != 0:
+            set result to create_map()
+            set ok to map_insert(result and "error" and ONION_ERR_CRYPTO_FAILED)
+            return result
+
+        set current_payload to map_get_val(enc_res and "ciphertext")
+        set current_nonce to map_get_val(enc_res and "nonce")
+
+        if idx > 0:
+            set next_hop_ptr to get_list(hops and idx)
+            set current_next to ptr_to_str(next_hop_ptr)
+        else:
+            set current_next to ""
+
+        set is_exit to 0
+        set idx to idx - 1
+
+    set result to create_map()
+    set ok to map_insert(result and "ciphertext" and current_payload)
+    set ok to map_insert(result and "nonce" and current_nonce)
+    set ok to map_insert(result and "error" and ONION_ERR_NONE)
+    return result
+
+# ================================================================
+# Onion Packet Processing (Decryption Step)
+# ================================================================
+
+define onion_decrypt_step with packet_map as Map and key_hex as Str returning Map:
+    set ciphertext to map_get_val(packet_map and "ciphertext")
+    set nonce to map_get_val(packet_map and "nonce")
+
+    set dec_res to decrypt_symmetric(ciphertext and nonce and key_hex)
+    set err to map_get_val(dec_res and "error")
+
+    set result to create_map()
+    if err != 0:
+        set ok to map_insert(result and "error" and ONION_ERR_CRYPTO_FAILED)
+        return result
+
+    set plaintext to map_get_val(dec_res and "plaintext")
+
+    set is_exit to json_get_int(plaintext and "is_exit")
+    set next_hop to json_get_string(plaintext and "next")
+
+    set ok to map_insert(result and "is_exit" and is_exit)
+    set ok to map_insert(result and "next" and next_hop)
+    set ok to map_insert(result and "error" and ONION_ERR_NONE)
+
+    if is_exit == 1:
+        set payload to json_get_string(plaintext and "payload")
+        set ok to map_insert(result and "payload" and payload)
+    else:
+        set inner_cipher to json_get_string(plaintext and "ciphertext")
+        set inner_nonce to json_get_string(plaintext and "nonce")
+        set ok to map_insert(result and "ciphertext" and inner_cipher)
+        set ok to map_insert(result and "nonce" and inner_nonce)
+
+    return result
+
+# ================================================================
+# Onion Forwarding — relay or deliver
+# ================================================================
+
+define onion_forward with packet_map as Map and my_key_hex as Str returning Map:
+    # Decrypt my layer
+    set step to onion_decrypt_step(packet_map and my_key_hex)
+    set err to map_get_val(step and "error")
+    if err != ONION_ERR_NONE:
+        return step
+
+    set is_exit to map_get_val(step and "is_exit")
+    set next_hop to ptr_to_str(map_get_val(step and "next"))
+
+    # Parse next_hop as "address:port"
+    set colon_idx to string_index_of(next_hop and ":")
+    set next_addr to substring(next_hop and 0 and colon_idx)
+    set port_str to substring(next_hop and colon_idx + 1 and string_length(next_hop) - colon_idx - 1)
+    set next_port to string_to_int(port_str)
+
+    set conn to transport_connect(next_addr and next_port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != 0:
+        set ok to map_insert(step and "error" and ONION_ERR_CRYPTO_FAILED)
+        return step
+
+    if is_exit == 1:
+        # Final hop — deliver payload to destination
+        set payload to ptr_to_str(map_get_val(step and "payload"))
+        set ok to transport_send(conn and "MSG_DELIVER" and payload)
+    else:
+        # Relay hop — forward inner packet
+        set inner_ct to ptr_to_str(map_get_val(step and "ciphertext"))
+        set inner_nc to ptr_to_str(map_get_val(step and "nonce"))
+        set fwd_payload to concat(inner_ct and ",")
+        set fwd_payload to concat(fwd_payload and inner_nc)
+        set ok to transport_send(conn and "ONION_DATA" and fwd_payload)
+
+    set ok to transport_close(conn)
+    return step

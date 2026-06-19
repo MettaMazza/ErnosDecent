@@ -1,0 +1,87 @@
+# ErnosDecent -- HTTP Server
+# Component: decent_host/http.ep
+# Implements: HTTP request parsing, response building, and socket step execution
+# Status: Production -- OperationTrojanClaude Phase 7
+
+import "net"
+import "string"
+import "static"
+
+# ================================================================
+# HTTP Server Operations
+# ================================================================
+
+define http_parse_request_path with req as Str returning Str:
+    set len to string_length(req)
+    if len < 5:
+        return ""
+    
+    # Find the end of the first line
+    set first_line_end to string_index_of(req and "\n")
+    set first_line to ""
+    if first_line_end < 0:
+        set first_line to req
+    else:
+        set first_line to substring(req and 0 and first_line_end)
+    
+    # Strip carriage return if present
+    set first_line_len to string_length(first_line)
+    if first_line_len > 0:
+        set last_char to get_character(first_line and first_line_len - 1)
+        if last_char == 13: # \r
+            set first_line to substring(first_line and 0 and first_line_len - 1)
+            
+    # Split the request line by spaces to locate the path (second token)
+    set parts to split(first_line and " ")
+    set parts_len to length_list(parts)
+    if parts_len < 2:
+        free_list(parts)
+        return ""
+        
+    set path to get_list(parts and 1)
+    free_list(parts)
+    return path
+
+define http_build_response with status as Int and content_type as Str and body as Str returning Str:
+    set body_len to string_length(body)
+    set len_str to int_to_string(body_len)
+    
+    set resp to "HTTP/1.1 "
+    if status == 200:
+        set resp to concat(resp and "200 OK")
+    else:
+        if status == 404:
+            set resp to concat(resp and "404 Not Found")
+        else:
+            set resp to concat(resp and "500 Internal Server Error")
+            
+    set resp to concat(resp and "\r\nContent-Type: ")
+    set resp to concat(resp and content_type)
+    set resp to concat(resp and "\r\nContent-Length: ")
+    set resp to concat(resp and len_str)
+    set resp to concat(resp and "\r\nConnection: close\r\n\r\n")
+    set resp to concat(resp and body)
+    return resp
+
+define http_server_step with server_fd as Int and static_mapper as Int returning Int:
+    set client_fd to net_accept(server_fd)
+    if client_fd < 0:
+        return 0 - 1
+        
+    set req to net_recv(client_fd and 4096)
+    if string_length(req) == 0:
+        set ok to net_close(client_fd)
+        return 0
+        
+    set path to http_parse_request_path(req)
+    set content to static_get_content(static_mapper and path)
+    
+    set resp to ""
+    if string_length(content) > 0:
+        set resp to http_build_response(200 and "text/html" and content)
+    else:
+        set resp to http_build_response(404 and "text/html" and "<h1>404 Not Found</h1>")
+        
+    set ok to net_send(client_fd and resp)
+    set ok to net_close(client_fd)
+    return 1

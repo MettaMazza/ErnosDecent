@@ -1,0 +1,49 @@
+# ErnosPlain Rebuild of ErnOS Agent Self-Recompilation Tool
+# Component: decent_agent/compiler_tool.ep
+
+import "os"
+import "fs"
+import "collections"
+import "string"
+import "../logging"
+
+define run_upgrade_background returning Int:
+    set res to run_command("bash upgrade.sh")
+    return 0
+
+define system_recompile returning Str:
+    log_info("compiler" and "Starting safety-gated system self-recompilation pipeline.")
+    
+    # 1. Run build
+    set build_res to run_command("bash build.sh")
+    
+    # Check if compilation failed
+    if string_contains(build_res and "Error: Clang compilation failed") == 1 or else string_contains(build_res and "error:") == 1:
+        return concat("RECOMPILE BLOCKED: Compilation failed.\n\n" and build_res)
+        
+    # Check for warnings gate
+    if string_contains(build_res and "warning:") == 1 or else string_contains(build_res and "warning[") == 1:
+        return concat("RECOMPILE BLOCKED: Compiler warnings detected. You must fix all warnings first.\n\n" and build_res)
+        
+    # 2. Run unit tests
+    set test_res to run_command("bash build.sh test")
+    if string_contains(test_res and "ALL COGNITIVE AGENT TESTS PASSED!") == 0 or else string_contains(test_res and "FAIL") == 1:
+        return concat("RECOMPILE BLOCKED: Unit tests failed.\n\n" and test_res)
+        
+    # 3. Stage the binary
+    if file_exists("./node") == 1:
+        # Save resume state
+        set resume_json to "{\n  \"message\": \"System recompile completed successfully. Upgraded daemon is online.\",\n  \"compiled_at\": \"staged\"\n}"
+        set ok to write_file("config/resume.json" and resume_json)
+        
+        # Stage binary as node_next
+        set cp_res to run_command("cp ./node ./node_next")
+        
+        # 4. Trigger hot-swap script upgrade.sh in the background
+        if file_exists("upgrade.sh") == 1:
+            spawn run_upgrade_background()
+            return "RECOMPILE SUCCESSFUL: staged binary as node_next. upgrade.sh launched in background."
+        else:
+            return "RECOMPILE SUCCESSFUL: staged binary as node_next. upgrade.sh not found."
+            
+    return "Error: Compiled binary './node' not found."

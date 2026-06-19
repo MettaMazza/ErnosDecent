@@ -1,0 +1,1258 @@
+# ErnosDecent -- Distributed Ledger
+# Component: decent_money/ledger.ep
+# Implements: UTXO transaction validations, Merkle trees, and Proof-of-Stake consensus
+# Status: Production -- OperationTrojanClaude Phase 8
+
+import "../decent_id/keys"
+import "string"
+import "collections"
+import "../storage"
+import "../decent_net/transport"
+import "contracts"
+import "token"
+
+# ================================================================
+# Constants and Error Codes
+# ================================================================
+
+set LEDGER_ERR_NONE to 0
+set LEDGER_ERR_TX_INVALID_INPUT to 901
+set LEDGER_ERR_TX_DOUBLE_SPEND to 902
+set LEDGER_ERR_TX_BAD_SIGNATURE to 903
+set LEDGER_ERR_TX_VALUE_MISMATCH to 904
+set LEDGER_ERR_BLOCK_INVALID_VALIDATOR to 905
+set LEDGER_ERR_BLOCK_BAD_HASH to 906
+set LEDGER_ERR_STAKING_INSUFFICIENT to 907
+# F2: block-propagation fork-choice / linkage outcomes
+set LEDGER_ERR_BLOCK_GAP to 908
+set LEDGER_ERR_BLOCK_STALE to 909
+set LEDGER_ERR_BLOCK_FORK to 910
+set LEDGER_ERR_BLOCK_EQUIVOCATION to 911
+set LEDGER_BLOCK_DUPLICATE to 912
+
+set TX_STANDARD to 1
+set TX_DEPLOY_CONTRACT to 2
+set TX_CALL_CONTRACT to 3
+
+# ================================================================
+# Helper Functions
+# ================================================================
+
+# Compute SHA-256 hash of a transaction structure deterministically
+define ledger_hash_tx with tx as Map returning Str:
+    set inputs to map_get_val(tx and "inputs")
+    set outputs to map_get_val(tx and "outputs")
+    set fee to map_get_val(tx and "fee")
+    
+    set s to ""
+    set tx_type to 1
+    if map_contains(tx and "type") == 1:
+        set tx_type to map_get_val(tx and "type")
+    set s to concat(s and int_to_string(tx_type))
+    set s to concat(s and ":")
+    
+    set in_len to length_list(inputs)
+    set i to 0
+    repeat while i < in_len:
+        set inp to get_list(inputs and i)
+        set ref_tx to map_get_val(inp and "tx_id")
+        set ref_idx_str to int_to_string(map_get_val(inp and "output_index"))
+        set s to concat(s and ref_tx)
+        set s to concat(s and ":")
+        set s to concat(s and ref_idx_str)
+        set i to i + 1
+        
+    set out_len to length_list(outputs)
+    set j to 0
+    repeat while j < out_len:
+        set outp to get_list(outputs and j)
+        set rec to map_get_val(outp and "recipient")
+        set amt_str to int_to_string(map_get_val(outp and "amount"))
+        set s to concat(s and rec)
+        set s to concat(s and ":")
+        set s to concat(s and amt_str)
+        set j to j + 1
+        
+    set s to concat(s and int_to_string(fee))
+    
+    if tx_type == 2:
+        set s to concat(s and ":")
+        set s to concat(s and map_get_val(tx and "contract_code"))
+        set s to concat(s and ":")
+        set s to concat(s and map_get_val(tx and "contract_owner"))
+        set s to concat(s and ":")
+        set s to concat(s and int_to_string(map_get_val(tx and "contract_gas_limit")))
+        
+    if tx_type == 3:
+        set s to concat(s and ":")
+        set s to concat(s and map_get_val(tx and "contract_id"))
+        set s to concat(s and ":")
+        set s to concat(s and map_get_val(tx and "contract_entrypoint"))
+        set s to concat(s and ":")
+        set s to concat(s and map_get_val(tx and "contract_args"))
+        set s to concat(s and ":")
+        set s to concat(s and int_to_string(map_get_val(tx and "contract_gas_limit")))
+        
+    return ep_sha256(s)
+
+# Compute Merkle Root of a list of transaction hashes
+define calculate_merkle_root with tx_ids as List returning Str:
+    set len to length_list(tx_ids)
+    if len == 0:
+        return ""
+    if len == 1:
+        return get_list(tx_ids and 0)
+        
+    set current_level to create_list()
+    set i to 0
+    repeat while i < len:
+        set ok to append_list(current_level and get_list(tx_ids and i))
+        set i to i + 1
+        
+    repeat while length_list(current_level) > 1:
+        set next_level to create_list()
+        set j to 0
+        set level_len to length_list(current_level)
+        repeat while j < level_len:
+            set left to get_list(current_level and j)
+            set right to left
+            if j + 1 < level_len:
+                set right to get_list(current_level and j + 1)
+            set combined to concat(left and right)
+            set parent_hash to ep_sha256(combined)
+            set ok to append_list(next_level and parent_hash)
+            set j to j + 2
+            
+        free_list(current_level)
+        set current_level to next_level
+        
+    set root to get_list(current_level and 0)
+    free_list(current_level)
+    set current_level to 0
+    return root
+
+# Pseudo-random conversion of a hex hash to an integer modulo bounds (for PoS election)
+define hash_to_int_modulo with hash_str as Str and bounds as Int returning Int:
+    # F3: parse the first 15 hex digits as a big-endian integer (~60 bits, fits signed
+    # 64-bit) instead of summing character byte values — the old sum had only ~6500
+    # distinct values regardless of stake, making validator selection grindable.
+    if bounds <= 0:
+        return 0
+    set hs to string_lower(hash_str)
+    set h_len to string_length(hs)
+    set take to 15
+    if h_len < take:
+        set take to h_len
+    set hexchars to "0123456789abcdef"
+    set acc to 0
+    set i to 0
+    repeat while i < take:
+        set v to string_index_of(hexchars and substring(hs and i and 1))
+        if v < 0:
+            set v to 0
+        set acc to acc * 16 + v
+        set i to i + 1
+    return acc modulo bounds
+
+# ================================================================
+# Ledger Initialization
+# ================================================================
+
+define ledger_create with genesis_pubkey as Str returning Map:
+    set ledger to create_map()
+    
+    set blocks to create_list()
+    set ok to map_insert(ledger and "blocks" and blocks)
+    
+    set utxos to create_map()
+    set ok to map_insert(ledger and "utxos" and utxos)
+    
+    set stakes to create_map()
+    set ok to map_insert(ledger and "stakes" and stakes)
+    
+    set validators to create_list()
+    set ok to map_insert(ledger and "validators" and validators)
+    
+    set values_list to create_list()
+    set ok to map_insert(ledger and "values_list" and values_list)
+    set ok to append_list(values_list and blocks)
+    set ok to append_list(values_list and utxos)
+    set ok to append_list(values_list and stakes)
+    set ok to append_list(values_list and validators)
+    
+    # Create Genesis Block
+    set genesis_block to create_map()
+    set ok to map_insert(genesis_block and "index" and 0)
+    set ok to map_insert(genesis_block and "prev_hash" and "0000000000000000000000000000000000000000000000000000000000000000")
+    set ok to map_insert(genesis_block and "timestamp" and ep_time_now_sec())
+    
+    set genesis_txs to create_list()
+    # Award genesis coins to a default address
+    set genesis_tx to create_map()
+    set empty_inputs to create_list()
+    set genesis_outputs to create_list()
+    
+    set out1 to create_map()
+    set ok to map_insert(out1 and "recipient" and genesis_pubkey)
+    set ok to map_insert(out1 and "amount" and 1000000)
+    set ok to map_insert(out1 and "index" and 0)
+    set ok to append_list(genesis_outputs and out1)
+    
+    set ok to map_insert(genesis_tx and "inputs" and empty_inputs)
+    set ok to map_insert(genesis_tx and "outputs" and genesis_outputs)
+    set ok to map_insert(genesis_tx and "fee" and 0)
+    
+    set tx_id to ledger_hash_tx(genesis_tx)
+    set ok to map_insert(genesis_tx and "id" and tx_id)
+    set ok to append_list(genesis_txs and genesis_tx)
+    
+    set ok to map_insert(genesis_block and "transactions" and genesis_txs)
+    
+    set tx_hashes to create_list()
+    set ok to append_list(tx_hashes and tx_id)
+    set root to calculate_merkle_root(tx_hashes)
+    free_list(tx_hashes)
+    set tx_hashes to 0
+    set ok to map_insert(genesis_block and "merkle_root" and root)
+    
+    set block_hash_input to concat(root and "0000000000000000000000000000000000000000000000000000000000000000")
+    set block_hash to ep_sha256(block_hash_input)
+    set ok to map_insert(genesis_block and "hash" and block_hash)
+    
+    set ok to append_list(blocks and genesis_block)
+    
+    # Store genesis output in UTXOs
+    set utxo_key to concat(tx_id and ":0")
+    set ok to map_insert(utxos and utxo_key and out1)
+    
+    set ok to append_list(values_list and genesis_block)
+    set ok to append_list(values_list and genesis_txs)
+    set ok to append_list(values_list and genesis_tx)
+    set ok to append_list(values_list and out1)
+    set ok to append_list(values_list and utxo_key)
+    set ok to append_list(values_list and block_hash)
+    set ok to append_list(values_list and root)
+    set ok to append_list(values_list and genesis_pubkey)
+    
+    return ledger
+
+# ================================================================
+# Smart Contract Backup, Restore, and State Commitment
+# ================================================================
+
+define ledger_backup_contracts returning Map:
+    set backup to create_map()
+    set ok to contracts_init()
+    set keys to map_keys(DEPLOYED_CONTRACTS)
+    set keys_len to length_list(keys)
+    set i to 0
+    repeat while i < keys_len:
+        set k to get_list(keys and i)
+        set contract to map_get_val(DEPLOYED_CONTRACTS and k)
+        
+        set contract_clone to create_map()
+        set ok to map_insert(contract_clone and "id" and map_get_val(contract and "id"))
+        set ok to map_insert(contract_clone and "code" and map_get_val(contract and "code"))
+        set ok to map_insert(contract_clone and "owner" and map_get_val(contract and "owner"))
+        set ok to map_insert(contract_clone and "balance" and map_get_val(contract and "balance"))
+        set ok to map_insert(contract_clone and "max_gas" and map_get_val(contract and "max_gas"))
+        
+        set storage to map_get_val(contract and "storage")
+        set storage_clone to contract_clone_map(storage)
+        set ok to map_insert(contract_clone and "storage" and storage_clone)
+        
+        set ok to map_insert(backup and k and contract_clone)
+        set i to i + 1
+    free_list(keys)
+    return backup
+
+define ledger_restore_contracts with backup as Map returning Int:
+    set ok to contracts_init()
+    set keys to map_keys(DEPLOYED_CONTRACTS)
+    set keys_len to length_list(keys)
+    set i to 0
+    repeat while i < keys_len:
+        set k to get_list(keys and i)
+        map_delete(DEPLOYED_CONTRACTS and k)
+        set i to i + 1
+    free_list(keys)
+    
+    set b_keys to map_keys(backup)
+    set b_keys_len to length_list(b_keys)
+    set i to 0
+    repeat while i < b_keys_len:
+        set k to get_list(b_keys and i)
+        set contract_clone to map_get_val(backup and k)
+        
+        set contract to create_map()
+        set ok to map_insert(contract and "id" and map_get_val(contract_clone and "id"))
+        set ok to map_insert(contract and "code" and map_get_val(contract_clone and "code"))
+        set ok to map_insert(contract and "owner" and map_get_val(contract_clone and "owner"))
+        set ok to map_insert(contract and "balance" and map_get_val(contract_clone and "balance"))
+        set ok to map_insert(contract_clone and "max_gas" and map_get_val(contract_clone and "max_gas"))
+        
+        set storage_clone to map_get_val(contract_clone and "storage")
+        set storage to contract_clone_map(storage_clone)
+        set ok to map_insert(contract and "storage" and storage)
+        
+        set events to create_list()
+        set ok to map_insert(contract and "events" and events)
+        set values_list to create_list()
+        set ok to map_insert(contract and "values_list" and values_list)
+        set ok to append_list(values_list and storage)
+        set ok to append_list(values_list and events)
+        
+        set ok to map_insert(DEPLOYED_CONTRACTS and k and contract)
+        set i to i + 1
+    free_list(b_keys)
+    return 0
+
+define ledger_str_compare with s1 as Str and s2 as Str returning Int:
+    set len1 to string_length(s1)
+    set len2 to string_length(s2)
+    set min_len to len1
+    if len2 < len1:
+        set min_len to len2
+    set i to 0
+    repeat while i < min_len:
+        set c1 to get_character(s1 and i)
+        set c2 to get_character(s2 and i)
+        if c1 < c2:
+            return 0 - 1
+        if c1 > c2:
+            return 1
+        set i to i + 1
+    if len1 < len2:
+        return 0 - 1
+    if len1 > len2:
+        return 1
+    return 0
+
+define ledger_compute_state_root returning Str:
+    set ok to contracts_init()
+    set keys to map_keys(DEPLOYED_CONTRACTS)
+    set keys_len to length_list(keys)
+    
+    set i to 0
+    repeat while i < keys_len:
+        set j to i + 1
+        repeat while j < keys_len:
+            set k1 to get_list(keys and i)
+            set k2 to get_list(keys and j)
+            if ledger_str_compare(k1 and k2) > 0:
+                set ok to set_list(keys and i and k2)
+                set ok to set_list(keys and j and k1)
+            set j to j + 1
+        set i to i + 1
+        
+    set s to ""
+    set i to 0
+    repeat while i < keys_len:
+        set k to get_list(keys and i)
+        set contract to map_get_val(DEPLOYED_CONTRACTS and k)
+        set bal to map_get_val(contract and "balance")
+        set s to concat(s and k)
+        set s to concat(s and ":")
+        set s to concat(s and int_to_string(bal))
+        
+        set storage to map_get_val(contract and "storage")
+        set st_keys to map_keys(storage)
+        set st_keys_len to length_list(st_keys)
+        
+        set m to 0
+        repeat while m < st_keys_len:
+            set n to m + 1
+            repeat while n < st_keys_len:
+                set sk1 to get_list(st_keys and m)
+                set sk2 to get_list(st_keys and n)
+                if ledger_str_compare(sk1 and sk2) > 0:
+                    set ok to set_list(st_keys and m and sk2)
+                    set ok to set_list(st_keys and n and sk1)
+                set n to n + 1
+            set m to m + 1
+            
+        set m to 0
+        repeat while m < st_keys_len:
+            set sk to get_list(st_keys and m)
+            set sv to map_get_val(storage and sk)
+            set s to concat(s and ";")
+            set s to concat(s and sk)
+            set s to concat(s and "=")
+            set s to concat(s and sv)
+            set m to m + 1
+            
+        free_list(st_keys)
+        set i to i + 1
+        
+    free_list(keys)
+    return ep_sha256(s)
+
+define ledger_compute_block_hash with merkle_root as Str and prev_hash as Str and state_root as Str returning Str:
+    set block_hash_input to concat(merkle_root and prev_hash)
+    set block_hash_input to concat(block_hash_input and state_root)
+    return ep_sha256(block_hash_input)
+
+# ================================================================
+# Staking operations (Proof of Stake)
+# ================================================================
+
+define ledger_stake_coins with ledger as Map and validator_pub_key as Str and amount as Int returning Int:
+    set utxos to map_get_val(ledger and "utxos")
+    set stakes to map_get_val(ledger and "stakes")
+    set validators to map_get_val(ledger and "validators")
+
+    if amount < 1:
+        return LEDGER_ERR_STAKING_INSUFFICIENT
+
+    # Select the validator's spendable UTXOs until they cover the stake amount.
+    # We record SELECTED INDICES (ints) into the keys snapshot rather than key
+    # pointers, so deleting from the map cannot dangle the snapshot. map_keys
+    # returns strdup copies and map_delete matches by value, so this is safe.
+    set keys to map_keys(utxos)
+    set keys_len to length_list(keys)
+    set collected to 0
+    set sel_idx to create_list()
+    set i to 0
+    repeat while i < keys_len:
+        if collected < amount:
+            set k to get_list(keys and i)
+            set utxo to map_get_val(utxos and k)
+            if map_get_val(utxo and "recipient") equals validator_pub_key:
+                set collected to collected + map_get_val(utxo and "amount")
+                set ok to append_list(sel_idx and i)
+        set i to i + 1
+
+    if collected < amount:
+        free_list(sel_idx)
+        free_list(keys)
+        return LEDGER_ERR_STAKING_INSUFFICIENT
+
+    # Bond the stake by REMOVING the selected UTXOs from the spendable set, so the
+    # coins can no longer be spent or re-staked. (Previously this only incremented
+    # the stakes registry, leaving the coins spendable and letting the same balance
+    # be staked repeatedly -- stake was free to forge.)
+    set d to 0
+    set dl to length_list(sel_idx)
+    repeat while d < dl:
+        set ok to map_delete(utxos and get_list(keys and get_list(sel_idx and d)))
+        set d to d + 1
+    free_list(sel_idx)
+    free_list(keys)
+
+    # Return any over-collected change as a spendable UTXO, keyed in normal
+    # "txid:index" form so a later transaction input can reference it.
+    set change to collected - amount
+    if change > 0:
+        set counter to 0
+        if map_contains(ledger and "stake_change_counter") == 1:
+            set counter to map_get_val(ledger and "stake_change_counter")
+        set ok to map_insert(ledger and "stake_change_counter" and counter + 1)
+        set change_utxo to create_map()
+        set ok to map_insert(change_utxo and "recipient" and validator_pub_key)
+        set ok to map_insert(change_utxo and "amount" and change)
+        set ok to map_insert(change_utxo and "index" and 0)
+        set change_key to concat("stakechange_" and concat(int_to_string(counter) and ":0"))
+        set ok to map_insert(utxos and change_key and change_utxo)
+
+    # Record the bonded stake.
+    set current_stake to 0
+    if map_contains(stakes and validator_pub_key) == 1:
+        set current_stake to map_get_val(stakes and validator_pub_key)
+    else:
+        set ok to append_list(validators and validator_pub_key)
+
+    set ok to map_insert(stakes and validator_pub_key and current_stake + amount)
+    return LEDGER_ERR_NONE
+
+# Proof-of-Stake validator election based on stake weightings and previous block hash
+define ledger_elect_validator with ledger as Map and prev_hash as Str returning Str:
+    set stakes to map_get_val(ledger and "stakes")
+    set validators to map_get_val(ledger and "validators")
+    set v_len to length_list(validators)
+    if v_len == 0:
+        set blocks to map_get_val(ledger and "blocks")
+        set gen_block to get_list(blocks and 0)
+        set gen_txs to map_get_val(gen_block and "transactions")
+        set gen_tx to get_list(gen_txs and 0)
+        set gen_outs to map_get_val(gen_tx and "outputs")
+        set gen_out to get_list(gen_outs and 0)
+        return map_get_val(gen_out and "recipient")
+        
+    # Compute total stake
+    set total_stake to 0
+    set i to 0
+    repeat while i < v_len:
+        set val_key to get_list(validators and i)
+        set total_stake to total_stake + map_get_val(stakes and val_key)
+        set i to i + 1
+        
+    if total_stake == 0:
+        set blocks to map_get_val(ledger and "blocks")
+        set gen_block to get_list(blocks and 0)
+        set gen_txs to map_get_val(gen_block and "transactions")
+        set gen_tx to get_list(gen_txs and 0)
+        set gen_outs to map_get_val(gen_tx and "outputs")
+        set gen_out to get_list(gen_outs and 0)
+        return map_get_val(gen_out and "recipient")
+        
+    # Select validator deterministically using the prev_hash as seed
+    set target to hash_to_int_modulo(prev_hash and total_stake)
+    
+    set running_sum to 0
+    set j to 0
+    repeat while j < v_len:
+        set val_key to get_list(validators and j)
+        set running_sum to running_sum + map_get_val(stakes and val_key)
+        if running_sum > target:
+            return val_key
+        set j to j + 1
+        
+    return get_list(validators and 0)
+
+# ================================================================
+# Transaction Management
+# ================================================================
+
+define ledger_create_tx with inputs as Int and outputs as Int and fee as Int returning Map:
+    set tx to create_map()
+    set ok to map_insert(tx and "inputs" and inputs)
+    set ok to map_insert(tx and "outputs" and outputs)
+    set ok to map_insert(tx and "fee" and fee)
+    set ok to map_insert(tx and "type" and 1)
+    set ok to map_insert(tx and "timestamp" and ep_time_now_sec())
+    
+    # Generate Tx ID
+    set tx_id to ledger_hash_tx(tx)
+    set ok to map_insert(tx and "id" and tx_id)
+    return tx
+
+define ledger_validate_tx with ledger as Map and tx as Map returning Int:
+    set utxos to map_get_val(ledger and "utxos")
+    set inputs to map_get_val(tx and "inputs")
+    set outputs to map_get_val(tx and "outputs")
+    set fee to map_get_val(tx and "fee")
+    set tx_id to map_get_val(tx and "id")
+
+    # Reject value-creating transactions BEFORE any signature check: every output
+    # amount must be strictly positive and the fee must be non-negative. Without
+    # this, a transaction can satisfy input_sum == output_sum + fee while minting
+    # coins via a negative fee (input 100, output 1000, fee -900) or a negative
+    # output (outputs [1000000, -999900]), breaking conservation of supply.
+    if fee < 0:
+        return LEDGER_ERR_TX_VALUE_MISMATCH
+    set vchk_len to length_list(outputs)
+    set vchk to 0
+    repeat while vchk < vchk_len:
+        set vout to get_list(outputs and vchk)
+        if map_get_val(vout and "amount") < 1:
+            return LEDGER_ERR_TX_VALUE_MISMATCH
+        set vchk to vchk + 1
+
+    set input_sum to 0
+    set in_len to length_list(inputs)
+    set i to 0
+    repeat while i < in_len:
+        set inp to get_list(inputs and i)
+        set ref_tx_id to map_get_val(inp and "tx_id")
+        set ref_idx to map_get_val(inp and "output_index")
+        
+        set utxo_key to concat(ref_tx_id and ":")
+        set utxo_key to concat(utxo_key and int_to_string(ref_idx))
+        
+        # Verify UTXO exists in the unspent set
+        if map_contains(utxos and utxo_key) == 0:
+            return LEDGER_ERR_TX_INVALID_INPUT
+            
+        set ref_out to map_get_val(utxos and utxo_key)
+        set ref_amt to map_get_val(ref_out and "amount")
+        set ref_recipient to map_get_val(ref_out and "recipient")
+
+        # Overflow guard (UB-safe: checked before the add, never overflows the
+        # check itself). ref_amt >= 1, so a sum exceeding the signed-64-bit max
+        # is rejected rather than silently wrapping.
+        if input_sum > 9223372036854775807 - ref_amt:
+            return LEDGER_ERR_TX_VALUE_MISMATCH
+        set input_sum to input_sum + ref_amt
+        
+        # Verify input signature matches the public key of the unspent output owner
+        set signature to map_get_val(inp and "signature")
+        set verify_err to verify_signature(tx_id and signature and ref_recipient)
+        if verify_err != 0:
+            return LEDGER_ERR_TX_BAD_SIGNATURE
+            
+        set i to i + 1
+        
+    set output_sum to 0
+    set out_len to length_list(outputs)
+    set j to 0
+    repeat while j < out_len:
+        set outp to get_list(outputs and j)
+        set out_amt to map_get_val(outp and "amount")
+        # Overflow guard: amounts are >= 1 (checked above). Without this, two or
+        # more huge outputs could wrap past the 64-bit max to a small total that
+        # passes the conservation check below -- an overflow mint.
+        if output_sum > 9223372036854775807 - out_amt:
+            return LEDGER_ERR_TX_VALUE_MISMATCH
+        set output_sum to output_sum + out_amt
+        set j to j + 1
+
+    # Total input value must match outputs + fee (overflow-guarded; fee >= 0).
+    if output_sum > 9223372036854775807 - fee:
+        return LEDGER_ERR_TX_VALUE_MISMATCH
+    if input_sum != output_sum + fee:
+        return LEDGER_ERR_TX_VALUE_MISMATCH
+        
+    return LEDGER_ERR_NONE
+
+# ================================================================
+# Block Processing and Balance Hook
+# ================================================================
+
+define ledger_add_block with ledger as Map and transactions as List and validator_did as Str and signature as Str and expected_state_root as Str returning Int:
+    set blocks to map_get_val(ledger and "blocks")
+    set utxos to map_get_val(ledger and "utxos")
+    set values_list to map_get_val(ledger and "values_list")
+    
+    set prev_block to get_list(blocks and length_list(blocks) - 1)
+    set prev_hash to map_get_val(prev_block and "hash")
+    
+    # 1. Verify Validator Selection via Proof-of-Stake
+    set elected_validator to ledger_elect_validator(ledger and prev_hash)
+    if elected_validator equals validator_did:
+        set val_ok to 1
+    else:
+        return LEDGER_ERR_BLOCK_INVALID_VALIDATOR
+        
+    # 2. Validate Block transactions
+    set total_fee to 0
+    set tx_hashes to create_list()
+    set tx_len to length_list(transactions)
+    set spent_in_block to create_map()
+    set i to 0
+    repeat while i < tx_len:
+        set tx to get_list(transactions and i)
+        
+        set inputs to map_get_val(tx and "inputs")
+        set in_len to length_list(inputs)
+        set k to 0
+        repeat while k < in_len:
+            set inp to get_list(inputs and k)
+            set ref_tx_id to map_get_val(inp and "tx_id")
+            set ref_idx to map_get_val(inp and "output_index")
+            set utxo_key to concat(ref_tx_id and ":")
+            set utxo_key to concat(utxo_key and int_to_string(ref_idx))
+            
+            if map_contains(spent_in_block and utxo_key) == 1:
+                free_list(tx_hashes)
+                free_map(spent_in_block)
+                return LEDGER_ERR_TX_DOUBLE_SPEND
+                
+            set ok to map_insert(spent_in_block and utxo_key and 1)
+            set k to k + 1
+
+        set tx_err to ledger_validate_tx(ledger and tx)
+        if tx_err != LEDGER_ERR_NONE:
+            free_list(tx_hashes)
+            free_map(spent_in_block)
+            return tx_err
+            
+        set total_fee to total_fee + map_get_val(tx and "fee")
+        set ok to append_list(tx_hashes and map_get_val(tx and "id"))
+        set i to i + 1
+        
+    free_map(spent_in_block)
+        
+    # 3. Create Block Map structure
+    set new_block to create_map()
+    set ok to map_insert(new_block and "index" and map_get_val(prev_block and "index") + 1)
+    set ok to map_insert(new_block and "prev_hash" and prev_hash)
+    set ok to map_insert(new_block and "previous_hash" and prev_hash)
+    set ok to map_insert(new_block and "timestamp" and ep_time_now_sec())
+    set ok to map_insert(new_block and "validator" and validator_did)
+    set ok to map_insert(new_block and "transactions" and transactions)
+    
+    set root_hash to calculate_merkle_root(tx_hashes)
+    free_list(tx_hashes)
+    set tx_hashes to 0
+    set ok to map_insert(new_block and "merkle_root" and root_hash)
+
+    # 4. Backup state in case VM execution or state root check fails
+    set utxo_backup to contract_clone_map(utxos)
+    set contracts_backup to ledger_backup_contracts()
+
+    # Speculatively commit block transactions and run smart contract VMs
+    set j to 0
+    repeat while j < tx_len:
+        set tx to get_list(transactions and j)
+        set inputs to map_get_val(tx and "inputs")
+        set outputs to map_get_val(tx and "outputs")
+        set tx_id to map_get_val(tx and "id")
+        
+        # Spend inputs
+        set in_len to length_list(inputs)
+        set k to 0
+        repeat while k < in_len:
+            set inp to get_list(inputs and k)
+            set ref_tx_id to map_get_val(inp and "tx_id")
+            set ref_idx to map_get_val(inp and "output_index")
+            set utxo_key to concat(ref_tx_id and ":")
+            set utxo_key to concat(utxo_key and int_to_string(ref_idx))
+            map_delete(utxos and utxo_key)
+            set k to k + 1
+            
+        # Add outputs to UTXO database
+        set out_len to length_list(outputs)
+        set l to 0
+        repeat while l < out_len:
+            set outp to get_list(outputs and l)
+            set utxo_key to concat(tx_id and ":")
+            set utxo_key to concat(utxo_key and int_to_string(l))
+            set ok to map_insert(utxos and utxo_key and outp)
+            set ok to append_list(values_list and utxo_key)
+            set ok to append_list(values_list and outp)
+            set l to l + 1
+            
+        # Execute VM smart contract mutations if applicable
+        set tx_type to 1
+        if map_contains(tx and "type") == 1:
+            set tx_type to map_get_val(tx and "type")
+
+        if tx_type == 2: # TX_DEPLOY_CONTRACT
+            set c_code to map_get_val(tx and "contract_code")
+            set c_owner to map_get_val(tx and "contract_owner")
+            set c_gas_limit to map_get_val(tx and "contract_gas_limit")
+            
+            set det_id to concat("contract_" and substring(tx_id and 0 and 8))
+            set ok to contracts_init()
+            set contract to create_map()
+            set ok to map_insert(contract and "id" and det_id)
+            set ok to map_insert(contract and "code" and c_code)
+            set ok to map_insert(contract and "owner" and c_owner)
+            set storage to create_map()
+            set ok to map_insert(contract and "storage" and storage)
+            set ok to map_insert(contract and "balance" and 0)
+            set events to create_list()
+            set ok to map_insert(contract and "events" and events)
+            set ok to map_insert(contract and "max_gas" and c_gas_limit)
+            set values_list_c to create_list()
+            set ok to map_insert(contract and "values_list" and values_list_c)
+            set ok to append_list(values_list_c and storage)
+            set ok to append_list(values_list_c and events)
+            set ok to map_insert(DEPLOYED_CONTRACTS and det_id and contract)
+
+        else:
+            if tx_type == 3: # TX_CALL_CONTRACT
+                set c_id to map_get_val(tx and "contract_id")
+                set c_entrypoint to map_get_val(tx and "contract_entrypoint")
+                set c_args_str to map_get_val(tx and "contract_args")
+                set c_gas_limit to map_get_val(tx and "contract_gas_limit")
+                
+                set c_args to create_list()
+                if string_length(c_args_str) > 0:
+                    set arg_parts to string_split(c_args_str and ",")
+                    set arg_parts_len to length_list(arg_parts)
+                    set a_i to 0
+                    repeat while a_i < arg_parts_len:
+                        set ok to append_list(c_args and get_list(arg_parts and a_i))
+                        set a_i to a_i + 1
+                    free_list(arg_parts)
+                    
+                set ok to contracts_init()
+                set target_contract to map_get_val(DEPLOYED_CONTRACTS and c_id)
+                if target_contract == 0:
+                    # rollback contracts
+                    set ok to ledger_restore_contracts(contracts_backup)
+                    free_map(contracts_backup)
+                    # restore UTXOs
+                    set utxos_keys to map_keys(utxos)
+                    set uk_len to length_list(utxos_keys)
+                    set u_i to 0
+                    repeat while u_i < uk_len:
+                        map_delete(utxos and get_list(utxos_keys and u_i))
+                        set u_i to u_i + 1
+                    free_list(utxos_keys)
+                    set bak_keys to map_keys(utxo_backup)
+                    set bk_len to length_list(bak_keys)
+                    set u_i to 0
+                    repeat while u_i < bk_len:
+                        set bk_key to get_list(bak_keys and u_i)
+                        set ok to map_insert(utxos and bk_key and map_get_val(utxo_backup and bk_key))
+                        set u_i to u_i + 1
+                    free_list(bak_keys)
+                    free_map(utxo_backup)
+                    return LEDGER_ERR_TX_INVALID_INPUT
+                else:
+                    set sender_did to validator_did
+                    if length_list(inputs) > 0:
+                        set first_inp to get_list(inputs and 0)
+                        set sender_did to map_get_val(first_inp and "owner")
+                    
+                    set call_res to contract_call(target_contract and c_entrypoint and c_args and sender_did and c_gas_limit)
+                    set status to map_get_val(call_res and "status")
+                    if status != 0:
+                        # rollback contracts
+                        set ok to ledger_restore_contracts(contracts_backup)
+                        free_map(contracts_backup)
+                        # restore UTXOs
+                        set utxos_keys to map_keys(utxos)
+                        set uk_len to length_list(utxos_keys)
+                        set u_i to 0
+                        repeat while u_i < uk_len:
+                            map_delete(utxos and get_list(utxos_keys and u_i))
+                            set u_i to u_i + 1
+                        free_list(utxos_keys)
+                        set bak_keys to map_keys(utxo_backup)
+                        set bk_len to length_list(bak_keys)
+                        set u_i to 0
+                        repeat while u_i < bk_len:
+                            set bk_key to get_list(bak_keys and u_i)
+                            set ok to map_insert(utxos and bk_key and map_get_val(utxo_backup and bk_key))
+                            set u_i to u_i + 1
+                        free_list(bak_keys)
+                        free_map(utxo_backup)
+                        return LEDGER_ERR_TX_INVALID_INPUT
+
+        set j to j + 1
+
+    # Compute actual post-execution state root
+    set current_state_root to ledger_compute_state_root()
+    set ok to map_insert(new_block and "state_root" and current_state_root)
+
+    # Check state root if validator provided one
+    if string_length(expected_state_root) > 0:
+        if current_state_root equals expected_state_root:
+            set root_ok to 1
+        else:
+            # rollback contracts
+            set ok to ledger_restore_contracts(contracts_backup)
+            free_map(contracts_backup)
+            # restore UTXOs
+            set utxos_keys to map_keys(utxos)
+            set uk_len to length_list(utxos_keys)
+            set u_i to 0
+            repeat while u_i < uk_len:
+                map_delete(utxos and get_list(utxos_keys and u_i))
+                set u_i to u_i + 1
+            free_list(utxos_keys)
+            set bak_keys to map_keys(utxo_backup)
+            set bk_len to length_list(bak_keys)
+            set u_i to 0
+            repeat while u_i < bk_len:
+                set bk_key to get_list(bak_keys and u_i)
+                set ok to map_insert(utxos and bk_key and map_get_val(utxo_backup and bk_key))
+                set u_i to u_i + 1
+            free_list(bak_keys)
+            free_map(utxo_backup)
+            return LEDGER_ERR_BLOCK_BAD_HASH
+
+    # 5. Compute Block Hash with state commitment
+    set block_hash to ledger_compute_block_hash(root_hash and prev_hash and current_state_root)
+    set ok to map_insert(new_block and "hash" and block_hash)
+    
+    # Verify block signature by validator
+    set sig_err to verify_signature(block_hash and signature and validator_did)
+    if sig_err != 0:
+        # rollback contracts
+        set ok to ledger_restore_contracts(contracts_backup)
+        free_map(contracts_backup)
+        # restore UTXOs
+        set utxos_keys to map_keys(utxos)
+        set uk_len to length_list(utxos_keys)
+        set u_i to 0
+        repeat while u_i < uk_len:
+            map_delete(utxos and get_list(utxos_keys and u_i))
+            set u_i to u_i + 1
+        free_list(utxos_keys)
+        set bak_keys to map_keys(utxo_backup)
+        set bk_len to length_list(bak_keys)
+        set u_i to 0
+        repeat while u_i < bk_len:
+            set bk_key to get_list(bak_keys and u_i)
+            set ok to map_insert(utxos and bk_key and map_get_val(utxo_backup and bk_key))
+            set u_i to u_i + 1
+        free_list(bak_keys)
+        free_map(utxo_backup)
+        return LEDGER_ERR_BLOCK_BAD_HASH
+
+    # 6. Distribute transaction fees to validator
+    if total_fee > 0:
+        set reward_out to create_map()
+        set ok to map_insert(reward_out and "recipient" and validator_did)
+        set ok to map_insert(reward_out and "amount" and total_fee)
+        set ok to map_insert(reward_out and "index" and 0)
+        set reward_key to concat(block_hash and ":0")
+        set ok to map_insert(utxos and reward_key and reward_out)
+        set ok to append_list(values_list and reward_out)
+        set ok to append_list(values_list and reward_key)
+        
+    set ok to append_list(blocks and new_block)
+
+    # F4: persist the block to SQLite + protect GC roots BEFORE returning. These were
+    # below an early `return` (dead code) — blocks were never durably persisted.
+    set block_idx to map_get_val(new_block and "index")
+    set persist_ok to storage_ledger_add_block(block_idx and prev_hash and block_hash and validator_did and ep_time_now_sec() and tx_len and root_hash)
+
+    set ok to append_list(values_list and new_block)
+    set ok to append_list(values_list and transactions)
+    set ok to append_list(values_list and prev_hash)
+    set ok to append_list(values_list and root_hash)
+    set ok to append_list(values_list and block_hash)
+    set ok to append_list(values_list and validator_did)
+    set ok to append_list(values_list and signature)
+
+    free_map(contracts_backup)
+    free_map(utxo_backup)
+    return LEDGER_ERR_NONE
+
+define ledger_get_balance with ledger as Map and address_did as Str returning Int:
+    set utxos to map_get_val(ledger and "utxos")
+    set keys to map_keys(utxos)
+    set keys_len to length_list(keys)
+    set total_balance to 0
+    
+    set i to 0
+    repeat while i < keys_len:
+        set key to get_list(keys and i)
+        set utxo to map_get_val(utxos and key)
+        set recipient to map_get_val(utxo and "recipient")
+        if recipient equals address_did:
+            set amount to map_get_val(utxo and "amount")
+            set total_balance to total_balance + amount
+        set i to i + 1
+        
+    free_list(keys)
+    set keys to 0
+    return total_balance
+
+# ================================================================
+# Wire Serialization / Deserialization
+# ================================================================
+
+define ledger_serialize_tx with tx as Map returning Str:
+    # Format: type|tx_id|fee|timestamp|input_count|output_count|inputs...|outputs...|extras
+    set tx_id to ptr_to_str(map_get_val(tx and "id"))
+    set fee to map_get_val(tx and "fee")
+    set timestamp to map_get_val(tx and "timestamp")
+    set inputs to map_get_val(tx and "inputs")
+    set outputs to map_get_val(tx and "outputs")
+    set in_count to length_list(inputs)
+    set out_count to length_list(outputs)
+    set tx_type to 1
+    if map_contains(tx and "type") == 1:
+        set tx_type to map_get_val(tx and "type")
+
+    set s to int_to_string(tx_type)
+    set s to concat(s and "|")
+    set s to concat(s and tx_id)
+    set s to concat(s and "|")
+    set s to concat(s and int_to_string(fee))
+    set s to concat(s and "|")
+    set s to concat(s and int_to_string(timestamp))
+    set s to concat(s and "|")
+    set s to concat(s and int_to_string(in_count))
+    set s to concat(s and "|")
+    set s to concat(s and int_to_string(out_count))
+
+    set i to 0
+    repeat while i < in_count:
+        set inp to get_list(inputs and i)
+        set s to concat(s and "|")
+        set s to concat(s and ptr_to_str(map_get_val(inp and "tx_id")))
+        set s to concat(s and "~")
+        set s to concat(s and int_to_string(map_get_val(inp and "output_index")))
+        set s to concat(s and "~")
+        set s to concat(s and int_to_string(map_get_val(inp and "amount")))
+        set s to concat(s and "~")
+        set s to concat(s and ptr_to_str(map_get_val(inp and "owner")))
+        set s to concat(s and "~")
+        set s to concat(s and ptr_to_str(map_get_val(inp and "signature")))
+        set i to i + 1
+
+    set i to 0
+    repeat while i < out_count:
+        set outp to get_list(outputs and i)
+        set s to concat(s and "|")
+        set s to concat(s and int_to_string(map_get_val(outp and "amount")))
+        set s to concat(s and "~")
+        set s to concat(s and ptr_to_str(map_get_val(outp and "recipient")))
+        set i to i + 1
+
+    if tx_type == 2:
+        set s to concat(s and "|")
+        set s to concat(s and ptr_to_str(map_get_val(tx and "contract_code")))
+        set s to concat(s and "|")
+        set s to concat(s and ptr_to_str(map_get_val(tx and "contract_owner")))
+        set s to concat(s and "|")
+        set s to concat(s and int_to_string(map_get_val(tx and "contract_gas_limit")))
+
+    if tx_type == 3:
+        set s to concat(s and "|")
+        set s to concat(s and ptr_to_str(map_get_val(tx and "contract_id")))
+        set s to concat(s and "|")
+        set s to concat(s and ptr_to_str(map_get_val(tx and "contract_entrypoint")))
+        set s to concat(s and "|")
+        set s to concat(s and ptr_to_str(map_get_val(tx and "contract_args")))
+        set s to concat(s and "|")
+        set s to concat(s and int_to_string(map_get_val(tx and "contract_gas_limit")))
+
+    return s
+
+define ledger_deserialize_tx with data as Str returning Map:
+    set parts to string_split(data and "|")
+    set tx to create_map()
+    set tx_type to string_to_int(get_list(parts and 0))
+    set ok to map_insert(tx and "type" and tx_type)
+    set ok to map_insert(tx and "id" and get_list(parts and 1))
+    set ok to map_insert(tx and "fee" and string_to_int(get_list(parts and 2)))
+    set ok to map_insert(tx and "timestamp" and string_to_int(get_list(parts and 3)))
+    set in_count to string_to_int(get_list(parts and 4))
+    set out_count to string_to_int(get_list(parts and 5))
+
+    set inputs to create_list()
+    set idx to 6
+    set i to 0
+    repeat while i < in_count:
+        set inp_str to get_list(parts and idx)
+        set inp_parts to string_split(inp_str and "~")
+        set inp to create_map()
+        set ok to map_insert(inp and "tx_id" and get_list(inp_parts and 0))
+        set ok to map_insert(inp and "output_index" and string_to_int(get_list(inp_parts and 1)))
+        set ok to map_insert(inp and "amount" and string_to_int(get_list(inp_parts and 2)))
+        set ok to map_insert(inp and "owner" and get_list(inp_parts and 3))
+        set ok to map_insert(inp and "signature" and get_list(inp_parts and 4))
+        set ok to append_list(inputs and inp)
+        free_list(inp_parts)
+        set idx to idx + 1
+        set i to i + 1
+    set ok to map_insert(tx and "inputs" and inputs)
+
+    set outputs to create_list()
+    set i to 0
+    repeat while i < out_count:
+        set outp_str to get_list(parts and idx)
+        set outp_parts to string_split(outp_str and "~")
+        set outp to create_map()
+        set ok to map_insert(outp and "amount" and string_to_int(get_list(outp_parts and 0)))
+        set ok to map_insert(outp and "recipient" and get_list(outp_parts and 1))
+        set ok to append_list(outputs and outp)
+        free_list(outp_parts)
+        set idx to idx + 1
+        set i to i + 1
+    set ok to map_insert(tx and "outputs" and outputs)
+
+    if tx_type == 2:
+        set ok to map_insert(tx and "contract_code" and get_list(parts and idx))
+        set ok to map_insert(tx and "contract_owner" and get_list(parts and idx + 1))
+        set ok to map_insert(tx and "contract_gas_limit" and string_to_int(get_list(parts and idx + 2)))
+
+    if tx_type == 3:
+        set ok to map_insert(tx and "contract_id" and get_list(parts and idx))
+        set ok to map_insert(tx and "contract_entrypoint" and get_list(parts and idx + 1))
+        set ok to map_insert(tx and "contract_args" and get_list(parts and idx + 2))
+        set ok to map_insert(tx and "contract_gas_limit" and string_to_int(get_list(parts and idx + 3)))
+
+    free_list(parts)
+    return tx
+
+define ledger_serialize_block with block as Map returning Str:
+    set index to map_get_val(block and "index")
+    set prev_hash to ptr_to_str(map_get_val(block and "previous_hash"))
+    set merkle to ptr_to_str(map_get_val(block and "merkle_root"))
+    set validator to ptr_to_str(map_get_val(block and "validator"))
+    set signature to ptr_to_str(map_get_val(block and "signature"))
+    set timestamp to map_get_val(block and "timestamp")
+    set txs to map_get_val(block and "transactions")
+    set tx_count to length_list(txs)
+    set state_root to ""
+    if map_contains(block and "state_root") == 1:
+        set state_root to ptr_to_str(map_get_val(block and "state_root"))
+
+    set s to int_to_string(index)
+    set s to concat(s and ";")
+    set s to concat(s and prev_hash)
+    set s to concat(s and ";")
+    set s to concat(s and merkle)
+    set s to concat(s and ";")
+    set s to concat(s and validator)
+    set s to concat(s and ";")
+    set s to concat(s and signature)
+    set s to concat(s and ";")
+    set s to concat(s and int_to_string(timestamp))
+    set s to concat(s and ";")
+    set s to concat(s and int_to_string(tx_count))
+    set s to concat(s and ";")
+    set s to concat(s and state_root)
+
+    set i to 0
+    repeat while i < tx_count:
+        set tx to get_list(txs and i)
+        set tx_str to ledger_serialize_tx(tx)
+        set s to concat(s and "#")
+        set s to concat(s and tx_str)
+        set i to i + 1
+
+    return s
+
+define ledger_deserialize_block with data as Str returning Map:
+    set hash_idx to string_index_of(data and "#")
+    set header_str to data
+    set txs_str to ""
+    if hash_idx > 0:
+        set header_str to substring(data and 0 and hash_idx)
+        set txs_str to substring(data and hash_idx + 1 and string_length(data) - hash_idx - 1)
+
+    set parts to string_split(header_str and ";")
+    set block to create_map()
+    set ok to map_insert(block and "index" and string_to_int(get_list(parts and 0)))
+    set ok to map_insert(block and "previous_hash" and get_list(parts and 1))
+    set ok to map_insert(block and "prev_hash" and get_list(parts and 1))
+    set ok to map_insert(block and "merkle_root" and get_list(parts and 2))
+    set ok to map_insert(block and "validator" and get_list(parts and 3))
+    set ok to map_insert(block and "signature" and get_list(parts and 4))
+    set ok to map_insert(block and "timestamp" and string_to_int(get_list(parts and 5)))
+    set tx_count to string_to_int(get_list(parts and 6))
+    if length_list(parts) > 7:
+        set ok to map_insert(block and "state_root" and get_list(parts and 7))
+    free_list(parts)
+
+    set transactions to create_list()
+    if tx_count > 0:
+        if string_length(txs_str) > 0:
+            set tx_strs to string_split(txs_str and "#")
+            set i to 0
+            repeat while i < length_list(tx_strs):
+                set tx to ledger_deserialize_tx(get_list(tx_strs and i))
+                set ok to append_list(transactions and tx)
+                set i to i + 1
+            free_list(tx_strs)
+    set ok to map_insert(block and "transactions" and transactions)
+    return block
+
+# ================================================================
+# Network Distribution
+# ================================================================
+
+# Block broadcast lives in protocol_server.ep (broadcast_block_to_peers /
+# block_broadcast_p2p): blocks are gossiped over the authenticated Noise P2P
+# channel where the BLOCK_PROPAGATE receiver listens, not raw transport.
+
+define ledger_receive_block with ledger as Map and data as Str returning Int:
+    set block to ledger_deserialize_block(data)
+    set txs to map_get_val(block and "transactions")
+    set tx_count to length_list(txs)
+
+    # ----------------------------------------------------------------
+    # F2: linkage validation + first-seen fork-choice + equivocation.
+    # This chain is leader-ordered (Raft, F1) and uses a first-seen policy:
+    # a block is accepted only if it cleanly extends our current tip. We do
+    # NOT perform heavier-chain reorgs here — automatic reorg requires the
+    # full BFT machinery and is Phase K, not a degraded shortcut. Under a
+    # single ordered log there are no honest competing forks, so first-seen
+    # extension + equivocation flagging is the correct, complete policy here.
+    # ----------------------------------------------------------------
+    set blocks to map_get_val(ledger and "blocks")
+    set tip to get_list(blocks and length_list(blocks) - 1)
+    set tip_index to map_get_val(tip and "index")
+    set tip_hash to ptr_to_str(map_get_val(tip and "hash"))
+
+    set r_index to map_get_val(block and "index")
+    set r_prev to ptr_to_str(map_get_val(block and "prev_hash"))
+    set r_validator to ptr_to_str(map_get_val(block and "validator"))
+    set r_merkle to ptr_to_str(map_get_val(block and "merkle_root"))
+
+    # Per-height record of (validator|merkle) we have already seen, so a second
+    # distinct block at a height we already hold is caught as fork/equivocation.
+    if map_contains(ledger and "seen_blocks") == 0:
+        set sb_new to create_map()
+        set ok to map_insert(ledger and "seen_blocks" and sb_new)
+        set vlist to map_get_val(ledger and "values_list")
+        set ok to append_list(vlist and sb_new)
+    set seen_blocks to map_get_val(ledger and "seen_blocks")
+    set height_key to int_to_string(r_index)
+
+    # Case A: we already have a block at this height (received index <= tip).
+    if r_index <= tip_index:
+        if map_contains(seen_blocks and height_key) == 1:
+            set prior to ptr_to_str(map_get_val(seen_blocks and height_key))
+            set this_fp to concat(r_validator and "|")
+            set this_fp to concat(this_fp and r_merkle)
+            if prior equals this_fp:
+                free_map(block)
+                return LEDGER_BLOCK_DUPLICATE
+            # Same height, different content. If the same validator produced
+            # two distinct blocks, that is provable equivocation.
+            set prior_val to substring(prior and 0 and string_index_of(prior and "|"))
+            free_map(block)
+            if prior_val equals r_validator:
+                display concat("[LEDGER] EQUIVOCATION: validator double-signed height " and height_key)
+                return LEDGER_ERR_BLOCK_EQUIVOCATION
+            return LEDGER_ERR_BLOCK_STALE
+        free_map(block)
+        return LEDGER_ERR_BLOCK_STALE
+
+    # Case B: gap — block is more than one ahead of our tip. We are missing
+    # intermediate blocks; do NOT apply out of order (would silently corrupt
+    # the chain). Caller should sync the missing range first.
+    if r_index > tip_index + 1:
+        free_map(block)
+        return LEDGER_ERR_BLOCK_GAP
+
+    # Case C: index == tip+1 but it builds on a parent that is not our tip —
+    # a competing fork at the next height. First-seen wins: reject the newcomer.
+    if (r_prev equals tip_hash) == 0:
+        free_map(block)
+        return LEDGER_ERR_BLOCK_FORK
+
+    # Case D: clean extension of our tip — validate and apply below.
+
+    set spent_in_block to create_map()
+    set i to 0
+    repeat while i < tx_count:
+        set tx to get_list(txs and i)
+        
+        set inputs to map_get_val(tx and "inputs")
+        set in_len to length_list(inputs)
+        set k to 0
+        repeat while k < in_len:
+            set inp to get_list(inputs and k)
+            set ref_tx_id to map_get_val(inp and "tx_id")
+            set ref_idx to map_get_val(inp and "output_index")
+            set utxo_key to concat(ref_tx_id and ":")
+            set utxo_key to concat(utxo_key and int_to_string(ref_idx))
+            
+            if map_contains(spent_in_block and utxo_key) == 1:
+                free_map(spent_in_block)
+                free_map(block)
+                return LEDGER_ERR_TX_DOUBLE_SPEND
+                
+            set ok to map_insert(spent_in_block and utxo_key and 1)
+            set k to k + 1
+
+        set valid to ledger_validate_tx(ledger and tx)
+        if valid != LEDGER_ERR_NONE:
+            free_map(spent_in_block)
+            free_map(block)
+            return valid
+        set i to i + 1
+
+    free_map(spent_in_block)
+
+    # Add block to chain, passing the validator's expected state root
+    set validator to ptr_to_str(map_get_val(block and "validator"))
+    set signature to ptr_to_str(map_get_val(block and "signature"))
+    set expected_root to ""
+    if map_contains(block and "state_root") == 1:
+        set expected_root to ptr_to_str(map_get_val(block and "state_root"))
+        
+    set err to ledger_add_block(ledger and txs and validator and signature and expected_root)
+    if err == LEDGER_ERR_NONE:
+        # Record what we accepted at this height so a later distinct block at the
+        # same height is caught as a fork/equivocation rather than silently re-applied.
+        set fp to concat(r_validator and "|")
+        set fp to concat(fp and r_merkle)
+        set ok to map_insert(seen_blocks and height_key and fp)
+        set vlist2 to map_get_val(ledger and "values_list")
+        set ok to append_list(vlist2 and fp)
+        set ok to append_list(vlist2 and height_key)
+    free_map(block)
+    return err

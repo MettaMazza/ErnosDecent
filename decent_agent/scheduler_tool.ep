@@ -1,0 +1,177 @@
+# ErnosPlain Rebuild of ErnOS Agent Task Scheduler Tool
+# Component: decent_agent/scheduler_tool.ep
+
+import "collections"
+import "string"
+import "scheduler"
+
+define cast_int_to_str with val as Int returning Str:
+    set s to concat("" and ptr_to_str(val))
+    return s
+
+define operate_scheduler with action_name as Str and args_list as List returning Str:
+    set action to string_lower(string_trim(action_name))
+    
+    if action equals "create":
+        if length_list(args_list) < 4:
+            return "Error: create action requires name, instruction, schedule_type, and schedule_value."
+        
+        set name_val to cast_int_to_str(get_list(args_list and 0))
+        set inst_val to cast_int_to_str(get_list(args_list and 1))
+        set stype_val to cast_int_to_str(get_list(args_list and 2))
+        set sval_val to cast_int_to_str(get_list(args_list and 3))
+        
+        display f"DEBUG CREATE: name_val='{name_val}', len={int_to_string(string_length(name_val))}"
+        display f"DEBUG CREATE: inst_val='{inst_val}', len={int_to_string(string_length(inst_val))}"
+        display f"DEBUG CREATE: stype_val='{stype_val}', len={int_to_string(string_length(stype_val))}"
+        display f"DEBUG CREATE: sval_val='{sval_val}', len={int_to_string(string_length(sval_val))}"
+        
+        if stype_val equals "once" == 0 and also stype_val equals "interval" == 0 and also stype_val equals "idle" == 0:
+            return f"Error: Invalid schedule_type '{stype_val}'. Valid types: once, interval, idle."
+            
+        set jobs_list to scheduler_load()
+        
+        # Check if name already exists
+        set len to length_list(jobs_list)
+        set i to 0
+        repeat while i < len:
+            set job_map to get_list(jobs_list and i)
+            set name_check to cast_int_to_str(map_get_val(job_map and "name"))
+            if name_check equals name_val:
+                free_list(jobs_list)
+                return f"Error: A scheduled task named '{name_val}' already exists."
+            set i to i + 1
+            
+        set now_epoch to ep_time_now_sec()
+        set new_id to concat("job_" and int_to_string(now_epoch))
+        
+        set new_job to create_map()
+        set ok to map_insert(new_job and "id" and new_id)
+        set ok to map_insert(new_job and "name" and name_val)
+        set ok to map_insert(new_job and "instruction" and inst_val)
+        set ok to map_insert(new_job and "schedule_type" and stype_val)
+        set ok to map_insert(new_job and "schedule_value" and sval_val)
+        set ok to map_insert(new_job and "last_run" and "0")
+        set ok to map_insert(new_job and "enabled" and "1")
+        
+        set ok to append_list(jobs_list and new_job)
+        set ok to scheduler_save(jobs_list)
+        free_list(jobs_list)
+        
+        return f"Successfully created job '{name_val}' with ID '{new_id}'."
+        
+    if action equals "list":
+        set jobs_list to scheduler_load()
+        set len to length_list(jobs_list)
+        if len == 0:
+            free_list(jobs_list)
+            return "No scheduled tasks registered."
+            
+        set res to f"Scheduled Tasks ({int_to_string(len)}):\n"
+        set i to 0
+        repeat while i < len:
+            set job_map to get_list(jobs_list and i)
+            set id_val to cast_int_to_str(map_get_val(job_map and "id"))
+            set name_val to cast_int_to_str(map_get_val(job_map and "name"))
+            set stype_val to cast_int_to_str(map_get_val(job_map and "schedule_type"))
+            set sval_val to cast_int_to_str(map_get_val(job_map and "schedule_value"))
+            set last_val to cast_int_to_str(map_get_val(job_map and "last_run"))
+            set en_val to cast_int_to_str(map_get_val(job_map and "enabled"))
+            
+            set status_str to "enabled"
+            if en_val equals "0":
+                set status_str to "disabled"
+                
+            set last_run_str to "never"
+            if last_val equals "0" == 0:
+                set last_run_str to last_val
+                
+            set res to concat(res and f"  * [{id_val}] '{name_val}' ({status_str}) | type: {stype_val} | val: {sval_val} | last run: {last_run_str}\n")
+            set i to i + 1
+            
+        free_list(jobs_list)
+        return res
+        
+    if action equals "delete":
+        if length_list(args_list) < 1:
+            return "Error: delete action requires job_id."
+        set target_id to cast_int_to_str(get_list(args_list and 0))
+        
+        set jobs_list to scheduler_load()
+        set len to length_list(jobs_list)
+        set new_list to create_list()
+        set found to 0
+        set i to 0
+        repeat while i < len:
+            set job_map to get_list(jobs_list and i)
+            set id_val to cast_int_to_str(map_get_val(job_map and "id"))
+            if id_val equals target_id:
+                set found to 1
+            else:
+                set ok to append_list(new_list and job_map)
+            set i to i + 1
+            
+        if found == 1:
+            set ok to scheduler_save(new_list)
+            free_list(jobs_list)
+            free_list(new_list)
+            return f"Successfully deleted job '{target_id}'."
+        else:
+            free_list(jobs_list)
+            free_list(new_list)
+            return f"Error: Job ID '{target_id}' not found."
+            
+    if action equals "toggle":
+        if length_list(args_list) < 1:
+            return "Error: toggle action requires job_id."
+        set target_id to cast_int_to_str(get_list(args_list and 0))
+        
+        set jobs_list to scheduler_load()
+        set len to length_list(jobs_list)
+        set found to 0
+        set i to 0
+        repeat while i < len:
+            set job_map to get_list(jobs_list and i)
+            set id_val to cast_int_to_str(map_get_val(job_map and "id"))
+            if id_val equals target_id:
+                set found to 1
+                set en_val to cast_int_to_str(map_get_val(job_map and "enabled"))
+                if en_val equals "1":
+                    set ok to map_insert(job_map and "enabled" and "0")
+                else:
+                    set ok to map_insert(job_map and "enabled" and "1")
+            set i to i + 1
+            
+        if found == 1:
+            set ok to scheduler_save(jobs_list)
+            free_list(jobs_list)
+            return f"Successfully toggled job '{target_id}'."
+        else:
+            free_list(jobs_list)
+            return f"Error: Job ID '{target_id}' not found."
+            
+    if action equals "run_now":
+        if length_list(args_list) < 1:
+            return "Error: run_now action requires job_id."
+        set target_id to cast_int_to_str(get_list(args_list and 0))
+        
+        set jobs_list to scheduler_load()
+        set len to length_list(jobs_list)
+        set found to 0
+        set inst_val to ""
+        set i to 0
+        repeat while i < len:
+            set job_map to get_list(jobs_list and i)
+            set id_val to cast_int_to_str(map_get_val(job_map and "id"))
+            if id_val equals target_id:
+                set found to 1
+                set inst_val to cast_int_to_str(map_get_val(job_map and "instruction"))
+            set i to i + 1
+            
+        free_list(jobs_list)
+        if found == 1:
+            return f"Job '{target_id}' triggered synchronously: {inst_val}"
+        else:
+            return f"Error: Job ID '{target_id}' not found."
+            
+    return f"Error: Unknown action '{action_name}'. Valid actions: create, list, delete, toggle, run_now."

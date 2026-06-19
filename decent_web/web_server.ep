@@ -1,0 +1,1704 @@
+# ErnosDecent -- Web UI Server
+# Component: decent_web/web_server.ep
+# Status: Production -- OperationTrojanClaude Phase 15
+
+import "collections"
+import "string"
+import "net"
+import "os"
+import "fs"
+import "http"
+import "static_server"
+import "websocket"
+import "json"
+import "../config.ep"
+import "../decent_id/auth.ep"
+import "../decent_id/keys.ep"
+import "../decent_store/rag"
+import "../storage"
+
+set IPC_DAEMON_PORT to 5000
+
+define query_daemon_ipc with command as Str returning Str:
+    # Connect to the local IPC daemon
+    set fd to ep_net_connect("127.0.0.1" and IPC_DAEMON_PORT)
+    if fd < 0:
+        return "error:daemon_offline"
+    # Prepend the IPC auth token (read from the 0600 ipc-token file) so the daemon
+    # accepts the command. Same-user callers can read the token; cross-user/sandboxed
+    # processes cannot, closing the unauthenticated-control-plane hole.
+    set ipc_tok to ipc_read_token()
+    set ok to ep_net_send(fd and concat("AUTH " and concat(ipc_tok and concat(" " and command))))
+    set resp to ep_net_recv(fd and 65536)
+    set ok to ep_net_close(fd)
+    return resp
+
+define extract_ipc_field with ipc_resp as Str and field_name as Str returning Str:
+    # Parse "key:value,key2:value2" format and return value for given field
+    set parts to string_split(ipc_resp and ",")
+    set count to length_list(parts)
+    set result to ""
+    set i to 0
+    repeat while i < count:
+        set p to get_list(parts and i)
+        set field_with_colon to concat(field_name and ":")
+        if string_contains(p and field_with_colon) == 1:
+            set colon_len to string_length(field_with_colon)
+            set val_len to string_length(p) - colon_len
+            if val_len > 0:
+                set result to substring(p and colon_len and val_len)
+        set i to i + 1
+    # Note: do NOT free_list(parts) here — caller may still reference
+    # returned string values. Let GC handle cleanup.
+    return result
+
+define extract_ipc_json_data with ipc_resp as Str returning Str:
+    set data_pos to string_index_of(ipc_resp and "data:")
+    if data_pos >= 0:
+        set skip to data_pos + 5
+        return substring(ipc_resp and skip and string_length(ipc_resp) - skip)
+    return ""
+
+define escape_json_string with input as Str returning Str:
+    set escaped to string_replace(input and "\\" and "\\\\")
+    set escaped to string_replace(escaped and "\"" and "\\\"")
+    set escaped to string_replace(escaped and "\n" and "\\n")
+    set escaped to string_replace(escaped and "\r" and "\\r")
+    set escaped to string_replace(escaped and "\t" and "\\t")
+    return escaped
+
+# Wrap an arbitrary string as a safely single-quoted shell argument. Single quotes
+# inside are closed/escaped/reopened ('\'') so no metacharacter can break out.
+define web_sq with s as Str returning Str:
+    set esc to string_replace(s and "'" and "'\\''")
+    return concat("'" and concat(esc and "'"))
+
+# Extract the bare host from a URL (strips scheme, userinfo, port, path; unwraps a
+# bracketed IPv6 literal).
+define url_extract_host with url as Str returning Str:
+    set host to url
+    set sp to string_index_of(host and "://")
+    if sp >= 0:
+        set host to substring(host and sp + 3 and string_length(host) - sp - 3)
+    set slp to string_index_of(host and "/")
+    if slp >= 0:
+        set host to substring(host and 0 and slp)
+    set atp to string_index_of(host and "@")
+    if atp >= 0:
+        set host to substring(host and atp + 1 and string_length(host) - atp - 1)
+    if string_index_of(host and "[") == 0:
+        set rb to string_index_of(host and "]")
+        if rb > 0:
+            return substring(host and 1 and rb - 1)
+    set cp to string_index_of(host and ":")
+    if cp >= 0:
+        set host to substring(host and 0 and cp)
+    return host
+
+# SSRF guard: allow only http(s) to a non-internal host. Blocks loopback, RFC1918,
+# link-local, and unique-local literals so a user-supplied fetch URL cannot reach
+# the node's own control plane or the LAN. (Residual: DNS names that resolve to
+# internal IPs — bounded by dropping redirect-following at the curl call site.)
+define url_is_safe_external with url as Str returning Int:
+    set lower to string_lower(url)
+    if string_index_of(lower and "http://") != 0 and also string_index_of(lower and "https://") != 0:
+        return 0
+    set host to string_lower(url_extract_host(url))
+    if string_length(host) == 0:
+        return 0
+    if host equals "localhost" or else host equals "127.0.0.1" or else host equals "0.0.0.0" or else host equals "::1":
+        return 0
+    if string_index_of(host and "127.") == 0 or else string_index_of(host and "10.") == 0:
+        return 0
+    if string_index_of(host and "192.168.") == 0 or else string_index_of(host and "169.254.") == 0:
+        return 0
+    if string_index_of(host and "172.") == 0:
+        set rest to substring(host and 4 and string_length(host) - 4)
+        set dotp to string_index_of(rest and ".")
+        if dotp > 0:
+            set o2 to string_to_int(substring(rest and 0 and dotp))
+            if o2 >= 16 and also o2 <= 31:
+                return 0
+    if string_index_of(host and "fe80") == 0 or else string_index_of(host and "fc") == 0 or else string_index_of(host and "fd") == 0:
+        if string_index_of(host and ".") < 0:
+            return 0
+    return 1
+
+define curl_get with url as Str and headers_str as Str returning Str:
+    if url_is_safe_external(url) == 0:
+        return "{\"error\":\"blocked: disallowed or internal URL (SSRF protection)\"}"
+    set cmd to "curl -s --max-redirs 0"
+    set headers_clean to string_replace(headers_str and "\r" and "")
+    set parts to string_split(headers_clean and "\n")
+    set count to length_list(parts)
+    set i to 0
+    repeat while i < count:
+        set h to string_trim(get_list(parts and i))
+        if string_length(h) > 0:
+            set h_escaped to string_replace(h and "'" and "'\\''")
+            set cmd to concat(cmd and concat(" -H '" and concat(h_escaped and "'")))
+        set i to i + 1
+    
+    set url_escaped to string_replace(url and "'" and "'\\''")
+    set cmd to concat(cmd and concat(" '" and concat(url_escaped and "'")))
+    
+    set res to run_command(cmd)
+    return res
+
+define sanitize_reader_html with raw_html as Str returning Str:
+    set clean to raw_html
+
+    set lower_html to string_lower(clean)
+    set script_pos to string_index_of(lower_html and "<script")
+    repeat while script_pos >= 0:
+        set prefix to substring(clean and 0 and script_pos)
+        set suffix to substring(clean and script_pos + 7 and string_length(clean) - (script_pos + 7))
+        set clean to concat(prefix and concat("<x-script" and suffix))
+        set lower_html to string_lower(clean)
+        set script_pos to string_index_of(lower_html and "<script")
+
+    set lower_html to string_lower(clean)
+    set close_pos to string_index_of(lower_html and "</script>")
+    repeat while close_pos >= 0:
+        set prefix to substring(clean and 0 and close_pos)
+        set suffix to substring(clean and close_pos + 9 and string_length(clean) - (close_pos + 9))
+        set clean to concat(prefix and concat("</x-script>" and suffix))
+        set lower_html to string_lower(clean)
+        set close_pos to string_index_of(lower_html and "</script>")
+
+    set lower_html to string_lower(clean)
+    set iframe_pos to string_index_of(lower_html and "<iframe")
+    repeat while iframe_pos >= 0:
+        set prefix to substring(clean and 0 and iframe_pos)
+        set suffix to substring(clean and iframe_pos + 7 and string_length(clean) - (iframe_pos + 7))
+        set clean to concat(prefix and concat("<x-iframe" and suffix))
+        set lower_html to string_lower(clean)
+        set iframe_pos to string_index_of(lower_html and "<iframe")
+
+    set lower_html to string_lower(clean)
+    set close_pos to string_index_of(lower_html and "</iframe>")
+    repeat while close_pos >= 0:
+        set prefix to substring(clean and 0 and close_pos)
+        set suffix to substring(clean and close_pos + 10 and string_length(clean) - (close_pos + 10))
+        set clean to concat(prefix and concat("</x-iframe>" and suffix))
+        set lower_html to string_lower(clean)
+        set close_pos to string_index_of(lower_html and "</iframe>")
+
+    return clean
+
+define build_status_json with role as Str and did_val as Str and term as Str and peers as Str and dht_size as Str and is_static as Str and elect_enabled as Str and reg_name as Str and gitdec_updates as Str returning Str:
+    set j to "{\"type\":\"status\",\"role\":\""
+    set j to concat(j and role)
+    set j to concat(j and "\",\"term\":")
+    set j to concat(j and term)
+    set j to concat(j and ",\"did\":\"")
+    set j to concat(j and did_val)
+    set j to concat(j and "\",\"peers\":")
+    set j to concat(j and peers)
+    set j to concat(j and ",\"dht_size\":")
+    set j to concat(j and dht_size)
+    set j to concat(j and ",\"is_static_host\":")
+    set j to concat(j and is_static)
+    set j to concat(j and ",\"enable_host_election\":")
+    set j to concat(j and elect_enabled)
+    set j to concat(j and ",\"name\":\"")
+    set j to concat(j and reg_name)
+    set j to concat(j and "\",\"gitdec_updates\":")
+    set j to concat(j and gitdec_updates)
+    set j to concat(j and "}")
+    return j
+
+define websocket_session_loop with client_fd as Int and require_token as Int returning Int:
+    # Non-browser clients (no Origin header) must authenticate the WS the same way
+    # they authenticate IPC: the first frame must be {"type":"auth","token":<ipc-token>}.
+    # Browser clients are authenticated by the Origin allowlist instead (they cannot
+    # read the 0600 token file). This stops a non-same-user local process from using
+    # the WS as an unauthenticated bypass around the IPC token gate.
+    if require_token == 1:
+        set auth_frame to ws_read_frame(client_fd)
+        set provided to json_get_string(auth_frame and "token")
+        set expected to ipc_read_token()
+        if string_length(expected) == 0:
+            set ok to net_close(client_fd)
+            return 0
+        if provided equals expected:
+            display "[ws] first-frame token accepted (non-browser client)."
+        else:
+            display "[-] WS first-frame token missing/invalid; closing."
+            set ok to net_close(client_fd)
+            return 0
+    display "[*] WebSocket session active."
+    repeat while 1 == 1:
+        set payload to ws_read_frame(client_fd)
+        if string_length(payload) == 0:
+            display "[*] WebSocket session closed by client."
+            return 0
+        
+        # Handle ping/pong sentinels from ws_read_frame
+        if payload equals "PING_HANDLED":
+            display "[ws] Ping received, pong sent."
+        else:
+            if payload equals "PONG_IGNORED":
+                display "[ws] Pong received, ignored."
+            else:
+                # Parse JSON payload
+                set msg_type to json_get_string(payload and "type")
+                display f"[ws] Received: type={msg_type}"
+                
+                if msg_type equals "get_status":
+                    set ipc_resp to query_daemon_ipc("STATUS")
+                    display f"[ws] IPC STATUS -> {ipc_resp}"
+                    set role to extract_ipc_field(ipc_resp and "role")
+                    set did_val to extract_ipc_field(ipc_resp and "did")
+                    set term to extract_ipc_field(ipc_resp and "term")
+                    set peers to extract_ipc_field(ipc_resp and "peers")
+                    set dht_size to extract_ipc_field(ipc_resp and "dht_size")
+                    set is_static to extract_ipc_field(ipc_resp and "is_static_host")
+                    set elect_enabled to extract_ipc_field(ipc_resp and "enable_host_election")
+                    set reg_name to extract_ipc_field(ipc_resp and "name")
+                    set gitdec_updates to extract_ipc_field(ipc_resp and "gitdec_updates")
+                    if string_length(role) == 0:
+                        set role to "unknown"
+                    if string_length(did_val) == 0:
+                        set did_val to "error:daemon_offline"
+                    if string_length(term) == 0:
+                        set term to "0"
+                    if string_length(peers) == 0:
+                        set peers to "0"
+                    if string_length(dht_size) == 0:
+                        set dht_size to "0"
+                    if string_length(is_static) == 0:
+                        set is_static to "0"
+                    if string_length(elect_enabled) == 0:
+                        set elect_enabled to "1"
+                    if string_length(reg_name) == 0:
+                        set reg_name to "none"
+                    if string_length(gitdec_updates) == 0:
+                        set gitdec_updates to "0"
+                    set resp to build_status_json(role and did_val and term and peers and dht_size and is_static and elect_enabled and reg_name and gitdec_updates)
+                    ws_send_text(client_fd and resp)
+                else if msg_type equals "get_agent_memory":
+                    set ipc_resp to query_daemon_ipc("AGENT GET MEMORY")
+                    ws_send_text(client_fd and ipc_resp)
+                else if msg_type equals "get_ai_models":
+                    set ipc_resp to query_daemon_ipc("AI MODELS")
+                    if string_contains(ipc_resp and "error:") == 1:
+                        set body to "{\"type\":\"ai_models\",\"models\":[]}"
+                    else:
+                        set body to "{\"type\":\"ai_models\",\"models\":"
+                        set body to concat(body and ipc_resp)
+                        set body to concat(body and "}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "get_turing_grid":
+                    set ipc_resp to query_daemon_ipc("AGENT GET GRID")
+                    ws_send_text(client_fd and ipc_resp)
+                else if msg_type equals "decay_memory":
+                    set ipc_resp to query_daemon_ipc("AGENT DECAY MEMORY")
+                    ws_send_text(client_fd and ipc_resp)
+                else if msg_type equals "run_autonomy_agent":
+                    set ipc_resp to query_daemon_ipc("AI AUTONOMY")
+                    set resp_pos to string_index_of(ipc_resp and "response:")
+                    if resp_pos >= 0:
+                        set skip to resp_pos + 9
+                        set ai_text to substring(ipc_resp and skip and string_length(ipc_resp) - skip)
+                    else:
+                        set ai_text to ipc_resp
+                    set escaped_ai to escape_json_string(ai_text)
+                    set token_msg to "{\"type\":\"ai_token\",\"token\":\""
+                    set token_msg to concat(token_msg and escaped_ai)
+                    set token_msg to concat(token_msg and "\"}")
+                    ws_send_text(client_fd and token_msg)
+                    ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                else if msg_type equals "get_identity":
+                    set ipc_resp to query_daemon_ipc("IDENTITY")
+                    display f"[ws] IPC IDENTITY -> {ipc_resp}"
+                    set did_val to extract_ipc_field(ipc_resp and "did")
+                    set signing_key to extract_ipc_field(ipc_resp and "signing_key")
+                    set enc_key to extract_ipc_field(ipc_resp and "encryption_key")
+                    set reg_name to extract_ipc_field(ipc_resp and "name")
+                    if string_length(reg_name) == 0:
+                        set reg_name to "none"
+                    set id_json to "{\"type\":\"identity\",\"did\":\""
+                    set id_json to concat(id_json and did_val)
+                    set id_json to concat(id_json and "\",\"signing_key\":\"")
+                    set id_json to concat(id_json and signing_key)
+                    set id_json to concat(id_json and "\",\"encryption_key\":\"")
+                    set id_json to concat(id_json and enc_key)
+                    set id_json to concat(id_json and "\",\"name\":\"")
+                    set id_json to concat(id_json and reg_name)
+                    set id_json to concat(id_json and "\"}")
+                    ws_send_text(client_fd and id_json)
+                else if msg_type equals "get_storage":
+                    set ipc_resp to query_daemon_ipc("STORAGE STATUS")
+                    ws_send_text(client_fd and ipc_resp)
+                else if msg_type equals "get_pool":
+                    set ipc_resp to query_daemon_ipc("POOL STATUS")
+                    display f"[ws] IPC POOL -> {ipc_resp}"
+                    set bw_up to extract_ipc_field(ipc_resp and "bandwidth_up")
+                    set bw_down to extract_ipc_field(ipc_resp and "bandwidth_down")
+                    set compute to extract_ipc_field(ipc_resp and "compute_slots")
+                    if string_length(bw_up) == 0:
+                        set bw_up to "0"
+                    if string_length(bw_down) == 0:
+                        set bw_down to "0"
+                    if string_length(compute) == 0:
+                        set compute to "0"
+                    set body to "{\"type\":\"pool\",\"bandwidth_up\":\""
+                    set body to concat(body and bw_up)
+                    set body to concat(body and "\",\"bandwidth_down\":\"")
+                    set body to concat(body and bw_down)
+                    set body to concat(body and "\",\"compute_slots\":")
+                    set body to concat(body and compute)
+                    set body to concat(body and "}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "get_network":
+                    set ipc_resp to query_daemon_ipc("NET STATUS")
+                    display f"[ws] IPC NET -> {ipc_resp}"
+                    set nat_mode to extract_ipc_field(ipc_resp and "nat_mode")
+                    set active_circuits to extract_ipc_field(ipc_resp and "active_circuits")
+                    if string_length(nat_mode) == 0:
+                        set nat_mode to "relay"
+                    if string_length(active_circuits) == 0:
+                        set active_circuits to "0"
+                    set body to "{\"type\":\"network\",\"nat_mode\":\""
+                    set body to concat(body and nat_mode)
+                    set body to concat(body and "\",\"active_circuits\":")
+                    set body to concat(body and active_circuits)
+                    set body to concat(body and "}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "ai_prompt":
+                    set prompt to json_get_string(payload and "prompt")
+                    set system_prompt to json_get_string(payload and "system")
+                    set model_name to json_get_string(payload and "model")
+                    # E2: the WebUI is the authenticated local operator (the WS is
+                    # Origin/loopback-gated), so assert admin server-side as the FIRST
+                    # marker — role is locked before any [SYSTEM:] is parsed.
+                    set ai_cmd to "AI INFER [ROLE:admin] "
+                    if string_length(model_name) > 0:
+                        set ai_cmd to concat(ai_cmd and "[MODEL:")
+                        set ai_cmd to concat(ai_cmd and model_name)
+                        set ai_cmd to concat(ai_cmd and "] ")
+                    if string_length(system_prompt) > 0:
+                        set ai_cmd to concat(ai_cmd and "[SYSTEM:")
+                        set ai_cmd to concat(ai_cmd and system_prompt)
+                        set ai_cmd to concat(ai_cmd and "] ")
+                    set ai_cmd to concat(ai_cmd and prompt)
+                    set ai_resp to query_daemon_ipc(ai_cmd)
+                    display f"[ws] IPC AI -> {ai_resp}"
+                    if string_contains(ai_resp and "error:") == 1:
+                        set err_msg to "{\"type\":\"ai_token\",\"token\":\"AI subsystem not yet active. \"}"
+                        ws_send_text(client_fd and err_msg)
+                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                    else if string_contains(ai_resp and "ai:pending_approval") == 1:
+                        # Tool requires user approval — send approval request to frontend
+                        set p_tool to extract_ipc_field(ai_resp and "tool")
+                        set p_summary to extract_ipc_field(ai_resp and "summary")
+                        set approval_msg to "{\"type\":\"tool_pending_approval\",\"tool\":\""
+                        set approval_msg to concat(approval_msg and escape_json_string(p_tool))
+                        set approval_msg to concat(approval_msg and "\",\"summary\":\"")
+                        set approval_msg to concat(approval_msg and escape_json_string(p_summary))
+                        set approval_msg to concat(approval_msg and "\"}")
+                        ws_send_text(client_fd and approval_msg)
+                    else:
+                        set resp_pos to string_index_of(ai_resp and "response:")
+                        if resp_pos >= 0:
+                            set skip to resp_pos + 9
+                            set ai_text to substring(ai_resp and skip and string_length(ai_resp) - skip)
+                        else:
+                            set ai_text to ai_resp
+                        set escaped_ai to escape_json_string(ai_text)
+                        set token_msg to "{\"type\":\"ai_token\",\"token\":\""
+                        set token_msg to concat(token_msg and escaped_ai)
+                        set token_msg to concat(token_msg and "\"}")
+                        ws_send_text(client_fd and token_msg)
+                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                else if msg_type equals "tool_approve":
+                    # User approved a pending tool — relay to daemon
+                    set approve_resp to query_daemon_ipc("AI APPROVE")
+                    display f"[ws] IPC AI APPROVE -> {approve_resp}"
+                    if string_contains(approve_resp and "ai:pending_approval") == 1:
+                        # Another tool in the chain also needs approval
+                        set p_tool to extract_ipc_field(approve_resp and "tool")
+                        set p_summary to extract_ipc_field(approve_resp and "summary")
+                        set approval_msg to "{\"type\":\"tool_pending_approval\",\"tool\":\""
+                        set approval_msg to concat(approval_msg and escape_json_string(p_tool))
+                        set approval_msg to concat(approval_msg and "\",\"summary\":\"")
+                        set approval_msg to concat(approval_msg and escape_json_string(p_summary))
+                        set approval_msg to concat(approval_msg and "\"}")
+                        ws_send_text(client_fd and approval_msg)
+                    else if string_contains(approve_resp and "error:") == 1:
+                        set err_msg to "{\"type\":\"ai_token\",\"token\":\"Error processing approval. \"}"
+                        ws_send_text(client_fd and err_msg)
+                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                    else:
+                        set resp_pos to string_index_of(approve_resp and "response:")
+                        if resp_pos >= 0:
+                            set skip to resp_pos + 9
+                            set ai_text to substring(approve_resp and skip and string_length(approve_resp) - skip)
+                        else:
+                            set ai_text to approve_resp
+                        set escaped_ai to escape_json_string(ai_text)
+                        set token_msg to "{\"type\":\"ai_token\",\"token\":\""
+                        set token_msg to concat(token_msg and escaped_ai)
+                        set token_msg to concat(token_msg and "\"}")
+                        ws_send_text(client_fd and token_msg)
+                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                else if msg_type equals "tool_approve_all":
+                    # User approved all pending tools — relay to daemon
+                    set approve_resp to query_daemon_ipc("AI APPROVE_ALL")
+                    display f"[ws] IPC AI APPROVE_ALL -> {approve_resp}"
+                    if string_contains(approve_resp and "ai:pending_approval") == 1:
+                        set p_tool to extract_ipc_field(approve_resp and "tool")
+                        set p_summary to extract_ipc_field(approve_resp and "summary")
+                        set approval_msg to "{\"type\":\"tool_pending_approval\",\"tool\":\""
+                        set approval_msg to concat(approval_msg and escape_json_string(p_tool))
+                        set approval_msg to concat(approval_msg and "\",\"summary\":\"")
+                        set approval_msg to concat(approval_msg and escape_json_string(p_summary))
+                        set approval_msg to concat(approval_msg and "\"}")
+                        ws_send_text(client_fd and approval_msg)
+                    else if string_contains(approve_resp and "error:") == 1:
+                        set err_msg to "{\"type\":\"ai_token\",\"token\":\"Error processing approval. \"}"
+                        ws_send_text(client_fd and err_msg)
+                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                    else:
+                        set resp_pos to string_index_of(approve_resp and "response:")
+                        if resp_pos >= 0:
+                            set skip to resp_pos + 9
+                            set ai_text to substring(approve_resp and skip and string_length(approve_resp) - skip)
+                        else:
+                            set ai_text to approve_resp
+                        set escaped_ai to escape_json_string(ai_text)
+                        set token_msg to "{\"type\":\"ai_token\",\"token\":\""
+                        set token_msg to concat(token_msg and escaped_ai)
+                        set token_msg to concat(token_msg and "\"}")
+                        ws_send_text(client_fd and token_msg)
+                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                else if msg_type equals "tool_deny":
+                    # User denied a pending tool — relay to daemon
+                    set deny_resp to query_daemon_ipc("AI DENY")
+                    display f"[ws] IPC AI DENY -> {deny_resp}"
+                    if string_contains(deny_resp and "ai:pending_approval") == 1:
+                        set p_tool to extract_ipc_field(deny_resp and "tool")
+                        set p_summary to extract_ipc_field(deny_resp and "summary")
+                        set approval_msg to "{\"type\":\"tool_pending_approval\",\"tool\":\""
+                        set approval_msg to concat(approval_msg and escape_json_string(p_tool))
+                        set approval_msg to concat(approval_msg and "\",\"summary\":\"")
+                        set approval_msg to concat(approval_msg and escape_json_string(p_summary))
+                        set approval_msg to concat(approval_msg and "\"}")
+                        ws_send_text(client_fd and approval_msg)
+                    else if string_contains(deny_resp and "error:") == 1:
+                        set err_msg to "{\"type\":\"ai_token\",\"token\":\"Tool denied. \"}"
+                        ws_send_text(client_fd and err_msg)
+                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                    else:
+                        set resp_pos to string_index_of(deny_resp and "response:")
+                        if resp_pos >= 0:
+                            set skip to resp_pos + 9
+                            set ai_text to substring(deny_resp and skip and string_length(deny_resp) - skip)
+                        else:
+                            set ai_text to deny_resp
+                        set escaped_ai to escape_json_string(ai_text)
+                        set token_msg to "{\"type\":\"ai_token\",\"token\":\""
+                        set token_msg to concat(token_msg and escaped_ai)
+                        set token_msg to concat(token_msg and "\"}")
+                        ws_send_text(client_fd and token_msg)
+                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                else if msg_type equals "send_chat":
+                    set text to json_get_string(payload and "text")
+                    set msg_cmd to concat("MSG SEND " and text)
+                    set msg_resp to query_daemon_ipc(msg_cmd)
+                    display f"[ws] IPC MSG -> {msg_resp}"
+                    if string_contains(msg_resp and "error:") == 1:
+                        set chat_resp to "{\"type\":\"chat_msg\",\"sender\":\"system\",\"text\":\"Messaging subsystem not available.\"}"
+                    else:
+                        set chat_resp to "{\"type\":\"chat_msg\",\"sender\":\"system\",\"text\":\"Message sent.\"}"
+                    ws_send_text(client_fd and chat_resp)
+                else if msg_type equals "transfer":
+                    set amount to json_get_string(payload and "amount")
+                    set to_addr to json_get_string(payload and "to")
+                    set xfer_cmd to concat("MONEY TRANSFER " and amount)
+                    set xfer_cmd to concat(xfer_cmd and " ")
+                    set xfer_cmd to concat(xfer_cmd and to_addr)
+                    set xfer_resp to query_daemon_ipc(xfer_cmd)
+                    display f"[ws] IPC TRANSFER -> {xfer_resp}"
+                    set bal_resp to query_daemon_ipc("WALLET BALANCE")
+                    set balance to extract_ipc_field(bal_resp and "wallet_balance")
+                    if string_length(balance) == 0:
+                        set balance to "0"
+                    set wr to "{\"type\":\"wallet\",\"balance\":\""
+                    set wr to concat(wr and balance)
+                    set wr to concat(wr and "\"}")
+                    ws_send_text(client_fd and wr)
+                else if msg_type equals "swap":
+                    set from_token to json_get_string(payload and "from_token")
+                    set to_token to json_get_string(payload and "to_token")
+                    set swap_amount to json_get_string(payload and "amount")
+                    set swap_cmd to concat("MONEY SWAP " and from_token)
+                    set swap_cmd to concat(swap_cmd and " ")
+                    set swap_cmd to concat(swap_cmd and to_token)
+                    set swap_cmd to concat(swap_cmd and " ")
+                    set swap_cmd to concat(swap_cmd and swap_amount)
+                    set swap_resp to query_daemon_ipc(swap_cmd)
+                    display f"[ws] IPC SWAP -> {swap_resp}"
+                    set swap_reason to extract_ipc_field(swap_resp and "reason")
+                    if string_length(swap_reason) > 0:
+                        set sr to "{\"type\":\"swap_result\",\"success\":false,\"reason\":\""
+                        set sr to concat(sr and swap_reason)
+                        set sr to concat(sr and "\"}")
+                        ws_send_text(client_fd and sr)
+                    else:
+                        ws_send_text(client_fd and "{\"type\":\"swap_result\",\"success\":true}")
+                    set bal_resp to query_daemon_ipc("WALLET BALANCE")
+                    set balance to extract_ipc_field(bal_resp and "wallet_balance")
+                    if string_length(balance) == 0:
+                        set balance to "0"
+                    set wr to "{\"type\":\"wallet\",\"balance\":\""
+                    set wr to concat(wr and balance)
+                    set wr to concat(wr and "\"}")
+                    ws_send_text(client_fd and wr)
+                else if msg_type equals "dht_store":
+                    set dht_key to json_get_string(payload and "key")
+                    set dht_value to json_get_string(payload and "value")
+                    set dht_cmd to concat("DHT STORE " and dht_key)
+                    set dht_cmd to concat(dht_cmd and " ")
+                    set dht_cmd to concat(dht_cmd and dht_value)
+                    set dht_resp to query_daemon_ipc(dht_cmd)
+                    display f"[ws] IPC DHT STORE -> {dht_resp}"
+                    set body to "{\"type\":\"dht_result\",\"action\":\"store\",\"key\":\""
+                    set body to concat(body and dht_key)
+                    set body to concat(body and "\",\"status\":\"stored\"}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "dht_get":
+                    set dht_key to json_get_string(payload and "key")
+                    set dht_cmd to concat("DHT GET " and dht_key)
+                    set dht_resp to query_daemon_ipc(dht_cmd)
+                    display f"[ws] IPC DHT GET -> {dht_resp}"
+                    set dht_val to extract_ipc_field(dht_resp and "value")
+                    if string_length(dht_val) > 0:
+                        set body to "{\"type\":\"dht_result\",\"action\":\"get\",\"key\":\""
+                        set body to concat(body and dht_key)
+                        set body to concat(body and "\",\"value\":\"")
+                        set body to concat(body and dht_val)
+                        set body to concat(body and "\",\"found\":true}")
+                    else:
+                        set body to "{\"type\":\"dht_result\",\"action\":\"get\",\"key\":\""
+                        set body to concat(body and dht_key)
+                        set body to concat(body and "\",\"found\":false}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "name_register":
+                    set reg_name to json_get_string(payload and "name")
+                    set reg_cmd to concat("NAME REGISTER " and reg_name)
+                    set reg_resp to query_daemon_ipc(reg_cmd)
+                    display f"[ws] IPC NAME REG -> {reg_resp}"
+                    set reg_did to extract_ipc_field(reg_resp and "did")
+                    if string_length(reg_did) > 0:
+                        set body to "{\"type\":\"name_result\",\"action\":\"register\",\"name\":\""
+                        set body to concat(body and reg_name)
+                        set body to concat(body and "\",\"did\":\"")
+                        set body to concat(body and reg_did)
+                        set body to concat(body and "\",\"success\":true}")
+                    else:
+                        set body to "{\"type\":\"name_result\",\"action\":\"register\",\"name\":\""
+                        set body to concat(body and reg_name)
+                        set body to concat(body and "\",\"success\":false}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "name_resolve":
+                    set res_name to json_get_string(payload and "name")
+                    set res_cmd to concat("NAME RESOLVE " and res_name)
+                    set res_resp to query_daemon_ipc(res_cmd)
+                    display f"[ws] IPC NAME RESOLVE -> {res_resp}"
+                    set res_did to extract_ipc_field(res_resp and "did")
+                    if string_length(res_did) > 0:
+                        set body to "{\"type\":\"name_result\",\"action\":\"resolve\",\"name\":\""
+                        set body to concat(body and res_name)
+                        set body to concat(body and "\",\"did\":\"")
+                        set body to concat(body and res_did)
+                        set body to concat(body and "\",\"found\":true}")
+                    else:
+                        set body to "{\"type\":\"name_result\",\"action\":\"resolve\",\"name\":\""
+                        set body to concat(body and res_name)
+                        set body to concat(body and "\",\"found\":false}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "onion_search":
+                    set engine to json_get_string(payload and "engine")
+                    set query to json_get_string(payload and "query")
+                    set search_cmd to concat("ONION SEARCH " and engine)
+                    set search_cmd to concat(search_cmd and " ")
+                    set search_cmd to concat(search_cmd and query)
+                    set search_resp to query_daemon_ipc(search_cmd)
+                    display f"[ws] IPC ONION SEARCH -> {search_resp}"
+                    ws_send_text(client_fd and search_resp)
+                else if msg_type equals "onion_view":
+                    set view_url to json_get_string(payload and "url")
+                    set tab_id to json_get_string(payload and "tabId")
+                    display f"[ws] Request to view URL: {view_url} (tab: {tab_id})"
+                    set headers to "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0\r\nAccept: text/html"
+                    set html_resp to curl_get(view_url and headers)
+                    set clean_html to ""
+                    if string_length(html_resp) > 0:
+                        set clean_html to sanitize_reader_html(html_resp)
+                    else:
+                        set clean_html to "<p style='color: var(--text-muted); text-align: center;'>Unable to load page content anonymously.</p>"
+                    set escaped_html to escape_json_string(clean_html)
+                    set body to "{\"type\":\"onion_view_result\",\"url\":\""
+                    set body to concat(body and view_url)
+                    set body to concat(body and "\",\"tabId\":\"")
+                    set body to concat(body and tab_id)
+                    set body to concat(body and "\",\"html\":\"")
+                    set body to concat(body and escaped_html)
+                    set body to concat(body and "\"}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "get_wallet":
+                    set bal_resp to query_daemon_ipc("WALLET BALANCE")
+                    display f"[ws] IPC WALLET -> {bal_resp}"
+                    set balance to extract_ipc_field(bal_resp and "wallet_balance")
+                    if string_length(balance) == 0:
+                        set balance to "0"
+                    set wr to "{\"type\":\"wallet\",\"balance\":\""
+                    set wr to concat(wr and balance)
+                    set wr to concat(wr and "\"}")
+                    ws_send_text(client_fd and wr)
+                else if msg_type equals "session_list":
+                    set ipc_resp to query_daemon_ipc("SESSION LIST")
+                    set list_json to extract_ipc_json_data(ipc_resp)
+                    set body to "{\"type\":\"session_list\",\"sessions\":"
+                    set body to concat(body and list_json)
+                    set body to concat(body and "}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "session_get_active":
+                    set ipc_resp to query_daemon_ipc("SESSION ACTIVE")
+                    set sess_id to "default"
+                    set id_pos to string_index_of(ipc_resp and "id:")
+                    if id_pos >= 0:
+                        set skip to id_pos + 3
+                        set sess_id to substring(ipc_resp and skip and string_length(ipc_resp) - skip)
+                    set body to "{\"type\":\"session_active_id\",\"id\":\""
+                    set body to concat(body and sess_id)
+                    set body to concat(body and "\"}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "session_new":
+                    set s_id to json_get_string(payload and "id")
+                    set s_title to json_get_string(payload and "title")
+                    set s_model to json_get_string(payload and "model")
+                    set s_sys to json_get_string(payload and "system")
+                    set new_json to "{\"id\":\""
+                    set new_json to concat(new_json and s_id)
+                    set new_json to concat(new_json and "\",\"title\":\"")
+                    set new_json to concat(new_json and s_title)
+                    set new_json to concat(new_json and "\",\"model\":\"")
+                    set new_json to concat(new_json and s_model)
+                    set new_json to concat(new_json and "\",\"system_prompt\":\"")
+                    set new_json to concat(new_json and s_sys)
+                    set new_json to concat(new_json and "\"}")
+                    set ipc_resp to query_daemon_ipc(concat("SESSION NEW " and new_json))
+                    set body to "{\"type\":\"session_new_result\",\"success\":true,\"id\":\""
+                    set body to concat(body and s_id)
+                    set body to concat(body and "\"}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "session_switch":
+                    set s_id to json_get_string(payload and "id")
+                    set ipc_resp to query_daemon_ipc(concat("SESSION SET " and s_id))
+                    set get_resp to query_daemon_ipc(concat("SESSION GET " and s_id))
+                    set sess_json to extract_ipc_json_data(get_resp)
+                    set body to "{\"type\":\"session_active\",\"session\":"
+                    set body to concat(body and sess_json)
+                    set body to concat(body and "}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "session_update_model":
+                    set s_id to json_get_string(payload and "id")
+                    set s_model to json_get_string(payload and "model")
+                    set update_json to "{\"id\":\""
+                    set update_json to concat(update_json and s_id)
+                    set update_json to concat(update_json and "\",\"model\":\"")
+                    set update_json to concat(update_json and s_model)
+                    set update_json to concat(update_json and "\"}")
+                    set ipc_resp to query_daemon_ipc(concat("SESSION UPDATE_MODEL " and update_json))
+                    set body to "{\"type\":\"session_update_model_result\",\"success\":true,\"id\":\""
+                    set body to concat(body and s_id)
+                    set body to concat(body and "\"}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "session_rename":
+                    set s_id to json_get_string(payload and "id")
+                    set s_title to json_get_string(payload and "title")
+                    set rename_json to "{\"id\":\""
+                    set rename_json to concat(rename_json and s_id)
+                    set rename_json to concat(rename_json and "\",\"title\":\"")
+                    set rename_json to concat(rename_json and s_title)
+                    set rename_json to concat(rename_json and "\"}")
+                    set ipc_resp to query_daemon_ipc(concat("SESSION RENAME " and rename_json))
+                    set body to "{\"type\":\"session_rename_result\",\"success\":true,\"id\":\""
+                    set body to concat(body and s_id)
+                    set body to concat(body and "\"}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "session_delete":
+                    set s_id to json_get_string(payload and "id")
+                    set ipc_resp to query_daemon_ipc(concat("SESSION DELETE " and s_id))
+                    set body to "{\"type\":\"session_delete_result\",\"success\":true,\"id\":\""
+                    set body to concat(body and s_id)
+                    set body to concat(body and "\"}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "session_get":
+                    set s_id to json_get_string(payload and "id")
+                    set get_resp to query_daemon_ipc(concat("SESSION GET " and s_id))
+                    set sess_json to extract_ipc_json_data(get_resp)
+                    set body to "{\"type\":\"session_details\",\"session\":"
+                    set body to concat(body and sess_json)
+                    set body to concat(body and "}")
+                    ws_send_text(client_fd and body)
+                else if msg_type equals "get_platforms":
+                    set plat_data to ""
+                    if file_exists("config/platforms.json") == 1:
+                        set plat_data to read_file("config/platforms.json")
+                    else:
+                        set plat_data to "{\"discord\":{\"enabled\":false,\"token\":\"\",\"channel\":\"\",\"status\":\"OFFLINE\"},\"whatsapp\":{\"enabled\":false,\"token\":\"\",\"phone_id\":\"\",\"status\":\"OFFLINE\"},\"telegram\":{\"enabled\":false,\"token\":\"\",\"status\":\"OFFLINE\"}}"
+                    set resp to "{\"type\":\"platforms\",\"data\":"
+                    set resp to concat(resp and plat_data)
+                    set resp to concat(resp and "}")
+                    ws_send_text(client_fd and resp)
+                else if msg_type equals "save_platforms":
+                    set plat_data to json_get_string(payload and "data")
+                    set ok to write_file("config/platforms.json" and plat_data)
+                    set run_res to run_command("python3 decent_net/discord_manager.py")
+                    set resp to "{\"type\":\"platforms_saved\",\"success\":true}"
+                    ws_send_text(client_fd and resp)
+                else if msg_type equals "get_plugins":
+                    set plug_data to ""
+                    if file_exists("config/plugins.json") == 1:
+                        set plug_data to read_file("config/plugins.json")
+                    else:
+                        set plug_data to "[{\"id\":\"webhook_adapter\",\"name\":\"Custom Webhook Adapter\",\"endpoint\":\"http://127.0.0.1:9000/webhook\",\"desc\":\"Forwards mesh social events to custom URL endpoints.\",\"enabled\":true,\"status\":\"ACTIVE\"},{\"id\":\"memory_pruner\",\"name\":\"Hebbian Memory Pruner\",\"endpoint\":\"local:memory_pruner\",\"desc\":\"Automatically decays weak synapse weights during idle sweeps.\",\"enabled\":false,\"status\":\"INACTIVE\"}]"
+                    set resp to "{\"type\":\"plugins\",\"data\":"
+                    set resp to concat(resp and plug_data)
+                    set resp to concat(resp and "}")
+                    ws_send_text(client_fd and resp)
+                else if msg_type equals "save_plugins":
+                    set plug_data to json_get_string(payload and "data")
+                    set ok to write_file("config/plugins.json" and plug_data)
+                    set resp to "{\"type\":\"plugins_saved\",\"success\":true}"
+                    ws_send_text(client_fd and resp)
+                else if msg_type equals "get_prompts":
+                    set prompt_data to ""
+                    if file_exists("config/prompts.json") == 1:
+                        set prompt_data to read_file("config/prompts.json")
+                    else:
+                        set prompt_data to "{\"kernel\":\"\",\"persona\":\"\",\"observer\":\"\"}"
+                    set resp to "{\"type\":\"prompts\",\"data\":"
+                    set resp to concat(resp and prompt_data)
+                    set resp to concat(resp and "}")
+                    ws_send_text(client_fd and resp)
+                else if msg_type equals "save_prompts":
+                    set prompt_data to json_get_string(payload and "data")
+                    set ok to write_file("config/prompts.json" and prompt_data)
+                    set root to json_parse(prompt_data)
+                    if root != 0:
+                        set node to get_json_object_value(root and "persona")
+                        if node != 0:
+                            set persona_val to get_json_value(node)
+                            set ok to write_file("config/agent_persona.txt" and persona_val)
+                    set resp to "{\"type\":\"prompts_saved\",\"success\":true}"
+                    ws_send_text(client_fd and resp)
+                else if msg_type equals "get_system_config":
+                    set home to get_home_dir()
+                    set cfg_path to concat(home and "/.ernosdecent/config.toml")
+                    set cfg to config_load(cfg_path)
+                    
+                    set resp to "{\"type\":\"system_config\",\"data\":{"
+                    set resp to concat(resp and concat("\"node_name\":\"" and concat(config_get_str(cfg and "node.name") and "\",")))
+                    set resp to concat(resp and concat("\"node_data_dir\":\"" and concat(config_get_str(cfg and "node.data_dir") and "\",")))
+                    set resp to concat(resp and concat("\"node_log_level\":\"" and concat(config_get_str(cfg and "node.log_level") and "\",")))
+                    set resp to concat(resp and concat("\"network_listen_address\":\"" and concat(config_get_str(cfg and "network.listen_address") and "\",")))
+                    set resp to concat(resp and concat("\"network_p2p_port\":" and concat(int_to_string(config_get_int(cfg and "network.p2p_port")) and ",")))
+                    set resp to concat(resp and concat("\"network_dht_port\":" and concat(int_to_string(config_get_int(cfg and "network.dht_port")) and ",")))
+                    set resp to concat(resp and concat("\"network_relay_port\":" and concat(int_to_string(config_get_int(cfg and "network.relay_port")) and ",")))
+                    set resp to concat(resp and concat("\"network_ipc_port\":" and concat(int_to_string(config_get_int(cfg and "network.ipc_port")) and ",")))
+                    set resp to concat(resp and concat("\"network_web_port\":" and concat(int_to_string(config_get_int(cfg and "network.web_port")) and ",")))
+                    set resp to concat(resp and concat("\"network_max_connections\":" and concat(int_to_string(config_get_int(cfg and "network.max_connections")) and ",")))
+                    set resp to concat(resp and concat("\"network_max_message_size\":" and concat(int_to_string(config_get_int(cfg and "network.max_message_size")) and ",")))
+                    set resp to concat(resp and concat("\"network_seed_addr\":\"" and concat(config_get_str(cfg and "network.seed_addr") and "\",")))
+                    set resp to concat(resp and concat("\"network_seed_port\":" and concat(int_to_string(config_get_int(cfg and "network.seed_port")) and ",")))
+                    set resp to concat(resp and concat("\"network_enable_host_election\":" and concat(int_to_string(config_get_int(cfg and "network.enable_host_election")) and ",")))
+                    set resp to concat(resp and concat("\"network_is_static_host\":" and concat(int_to_string(config_get_int(cfg and "network.is_static_host")) and ",")))
+                    set resp to concat(resp and concat("\"consensus_raft_port\":" and concat(int_to_string(config_get_int(cfg and "consensus.raft_port")) and ",")))
+                    set resp to concat(resp and concat("\"consensus_election_timeout_ms\":" and concat(int_to_string(config_get_int(cfg and "consensus.election_timeout_ms")) and ",")))
+                    set resp to concat(resp and concat("\"consensus_heartbeat_interval_ms\":" and concat(int_to_string(config_get_int(cfg and "consensus.heartbeat_interval_ms")) and ",")))
+                    set resp to concat(resp and concat("\"security_rate_limit_per_minute\":" and concat(int_to_string(config_get_int(cfg and "security.rate_limit_per_minute")) and ",")))
+                    set resp to concat(resp and concat("\"security_ban_threshold\":" and concat(int_to_string(config_get_int(cfg and "security.ban_threshold")) and ",")))
+                    set resp to concat(resp and concat("\"security_ban_duration_sec\":" and concat(int_to_string(config_get_int(cfg and "security.ban_duration_sec")) and ",")))
+                    set resp to concat(resp and concat("\"storage_max_content_size\":" and concat(int_to_string(config_get_int(cfg and "storage.max_content_size")) and ",")))
+                    set resp to concat(resp and concat("\"storage_dht_ttl_sec\":" and concat(int_to_string(config_get_int(cfg and "storage.dht_ttl_sec")) and "}}}")))
+                    
+                    ws_send_text(client_fd and resp)
+                else if msg_type equals "save_system_config":
+                    set sys_data_json to json_get_string(payload and "data")
+                    set root to json_parse(sys_data_json)
+                    if root != 0:
+                        set home to get_home_dir()
+                        set cfg_path to concat(home and "/.ernosdecent/config.toml")
+                        set cfg to config_load(cfg_path)
+                        
+                        set ok to web_server_update_config_str(cfg and root and "node_name" and "node.name")
+                        set ok to web_server_update_config_str(cfg and root and "node_data_dir" and "node.data_dir")
+                        set ok to web_server_update_config_str(cfg and root and "node_log_level" and "node.log_level")
+                        
+                        set ok to web_server_update_config_str(cfg and root and "network_listen_address" and "network.listen_address")
+                        set ok to web_server_update_config_int(cfg and root and "network_p2p_port" and "network.p2p_port")
+                        set ok to web_server_update_config_int(cfg and root and "network_dht_port" and "network.dht_port")
+                        set ok to web_server_update_config_int(cfg and root and "network_relay_port" and "network.relay_port")
+                        set ok to web_server_update_config_int(cfg and root and "network_ipc_port" and "network.ipc_port")
+                        set ok to web_server_update_config_int(cfg and root and "network_web_port" and "network.web_port")
+                        set ok to web_server_update_config_int(cfg and root and "network_max_connections" and "network.max_connections")
+                        set ok to web_server_update_config_int(cfg and root and "network_max_message_size" and "network.max_message_size")
+                        set ok to web_server_update_config_str(cfg and root and "network_seed_addr" and "network.seed_addr")
+                        set ok to web_server_update_config_int(cfg and root and "network_seed_port" and "network.seed_port")
+                        set ok to web_server_update_config_int(cfg and root and "network_enable_host_election" and "network.enable_host_election")
+                        set ok to web_server_update_config_int(cfg and root and "network_is_static_host" and "network.is_static_host")
+                        
+                        set ok to web_server_update_config_int(cfg and root and "consensus_raft_port" and "consensus.raft_port")
+                        set ok to web_server_update_config_int(cfg and root and "consensus_election_timeout_ms" and "consensus.election_timeout_ms")
+                        set ok to web_server_update_config_int(cfg and root and "consensus_heartbeat_interval_ms" and "consensus.heartbeat_interval_ms")
+                        
+                        set ok to web_server_update_config_int(cfg and root and "security_rate_limit_per_minute" and "security.rate_limit_per_minute")
+                        set ok to web_server_update_config_int(cfg and root and "security_ban_threshold" and "security.ban_threshold")
+                        set ok to web_server_update_config_int(cfg and root and "security_ban_duration_sec" and "security.ban_duration_sec")
+                        
+                        set ok to web_server_update_config_int(cfg and root and "storage_max_content_size" and "storage.max_content_size")
+                        set ok to web_server_update_config_int(cfg and root and "storage_dht_ttl_sec" and "storage.dht_ttl_sec")
+                        
+                        set save_ok to config_save(cfg_path and cfg)
+                        
+                    set resp to "{\"type\":\"system_config_saved\",\"success\":true}"
+                    ws_send_text(client_fd and resp)
+                else if msg_type equals "gitdec_get_repos":
+                    set ipc_resp to query_daemon_ipc("GITDEC REPO LIST")
+                    set repos_str to extract_ipc_field(ipc_resp and "repos")
+                    set repos_json to "{\"type\":\"gitdec_repos\",\"repos\":\""
+                    set repos_json to concat(repos_json and repos_str)
+                    set repos_json to concat(repos_json and "\"}")
+                    ws_send_text(client_fd and repos_json)
+                else if msg_type equals "gitdec_get_repo_file":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set filename to json_get_string(payload and "filename")
+                    
+                    set file_content to ""
+                    if repo_id equals "ErnosDecent":
+                        if file_exists(filename) == 1:
+                            set file_content to read_file(filename)
+                        else:
+                            # Fallback for nested or absolute paths
+                            set local_path to path_join("docs" and filename)
+                            if file_exists(local_path) == 1:
+                                set file_content to read_file(local_path)
+                                
+                    if string_length(file_content) == 0:
+                        set ipc_resp to query_daemon_ipc(f"GITDEC REPO GET_FILE {repo_id} {filename}")
+                        set payload_pos to string_index_of(ipc_resp and "payload:")
+                        if payload_pos >= 0:
+                            set skip to payload_pos + 8
+                            set file_content to substring(ipc_resp and skip and string_length(ipc_resp) - skip)
+                            
+                    set escaped_content to escape_json_string(file_content)
+                    set file_json to "{\"type\":\"gitdec_file\",\"repo_id\":\""
+                    set file_json to concat(file_json and repo_id)
+                    set file_json to concat(file_json and "\",\"filename\":\"")
+                    set file_json to concat(file_json and filename)
+                    set file_json to concat(file_json and "\",\"content\":\"")
+                    set file_json to concat(file_json and escaped_content)
+                    set file_json to concat(file_json and "\"}")
+                    ws_send_text(client_fd and file_json)
+                else if msg_type equals "gitdec_list_files":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC REPO LIST_FILES {repo_id}")
+                    set files_str to ""
+                    set files_pos to string_index_of(ipc_resp and "files:")
+                    if files_pos >= 0:
+                        set skip to files_pos + 6
+                        set files_str to substring(ipc_resp and skip and string_length(ipc_resp) - skip)
+                    set escaped_files to escape_json_string(files_str)
+                    set files_json to "{\"type\":\"gitdec_files\",\"repo_id\":\""
+                    set files_json to concat(files_json and repo_id)
+                    set files_json to concat(files_json and "\",\"files\":\"")
+                    set files_json to concat(files_json and escaped_files)
+                    set files_json to concat(files_json and "\"}")
+                    ws_send_text(client_fd and files_json)
+                else if msg_type equals "gitdec_create_repo":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set name to json_get_string(payload and "name")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC REPO CREATE {repo_id} {name}")
+                    ws_send_text(client_fd and "{\"type\":\"gitdec_create_ok\"}")
+                else if msg_type equals "gitdec_clone_repo":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC REPO CLONE {repo_id}")
+                    if string_contains(ipc_resp and "error:") == 1:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_clone_error\",\"message\":\"Clone failed\"}")
+                    else:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_clone_ok\"}")
+                else if msg_type equals "gitdec_import_repo":
+                    set imp_name to json_get_string(payload and "name")
+                    set imp_path to json_get_string(payload and "path")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC REPO IMPORT {imp_name}|{imp_path}")
+                    if string_contains(ipc_resp and "import_ok") == 1:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_import_ok\"}")
+                    else:
+                        set imp_err_json to concat("{\"type\":\"gitdec_import_error\",\"message\":\"" and concat(escape_json_string(ipc_resp) and "\"}"))
+                        ws_send_text(client_fd and imp_err_json)
+                else if msg_type equals "gitdec_set_auto_update":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set au_enabled to json_get_string(payload and "enabled")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC AUTOUPDATE {repo_id} {au_enabled}")
+                    if string_contains(ipc_resp and "error") == 1:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_auto_update_error\",\"message\":\"Bad request\"}")
+                    else:
+                        set au_json to concat("{\"type\":\"gitdec_auto_update_state\",\"repo_id\":\"" and repo_id)
+                        set au_json to concat(au_json and "\",\"enabled\":")
+                        set au_json to concat(au_json and au_enabled)
+                        set au_json to concat(au_json and "}")
+                        ws_send_text(client_fd and au_json)
+                else if msg_type equals "gitdec_get_auto_update":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC GET_AUTOUPDATE {repo_id}")
+                    set au_state to extract_ipc_field(ipc_resp and "enabled")
+                    if string_length(au_state) == 0:
+                        set au_state to "0"
+                    set au_gjson to concat("{\"type\":\"gitdec_auto_update_state\",\"repo_id\":\"" and repo_id)
+                    set au_gjson to concat(au_gjson and "\",\"enabled\":")
+                    set au_gjson to concat(au_gjson and au_state)
+                    set au_gjson to concat(au_gjson and "}")
+                    ws_send_text(client_fd and au_gjson)
+                else if msg_type equals "gitdec_merge":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set source_branch to json_get_string(payload and "source_branch")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC MERGE {repo_id} {source_branch}")
+                    if string_contains(ipc_resp and "error") == 1:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_merge_error\",\"message\":\"Merge failed (unauthorized or branch not found)\"}")
+                    else:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_merge_ok\"}")
+                else if msg_type equals "gitdec_add_collab":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set collab_did to json_get_string(payload and "collab_did")
+                    set role to json_get_string(payload and "role")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC REPO COLLAB ADD {repo_id} {collab_did} {role}")
+                    ws_send_text(client_fd and "{\"type\":\"gitdec_collab_ok\"}")
+                else if msg_type equals "gitdec_remove_collab":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set collab_did to json_get_string(payload and "collab_did")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC REPO COLLAB REMOVE {repo_id} {collab_did}")
+                    if string_contains(ipc_resp and "error") == 1:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_collab_error\",\"message\":\"Unauthorized or not found\"}")
+                    else:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_collab_ok\"}")
+                else if msg_type equals "gitdec_delete_repo":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set ipc_resp to query_daemon_ipc(f"GITDEC REPO DELETE {repo_id}")
+                    if string_contains(ipc_resp and "error") == 1:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_delete_error\",\"message\":\"Unauthorized or not found\"}")
+                    else:
+                        ws_send_text(client_fd and "{\"type\":\"gitdec_delete_ok\"}")
+                else if msg_type equals "gitdec_create_issue":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set title to json_get_string(payload and "title")
+                    set body to json_get_string(payload and "body")
+                    set issue_json to "{\n"
+                    set issue_json to concat(issue_json and f"  \"repo_id\": \"{repo_id}\",\n")
+                    set issue_json to concat(issue_json and f"  \"title\": \"{title}\",\n")
+                    set issue_json to concat(issue_json and f"  \"body\": \"{body}\"\n")
+                    set issue_json to concat(issue_json and "}")
+                    set ipc_resp to query_daemon_ipc(concat("GITDEC ISSUE CREATE_JSON " and issue_json))
+                    ws_send_text(client_fd and "{\"type\":\"gitdec_issue_created\"}")
+                else if msg_type equals "gitdec_comment_issue":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set issue_id to json_get_string(payload and "issue_id")
+                    set comment to json_get_string(payload and "comment")
+                    set comment_json to "{\n"
+                    set comment_json to concat(comment_json and f"  \"repo_id\": \"{repo_id}\",\n")
+                    set comment_json to concat(comment_json and f"  \"issue_id\": \"{issue_id}\",\n")
+                    set comment_json to concat(comment_json and f"  \"comment\": \"{comment}\"\n")
+                    set comment_json to concat(comment_json and "}")
+                    set ipc_resp to query_daemon_ipc(concat("GITDEC ISSUE COMMENT_JSON " and comment_json))
+                    ws_send_text(client_fd and "{\"type\":\"gitdec_comment_ok\"}")
+                else if msg_type equals "gitdec_create_pr":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set title to json_get_string(payload and "title")
+                    set source to json_get_string(payload and "source")
+                    set target to json_get_string(payload and "target")
+                    set desc to json_get_string(payload and "description")
+                    set pr_json to "{\n"
+                    set pr_json to concat(pr_json and f"  \"repo_id\": \"{repo_id}\",\n")
+                    set pr_json to concat(pr_json and f"  \"title\": \"{title}\",\n")
+                    set pr_json to concat(pr_json and f"  \"source\": \"{source}\",\n")
+                    set pr_json to concat(pr_json and f"  \"target\": \"{target}\",\n")
+                    set pr_json to concat(pr_json and f"  \"description\": \"{desc}\"\n")
+                    set pr_json to concat(pr_json and "}")
+                    set ipc_resp to query_daemon_ipc(concat("GITDEC PR CREATE_JSON " and pr_json))
+                    ws_send_text(client_fd and "{\"type\":\"gitdec_pr_created\"}")
+                else if msg_type equals "gitdec_review_pr":
+                    set repo_id to json_get_string(payload and "repo_id")
+                    set pr_id to json_get_string(payload and "pr_id")
+                    set decision to json_get_string(payload and "decision")
+                    set comment to json_get_string(payload and "comment")
+                    set review_json to "{\n"
+                    set review_json to concat(review_json and f"  \"repo_id\": \"{repo_id}\",\n")
+                    set review_json to concat(review_json and f"  \"pr_id\": \"{pr_id}\",\n")
+                    set review_json to concat(review_json and f"  \"decision\": \"{decision}\",\n")
+                    set review_json to concat(review_json and f"  \"comment\": \"{comment}\"\n")
+                    set review_json to concat(review_json and "}")
+                    set ipc_resp to query_daemon_ipc(concat("GITDEC PR REVIEW_JSON " and review_json))
+                    ws_send_text(client_fd and "{\"type\":\"gitdec_review_ok\"}")
+                else:
+                    display f"[ws] Unknown message type: {msg_type}"
+                    set err to "{\"type\":\"error\",\"message\":\"Unknown message type\"}"
+                    ws_send_text(client_fd and err)
+    return 0
+
+
+define extract_request_body with raw_request as Str returning Str:
+    set pos to string_index_of(raw_request and "\r\n\r\n")
+    if pos >= 0:
+        set start to pos + 4
+        return substring(raw_request and start and string_length(raw_request) - start)
+    set pos2 to string_index_of(raw_request and "\n\n")
+    if pos2 >= 0:
+        set start2 to pos2 + 2
+        return substring(raw_request and start2 and string_length(raw_request) - start2)
+    return ""
+
+
+set NODE_PUBLIC_KEY to ""
+
+define extract_header_value with raw_req as Str and header_name as Str returning Str:
+    set req_lower to string_lower(raw_req)
+    set h_lower to string_lower(header_name)
+    set search_str to concat(h_lower and ":")
+    set pos to string_index_of(req_lower and search_str)
+    if pos < 0:
+        return ""
+    # Find end of the line
+    set start_val to pos + string_length(search_str)
+    set req_len to string_length(raw_req)
+    set end_val to start_val
+    set loop to 1
+    repeat while end_val < req_len && loop == 1:
+        set c to get_character(raw_req and end_val)
+        if c == 13 or else c == 10: # '\r' or '\n'
+            set loop to 0
+        else:
+            set end_val to end_val + 1
+    
+    # Extract the line portion
+    set line_val to substring(raw_req and start_val and (end_val - start_val))
+    return string_trim(line_val)
+
+define get_web_password_file returning Str:
+    set home to get_home_dir()
+    return concat(home and "/.ernosdecent/web-password")
+
+# Login brute-force throttle. State lives in a module-level map (mutation by
+# reference persists across requests in Ernos); counts are stored as strings to
+# avoid storing bare ints in a GC-scanned map. After 5 consecutive failures the
+# endpoint locks for 60s. Defence-in-depth atop the 192-bit random password.
+set LOGIN_THROTTLE to create_map()
+
+define login_throttle_allowed returning Int:
+    if map_contains(LOGIN_THROTTLE and "until") == 0:
+        return 1
+    set until_t to string_to_int(ptr_to_str(map_get_val(LOGIN_THROTTLE and "until")))
+    if ep_time_now_sec() < until_t:
+        return 0
+    return 1
+
+define login_throttle_fail returning Int:
+    set fails to 0
+    if map_contains(LOGIN_THROTTLE and "fails") == 1:
+        set fails to string_to_int(ptr_to_str(map_get_val(LOGIN_THROTTLE and "fails")))
+    set fails to fails + 1
+    if fails >= 5:
+        set ok to map_insert(LOGIN_THROTTLE and "until" and int_to_string(ep_time_now_sec() + 60))
+        set ok to map_insert(LOGIN_THROTTLE and "fails" and "0")
+    else:
+        set ok to map_insert(LOGIN_THROTTLE and "fails" and int_to_string(fails))
+    return 0
+
+define login_throttle_reset returning Int:
+    set ok to map_insert(LOGIN_THROTTLE and "fails" and "0")
+    set ok to map_insert(LOGIN_THROTTLE and "until" and "0")
+    return 0
+
+define verify_web_password with passphrase as Str returning Int:
+    set secret_file to get_web_password_file()
+    if file_exists(secret_file) == 0:
+        # First run: generate a random 24-byte (48 hex char) password instead of a
+        # known default, persist it 0600, and print it ONCE to the operator console.
+        set gen_pass to keys_random_hex(24)
+        if string_length(gen_pass) == 0:
+            # Crypto unavailable: fail closed rather than fall back to a known default.
+            display "[-] FATAL: cannot generate web password (crypto init failed); refusing weak default."
+            return 0
+        set ok to write_file(secret_file and gen_pass)
+        set ok to keys_chmod(secret_file and 384)
+        display "==================================================================="
+        display f"[*] Web UI password (shown once) — saved to {secret_file}:"
+        display f"      {gen_pass}"
+        display "==================================================================="
+
+    set saved_pass to string_trim(read_file(secret_file))
+    if string_length(saved_pass) == 0:
+        return 0
+    if passphrase equals saved_pass:
+        return 1
+    return 0
+
+define get_system_secret with name as Str returning Str:
+    set path1 to concat("/persist/secrets/" and name)
+    if file_exists(path1) == 1:
+        return string_trim(read_file(path1))
+    return ""
+
+define authenticate_request with req as Str and pub_key as Str returning Int:
+    set token to extract_header_value(req and "X-Session-Token")
+    if string_length(token) == 0:
+        # Try Authorization header
+        set auth_hdr to extract_header_value(req and "Authorization")
+        if string_length(auth_hdr) > 7:
+            if substring(auth_hdr and 0 and 7) equals "Bearer ":
+                set token to substring(auth_hdr and 7 and string_length(auth_hdr) - 7)
+
+    if string_length(token) == 0:
+        return 0 # No token
+        
+    set did to extract_header_value(req and "X-Session-Did")
+    set issued_str to extract_header_value(req and "X-Session-Issued")
+    set expires_str to extract_header_value(req and "X-Session-Expires")
+    set nonce to extract_header_value(req and "X-Session-Nonce")
+    
+    if string_length(did) == 0 or else string_length(issued_str) == 0 or else string_length(expires_str) == 0 or else string_length(nonce) == 0:
+        return 0 # Missing validation headers
+        
+    # Reconstruct payload hash
+    set payload_input to concat(did and ":")
+    set payload_input to concat(payload_input and issued_str)
+    set payload_input to concat(payload_input and ":")
+    set payload_input to concat(payload_input and expires_str)
+    set payload_input to concat(payload_input and ":")
+    set payload_input to concat(payload_input and nonce)
+    
+    set payload_hash to ep_sha256(payload_input)
+    
+    # Split token to check if file exists
+    set dot_pos to string_index_of(token and ".")
+    if dot_pos < 0:
+        return 0
+        
+    set ph_from_token to substring(token and 0 and dot_pos)
+    if ph_from_token equals payload_hash:
+        set ok to 1
+    else:
+        return 0
+        
+    # Check if the session file exists on disk
+    set home to get_home_dir()
+    set sess_dir to concat(home and "/.ernosdecent/auth_sessions")
+    set sess_file to concat(sess_dir and concat("/" and concat(payload_hash and ".json")))
+    if file_exists(sess_file) == 0:
+        return 0 # Revoked or rotated out
+        
+    # Verify signature
+    set verify_result to verify_session_token(token and pub_key and payload_hash)
+    set err to map_get_val(verify_result and "error")
+    set ok to free_map(verify_result)
+    
+    # Check expiry
+    set expires_at to string_to_int(expires_str)
+    set now to ep_time_now_sec()
+    
+    if err == 0 and also now < expires_at:
+        return 1 # Valid and active
+
+    return 0
+
+# Cross-Site WebSocket Hijacking (CSWSH) defense. Browsers ALWAYS send an Origin
+# header on the WS handshake; a malicious page the user visits would carry its own
+# off-box origin. The control plane is loopback-bound, so the only legitimate
+# browser origins are 127.0.0.1/localhost (any port). A missing Origin means a
+# non-browser local client (e.g. the CLI/tests), which is gated by the first-frame
+# token instead. Returns 1 if allowed, 0 if it must be rejected.
+define ws_origin_allowed with req as Str returning Int:
+    set origin to extract_header_value(req and "Origin")
+    if string_length(origin) == 0:
+        return 1
+    set host to origin
+    set sp to string_index_of(host and "://")
+    if sp >= 0:
+        set host to substring(host and sp + 3 and string_length(host) - sp - 3)
+    set cp to string_index_of(host and ":")
+    if cp >= 0:
+        set host to substring(host and 0 and cp)
+    set slp to string_index_of(host and "/")
+    if slp >= 0:
+        set host to substring(host and 0 and slp)
+    if host equals "127.0.0.1" or else host equals "localhost":
+        return 1
+    return 0
+
+# CSRF guard for /api/* routes. Browsers attach Origin (and/or Referer) on
+# cross-site requests; a malicious page cannot forge a local one. If neither header
+# is present the caller is a non-browser tool (curl/CLI), which is allowed here —
+# those reach the same surface over the token-gated IPC channel anyway. Returns 1
+# if the request may proceed, 0 if it is a cross-origin browser request to block.
+define web_csrf_ok with req as Str returning Int:
+    set origin to extract_header_value(req and "Origin")
+    if string_length(origin) > 0:
+        return ws_origin_allowed(req)
+    set referer to extract_header_value(req and "Referer")
+    if string_length(referer) > 0:
+        set rhost to string_lower(url_extract_host(referer))
+        if rhost equals "127.0.0.1" or else rhost equals "localhost":
+            return 1
+        return 0
+    return 1
+
+define proxy_request with client_fd as Int and req as Str and target_host as Str and target_port as Int and path_to_forward as Str returning Int:
+    set method to extract_request_method(req)
+    set body to extract_request_body(req)
+    
+    # Validate the HTTP method against a fixed allowlist — it is interpolated into
+    # the shell command, so an arbitrary value would be a command-injection vector.
+    set method_up to string_upper(method)
+    if method_up != "GET" and also method_up != "POST" and also method_up != "PUT" and also method_up != "DELETE" and also method_up != "PATCH" and also method_up != "HEAD" and also method_up != "OPTIONS":
+        set ok to send_response(client_fd and 400 and "application/json" and "{\"error\":\"invalid method\"}")
+        return 0
+
+    set url to f"http://{target_host}:{target_port}{path_to_forward}"
+    set cmd to concat("curl -s --max-redirs 0 -X " and method_up)
+
+    # Forward Content-Type if present (single-quote-escaped — no shell breakout).
+    set ct to extract_header_value(req and "Content-Type")
+    if string_length(ct) > 0:
+        set cmd to concat(cmd and concat(" -H " and web_sq(concat("Content-Type: " and ct))))
+
+    # Inject MeiliSearch key if proxying to MeiliSearch
+    if target_port == 7700:
+        set meili_key to get_system_secret("meili-master-key")
+        if string_length(meili_key) > 0:
+            set cmd to concat(cmd and concat(" -H " and web_sq(concat("Authorization: Bearer " and meili_key))))
+
+    # Forward the body if present
+    if string_length(body) > 0:
+        set body_file to f"config/proxy_body_{int_to_string(ep_time_now_sec())}_{int_to_string(client_fd)}.tmp"
+        set ok to write_file(body_file and body)
+        set cmd to concat(cmd and concat(" --data-binary " and web_sq(concat("@" and body_file))))
+
+    set cmd to concat(cmd and concat(" " and web_sq(url)))
+    
+    # Run the command
+    set resp to run_command(cmd)
+    
+    # Clean up the temp file if it was created
+    if string_length(body) > 0:
+        set ok to fs_delete_file(body_file)
+        
+    # Send the response back to the client
+    set ok to send_response(client_fd and 200 and "application/json" and resp)
+    return 0
+
+
+# Convert an arbitrary upload filename into a safe on-disk basename: every
+# character outside [A-Za-z0-9._-] becomes '_', every ".." is neutralised, and a
+# leading '-' or '.' is replaced. The result is always a single path component
+# that cannot traverse directories and contains no shell metacharacters, so it
+# is safe to use both as a filesystem path and (server-constructed) command
+# argument. Never empty (defaults to "upload"). The ORIGINAL filename is not
+# discarded — it is preserved verbatim for the indexer via a .meta sidecar, so
+# legitimate names (spaces, unicode, quotes) are accepted, only relocated.
+define web_safe_basename with name as Str returning Str:
+    set n to string_length(name)
+    set out to ""
+    set i to 0
+    repeat while i < n:
+        set c to get_character(name and i)
+        set keep to 0
+        if c >= 48 and also c < 58:
+            set keep to 1
+        if c >= 65 and also c < 91:
+            set keep to 1
+        if c >= 97 and also c < 123:
+            set keep to 1
+        if c == 46:
+            set keep to 1
+        if c == 45:
+            set keep to 1
+        if c == 95:
+            set keep to 1
+        if keep == 1:
+            set out to concat(out and char_from_code(c))
+        else:
+            set out to concat(out and "_")
+        set i to i + 1
+    repeat while string_contains(out and "..") == 1:
+        set out to string_replace(out and ".." and "__")
+    if string_length(out) > 0:
+        set f0 to get_character(out and 0)
+        if f0 == 45 or else f0 == 46:
+            set out to concat("_" and substring(out and 1 and (string_length(out) - 1)))
+    if string_length(out) == 0:
+        set out to "upload"
+    return out
+
+define handle_web_client_request with client_fd as Int and req as Str returning Int:
+    if string_length(req) == 0:
+        set ok to net_close(client_fd)
+        return 0
+        
+    if string_length(NODE_PUBLIC_KEY) == 0:
+        set ident_resp to query_daemon_ipc("IDENTITY")
+        set NODE_PUBLIC_KEY to extract_ipc_field(ident_resp and "signing_key")
+
+    set method to extract_request_method(req)
+    set raw_path to extract_request_path(req)
+    display f"[*] Web Request: {method} {raw_path}"
+    
+    # Check for WebSocket Upgrade (case-insensitive)
+    set req_lower to string_lower(req)
+    if string_contains(req_lower and "upgrade: websocket") == 1:
+        if ws_origin_allowed(req) == 0:
+            display "[-] WebSocket upgrade REJECTED: disallowed cross-origin (CSWSH)."
+            set ok to send_response(client_fd and 403 and "text/plain" and "Forbidden: cross-origin WebSocket")
+            set ok to net_close(client_fd)
+            return 0
+        display "[*] WebSocket upgrade header detected. Normalizing headers..."
+        # Normalize critical WebSocket headers for strict case-sensitive C parsers in ws_upgrade
+        set req_norm to req
+        set req_norm to string_replace(req_norm and "Upgrade: WebSocket" and "Upgrade: websocket")
+        set req_norm to string_replace(req_norm and "upgrade: websocket" and "Upgrade: websocket")
+        set req_norm to string_replace(req_norm and "upgrade: WebSocket" and "Upgrade: websocket")
+        
+        set req_norm to string_replace(req_norm and "Connection: keep-alive, Upgrade" and "Connection: Upgrade")
+        set req_norm to string_replace(req_norm and "Connection: upgrade" and "Connection: Upgrade")
+        set req_norm to string_replace(req_norm and "connection: upgrade" and "Connection: Upgrade")
+        set req_norm to string_replace(req_norm and "connection: Upgrade" and "Connection: Upgrade")
+        
+        set req_norm to string_replace(req_norm and "sec-websocket-key" and "Sec-WebSocket-Key")
+        set req_norm to string_replace(req_norm and "Sec-Websocket-Key" and "Sec-WebSocket-Key")
+        
+        # A present Origin means a browser (authenticated by the Origin allowlist
+        # above); its absence means a non-browser client that must present the token.
+        set ws_origin_hdr to extract_header_value(req and "Origin")
+        set ws_need_token to 1
+        if string_length(ws_origin_hdr) > 0:
+            set ws_need_token to 0
+        set ws_ok to ws_upgrade(client_fd and req_norm)
+        if ws_ok == 1:
+            display "[+] WebSocket upgrade handshake completed successfully."
+            websocket_session_loop(client_fd and ws_need_token)
+        else:
+            display "[-] WebSocket upgrade handshake failed!"
+            set ok to net_close(client_fd)
+        return 0
+
+    # API endpoints — CSRF guard: block cross-origin browser requests to any /api/*
+    # route (covers wallet/storage/pool/upload/login). Non-browser tools (no Origin/
+    # Referer) pass here and are gated on the token-authenticated IPC channel.
+    if string_index_of(raw_path and "/api/") == 0:
+        if web_csrf_ok(req) == 0:
+            display "[-] /api request REJECTED: cross-origin (CSRF)."
+            set ok to send_response(client_fd and 403 and "application/json" and "{\"error\":\"forbidden: cross-origin request blocked\"}")
+            return 0
+
+    # API endpoints
+    if raw_path equals "/api/login":
+        if method equals "POST":
+            set body to extract_request_body(req)
+            set root to json_parse(body)
+            if root != 0:
+                set pass_node to get_json_object_value(root and "passphrase")
+                if pass_node != 0:
+                    if login_throttle_allowed() == 0:
+                        set ok to send_response(client_fd and 429 and "application/json" and "{\"success\":false,\"message\":\"Too many failed attempts. Try again later.\"}")
+                        return 0
+                    set passphrase to get_json_value(pass_node)
+                    set auth_ok to verify_web_password(passphrase)
+                    if auth_ok == 1:
+                        set throttle_ok to login_throttle_reset()
+                        # Request a session token from the daemon
+                        set ipc_resp to query_daemon_ipc("SESSION TOKEN CREATE did:key:webclient 3600")
+                        if string_contains(ipc_resp and "token:error") == 1:
+                            set ok to send_response(client_fd and 500 and "application/json" and "{\"success\":false,\"message\":\"Failed to generate session token\"}")
+                        else:
+                            set tok to extract_ipc_field(ipc_resp and "token")
+                            set did_val to extract_ipc_field(ipc_resp and "did")
+                            set iss to extract_ipc_field(ipc_resp and "issued_at")
+                            set exp to extract_ipc_field(ipc_resp and "expires_at")
+                            set nonc to extract_ipc_field(ipc_resp and "nonce")
+                            set ph to extract_ipc_field(ipc_resp and "payload_hash")
+                            
+                            # Save the session to filesystem
+                            set home to get_home_dir()
+                            set sess_dir to concat(home and "/.ernosdecent/auth_sessions")
+                            if file_exists(sess_dir) == 0:
+                                set ok to create_directory(sess_dir)
+                                
+                            set sess_file to concat(sess_dir and concat("/" and concat(ph and ".json")))
+                            set sess_json to "{\"token\":\""
+                            set sess_json to concat(sess_json and tok)
+                            set sess_json to concat(sess_json and "\",\"did\":\"")
+                            set sess_json to concat(sess_json and did_val)
+                            set sess_json to concat(sess_json and "\",\"issued_at\":")
+                            set sess_json to concat(sess_json and iss)
+                            set sess_json to concat(sess_json and ",\"expires_at\":")
+                            set sess_json to concat(sess_json and exp)
+                            set sess_json to concat(sess_json and ",\"nonce\":\"")
+                            set sess_json to concat(sess_json and nonc)
+                            set sess_json to concat(sess_json and "\",\"payload_hash\":\"")
+                            set sess_json to concat(sess_json and ph)
+                            set sess_json to concat(sess_json and "\"}")
+                            set ok to write_file(sess_file and sess_json)
+                            
+                            set resp_json to "{\"success\":true,\"token\":\""
+                            set resp_json to concat(resp_json and tok)
+                            set resp_json to concat(resp_json and "\",\"did\":\"")
+                            set resp_json to concat(resp_json and did_val)
+                            set resp_json to concat(resp_json and "\",\"issued_at\":")
+                            set resp_json to concat(resp_json and iss)
+                            set resp_json to concat(resp_json and ",\"expires_at\":")
+                            set resp_json to concat(resp_json and exp)
+                            set resp_json to concat(resp_json and ",\"nonce\":\"")
+                            set resp_json to concat(resp_json and nonc)
+                            set resp_json to concat(resp_json and "\",\"payload_hash\":\"")
+                            set resp_json to concat(resp_json and ph)
+                            set resp_json to concat(resp_json and "\"}")
+                            set ok to send_response(client_fd and 200 and "application/json" and resp_json)
+                    else:
+                        set throttle_ok to login_throttle_fail()
+                        set ok to send_response(client_fd and 401 and "application/json" and "{\"success\":false,\"message\":\"Invalid passphrase\"}")
+                else:
+                    set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Missing passphrase\"}")
+            else:
+                set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Invalid JSON body\"}")
+            return 0
+        else:
+            set ok to send_response(client_fd and 405 and "application/json" and "{\"success\":false,\"message\":\"Method Not Allowed\"}")
+            return 0
+
+    if string_index_of(raw_path and "/api/meili") == 0:
+        # Enforce authentication
+        set auth_ok to authenticate_request(req and NODE_PUBLIC_KEY)
+        if auth_ok == 0:
+            set ok to send_response(client_fd and 401 and "application/json" and "{\"error\":\"unauthorized\",\"message\":\"Valid session token required\"}")
+            return 0
+            
+        # Extract subpath
+        set prefix_len to string_length("/api/meili")
+        set subpath to substring(raw_path and prefix_len and string_length(raw_path) - prefix_len)
+        if string_length(subpath) == 0:
+            set subpath to "/"
+            
+        set ok to proxy_request(client_fd and req and "127.0.0.1" and 7700 and subpath)
+        return 0
+
+    if string_index_of(raw_path and "/api/ollama") == 0:
+        # Enforce authentication
+        set auth_ok to authenticate_request(req and NODE_PUBLIC_KEY)
+        if auth_ok == 0:
+            set ok to send_response(client_fd and 401 and "application/json" and "{\"error\":\"unauthorized\",\"message\":\"Valid session token required\"}")
+            return 0
+            
+        # Extract subpath
+        set prefix_len to string_length("/api/ollama")
+        set subpath to substring(raw_path and prefix_len and string_length(raw_path) - prefix_len)
+        if string_length(subpath) == 0:
+            set subpath to "/"
+            
+        set ok to proxy_request(client_fd and req and "127.0.0.1" and 11434 and subpath)
+        return 0
+
+    if raw_path equals "/api/status":
+        set ipc_resp to query_daemon_ipc("STATUS")
+        set role to extract_ipc_field(ipc_resp and "role")
+        set did_val to extract_ipc_field(ipc_resp and "did")
+        set term to extract_ipc_field(ipc_resp and "term")
+        set peers to extract_ipc_field(ipc_resp and "peers")
+        set dht_size to extract_ipc_field(ipc_resp and "dht_size")
+        set is_static to extract_ipc_field(ipc_resp and "is_static_host")
+        set elect_enabled to extract_ipc_field(ipc_resp and "enable_host_election")
+        set reg_name to extract_ipc_field(ipc_resp and "name")
+        set gitdec_updates to extract_ipc_field(ipc_resp and "gitdec_updates")
+        if string_length(role) == 0:
+            set role to "unknown"
+        if string_length(did_val) == 0:
+            set did_val to "error:daemon_offline"
+        if string_length(term) == 0:
+            set term to "0"
+        if string_length(peers) == 0:
+            set peers to "0"
+        if string_length(dht_size) == 0:
+            set dht_size to "0"
+        if string_length(is_static) == 0:
+            set is_static to "0"
+        if string_length(elect_enabled) == 0:
+            set elect_enabled to "1"
+        if string_length(reg_name) == 0:
+            set reg_name to "none"
+        if string_length(gitdec_updates) == 0:
+            set gitdec_updates to "0"
+        set body to build_status_json(role and did_val and term and peers and dht_size and is_static and elect_enabled and reg_name and gitdec_updates)
+        set ok to send_response(client_fd and 200 and "application/json" and body)
+        return 0
+
+    if raw_path equals "/api/upload":
+        if method equals "POST":
+            set body to extract_request_body(req)
+            set root to json_parse(body)
+            if root != 0:
+                set name_node to get_json_object_value(root and "filename")
+                set cont_node to get_json_object_value(root and "content")
+                if name_node != 0 and also cont_node != 0:
+                    set filename to get_json_value(name_node)
+                    set content_b64 to get_json_value(cont_node)
+
+                    if string_length(filename) == 0:
+                        set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Missing filename.\"}")
+                        return 0
+
+                    if file_exists("config/uploads") == 0:
+                        set ok to create_directory("config/uploads")
+
+                    # The on-disk path is built ONLY from a server-sanitised
+                    # basename, so it cannot traverse directories and carries no
+                    # shell metacharacters. The original filename and extension
+                    # (which may contain anything) are written to a .meta sidecar
+                    # and read by the indexer out-of-band, so no untrusted data
+                    # is ever placed on the shell command line.
+                    # Native ErnosPlain ingestion (no Python sidecar): decode the upload,
+                    # then index it tagged with the ACTIVE SESSION so retrieval is
+                    # session-scoped (a later session won't auto-see this document).
+                    set up_text to rag_base64_decode(content_b64)
+                    set up_sess_resp to query_daemon_ipc("SESSION ACTIVE")
+                    set up_session to extract_ipc_field(up_sess_resp and "id")
+                    set up_chunks to rag_index(storage_get_db() and filename and up_text and up_session)
+                    display f"[web] Upload: indexed '{filename}' ({up_chunks} chunks, session={up_session})"
+
+                    if up_chunks > 0:
+                        set resp_body to "{\"success\":true,\"message\":\"Document uploaded and indexed into this session.\"}"
+                        set ok to send_response(client_fd and 200 and "application/json" and resp_body)
+                        return 0
+                    else:
+                        set resp_body to "{\"success\":false,\"message\":\"Indexing produced no chunks (empty file, or Ollama / nomic-embed-text unavailable).\"}"
+                        set ok to send_response(client_fd and 500 and "application/json" and resp_body)
+                        return 0
+                else:
+                    set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Missing filename or content.\"}")
+                    return 0
+            else:
+                set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Invalid JSON body.\"}")
+                return 0
+        else:
+            set ok to send_response(client_fd and 405 and "application/json" and "{\"success\":false,\"message\":\"Method Not Allowed.\"}")
+            return 0
+
+    if raw_path equals "/api/wallet":
+        set ipc_resp to query_daemon_ipc("WALLET BALANCE")
+        set balance_str to extract_ipc_field(ipc_resp and "wallet_balance")
+        if string_length(balance_str) == 0:
+            set balance_str to "0.00"
+        set body to "{\"type\":\"wallet\",\"balance\":\""
+        set body to concat(body and balance_str)
+        set body to concat(body and "\"}")
+        set ok to send_response(client_fd and 200 and "application/json" and body)
+        return 0
+
+    if raw_path equals "/api/storage":
+        set ipc_resp to query_daemon_ipc("STORAGE STATUS")
+        set ok to send_response(client_fd and 200 and "application/json" and ipc_resp)
+        return 0
+
+    if raw_path equals "/api/pool":
+        set ipc_resp to query_daemon_ipc("POOL STATUS")
+        set bw_up to extract_ipc_field(ipc_resp and "bandwidth_up")
+        set bw_down to extract_ipc_field(ipc_resp and "bandwidth_down")
+        set compute to extract_ipc_field(ipc_resp and "compute_slots")
+        if string_length(bw_up) == 0:
+            set bw_up to "0"
+        if string_length(bw_down) == 0:
+            set bw_down to "0"
+        if string_length(compute) == 0:
+            set compute to "0"
+        set body to "{\"type\":\"pool\",\"bandwidth_up\":\""
+        set body to concat(body and bw_up)
+        set body to concat(body and "\",\"bandwidth_down\":\"")
+        set body to concat(body and bw_down)
+        set body to concat(body and "\",\"compute_slots\":")
+        set body to concat(body and compute)
+        set body to concat(body and "}")
+        set ok to send_response(client_fd and 200 and "application/json" and body)
+        return 0
+
+    # Serve static assets
+    set safe_path to sanitize_path(raw_path)
+    set rel_path to safe_path
+    if string_length(safe_path) > 1:
+        set first_char to get_character(safe_path and 0)
+        if first_char == 47: # '/'
+            set rel_path to substring(safe_path and 1 and string_length(safe_path) - 1)
+
+    set file_path to concat("decent_web/" and rel_path)
+    
+    if file_exists(file_path) == 1:
+        if is_directory(file_path) == 1:
+            set index_path to concat(file_path and "/index.html")
+            if file_exists(index_path) == 1:
+                set content to read_file(index_path)
+                set ok to send_response(client_fd and 200 and "text/html" and content)
+            else:
+                set ok to send_response(client_fd and 404 and "text/plain" and "Not Found")
+        else:
+            set content to read_file(file_path)
+            set ext to path_extension(file_path)
+            set mime to get_mime_type(ext)
+            set ok to send_response(client_fd and 200 and mime and content)
+    else:
+        set ok to send_response(client_fd and 404 and "text/plain" and "404 Not Found")
+        
+    return 0
+
+define run_web_server with port as Int and ipc_port as Int returning Int:
+    set IPC_DAEMON_PORT to ipc_port
+    display f"[*] Web UI server starting on port {port}..."
+    set server to start_server(port)
+    if server == 0:
+        display f"[-] Failed to start HTTP server on port {port}!"
+        return 1
+        
+    repeat while 1 == 1:
+        set request to receive from server
+        set client_fd to get_list(request and 0)
+        set req_str to get_list(request and 1)
+        
+        spawn handle_web_client_request(client_fd and req_str)
+        # Note: do NOT free_list(request) here — spawned thread
+        # still references req_str which lives inside the list.
+        # Let GC handle cleanup.
+    return 0
+
+# ================================================================
+# System configuration helpers
+# ================================================================
+
+define web_server_update_config_str with cfg as Map and json_root as Int and json_key as Str and cfg_key as Str returning Int:
+    set node to get_json_object_value(json_root and json_key)
+    if node != 0:
+        set val to get_json_value(node)
+        set ok to map_insert(cfg and cfg_key and val)
+    return 0
+
+define web_server_update_config_int with cfg as Map and json_root as Int and json_key as Str and cfg_key as Str returning Int:
+    set node to get_json_object_value(json_root and json_key)
+    if node != 0:
+        set v_type to get_json_type(node)
+        if v_type == 1:
+            set val to get_json_value(node)
+            set ok to map_insert(cfg and cfg_key and val)
+        else:
+            if v_type == 2:
+                set val_str to get_json_value(node)
+                if string_length(val_str) > 0:
+                    set val to string_to_int(val_str)
+                    set ok to map_insert(cfg and cfg_key and val)
+    return 0

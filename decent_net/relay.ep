@@ -1,0 +1,455 @@
+# ErnosDecent -- Encrypted Relay for NAT Traversal
+# Component: decent_net/relay.ep
+# Implements: Relay protocol for nodes behind NAT/firewall
+#             Uses Noise-encrypted channels for all relay traffic
+#             Relay nodes forward encrypted packets without seeing content
+# Status: Production -- OperationTrojanClaude Phase 3
+
+import "dht"
+import "noise"
+import "../decent_id/keys"
+import "string"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set RELAY_ERR_NONE to 0
+set RELAY_ERR_NOT_FOUND to 601
+set RELAY_ERR_CIRCUIT_FAILED to 602
+set RELAY_ERR_ALREADY_REGISTERED to 603
+set RELAY_ERR_CAPACITY_FULL to 604
+set RELAY_ERR_INVALID_MESSAGE to 605
+set RELAY_ERR_INTERNAL_TARGET to 611
+set RELAY_ERR_ENCRYPTION_FAILED to 606
+set RELAY_ERR_DECRYPTION_FAILED to 607
+set RELAY_ERR_EXPIRED to 608
+set RELAY_ERR_NOT_REGISTERED to 609
+
+# Relay message types
+set RELAY_MSG_REGISTER to 10
+set RELAY_MSG_REGISTER_ACK to 11
+set RELAY_MSG_CONNECT to 12
+set RELAY_MSG_CONNECT_ACK to 13
+set RELAY_MSG_DATA to 14
+set RELAY_MSG_DATA_ACK to 15
+set RELAY_MSG_DISCONNECT to 16
+set RELAY_MSG_HEARTBEAT to 17
+set RELAY_MSG_HEARTBEAT_ACK to 18
+
+# Circuit states
+set CIRCUIT_STATE_PENDING to 0
+set CIRCUIT_STATE_ACTIVE to 1
+set CIRCUIT_STATE_CLOSED to 2
+
+# Relay limits
+set RELAY_MAX_REGISTRATIONS to 1000
+set RELAY_MAX_CIRCUITS to 500
+set RELAY_REGISTRATION_TTL to 3600
+set RELAY_HEARTBEAT_INTERVAL to 30
+set RELAY_CIRCUIT_TIMEOUT to 300
+
+# ================================================================
+# Registration -- a node registers with a relay to be reachable
+# ================================================================
+
+define create_registration with node_id as Str and node_pub_hex as Str and address as Str and port as Int:
+    set reg to create_map()
+    set ok to map_insert(reg and "node_id" and node_id)
+    set ok to map_insert(reg and "pub_hex" and node_pub_hex)
+    set ok to map_insert(reg and "address" and address)
+    set ok to map_insert(reg and "port" and port)
+    set ok to map_insert(reg and "registered_at" and ep_time_now_sec())
+    set ok to map_insert(reg and "expires_at" and ep_time_now_sec() + RELAY_REGISTRATION_TTL)
+    set ok to map_insert(reg and "last_heartbeat" and ep_time_now_sec())
+    return reg
+
+define is_registration_valid with reg as Int returning Int:
+    set expires_at to map_get_val(reg and "expires_at")
+    set now to ep_time_now_sec()
+    if now >= expires_at:
+        return 0
+    return 1
+
+define refresh_registration with reg as Int:
+    set ok to map_insert(reg and "expires_at" and ep_time_now_sec() + RELAY_REGISTRATION_TTL)
+    set ok to map_insert(reg and "last_heartbeat" and ep_time_now_sec())
+    return 0
+
+# ================================================================
+# Circuit -- an encrypted path between two nodes through a relay
+# ================================================================
+
+define create_circuit with circuit_id as Str and source_id as Str and target_id as Str:
+    set circuit to create_map()
+    set ok to map_insert(circuit and "id" and circuit_id)
+    set ok to map_insert(circuit and "source" and source_id)
+    set ok to map_insert(circuit and "target" and target_id)
+    set ok to map_insert(circuit and "state" and CIRCUIT_STATE_PENDING)
+    set ok to map_insert(circuit and "created_at" and ep_time_now_sec())
+    set ok to map_insert(circuit and "last_activity" and ep_time_now_sec())
+    set ok to map_insert(circuit and "bytes_relayed" and 0)
+    set ok to map_insert(circuit and "messages_relayed" and 0)
+    return circuit
+
+define circuit_activate with circuit as Int:
+    set ok to map_insert(circuit and "state" and CIRCUIT_STATE_ACTIVE)
+    set ok to map_insert(circuit and "last_activity" and ep_time_now_sec())
+    return 0
+
+define circuit_close with circuit as Int:
+    set ok to map_insert(circuit and "state" and CIRCUIT_STATE_CLOSED)
+    return 0
+
+define is_circuit_active with circuit as Int returning Int:
+    set state to map_get_val(circuit and "state")
+    if state != CIRCUIT_STATE_ACTIVE:
+        return 0
+    # Check timeout
+    set last_act to map_get_val(circuit and "last_activity")
+    set now to ep_time_now_sec()
+    if now - last_act > RELAY_CIRCUIT_TIMEOUT:
+        set ok to circuit_close(circuit)
+        return 0
+    return 1
+
+define circuit_record_data with circuit as Int and data_size as Int:
+    set bytes to map_get_val(circuit and "bytes_relayed")
+    set msgs to map_get_val(circuit and "messages_relayed")
+    set ok to map_insert(circuit and "bytes_relayed" and bytes + data_size)
+    set ok to map_insert(circuit and "messages_relayed" and msgs + 1)
+    set ok to map_insert(circuit and "last_activity" and ep_time_now_sec())
+    return 0
+
+# ================================================================
+# Relay Node -- manages registrations and circuits
+# ================================================================
+
+define create_relay_node with node_id as Str:
+    set relay to create_map()
+    set ok to map_insert(relay and "id" and node_id)
+    set registrations to create_map()
+    set ok to map_insert(relay and "registrations" and registrations)
+    set circuits to create_map()
+    set ok to map_insert(relay and "circuits" and circuits)
+    set ok to map_insert(relay and "registration_count" and 0)
+    set ok to map_insert(relay and "circuit_count" and 0)
+    set ok to map_insert(relay and "total_bytes_relayed" and 0)
+    set ok to map_insert(relay and "error" and RELAY_ERR_NONE)
+    return relay
+
+# Anti-SSRF: reject relay targets that point at the local host or private/link-local
+# ranges, so a registrant cannot turn the relay into a proxy to internal services.
+define relay_addr_is_internal with addr as Str returning Int:
+    set h to string_lower(addr)
+    if h equals "localhost" or else h equals "127.0.0.1" or else h equals "0.0.0.0" or else h equals "::1":
+        return 1
+    if string_index_of(h and "127.") == 0 or else string_index_of(h and "10.") == 0:
+        return 1
+    if string_index_of(h and "192.168.") == 0 or else string_index_of(h and "169.254.") == 0:
+        return 1
+    if string_index_of(h and "172.") == 0:
+        set rest to substring(h and 4 and string_length(h) - 4)
+        set dotp to string_index_of(rest and ".")
+        if dotp > 0:
+            set o2 to string_to_int(substring(rest and 0 and dotp))
+            if o2 >= 16 and also o2 <= 31:
+                return 1
+    return 0
+
+define relay_register with relay as Int and node_id as Str and node_pub_hex as Str and address as Str and port as Int returning Int:
+    # Reject internal/loopback targets before storing the registration (SSRF guard).
+    if relay_addr_is_internal(address) == 1:
+        return RELAY_ERR_INTERNAL_TARGET
+    # Register a node to be reachable through this relay
+    set registrations to map_get_val(relay and "registrations")
+    set count to map_get_val(relay and "registration_count")
+
+    # Check if already registered
+    set existing to map_get_val(registrations and node_id)
+    if existing != 0:
+        # Refresh existing registration and update address/port
+        set ok to refresh_registration(existing)
+        set ok to map_insert(existing and "address" and address)
+        set ok to map_insert(existing and "port" and port)
+        return RELAY_ERR_NONE
+
+    # Check capacity
+    if count >= RELAY_MAX_REGISTRATIONS:
+        return RELAY_ERR_CAPACITY_FULL
+
+    # Create new registration with address and port
+    set reg to create_registration(node_id and node_pub_hex and address and port)
+    set ok to map_insert(registrations and node_id and reg)
+    set ok to map_insert(relay and "registration_count" and count + 1)
+    return RELAY_ERR_NONE
+
+define relay_unregister with relay as Int and node_id as Str returning Int:
+    set registrations to map_get_val(relay and "registrations")
+    set existing to map_get_val(registrations and node_id)
+    if existing == 0:
+        return RELAY_ERR_NOT_REGISTERED
+
+    set ok to map_delete(registrations and node_id)
+    set count to map_get_val(relay and "registration_count")
+    set ok to map_insert(relay and "registration_count" and count - 1)
+    return RELAY_ERR_NONE
+
+define relay_is_registered with relay as Int and node_id as Str returning Int:
+    set registrations to map_get_val(relay and "registrations")
+    set existing to map_get_val(registrations and node_id)
+    if existing == 0:
+        return 0
+    return is_registration_valid(existing)
+
+define relay_get_pub_hex with relay as Int and node_id as Str returning Str:
+    # Get the public key hex of a registered node
+    set registrations to map_get_val(relay and "registrations")
+    set reg to map_get_val(registrations and node_id)
+    if reg == 0:
+        return ""
+    return map_get_val(reg and "pub_hex")
+
+define relay_get_target_address with relay as Int and node_id as Str returning Map:
+    set registrations to map_get_val(relay and "registrations")
+    set result to create_map()
+    if map_contains(registrations and node_id) == 0:
+        set ok to map_insert(result and "error" and 1)
+        return result
+    set reg to map_get_val(registrations and node_id)
+    set address to ptr_to_str(map_get_val(reg and "address"))
+    set port to map_get_val(reg and "port")
+    set ok to map_insert(result and "error" and 0)
+    set ok to map_insert(result and "address" and address)
+    set ok to map_insert(result and "port" and port)
+    return result
+
+# ================================================================
+# Circuit Management
+# ================================================================
+
+define relay_create_circuit with relay as Int and source_id as Str and target_id as Str returning Int:
+    # Create a circuit between source and target through this relay
+    # Both must be registered (or source can be external)
+    set result to create_map()
+
+    # Target must be registered to be reachable
+    set target_registered to relay_is_registered(relay and target_id)
+    if target_registered == 0:
+        set ok to map_insert(result and "error" and RELAY_ERR_NOT_FOUND)
+        return result
+
+    # Check capacity
+    set circuit_count to map_get_val(relay and "circuit_count")
+    if circuit_count >= RELAY_MAX_CIRCUITS:
+        set ok to map_insert(result and "error" and RELAY_ERR_CAPACITY_FULL)
+        return result
+
+    # Generate circuit ID
+    set circuit_id to generate_random_node_id()
+    set circuit to create_circuit(circuit_id and source_id and target_id)
+    set ok to circuit_activate(circuit)
+
+    # Store the circuit
+    set circuits to map_get_val(relay and "circuits")
+    set ok to map_insert(circuits and circuit_id and circuit)
+    set ok to map_insert(relay and "circuit_count" and circuit_count + 1)
+
+    set ok to map_insert(result and "circuit_id" and circuit_id)
+    set ok to map_insert(result and "error" and RELAY_ERR_NONE)
+    return result
+
+define relay_close_circuit with relay as Int and circuit_id as Str returning Int:
+    set circuits to map_get_val(relay and "circuits")
+    set circuit to map_get_val(circuits and circuit_id)
+    if circuit == 0:
+        return RELAY_ERR_NOT_FOUND
+
+    set ok to circuit_close(circuit)
+    set count to map_get_val(relay and "circuit_count")
+    set ok to map_insert(relay and "circuit_count" and count - 1)
+    return RELAY_ERR_NONE
+
+define relay_forward_data with relay as Int and circuit_id as Str and encrypted_data as Str:
+    # Forward encrypted data through a circuit
+    # The relay never sees the plaintext -- it just passes the ciphertext
+    set result to create_map()
+    set circuits to map_get_val(relay and "circuits")
+    set circuit to map_get_val(circuits and circuit_id)
+
+    if circuit == 0:
+        set ok to map_insert(result and "error" and RELAY_ERR_NOT_FOUND)
+        return result
+
+    if is_circuit_active(circuit) == 0:
+        set ok to map_insert(result and "error" and RELAY_ERR_EXPIRED)
+        return result
+
+    # Record the relay activity
+    set data_size to string_length(encrypted_data) / 2
+    set ok to circuit_record_data(circuit and data_size)
+
+    # Update total relay stats
+    set total to map_get_val(relay and "total_bytes_relayed")
+    set ok to map_insert(relay and "total_bytes_relayed" and total + data_size)
+
+    # The relay's job: identify the other end and provide the data
+    set source to map_get_val(circuit and "source")
+    set target to map_get_val(circuit and "target")
+
+    set ok to map_insert(result and "circuit_id" and circuit_id)
+    set ok to map_insert(result and "source" and source)
+    set ok to map_insert(result and "target" and target)
+    set ok to map_insert(result and "data" and encrypted_data)
+    set ok to map_insert(result and "error" and RELAY_ERR_NONE)
+    return result
+
+# ================================================================
+# Relay Stats
+# ================================================================
+
+define relay_get_stats with relay as Int:
+    set stats to create_map()
+    set ok to map_insert(stats and "registrations" and map_get_val(relay and "registration_count"))
+    set ok to map_insert(stats and "circuits" and map_get_val(relay and "circuit_count"))
+    set ok to map_insert(stats and "total_bytes" and map_get_val(relay and "total_bytes_relayed"))
+    return stats
+
+define relay_get_circuit_stats with relay as Int and circuit_id as Str:
+    set result to create_map()
+    set circuits to map_get_val(relay and "circuits")
+    set circuit to map_get_val(circuits and circuit_id)
+    if circuit == 0:
+        set ok to map_insert(result and "error" and RELAY_ERR_NOT_FOUND)
+        return result
+
+    set ok to map_insert(result and "source" and map_get_val(circuit and "source"))
+    set ok to map_insert(result and "target" and map_get_val(circuit and "target"))
+    set ok to map_insert(result and "state" and map_get_val(circuit and "state"))
+    set ok to map_insert(result and "bytes_relayed" and map_get_val(circuit and "bytes_relayed"))
+    set ok to map_insert(result and "messages_relayed" and map_get_val(circuit and "messages_relayed"))
+    set ok to map_insert(result and "error" and RELAY_ERR_NONE)
+    return result
+
+# ================================================================
+# RPC Message Creation
+# ================================================================
+
+define create_relay_register_msg with sender_id as Str and pub_hex as Str:
+    set msg to create_map()
+    set ok to map_insert(msg and "type" and RELAY_MSG_REGISTER)
+    set ok to map_insert(msg and "sender" and sender_id)
+    set ok to map_insert(msg and "pub_hex" and pub_hex)
+    set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
+    return msg
+
+define create_relay_connect_msg with sender_id as Str and target_id as Str:
+    set msg to create_map()
+    set ok to map_insert(msg and "type" and RELAY_MSG_CONNECT)
+    set ok to map_insert(msg and "sender" and sender_id)
+    set ok to map_insert(msg and "target" and target_id)
+    set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
+    return msg
+
+define create_relay_data_msg with sender_id as Str and circuit_id as Str and encrypted_data as Str:
+    set msg to create_map()
+    set ok to map_insert(msg and "type" and RELAY_MSG_DATA)
+    set ok to map_insert(msg and "sender" and sender_id)
+    set ok to map_insert(msg and "circuit_id" and circuit_id)
+    set ok to map_insert(msg and "data" and encrypted_data)
+    set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
+    return msg
+
+define create_relay_disconnect_msg with sender_id as Str and circuit_id as Str:
+    set msg to create_map()
+    set ok to map_insert(msg and "type" and RELAY_MSG_DISCONNECT)
+    set ok to map_insert(msg and "sender" and sender_id)
+    set ok to map_insert(msg and "circuit_id" and circuit_id)
+    set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
+    return msg
+
+define create_relay_heartbeat_msg with sender_id as Str:
+    set msg to create_map()
+    set ok to map_insert(msg and "type" and RELAY_MSG_HEARTBEAT)
+    set ok to map_insert(msg and "sender" and sender_id)
+    set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
+    return msg
+
+# ================================================================
+# RPC Handler
+# ================================================================
+
+define relay_handle_message with relay as Int and msg as Int:
+    set result to create_map()
+    set msg_type to map_get_val(msg and "type")
+    set sender_id to map_get_val(msg and "sender")
+
+    if msg_type == RELAY_MSG_REGISTER:
+        set pub_hex to map_get_val(msg and "pub_hex")
+        set reg_addr to ptr_to_str(map_get_val(msg and "address"))
+        set reg_port to map_get_val(msg and "port")
+        if reg_port == 0:
+            set reg_port to 9100
+        if string_length(reg_addr) == 0:
+            set reg_addr to "127.0.0.1"
+        set reg_err to relay_register(relay and sender_id and pub_hex and reg_addr and reg_port)
+        set reply to create_map()
+        set ok to map_insert(reply and "type" and RELAY_MSG_REGISTER_ACK)
+        set ok to map_insert(reply and "status" and reg_err)
+        set ok to map_insert(result and "reply" and reply)
+        set ok to map_insert(result and "error" and reg_err)
+        return result
+
+    if msg_type == RELAY_MSG_CONNECT:
+        set target_id to map_get_val(msg and "target")
+        set circuit_result to relay_create_circuit(relay and sender_id and target_id)
+        set circuit_err to map_get_val(circuit_result and "error")
+
+        set reply to create_map()
+        set ok to map_insert(reply and "type" and RELAY_MSG_CONNECT_ACK)
+        set ok to map_insert(reply and "status" and circuit_err)
+        if circuit_err == RELAY_ERR_NONE:
+            set ok to map_insert(reply and "circuit_id" and map_get_val(circuit_result and "circuit_id"))
+        set ok to map_insert(result and "reply" and reply)
+        set ok to map_insert(result and "error" and circuit_err)
+        return result
+
+    if msg_type == RELAY_MSG_DATA:
+        set circuit_id to map_get_val(msg and "circuit_id")
+        set data to map_get_val(msg and "data")
+        set fwd to relay_forward_data(relay and circuit_id and data)
+        set fwd_err to map_get_val(fwd and "error")
+
+        set reply to create_map()
+        set ok to map_insert(reply and "type" and RELAY_MSG_DATA_ACK)
+        set ok to map_insert(reply and "status" and fwd_err)
+        if fwd_err == RELAY_ERR_NONE:
+            set ok to map_insert(reply and "target" and map_get_val(fwd and "target"))
+            set ok to map_insert(reply and "data" and data)
+        set ok to map_insert(result and "reply" and reply)
+        set ok to map_insert(result and "error" and fwd_err)
+        return result
+
+    if msg_type == RELAY_MSG_DISCONNECT:
+        set circuit_id to map_get_val(msg and "circuit_id")
+        set close_err to relay_close_circuit(relay and circuit_id)
+        set reply to create_map()
+        set ok to map_insert(reply and "type" and RELAY_MSG_DISCONNECT)
+        set ok to map_insert(reply and "status" and close_err)
+        set ok to map_insert(result and "reply" and reply)
+        set ok to map_insert(result and "error" and close_err)
+        return result
+
+    if msg_type == RELAY_MSG_HEARTBEAT:
+        set registrations to map_get_val(relay and "registrations")
+        set reg to map_get_val(registrations and sender_id)
+        if reg != 0:
+            set ok to refresh_registration(reg)
+        set reply to create_map()
+        set ok to map_insert(reply and "type" and RELAY_MSG_HEARTBEAT_ACK)
+        set ok to map_insert(result and "reply" and reply)
+        set ok to map_insert(result and "error" and RELAY_ERR_NONE)
+        return result
+
+    set ok to map_insert(result and "error" and RELAY_ERR_INVALID_MESSAGE)
+    return result

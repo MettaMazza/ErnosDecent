@@ -1,0 +1,62 @@
+# ErnosDecent — Raw Memory Helper for FFI
+# Component: decent_id/mem.ep
+# Provides: C heap byte buffer allocation for libsodium FFI interop
+# Status: Production — OperationTrojanClaude Phase 1
+#
+# EP lists store long long (8 bytes per element), but libsodium expects
+# contiguous byte arrays. This module provides calloc/free/memcpy wrappers
+# that allocate proper byte-sized buffers on the C heap.
+
+external define ep_dlopen with lib:
+external define ep_dlsym with handle and name:
+external define ep_dlcall1 with fn and a0:
+external define ep_dlcall2 with fn and a0 and a1:
+external define ep_dlcall3 with fn and a0 and a1 and a2:
+
+set LIBC_HANDLE to 0
+set FN_CALLOC to 0
+set FN_FREE to 0
+set FN_MEMCPY to 0
+set FN_MEMSET to 0
+
+define mem_init:
+    if LIBC_HANDLE != 0:
+        return 1
+    # macOS: libSystem.B.dylib contains calloc/free/memcpy
+    set LIBC_HANDLE to ep_dlopen("libSystem.B.dylib")
+    if LIBC_HANDLE == 0:
+        # Linux fallback
+        set LIBC_HANDLE to ep_dlopen("libc.so.6")
+    if LIBC_HANDLE == 0:
+        set LIBC_HANDLE to ep_dlopen("libc.so")
+    if LIBC_HANDLE == 0:
+        display "ERROR: Cannot load libc for memory allocation"
+        return 0
+    set FN_CALLOC to ep_dlsym(LIBC_HANDLE and "calloc")
+    set FN_FREE to ep_dlsym(LIBC_HANDLE and "free")
+    set FN_MEMCPY to ep_dlsym(LIBC_HANDLE and "memcpy")
+    set FN_MEMSET to ep_dlsym(LIBC_HANDLE and "memset")
+    return 1
+
+define mem_alloc with size:
+    # Allocate `size` bytes of zeroed memory on the C heap
+    # Returns: pointer (Int) to the allocated block, or 0 on failure
+    set ok to mem_init()
+    if ok == 0:
+        return 0
+    # calloc(1, size) — allocate 1 block of `size` bytes, zeroed
+    return ep_dlcall2(FN_CALLOC and 1 and size)
+
+define mem_free with ptr:
+    # Free a block allocated by mem_alloc
+    if ptr == 0:
+        return 0
+    set ok to mem_init()
+    return ep_dlcall1(FN_FREE and ptr)
+
+define mem_zero with ptr and size:
+    # Zero out a memory region
+    if ptr == 0:
+        return 0
+    set ok to mem_init()
+    return ep_dlcall3(FN_MEMSET and ptr and 0 and size)

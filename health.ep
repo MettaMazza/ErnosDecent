@@ -1,0 +1,168 @@
+# ErnosDecent -- Health Check System
+# Component: health.ep
+# Provides self-diagnostic checks for all subsystems
+# Returns structured health report
+# Status: Production
+
+import "collections"
+import "string"
+import "net"
+import "./decent_net/dht"
+import "./decent_consensus/raft"
+import "./decent_net/relay"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set HEALTH_OK to "healthy"
+set HEALTH_DEGRADED to "degraded"
+set HEALTH_DOWN to "down"
+
+# ================================================================
+# Individual Health Checks
+# ================================================================
+
+define check_crypto_health returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "subsystem" and "crypto")
+    set err to init_crypto()
+    if err == 0:
+        set ok to map_insert(result and "status" and HEALTH_OK)
+    else:
+        set ok to map_insert(result and "status" and HEALTH_DOWN)
+        set ok to map_insert(result and "error" and "crypto init failed")
+    return result
+
+define check_dht_health with dht as Int returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "subsystem" and "dht")
+    set peer_count to dht_node_peer_count(dht)
+    set ok to map_insert(result and "peer_count" and peer_count)
+    if peer_count > 0:
+        set ok to map_insert(result and "status" and HEALTH_OK)
+    else:
+        set ok to map_insert(result and "status" and HEALTH_DEGRADED)
+        set ok to map_insert(result and "warning" and "no peers discovered")
+    return result
+
+define check_raft_health with borrow raft_node as Map returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "subsystem" and "consensus")
+    set role to map_get_val(raft_node and "role")
+    set term to map_get_val(raft_node and "current_term")
+    set ok to map_insert(result and "role" and role)
+    set ok to map_insert(result and "term" and term)
+    # F5: report REAL liveness, not a hardcoded OK. Healthy only if the raft server
+    # thread actually bound its port ("server_ready"=1, set by raft_server_thread
+    # after a successful bind) AND the node loop is still running ("running"=1, set
+    # at startup / cleared on shutdown). Otherwise say so (DEGRADED) rather than
+    # claiming healthy.
+    set bound to 0
+    if map_contains(raft_node and "server_ready") == 1:
+        set bound to map_get_val(raft_node and "server_ready")
+    set running to 0
+    if map_contains(raft_node and "running") == 1:
+        set running to map_get_val(raft_node and "running")
+    if bound == 1 and also running == 1:
+        set ok to map_insert(result and "status" and HEALTH_OK)
+    else:
+        set ok to map_insert(result and "status" and HEALTH_DEGRADED)
+        set ok to map_insert(result and "warning" and "consensus server not running")
+    return result
+
+define check_network_health returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "subsystem" and "network")
+    # Check if we can bind a test port
+    set test_fd to ep_net_listen(59999)
+    if test_fd >= 0:
+        set ok to ep_net_close(test_fd)
+        set ok to map_insert(result and "status" and HEALTH_OK)
+        set ok to map_insert(result and "tcp_stack" and "available")
+    else:
+        set ok to map_insert(result and "status" and HEALTH_DEGRADED)
+        set ok to map_insert(result and "warning" and "tcp bind test failed")
+    return result
+
+define check_ipc_health with ipc_port as Int returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "subsystem" and "ipc")
+    set ok to map_insert(result and "port" and ipc_port)
+    # IPC is healthy if we got this far (called from IPC handler)
+    set ok to map_insert(result and "status" and HEALTH_OK)
+    return result
+
+# ================================================================
+# Full Health Report
+# ================================================================
+
+define run_health_check with dht as Int and borrow raft_node as Map and ipc_port as Int returning Map:
+    set report to create_map()
+    set checks to create_list()
+
+    set crypto_h to check_crypto_health()
+    set ok to append_list(checks and crypto_h)
+
+    set dht_h to check_dht_health(dht)
+    set ok to append_list(checks and dht_h)
+
+    set raft_h to check_raft_health(raft_node)
+    set ok to append_list(checks and raft_h)
+
+    set net_h to check_network_health()
+    set ok to append_list(checks and net_h)
+
+    set ipc_h to check_ipc_health(ipc_port)
+    set ok to append_list(checks and ipc_h)
+
+    set ok to map_insert(report and "checks" and checks)
+    set ok to map_insert(report and "check_count" and length_list(checks))
+
+    # Determine overall status
+    set overall to HEALTH_OK
+    set ci to 0
+    set total to length_list(checks)
+    repeat while ci < total:
+        set check to get_list(checks and ci)
+        set status to map_get_val(check and "status")
+        if status equals HEALTH_DOWN:
+            set overall to HEALTH_DOWN
+        else:
+            if status equals HEALTH_DEGRADED:
+                if overall equals HEALTH_OK:
+                    set overall to HEALTH_DEGRADED
+        set ci to ci + 1
+
+    set ok to map_insert(report and "overall" and overall)
+    set ok to map_insert(report and "timestamp" and ep_time_now_sec())
+    return report
+
+# ================================================================
+# Format health report as string
+# ================================================================
+
+define format_health_report with report as Map returning Str:
+    set overall to map_get_val(report and "overall")
+    set timestamp to map_get_val(report and "timestamp")
+    set checks to map_get_val(report and "checks")
+    set total to length_list(checks)
+
+    set out to concat("health:" and overall)
+    set out to concat(out and ",timestamp:")
+    set out to concat(out and int_to_string(timestamp))
+    set out to concat(out and ",checks:")
+    set out to concat(out and int_to_string(total))
+
+    set ci to 0
+    repeat while ci < total:
+        set check to get_list(checks and ci)
+        set subsys to map_get_val(check and "subsystem")
+        set status to map_get_val(check and "status")
+        set out to concat(out and ",")
+        set out to concat(out and subsys)
+        set out to concat(out and ":")
+        set out to concat(out and status)
+        set ci to ci + 1
+
+    return out

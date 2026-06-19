@@ -1,0 +1,730 @@
+# ErnosPlain Web Search and Visit Subsystem
+# Component: decent_agent/web_search.ep
+
+import "collections"
+import "string"
+import "json"
+import "fs"
+import "os"
+
+# URL encoding helper function
+define web_search_urlencode with input as Str returning Str:
+    set len to string_length(input)
+    set encoded to ""
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(input and i)
+        if (ch >= 48 and ch <= 57) or else (ch >= 65 and ch <= 90) or else (ch >= 97 and ch <= 122) or else ch == 45 or else ch == 95 or else ch == 46 or else ch == 126:
+            set encoded to concat(encoded and char_from_code(ch))
+        else if ch == 32:
+            set encoded to concat(encoded and "%20")
+        else:
+            set h1 to ch / 16
+            set h2 to ch % 16
+            set hex_chars to "0123456789ABCDEF"
+            set c1 to substring(hex_chars and h1 and 1)
+            set c2 to substring(hex_chars and h2 and 1)
+            set encoded to concat(encoded and concat("%" and concat(c1 and c2)))
+        set i to i + 1
+    return encoded
+
+# Parse .env key-value pairs
+define parse_env_file with path as Str and key as Str returning Str:
+    if file_exists(path) == 0:
+        return ""
+    set content to read_file(path)
+    set lines to string_split(content and "\n")
+    set count to length_list(lines)
+    set i to 0
+    set prefix to concat(key and "=")
+    set result to ""
+    repeat while i < count:
+        set line to string_trim(get_list(lines and i))
+        if string_length(line) > 0 and also get_character(line and 0) != 35:
+            if string_index_of(line and prefix) == 0:
+                set val_start to string_length(prefix)
+                set val to substring(line and val_start and string_length(line) - val_start)
+                set val_trimmed to string_trim(val)
+                set v_len to string_length(val_trimmed)
+                if v_len >= 2:
+                    set first_ch to get_character(val_trimmed and 0)
+                    set last_ch to get_character(val_trimmed and v_len - 1)
+                    if (first_ch == 34 and last_ch == 34) or else (first_ch == 39 and last_ch == 39):
+                        set val_trimmed to substring(val_trimmed and 1 and v_len - 2)
+                set result to val_trimmed
+        set i to i + 1
+    return result
+
+# Resolve key from OS environment or file configs
+define web_search_get_api_key with key as Str returning Str:
+    set cmd to concat("printenv " and key)
+    set raw_env to run_command(cmd)
+    set env_val to string_trim(raw_env)
+    if string_length(env_val) > 0 and also string_contains(env_val and "not found") == 0:
+        return env_val
+    set local_val to parse_env_file(".env" and key)
+    if string_length(local_val) > 0:
+        return local_val
+    set parent_val to parse_env_file("../.env" and key)
+    if string_length(parent_val) > 0:
+        return parent_val
+    set ws_val to parse_env_file("../../.env" and key)
+    if string_length(ws_val) > 0:
+        return ws_val
+    return ""
+
+# Execute standard system curl commands
+define web_search_http_get with url as Str and headers_list as List returning Str:
+    set cmd to "curl -s -L"
+    set h_len to length_list(headers_list)
+    set hi to 0
+    repeat while hi < h_len:
+        set h_val to get_list(headers_list and hi)
+        set h_escaped to string_replace(h_val and "'" and "'\\''")
+        set cmd to concat(cmd and concat(" -H '" and concat(h_escaped and "'")))
+        set hi to hi + 1
+        
+    set has_ua to 0
+    set hi to 0
+    repeat while hi < h_len:
+        set h_val to get_list(headers_list and hi)
+        set h_lower to string_to_lower(h_val)
+        if string_index_of(h_lower and "user-agent:") == 0:
+            set has_ua to 1
+        set hi to hi + 1
+    if has_ua == 0:
+        set cmd to concat(cmd and " -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'")
+        
+    set url_escaped to string_replace(url and "'" and "'\\''")
+    set cmd to concat(cmd and concat(" '" and concat(url_escaped and "'")))
+    
+    set res to run_command(cmd)
+    return res
+
+# Strip script, style, and HTML elements
+define web_search_strip_html with html as Str returning Str:
+    set len to string_length(html)
+    set result_list to create_list()
+    set in_tag to 0
+    set in_script to 0
+    set in_style to 0
+    set i to 0
+    
+    set html_lower to string_to_lower(html)
+    
+    repeat while i < len:
+        set ch to get_character(html and i)
+        
+        if in_script == 1:
+            if ch == 60:
+                if i + 9 <= len and also substring(html_lower and i and 9) equals "</script>":
+                    set in_script to 0
+                    set in_tag to 0
+                    set i to i + 9
+                    continue
+            set i to i + 1
+            continue
+            
+        if in_style == 1:
+            if ch == 60:
+                if i + 8 <= len and also substring(html_lower and i and 8) equals "</style>":
+                    set in_style to 0
+                    set in_tag to 0
+                    set i to i + 8
+                    continue
+            set i to i + 1
+            continue
+            
+        if ch == 60:
+            if i + 7 <= len and also substring(html_lower and i and 7) equals "<script":
+                set in_script to 1
+                set in_tag to 1
+                set i to i + 7
+                continue
+            if i + 6 <= len and also substring(html_lower and i and 6) equals "<style":
+                set in_style to 1
+                set in_tag to 1
+                set i to i + 6
+                continue
+            set in_tag to 1
+            set i to i + 1
+            continue
+            
+        if ch == 62:
+            set in_tag to 0
+            set ok to append_list(result_list and 32)
+            set i to i + 1
+            continue
+            
+        if in_tag == 0:
+            set ok to append_list(result_list and ch)
+            
+        set i to i + 1
+        
+    set raw_text to string_from_list(result_list)
+    free_list(result_list)
+    
+    set cleaned to string_replace(raw_text and "&amp;" and "&")
+    set cleaned to string_replace(cleaned and "&lt;" and "<")
+    set cleaned to string_replace(cleaned and "&gt;" and ">")
+    set cleaned to string_replace(cleaned and "&quot;" and "\"")
+    set cleaned to string_replace(cleaned and "&#39;" and "'")
+    set cleaned to string_replace(cleaned and "&nbsp;" and " ")
+    
+    set words to string_split(cleaned and " ")
+    set w_count to length_list(words)
+    set final_list to create_list()
+    set wi to 0
+    set added_any to 0
+    repeat while wi < w_count:
+        set w to get_list(words and wi)
+        set w_trimmed to string_trim(w)
+        set w_len to string_length(w_trimmed)
+        if w_len > 0:
+            if added_any == 1:
+                set ok to append_list(final_list and 32) # Space
+            else:
+                set added_any to 1
+            set wch_i to 0
+            repeat while wch_i < w_len:
+                set wch to get_character(w_trimmed and wch_i)
+                set ok to append_list(final_list and wch)
+                set wch_i to wch_i + 1
+        set wi to wi + 1
+    set final_text to string_from_list(final_list)
+    free_list(final_list)
+    return final_text
+
+# Tier 1: Brave Search
+define web_search_brave with query as Str and api_key as Str returning Str:
+    set q_encoded to web_search_urlencode(query)
+    set url to concat("https://api.search.brave.com/res/v1/web/search?q=" and concat(q_encoded and "&count=10&text_decorations=false"))
+    set headers to create_list()
+    set ok to append_list(headers and "Accept: application/json")
+    set ok to append_list(headers and concat("X-Subscription-Token: " and api_key))
+    set raw_resp to web_search_http_get(url and headers)
+    
+    if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
+        return ""
+        
+    set root to json_parse(raw_resp)
+    if root == 0:
+        return ""
+        
+    set web_node to get_json_object_value(root and "web")
+    if web_node == 0:
+        return ""
+    set results_node to get_json_object_value(web_node and "results")
+    if results_node == 0:
+        return ""
+        
+    set results_list to get_json_value(results_node)
+    set r_len to length_list(results_list)
+    if r_len == 0:
+        return ""
+        
+    set out to concat("--- BRAVE SEARCH RESULTS for '" and concat(query and "' ---\n"))
+    set limit to 8
+    if limit > r_len:
+        set limit to r_len
+    set ri to 0
+    repeat while ri < limit:
+        set item to get_list(results_list and ri)
+        set title_node to get_json_object_value(item and "title")
+        set desc_node to get_json_object_value(item and "description")
+        set url_node to get_json_object_value(item and "url")
+        
+        set title to "Untitled"
+        if title_node != 0:
+            set title to get_json_value(title_node)
+        set desc to ""
+        if desc_node != 0:
+            set desc to get_json_value(desc_node)
+        set item_url to ""
+        if url_node != 0:
+            set item_url to get_json_value(url_node)
+            
+        set out to concat(out and f"\n• {title}\n  {desc}\n  {item_url}\n")
+        set ri to ri + 1
+        
+    return out
+
+# Tier 2: Serper.dev Google SERP
+define web_search_serper with query as Str and api_key as Str returning Str:
+    set q_escaped to string_replace(query and "\\" and "\\\\")
+    set q_escaped to string_replace(q_escaped and "\"" and "\\\"")
+    set payload to concat("{\"q\": \"" and concat(q_escaped and "\", \"num\": 10}"))
+    set payload_escaped to string_replace(payload and "'" and "'\\''")
+    
+    set api_key_escaped to string_replace(api_key and "'" and "'\\''")
+    set cmd to concat("curl -s -X POST -H 'X-API-KEY: " and concat(api_key_escaped and concat("' -H 'Content-Type: application/json' -d '" and concat(payload_escaped and "' 'https://google.serper.dev/search'"))))
+    
+    set raw_resp to run_command(cmd)
+    if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
+        return ""
+        
+    set root to json_parse(raw_resp)
+    if root == 0:
+        return ""
+        
+    set out to concat("--- SERPER SEARCH RESULTS for '" and concat(query and "' ---\n"))
+    set has_data to 0
+    
+    set kg_node to get_json_object_value(root and "knowledgeGraph")
+    if kg_node != 0:
+        set title_node to get_json_object_value(kg_node and "title")
+        set desc_node to get_json_object_value(kg_node and "description")
+        if title_node != 0:
+            set title to get_json_value(title_node)
+            set desc to ""
+            if desc_node != 0:
+                set desc to get_json_value(desc_node)
+            set out to concat(out and f"\n📋 Knowledge Graph: {title} — {desc}\n")
+            set has_data to 1
+            
+    set ab_node to get_json_object_value(root and "answerBox")
+    if ab_node != 0:
+        set ans_node to get_json_object_value(ab_node and "answer")
+        if ans_node == 0:
+            set ans_node to get_json_object_value(ab_node and "snippet")
+        if ans_node != 0:
+            set ans to get_json_value(ans_node)
+            set out to concat(out and f"\n💡 Answer Box: {ans}\n")
+            set has_data to 1
+            
+    set org_node to get_json_object_value(root and "organic")
+    if org_node != 0:
+        set org_list to get_json_value(org_node)
+        set o_len to length_list(org_list)
+        set limit to 8
+        if limit > o_len:
+            set limit to o_len
+        set oi to 0
+        repeat while oi < limit:
+            set item to get_list(org_list and oi)
+            set title_node to get_json_object_value(item and "title")
+            set snippet_node to get_json_object_value(item and "snippet")
+            set link_node to get_json_object_value(item and "link")
+            
+            set title to "Untitled"
+            if title_node != 0:
+                set title to get_json_value(title_node)
+            set snippet to ""
+            if snippet_node != 0:
+                set snippet to get_json_value(snippet_node)
+            set link to ""
+            if link_node != 0:
+                set link to get_json_value(link_node)
+                
+            set out to concat(out and f"\n• {title}\n  {snippet}\n  {link}\n")
+            set oi to oi + 1
+            set has_data to 1
+            
+    if has_data == 0:
+        return ""
+    return out
+
+# Tier 3: Tavily AI
+define web_search_tavily with query as Str and api_key as Str returning Str:
+    set q_escaped to string_replace(query and "\\" and "\\\\")
+    set q_escaped to string_replace(q_escaped and "\"" and "\\\"")
+    set api_key_escaped to string_replace(api_key and "\\" and "\\\\")
+    set api_key_escaped to string_replace(api_key_escaped and "\"" and "\\\"")
+    
+    set payload to concat("{\"api_key\": \"" and concat(api_key_escaped and concat("\", \"query\": \"" and concat(q_escaped and "\", \"search_depth\": \"basic\", \"max_results\": 8, \"include_answer\": true}"))))
+    set payload_escaped to string_replace(payload and "'" and "'\\''")
+    
+    set cmd to concat("curl -s -X POST -H 'Content-Type: application/json' -d '" and concat(payload_escaped and "' 'https://api.tavily.com/search'"))
+    set raw_resp to run_command(cmd)
+    
+    if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
+        return ""
+        
+    set root to json_parse(raw_resp)
+    if root == 0:
+        return ""
+        
+    set out to concat("--- TAVILY SEARCH RESULTS for '" and concat(query and "' ---\n"))
+    set has_data to 0
+    
+    set ans_node to get_json_object_value(root and "answer")
+    if ans_node != 0:
+        set ans to get_json_value(ans_node)
+        if string_length(ans) > 0:
+            set out to concat(out and f"\n💡 Tavily Answer: {ans}\n")
+            set has_data to 1
+            
+    set res_node to get_json_object_value(root and "results")
+    if res_node != 0:
+        set res_list to get_json_value(res_node)
+        set r_len to length_list(res_list)
+        set limit to 8
+        if limit > r_len:
+            set limit to r_len
+        set ri to 0
+        repeat while ri < limit:
+            set item to get_list(res_list and ri)
+            set title_node to get_json_object_value(item and "title")
+            set content_node to get_json_object_value(item and "content")
+            set url_node to get_json_object_value(item and "url")
+            
+            set title to "Untitled"
+            if title_node != 0:
+                set title to get_json_value(title_node)
+            set content to ""
+            if content_node != 0:
+                set content to get_json_value(content_node)
+            set item_url to ""
+            if url_node != 0:
+                set item_url to get_json_value(url_node)
+                
+            set out to concat(out and f"\n• {title}\n  {content}\n  {item_url}\n")
+            set ri to ri + 1
+            set has_data to 1
+            
+    if has_data == 0:
+        return ""
+    return out
+
+# Tier 4: SerpAPI
+define web_search_serpapi with query as Str and api_key as Str returning Str:
+    set q_encoded to web_search_urlencode(query)
+    set api_escaped to web_search_urlencode(api_key)
+    set url to concat("https://serpapi.com/search.json?q=" and concat(q_encoded and concat("&api_key=" and concat(api_escaped and "&engine=google&num=10"))))
+    
+    set headers to create_list()
+    set raw_resp to web_search_http_get(url and headers)
+    
+    if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
+        return ""
+        
+    set root to json_parse(raw_resp)
+    if root == 0:
+        return ""
+        
+    set out to concat("--- SERPAPI SEARCH RESULTS for '" and concat(query and "' ---\n"))
+    set has_data to 0
+    
+    set ab_node to get_json_object_value(root and "answer_box")
+    if ab_node != 0:
+        set ans_node to get_json_object_value(ab_node and "answer")
+        if ans_node == 0:
+            set ans_node to get_json_object_value(ab_node and "snippet")
+        if ans_node == 0:
+            set ans_node to get_json_object_value(ab_node and "result")
+        if ans_node != 0:
+            set ans to get_json_value(ans_node)
+            set out to concat(out and f"\n💡 Answer Box: {ans}\n")
+            set has_data to 1
+            
+    set kg_node to get_json_object_value(root and "knowledge_graph")
+    if kg_node != 0:
+        set title_node to get_json_object_value(kg_node and "title")
+        set desc_node to get_json_object_value(kg_node and "description")
+        if title_node != 0:
+            set title to get_json_value(title_node)
+            set desc to ""
+            if desc_node != 0:
+                set desc to get_json_value(desc_node)
+            set out to concat(out and f"\n📋 Knowledge Graph: {title} — {desc}\n")
+            set has_data to 1
+            
+    set org_node to get_json_object_value(root and "organic_results")
+    if org_node != 0:
+        set org_list to get_json_value(org_node)
+        set o_len to length_list(org_list)
+        set limit to 8
+        if limit > o_len:
+            set limit to o_len
+        set oi to 0
+        repeat while oi < limit:
+            set item to get_list(org_list and oi)
+            set title_node to get_json_object_value(item and "title")
+            set snippet_node to get_json_object_value(item and "snippet")
+            set link_node to get_json_object_value(item and "link")
+            
+            set title to "Untitled"
+            if title_node != 0:
+                set title to get_json_value(title_node)
+            set snippet to ""
+            if snippet_node != 0:
+                set snippet to get_json_value(snippet_node)
+            set link to ""
+            if link_node != 0:
+                set link to get_json_value(link_node)
+                
+            set out to concat(out and f"\n• {title}\n  {snippet}\n  {link}\n")
+            set oi to oi + 1
+            set has_data to 1
+            
+    if has_data == 0:
+        return ""
+    return out
+
+# Tier 5: DuckDuckGo Scrape
+define web_search_ddg with query as Str returning Str:
+    set q_encoded to web_search_urlencode(query)
+    set url to concat("https://html.duckduckgo.com/html/?q=" and q_encoded)
+    set headers to create_list()
+    set raw_resp to web_search_http_get(url and headers)
+    
+    if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
+        return ""
+        
+    if string_contains(raw_resp and "anomaly.js") == 1 or else string_contains(raw_resp and "challenge-form") == 1:
+        return ""
+        
+    set stripped to web_search_strip_html(raw_resp)
+    set words to string_split(stripped and " ")
+    set w_len to length_list(words)
+    if w_len < 50:
+        return ""
+        
+    return concat("--- DDG SEARCH RESULTS for '" and concat(query and concat("' ---\n" and stripped)))
+
+# Tier 6: Google Scrape
+define web_search_google with query as Str returning Str:
+    set q_encoded to web_search_urlencode(query)
+    set url to concat("https://www.google.com/search?q=" and concat(q_encoded and "&hl=en&num=10"))
+    set headers to create_list()
+    set raw_resp to web_search_http_get(url and headers)
+    
+    if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
+        return ""
+        
+    if string_contains(raw_resp and "unusual traffic") == 1 or else string_contains(raw_resp and "captcha") == 1 or else string_contains(raw_resp and "recaptcha") == 1:
+        return ""
+        
+    set stripped to web_search_strip_html(raw_resp)
+    set words to string_split(stripped and " ")
+    set w_len to length_list(words)
+    if w_len < 80:
+        return ""
+        
+    return concat("--- GOOGLE SEARCH RESULTS for '" and concat(query and concat("' ---\n" and stripped)))
+
+# Tier 7: Wikipedia API
+define web_search_wikipedia with query as Str returning Str:
+    set q_encoded to web_search_urlencode(query)
+    set url to concat("https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=" and concat(q_encoded and "&srlimit=5&format=json"))
+    set headers to create_list()
+    set raw_resp to web_search_http_get(url and headers)
+    
+    if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
+        return ""
+        
+    set root to json_parse(raw_resp)
+    if root == 0:
+        return ""
+        
+    set query_node to get_json_object_value(root and "query")
+    if query_node == 0:
+        return ""
+    set search_node to get_json_object_value(query_node and "search")
+    if search_node == 0:
+        return ""
+        
+    set search_list to get_json_value(search_node)
+    set s_len to length_list(search_list)
+    if s_len == 0:
+        return ""
+        
+    set results_str to ""
+    set first_title to ""
+    set si to 0
+    repeat while si < s_len:
+        set item to get_list(search_list and si)
+        set title_node to get_json_object_value(item and "title")
+        set snippet_node to get_json_object_value(item and "snippet")
+        
+        set title to ""
+        if title_node != 0:
+            set title to get_json_value(title_node)
+            if si == 0:
+                set first_title to title
+        set snippet to ""
+        if snippet_node != 0:
+            set snippet to web_search_strip_html(get_json_value(snippet_node))
+            
+        set item_url to concat("https://en.wikipedia.org/wiki/" and web_search_urlencode(title))
+        set results_str to concat(results_str and f"\n• {title}\n  {snippet}\n  {item_url}\n")
+        set si to si + 1
+        
+    if string_length(first_title) > 0:
+        set t_encoded to web_search_urlencode(first_title)
+        set ext_url to concat("https://en.wikipedia.org/w/api.php?action=query&titles=" and concat(t_encoded and "&prop=extracts&exintro=true&explaintext=true&format=json"))
+        set ext_resp to web_search_http_get(ext_url and headers)
+        if string_length(ext_resp) > 0 and also string_index_of(ext_resp and "Error:") != 0:
+            set ext_resp_clean to string_replace(ext_resp and "\\u" and "u")
+            set ext_root to json_parse(ext_resp_clean)
+            if ext_root != 0:
+                set ext_query to get_json_object_value(ext_root and "query")
+                if ext_query != 0:
+                    set ext_pages to get_json_object_value(ext_query and "pages")
+                    if ext_pages != 0:
+                        set page_keys to get_json_value(ext_pages)
+                        if length_list(page_keys) > 0:
+                            set first_key to get_list(page_keys and 0)
+                            set page_item to get_json_object_value(ext_pages and first_key)
+                            set extract_node to get_json_object_value(page_item and "extract")
+                            if extract_node != 0:
+                                set extract to get_json_value(extract_node)
+                                set ext_len to string_length(extract)
+                                if ext_len > 1500:
+                                    set extract to substring(extract and 0 and 1500)
+                                set results_str to concat(f"📋 Wikipedia Summary: {first_title}\n{extract}\n\n" and results_str)
+                                
+    return concat("--- WIKIPEDIA RESULTS for '" and concat(query and concat("' ---\n" and results_str)))
+
+# Tier 8: Google News RSS
+define web_search_google_news with query as Str returning Str:
+    set q_encoded to web_search_urlencode(query)
+    set url to concat("https://news.google.com/rss/search?q=" and concat(q_encoded and "&hl=en-GB&gl=GB&ceid=GB:en"))
+    set headers to create_list()
+    set raw_resp to web_search_http_get(url and headers)
+    
+    if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
+        return ""
+        
+    set parts to string_split(raw_resp and "<item>")
+    set p_len to length_list(parts)
+    if p_len <= 1:
+        return ""
+        
+    set out to concat("--- GOOGLE NEWS RSS for '" and concat(query and "' ---\n"))
+    set limit to 9
+    if limit > p_len:
+        set limit to p_len
+    set pi to 1
+    set has_data to 0
+    repeat while pi < limit:
+        set part to get_list(parts and pi)
+        
+        set title to ""
+        set link to ""
+        set desc to ""
+        set pubdate to ""
+        
+        set t_pos to string_index_of(part and "<title>")
+        if t_pos >= 0:
+            set t_end to string_index_of(part and "</title>")
+            if t_end > t_pos:
+                set val_start to t_pos + 7
+                set title to substring(part and val_start and t_end - val_start)
+                
+        set l_pos to string_index_of(part and "<link>")
+        if l_pos >= 0:
+            set l_end to string_index_of(part and "</link>")
+            if l_end > l_pos:
+                set val_start to l_pos + 6
+                set link to substring(part and val_start and l_end - val_start)
+                
+        set d_pos to string_index_of(part and "<description>")
+        if d_pos >= 0:
+            set d_end to string_index_of(part and "</description>")
+            if d_end > d_pos:
+                set val_start to d_pos + 13
+                set desc to web_search_strip_html(substring(part and val_start and d_end - val_start))
+                
+        set p_pos to string_index_of(part and "<pubDate>")
+        if p_pos >= 0:
+            set p_end to string_index_of(part and "</pubDate>")
+            if p_end > p_pos:
+                set val_start to p_pos + 9
+                set pubdate to substring(part and val_start and p_end - val_start)
+                
+        set title to string_replace(title and "<![CDATA[" and "")
+        set title to string_replace(title and "]]>" and "")
+        set link to string_replace(link and "<![CDATA[" and "")
+        set link to string_replace(link and "]]>" and "")
+        set desc to string_replace(desc and "<![CDATA[" and "")
+        set desc to string_replace(desc and "]]>" and "")
+        
+        set title to string_trim(title)
+        set link to string_trim(link)
+        set desc to string_trim(desc)
+        set pubdate to string_trim(pubdate)
+        
+        if string_length(title) > 0:
+            set out to concat(out and f"\n• {title}\n  {desc}\n  {link} | {pubdate}\n")
+            set has_data to 1
+        set pi to pi + 1
+        
+    if has_data == 0:
+        return ""
+    return out
+
+# Main Waterfall orchestrator
+define web_search_waterfall with query as Str returning Str:
+    # Tier 1: Brave Search
+    set brave_key to web_search_get_api_key("BRAVE_API_KEY")
+    if string_length(brave_key) == 0:
+        set brave_key to web_search_get_api_key("BRAVE_SEARCH_API_KEY")
+    if string_length(brave_key) > 0:
+        set res to web_search_brave(query and brave_key)
+        if string_length(res) > 0:
+            return res
+            
+    # Tier 2: Serper
+    set serper_key to web_search_get_api_key("SERPER_API_KEY")
+    if string_length(serper_key) > 0:
+        set res to web_search_serper(query and serper_key)
+        if string_length(res) > 0:
+            return res
+            
+    # Tier 3: Tavily
+    set tavily_key to web_search_get_api_key("TAVILY_API_KEY")
+    if string_length(tavily_key) > 0:
+        set res to web_search_tavily(query and tavily_key)
+        if string_length(res) > 0:
+            return res
+            
+    # Tier 4: SerpAPI
+    set serpapi_key to web_search_get_api_key("SERPAPI_API_KEY")
+    if string_length(serpapi_key) == 0:
+        set serpapi_key to web_search_get_api_key("SERPAPI_KEY")
+    if string_length(serpapi_key) > 0:
+        set res to web_search_serpapi(query and serpapi_key)
+        if string_length(res) > 0:
+            return res
+            
+    # Tier 5: Google News RSS (free, no key, and FRESH). This is the only free
+    # source that returns current news, so it must run before the scrapers and
+    # Wikipedia. Previously it was LAST, after Wikipedia -- which almost always
+    # returns a (stale, tangential) result -- so News RSS effectively never ran.
+    set res to web_search_google_news(query)
+    if string_length(res) > 0:
+        return res
+
+    # Tier 6: DuckDuckGo scrape
+    set res to web_search_ddg(query)
+    if string_length(res) > 0:
+        return res
+
+    # Tier 7: Google scrape
+    set res to web_search_google(query)
+    if string_length(res) > 0:
+        return res
+
+    # Tier 8: Wikipedia (last resort -- encyclopedic, lags real-time news)
+    set res to web_search_wikipedia(query)
+    if string_length(res) > 0:
+        return res
+
+    return concat("All search providers (Brave, Serper, Tavily, SerpAPI, Google News RSS, DuckDuckGo, Google, Wikipedia) returned no results for '" and concat(query and "'."))
+
+# Webpage visiting tool
+define web_search_visit with url as Str returning Str:
+    if string_index_of(url and "http://") != 0 and also string_index_of(url and "https://") != 0:
+        return "Error: URL must start with http:// or https://"
+    set headers to create_list()
+    set raw_resp to web_search_http_get(url and headers)
+    if string_length(raw_resp) == 0:
+        return "Error: failed to retrieve webpage or connection timed out."
+    if string_index_of(raw_resp and "Error:") == 0:
+        return raw_resp
+    set max_len to 100000
+    if string_length(raw_resp) > max_len:
+        set raw_resp to substring(raw_resp and 0 and max_len)
+    set stripped to web_search_strip_html(raw_resp)
+    return concat(f"--- WEBPAGE CONTENT ({url}) ---\n" and stripped)

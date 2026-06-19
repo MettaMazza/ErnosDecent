@@ -1,0 +1,236 @@
+# ErnosDecent — Host Election & Fallback Routing
+# Component: decent_net/host_election.ep
+# Implements: Dynamic seed node election, fallback routing, and active connection tracking.
+
+import "../decent_id/did"
+import "../decent_id/keys"
+import "../config.ep"
+import "collections"
+import "string"
+import "json"
+import "fs"
+import "transport"
+import "dht"
+
+external define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node as Int and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int returning Map
+
+
+# ================================================================
+# Conversion Helpers
+# ================================================================
+
+define host_cast_map_to_list with m as Map returning List:
+    return m
+
+define host_cast_borrow_to_list with b as List returning List:
+    return b
+
+define host_json_to_map with json_node as Int returning Map:
+    if json_node == 0:
+        return 0
+    set type to get_json_type(json_node)
+    if type == 4:
+        # Object
+        set res to create_map()
+        set keys to get_list(json_node and 1)
+        set values to get_list(json_node and 2)
+        set len to length_list(keys)
+        set i to 0
+        repeat while i < len:
+            set k to get_list(keys and i)
+            set v_node to get_list(values and i)
+            set v to host_json_to_map(v_node)
+            set ok to map_insert(res and k and v)
+            set i to i + 1
+        return res
+    if type == 3:
+        # List
+        set res to create_list()
+        set items to get_list(json_node and 1)
+        set len to length_list(items)
+        set i to 0
+        repeat while i < len:
+            set item_node to get_list(items and i)
+            set item_val to host_json_to_map(item_node)
+            set ok to append_list(res and item_val)
+            set i to i + 1
+        return res
+    if type == 2:
+        # String
+        return get_json_value(json_node)
+    if type == 1:
+        # Integer
+        return get_json_value(json_node)
+    return 0
+
+# ================================================================
+# Manual Serializer
+# ================================================================
+
+define host_list_serialize with list as List returning Str:
+    set res to "["
+    set len to length_list(list)
+    set i to 0
+    repeat while i < len:
+        set item to get_list(list and i)
+        set node_id to map_get_val(item and "node_id")
+        set addr to map_get_val(item and "address")
+        set port to map_get_val(item and "port")
+        set conn to map_get_val(item and "connections")
+        set ls to map_get_val(item and "last_seen")
+        set stat to map_get_val(item and "is_static")
+        
+        set item_str to "{"
+        set item_str to concat(item_str and f"\"node_id\":\"{node_id}\",")
+        set item_str to concat(item_str and f"\"address\":\"{addr}\",")
+        set item_str to concat(item_str and f"\"port\":{int_to_string(port)},")
+        set item_str to concat(item_str and f"\"connections\":{int_to_string(conn)},")
+        set item_str to concat(item_str and f"\"last_seen\":{int_to_string(ls)},")
+        set item_str to concat(item_str and f"\"is_static\":{int_to_string(stat)}")
+        set item_str to concat(item_str and "}")
+        
+        set res to concat(res and item_str)
+        if i < len - 1:
+            set res to concat(res and ",")
+        set i to i + 1
+    set res to concat(res and "]")
+    return res
+
+# ================================================================
+# Sorting Logic (Prioritizes static/preferred host, then connections desc)
+# ================================================================
+
+define sort_hosts_descending with list as List returning Int:
+    set len to length_list(list)
+    set i to 0
+    repeat while i < len:
+        set max_idx to i
+        set max_val to -1
+        
+        set j to i
+        repeat while j < len:
+            set item to get_list(list and j)
+            set conn_count to map_get_val(item and "connections")
+            set is_static to map_get_val(item and "is_static")
+            set score to conn_count
+            if is_static == 1:
+                set score to conn_count + 10000
+                
+            if score > max_val:
+                set max_val to score
+                set max_idx to j
+            set j to j + 1
+            
+        if max_idx != i:
+            set temp to get_list(list and i)
+            set ok to set_list(list and i and get_list(list and max_idx))
+            set ok to set_list(list and max_idx and temp)
+            
+        set i to i + 1
+    return 0
+
+# ================================================================
+# Main Heartbeat and Dynamic Election Loop
+# ================================================================
+
+define host_election_loop with dht_node as Int and local_id as Str and local_ip as Str and local_port as Int and is_static as Int and raft_node as Map and peers as List and pub_hex as Str and raft_port as Int returning Int:
+    display "[+] Host Election loop active."
+    
+    set prev_primary_id to ""
+    
+    repeat while 1 == 1:
+        sleep_ms(15000)
+        
+        set home to get_home_dir()
+        set cfg_path to concat(home and "/.ernosdecent/config.toml")
+        set is_static_active to is_static
+        set elect_enabled to 1
+        set cfg to config_load(cfg_path)
+        if cfg != 0:
+            if map_contains(cfg and "network.is_static_host") == 1:
+                set is_static_active to config_get_int(cfg and "network.is_static_host")
+            if map_contains(cfg and "network.enable_host_election") == 1:
+                set elect_enabled to config_get_int(cfg and "network.enable_host_election")
+            free_map(cfg)
+            
+        if elect_enabled == 1:
+            set connections_count to dht_node_peer_count(dht_node)
+            
+            # 1. Fetch current hosts list from DHT
+            set get_res to dht_node_get_value(dht_node and "network:host_nodes")
+            set err to map_get_val(get_res and "error")
+            set hosts_list to create_list()
+            
+            if err == 0:
+                set json_str to map_get_val(get_res and "value")
+                if string_length(json_str) > 0:
+                    set root to json_parse(json_str)
+                    if root != 0:
+                        set mapped to host_json_to_map(root)
+                        set hosts_list to host_cast_map_to_list(mapped)
+                        
+            # 2. Clean old entries and append/update ourselves
+            set now to ep_time_now_sec()
+            set new_list to create_list()
+            set list_len to length_list(hosts_list)
+            set found to 0
+            set i to 0
+            
+            repeat while i < list_len:
+                set item to get_list(hosts_list and i)
+                set h_id to map_get_val(item and "node_id")
+                set last_seen to map_get_val(item and "last_seen")
+                
+                # Keep hosts that were active within the last 45 seconds
+                if now - last_seen <= 45:
+                    if h_id equals local_id:
+                        set ok to map_insert(item and "connections" and connections_count)
+                        set ok to map_insert(item and "last_seen" and now)
+                        set ok to map_insert(item and "is_static" and is_static_active)
+                        set found to 1
+                    set ok to append_list(new_list and item)
+                set i to i + 1
+                
+            if found == 0:
+                set item to create_map()
+                set ok to map_insert(item and "node_id" and local_id)
+                set ok to map_insert(item and "address" and local_ip)
+                set ok to map_insert(item and "port" and local_port)
+                set ok to map_insert(item and "connections" and connections_count)
+                set ok to map_insert(item and "last_seen" and now)
+                set ok to map_insert(item and "is_static" and is_static_active)
+                set ok to append_list(new_list and item)
+                
+            # Sort and persist
+            set ok to sort_hosts_descending(new_list)
+            set serialized to host_list_serialize(new_list)
+            set store_err to dht_node_store_value(dht_node and "network:host_nodes" and serialized)
+            
+            # 3. Determine elected Primary Host
+            if length_list(new_list) > 0:
+                set primary to get_list(new_list and 0)
+                set primary_id to map_get_val(primary and "node_id")
+                set primary_addr to map_get_val(primary and "address")
+                set primary_port to map_get_val(primary and "port")
+                
+                if primary_id equals local_id:
+                    # We are the host!
+                    if prev_primary_id equals local_id == 0:
+                        display f"[Host Election] I have been elected as the Primary Host Node ({int_to_string(connections_count)} active peer(s))"
+                        set prev_primary_id to local_id
+                else:
+                    # Someone else is the host. If it changed, bootstrap to them
+                    if primary_id equals prev_primary_id == 0:
+                        display f"[Host Election] New Primary Host Node elected: {primary_id} at {primary_addr}:{int_to_string(primary_port)}"
+                        # Try bootstrapping
+                        # Import dynamically using extern bootstrap_to_seed or invoke directly
+                        set boot_res to bootstrap_to_seed(primary_addr and primary_port and dht_node and borrow raft_node and host_cast_borrow_to_list(peers) and local_id and pub_hex and raft_port)
+                        set prev_primary_id to primary_id
+                        
+            free_map(get_res)
+            free_list(hosts_list)
+            free_list(new_list)
+        else:
+            set prev_primary_id to ""
+        
+    return 0

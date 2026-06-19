@@ -1,0 +1,1134 @@
+# ErnosDecent — GitDec Engine
+# Component: decent_net/gitdec.ep
+# Implements: Persistent repositories, remote pushes/pulls, issue tracking, and PR reviews.
+
+import "../decent_id/did"
+import "../decent_id/keys"
+import "../decent_social/nostr"
+import "../storage"
+import "collections"
+import "string"
+import "fs"
+import "json"
+import "transport"
+
+# ================================================================
+# Constants and Error Codes
+# ================================================================
+
+set GITDEC_ERR_NONE to 0
+set GITDEC_ERR_REPO_NOT_FOUND to 801
+set GITDEC_ERR_UNAUTHORIZED to 802
+set GITDEC_ERR_VERIFICATION_FAILED to 803
+set GITDEC_ERR_INVALID_REF to 804
+set GITDEC_ERR_NOT_FOUND to 805
+
+# ================================================================
+# Conversion: JSON Nodes to Native Maps/Lists
+# ================================================================
+
+define json_to_map with json_node as Int returning Map:
+    if json_node == 0:
+        return 0
+    set type to get_json_type(json_node)
+    if type == 4:
+        # Object
+        set res to create_map()
+        set keys to get_list(json_node and 1)
+        set values to get_list(json_node and 2)
+        set len to length_list(keys)
+        set i to 0
+        repeat while i < len:
+            set k to get_list(keys and i)
+            set v_node to get_list(values and i)
+            set v to json_to_map(v_node)
+            set ok to map_insert(res and k and v)
+            set i to i + 1
+        return res
+    if type == 3:
+        # List
+        set res to create_list()
+        set items to get_list(json_node and 1)
+        set len to length_list(items)
+        set i to 0
+        repeat while i < len:
+            set item_node to get_list(items and i)
+            set item_val to json_to_map(item_node)
+            set ok to append_list(res and item_val)
+            set i to i + 1
+        return res
+    if type == 2:
+        # String
+        return get_json_value(json_node)
+    if type == 1:
+        # Integer
+        return get_json_value(json_node)
+    return 0
+
+# ================================================================
+# Custom Serializers
+# ================================================================
+
+define gitdec_serialize_manifest with manifest as Map returning Str:
+    if manifest == 0:
+        return "{}"
+    set id_val to map_get_val(manifest and "id")
+    set name_val to map_get_val(manifest and "name")
+    set collaborators to map_get_val(manifest and "authorized_collaborators")
+    set refs to map_get_val(manifest and "ref_heads")
+    
+    set json_str to "{\n"
+    set json_str to concat(json_str and f"  \"id\": \"{id_val}\",\n")
+    set json_str to concat(json_str and f"  \"name\": \"{name_val}\",\n")
+    
+    # collaborators map
+    set json_str to concat(json_str and "  \"authorized_collaborators\": {\n")
+    set collab_keys to map_keys(collaborators)
+    set c_len to length_list(collab_keys)
+    set i to 0
+    repeat while i < c_len:
+        set k to get_list(collab_keys and i)
+        set v to map_get_val(collaborators and k)
+        set json_str to concat(json_str and f"    \"{k}\": \"{v}\"")
+        if i < c_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    set json_str to concat(json_str and "  },\n")
+    
+    # refs map
+    set json_str to concat(json_str and "  \"ref_heads\": {\n")
+    set ref_keys to map_keys(refs)
+    set r_len to length_list(ref_keys)
+    set i to 0
+    repeat while i < r_len:
+        set k to get_list(ref_keys and i)
+        set v to map_get_val(refs and k)
+        set json_str to concat(json_str and f"    \"{k}\": \"{v}\"")
+        if i < r_len - 1:
+            set json_str to concat(json_str and ",\n")
+        else:
+            set json_str to concat(json_str and "\n")
+        set i to i + 1
+    set json_str to concat(json_str and "  }\n")
+    set json_str to concat(json_str and "}\n")
+    
+    free_list(collab_keys)
+    free_list(ref_keys)
+    return json_str
+
+define gitdec_save_manifest with filepath as Str and manifest as Map returning Int:
+    set json_str to gitdec_serialize_manifest(manifest)
+    set ok to write_file(filepath and json_str)
+    return 0
+
+
+define gitdec_save_issues with filepath as Str and root as Map returning Int:
+    set issues_list to map_get_val(root and "issues")
+    set json_str to "{\n  \"issues\": [\n"
+    set i_len to length_list(issues_list)
+    set i to 0
+    repeat while i < i_len:
+        set issue to get_list(issues_list and i)
+        set id_val to map_get_val(issue and "id")
+        set title_val to map_get_val(issue and "title")
+        set body_val to map_get_val(issue and "body")
+        set author_val to map_get_val(issue and "author")
+        set status_val to map_get_val(issue and "status")
+        set comments_list to map_get_val(issue and "comments")
+        
+        set json_str to concat(json_str and "    {\n")
+        set json_str to concat(json_str and f"      \"id\": \"{id_val}\",\n")
+        set json_str to concat(json_str and f"      \"title\": \"{title_val}\",\n")
+        set json_str to concat(json_str and f"      \"body\": \"{body_val}\",\n")
+        set json_str to concat(json_str and f"      \"author\": \"{author_val}\",\n")
+        set json_str to concat(json_str and f"      \"status\": \"{status_val}\",\n")
+        
+        # comments list
+        set json_str to concat(json_str and "      \"comments\": [\n")
+        set c_len to length_list(comments_list)
+        set j to 0
+        repeat while j < c_len:
+            set comment to get_list(comments_list and j)
+            set c_author to map_get_val(comment and "author")
+            set c_text to map_get_val(comment and "text")
+            set c_time to map_get_val(comment and "timestamp")
+            set json_str to concat(json_str and "        {\n")
+            set json_str to concat(json_str and f"          \"author\": \"{c_author}\",\n")
+            set json_str to concat(json_str and f"          \"text\": \"{c_text}\",\n")
+            set json_str to concat(json_str and f"          \"timestamp\": \"{c_time}\"\n")
+            if j < c_len - 1:
+                set json_str to concat(json_str and "        },\n")
+            else:
+                set json_str to concat(json_str and "        }\n")
+            set j to j + 1
+        set json_str to concat(json_str and "      ]\n")
+        
+        if i < i_len - 1:
+            set json_str to concat(json_str and "    },\n")
+        else:
+            set json_str to concat(json_str and "    }\n")
+        set i to i + 1
+    set json_str to concat(json_str and "  ]\n}\n")
+    set ok to write_file(filepath and json_str)
+    return 0
+
+define gitdec_save_prs with filepath as Str and root as Map returning Int:
+    set prs_list to map_get_val(root and "pull_requests")
+    set json_str to "{\n  \"pull_requests\": [\n"
+    set p_len to length_list(prs_list)
+    set i to 0
+    repeat while i < p_len:
+        set pr to get_list(prs_list and i)
+        set id_val to map_get_val(pr and "id")
+        set title_val to map_get_val(pr and "title")
+        set source_val to map_get_val(pr and "source_branch")
+        set target_val to map_get_val(pr and "target_branch")
+        set desc_val to map_get_val(pr and "description")
+        set author_val to map_get_val(pr and "author")
+        set status_val to map_get_val(pr and "status")
+        set reviews_list to map_get_val(pr and "reviews")
+        
+        set json_str to concat(json_str and "    {\n")
+        set json_str to concat(json_str and f"      \"id\": \"{id_val}\",\n")
+        set json_str to concat(json_str and f"      \"title\": \"{title_val}\",\n")
+        set json_str to concat(json_str and f"      \"source_branch\": \"{source_val}\",\n")
+        set json_str to concat(json_str and f"      \"target_branch\": \"{target_val}\",\n")
+        set json_str to concat(json_str and f"      \"description\": \"{desc_val}\",\n")
+        set json_str to concat(json_str and f"      \"author\": \"{author_val}\",\n")
+        set json_str to concat(json_str and f"      \"status\": \"{status_val}\",\n")
+        
+        # reviews list
+        set json_str to concat(json_str and "      \"reviews\": [\n")
+        set r_len to length_list(reviews_list)
+        set j to 0
+        repeat while j < r_len:
+            set review to get_list(reviews_list and j)
+            set r_reviewer to map_get_val(review and "reviewer")
+            set r_decision to map_get_val(review and "decision")
+            set r_comment to map_get_val(review and "comment")
+            set r_time to map_get_val(review and "timestamp")
+            set json_str to concat(json_str and "        {\n")
+            set json_str to concat(json_str and f"          \"reviewer\": \"{r_reviewer}\",\n")
+            set json_str to concat(json_str and f"          \"decision\": \"{r_decision}\",\n")
+            set json_str to concat(json_str and f"          \"comment\": \"{r_comment}\",\n")
+            set json_str to concat(json_str and f"          \"timestamp\": \"{r_time}\"\n")
+            if j < r_len - 1:
+                set json_str to concat(json_str and "        },\n")
+            else:
+                set json_str to concat(json_str and "        }\n")
+            set j to j + 1
+        set json_str to concat(json_str and "      ]\n")
+        
+        if i < p_len - 1:
+            set json_str to concat(json_str and "    },\n")
+        else:
+            set json_str to concat(json_str and "    }\n")
+        set i to i + 1
+    set json_str to concat(json_str and "  ]\n}\n")
+    set ok to write_file(filepath and json_str)
+    return 0
+
+# ================================================================
+# Initialization & File Utilities
+# ================================================================
+
+define gitdec_init returning Int:
+    if file_exists("config/gitdec") == 0:
+        set ok to create_directory("config/gitdec")
+    if file_exists("config/gitdec/repos") == 0:
+        set ok to create_directory("config/gitdec/repos")
+    return 0
+
+define gitdec_load_json with filepath as Str returning Map:
+    if file_exists(filepath) == 0:
+        return 0
+    set content to read_file(filepath)
+    set root to json_parse(content)
+    if root == 0:
+        return 0
+    set mapped to json_to_map(root)
+    return mapped
+
+# ================================================================
+# Repository Creation and Manifests
+# ================================================================
+
+define gitdec_create_repo with repo_id as Str and name as Str and owner_did as Str returning Map:
+    set ok to gitdec_init()
+    
+    set repo_dir to path_join("config/gitdec/repos" and repo_id)
+    if file_exists(repo_dir) == 0:
+        set ok to create_directory(repo_dir)
+        
+    set obj_dir to path_join(repo_dir and "objects")
+    if file_exists(obj_dir) == 0:
+        set ok to create_directory(obj_dir)
+        
+    set manifest_path to path_join(repo_dir and "gitdec.json")
+    
+    set manifest to create_map()
+    set collaborators to create_map()
+    set refs to create_map()
+    
+    # Owner has administrator role
+    set ok to map_insert(collaborators and owner_did and "owner")
+    
+    set ok to map_insert(manifest and "id" and repo_id)
+    set ok to map_insert(manifest and "name" and name)
+    set ok to map_insert(manifest and "authorized_collaborators" and collaborators)
+    set ok to map_insert(manifest and "ref_heads" and refs)
+    
+    set ok to gitdec_save_manifest(manifest_path and manifest)
+    return manifest
+
+define gitdec_add_collaborator with repo_id as Str and owner_did as Str and collab_did as Str and role as Str returning Int:
+    set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+    set manifest to gitdec_load_json(manifest_path)
+    if manifest == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+        
+    set collaborators to map_get_val(manifest and "authorized_collaborators")
+    set current_role to map_get_val(collaborators and owner_did)
+    if (current_role equals "owner") == 0:
+        return GITDEC_ERR_UNAUTHORIZED
+        
+    set ok to map_insert(collaborators and collab_did and role)
+    set ok to gitdec_save_manifest(manifest_path and manifest)
+    return GITDEC_ERR_NONE
+
+define gitdec_remove_collaborator with repo_id as Str and owner_did as Str and collab_did as Str returning Int:
+    set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+    set manifest to gitdec_load_json(manifest_path)
+    if manifest == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+        
+    set collaborators to map_get_val(manifest and "authorized_collaborators")
+    set current_role to map_get_val(collaborators and owner_did)
+    if (current_role equals "owner") == 0:
+        free_map(manifest)
+        return GITDEC_ERR_UNAUTHORIZED
+        
+    set ok to map_delete(collaborators and collab_did)
+    set ok to gitdec_save_manifest(manifest_path and manifest)
+    free_map(manifest)
+    return GITDEC_ERR_NONE
+
+define gitdec_delete_repo with repo_id as Str and caller_did as Str returning Int:
+    set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+    set manifest to gitdec_load_json(manifest_path)
+    if manifest == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+        
+    set collaborators to map_get_val(manifest and "authorized_collaborators")
+    set current_role to map_get_val(collaborators and caller_did)
+    if (current_role equals "owner") == 0:
+        free_map(manifest)
+        return GITDEC_ERR_UNAUTHORIZED
+        
+    free_map(manifest)
+    
+    set repo_dir to path_join("config/gitdec/repos" and repo_id)
+    if file_exists(repo_dir) == 1:
+        set cmd to concat("rm -rf " and repo_dir)
+        set ok to run_command(cmd)
+        
+    return GITDEC_ERR_NONE
+
+# ================================================================
+# Push and Pull Operations
+# ================================================================
+
+define gitdec_push_commit with repo_id as Str and pusher_did as Str and branch as Str and commit_hash as Str and payload as Str and signature as Str returning Int:
+    set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+    set manifest to gitdec_load_json(manifest_path)
+    if manifest == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+        
+    set collaborators to map_get_val(manifest and "authorized_collaborators")
+    set role to map_get_val(collaborators and pusher_did)
+    if role == 0:
+        return GITDEC_ERR_UNAUTHORIZED
+        
+    # Resolve pusher's public key from DID
+    set resolve_res to did_resolve(pusher_did)
+    set err to map_get_val(resolve_res and "error")
+    if err != 0:
+        return GITDEC_ERR_VERIFICATION_FAILED
+        
+    set keys_map to map_get_val(resolve_res and "verification_method")
+    set pub_key_hex to map_get_val(keys_map and "public_key_hex")
+    
+    # Verify signature of the payload (commit changes)
+    set verify_ok to verify_signature(payload and signature and pub_key_hex)
+    if verify_ok != 0:
+        return GITDEC_ERR_VERIFICATION_FAILED
+        
+    # Write git object payload to objects directory
+    set obj_path to path_join(concat("config/gitdec/repos/" and repo_id) and concat("objects/" and commit_hash))
+    set ok to write_file(obj_path and payload)
+    
+    # Update branch ref head
+    set refs to map_get_val(manifest and "ref_heads")
+    set ok to map_insert(refs and branch and commit_hash)
+    set ok to gitdec_save_manifest(manifest_path and manifest)
+    
+    return GITDEC_ERR_NONE
+
+define gitdec_pull_ref with repo_id as Str and branch as Str returning Str:
+    set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+    set manifest to gitdec_load_json(manifest_path)
+    if manifest == 0:
+        return ""
+        
+    set refs to map_get_val(manifest and "ref_heads")
+    set commit_hash to map_get_val(refs and branch)
+    if commit_hash == 0:
+        return ""
+    return commit_hash
+
+define gitdec_get_object with repo_id as Str and object_hash as Str returning Str:
+    set obj_path to path_join(concat("config/gitdec/repos/" and repo_id) and concat("objects/" and object_hash))
+    if file_exists(obj_path) == 0:
+        return ""
+    return read_file(obj_path)
+
+# Merge a source branch into main (fast-forward: main := source head). Gated to
+# authorized collaborators and authenticated by the caller's signature over
+# caller|repo|source_branch|source_head. Callers broadcast the resulting main
+# push so every node's main advances (no loss / no forgetting).
+define gitdec_merge with repo_id as Str and source_branch as Str and caller_did as Str and signature as Str returning Int:
+    set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+    set manifest to gitdec_load_json(manifest_path)
+    if manifest == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+
+    set collaborators to map_get_val(manifest and "authorized_collaborators")
+    set role to map_get_val(collaborators and caller_did)
+    if role == 0:
+        return GITDEC_ERR_UNAUTHORIZED
+
+    set refs to map_get_val(manifest and "ref_heads")
+    set source_head to map_get_val(refs and source_branch)
+    if source_head == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+
+    set resolve_res to did_resolve(caller_did)
+    set rerr to map_get_val(resolve_res and "error")
+    if rerr != 0:
+        return GITDEC_ERR_VERIFICATION_FAILED
+    set keys_map to map_get_val(resolve_res and "verification_method")
+    set pub_key_hex to map_get_val(keys_map and "public_key_hex")
+    set merge_msg to concat(caller_did and "|")
+    set merge_msg to concat(merge_msg and repo_id)
+    set merge_msg to concat(merge_msg and "|")
+    set merge_msg to concat(merge_msg and source_branch)
+    set merge_msg to concat(merge_msg and "|")
+    set merge_msg to concat(merge_msg and source_head)
+    set verify_ok to verify_signature(merge_msg and signature and pub_key_hex)
+    if verify_ok != 0:
+        return GITDEC_ERR_VERIFICATION_FAILED
+
+    set ok to map_insert(refs and "main" and source_head)
+    set ok to gitdec_save_manifest(manifest_path and manifest)
+    return GITDEC_ERR_NONE
+
+# ================================================================
+# Issue and Pull Request Tracking
+# ================================================================
+
+define gitdec_create_issue with repo_id as Str and author_did as Str and title as Str and body as Str returning Map:
+    set issues_path to path_join(concat("config/gitdec/repos/" and repo_id) and "issues.json")
+    set root to gitdec_load_json(issues_path)
+    set issues_list to 0
+    if root == 0:
+        set root to create_map()
+        set issues_list to create_list()
+        set ok to map_insert(root and "issues" and issues_list)
+    else:
+        set issues_list to map_get_val(root and "issues")
+        
+    set issue to create_map()
+    set issue_id to concat("issue_" and int_to_string(ep_time_now_sec()))
+    set ok to map_insert(issue and "id" and issue_id)
+    set ok to map_insert(issue and "title" and title)
+    set ok to map_insert(issue and "body" and body)
+    set ok to map_insert(issue and "author" and author_did)
+    set ok to map_insert(issue and "status" and "open")
+    set ok to map_insert(issue and "comments" and create_list())
+    
+    set ok to append_list(issues_list and issue)
+    set ok to gitdec_save_issues(issues_path and root)
+    return issue
+
+define gitdec_comment_issue with repo_id as Str and issue_id as Str and author_did as Str and comment_text as Str returning Int:
+    set issues_path to path_join(concat("config/gitdec/repos/" and repo_id) and "issues.json")
+    set root to gitdec_load_json(issues_path)
+    if root == 0:
+        return GITDEC_ERR_NOT_FOUND
+        
+    set issues_list to map_get_val(root and "issues")
+    set len to length_list(issues_list)
+    set i to 0
+    set found to 0
+    repeat while i < len:
+        set issue to get_list(issues_list and i)
+        set current_id to map_get_val(issue and "id")
+        if current_id equals issue_id:
+            set comments to map_get_val(issue and "comments")
+            set comment to create_map()
+            set ok to map_insert(comment and "author" and author_did)
+            set ok to map_insert(comment and "text" and comment_text)
+            set ok to map_insert(comment and "timestamp" and int_to_string(ep_time_now_sec()))
+            set ok to append_list(comments and comment)
+            set found to 1
+            set i to len
+        set i to i + 1
+        
+    if found == 1:
+        set ok to gitdec_save_issues(issues_path and root)
+        return GITDEC_ERR_NONE
+    return GITDEC_ERR_NOT_FOUND
+
+define gitdec_create_pr with repo_id as Str and author_did as Str and title as Str and source as Str and target as Str and desc as Str returning Map:
+    set prs_path to path_join(concat("config/gitdec/repos/" and repo_id) and "pull_requests.json")
+    set root to gitdec_load_json(prs_path)
+    set prs_list to 0
+    if root == 0:
+        set root to create_map()
+        set prs_list to create_list()
+        set ok to map_insert(root and "pull_requests" and prs_list)
+    else:
+        set prs_list to map_get_val(root and "pull_requests")
+        
+    set pr to create_map()
+    set pr_id to concat("pr_" and int_to_string(ep_time_now_sec()))
+    set ok to map_insert(pr and "id" and pr_id)
+    set ok to map_insert(pr and "title" and title)
+    set ok to map_insert(pr and "source_branch" and source)
+    set ok to map_insert(pr and "target_branch" and target)
+    set ok to map_insert(pr and "description" and desc)
+    set ok to map_insert(pr and "author" and author_did)
+    set ok to map_insert(pr and "status" and "open")
+    set ok to map_insert(pr and "reviews" and create_list())
+    
+    set ok to append_list(prs_list and pr)
+    set ok to gitdec_save_prs(prs_path and root)
+    return pr
+
+define gitdec_review_pr with repo_id as Str and pr_id as Str and reviewer_did as Str and decision as Str and comment_text as Str returning Int:
+    set prs_path to path_join(concat("config/gitdec/repos/" and repo_id) and "pull_requests.json")
+    set root to gitdec_load_json(prs_path)
+    if root == 0:
+        return GITDEC_ERR_NOT_FOUND
+        
+    set prs_list to map_get_val(root and "pull_requests")
+    set len to length_list(prs_list)
+    set i to 0
+    set found to 0
+    repeat while i < len:
+        set pr to get_list(prs_list and i)
+        set current_id to map_get_val(pr and "id")
+        if current_id equals pr_id:
+            set reviews to map_get_val(pr and "reviews")
+            set review to create_map()
+            set ok to map_insert(review and "reviewer" and reviewer_did)
+            set ok to map_insert(review and "decision" and decision)
+            set ok to map_insert(review and "comment" and comment_text)
+            set ok to map_insert(review and "timestamp" and int_to_string(ep_time_now_sec()))
+            set ok to append_list(reviews and review)
+            if decision equals "approve":
+                set ok to map_insert(pr and "status" and "approved")
+            else:
+                set ok to map_insert(pr and "status" and "changes_requested")
+            set found to 1
+            set i to len
+        set i to i + 1
+        
+    if found == 1:
+        set ok to gitdec_save_prs(prs_path and root)
+        return GITDEC_ERR_NONE
+    return GITDEC_ERR_NOT_FOUND
+
+define gitdec_list_repos returning List:
+    if file_exists("config/gitdec/repos") == 0:
+        return create_list()
+    return list_directory("config/gitdec/repos")
+
+define gitdec_list_repo_files with repo_id as Str returning List:
+    set repo_dir to path_join("config/gitdec/repos" and repo_id)
+    if file_exists(repo_dir) == 0:
+        return create_list()
+    return list_directory(repo_dir)
+
+define gitdec_get_repo_file with repo_id as Str and filename as Str returning Str:
+    set repo_dir to path_join("config/gitdec/repos" and repo_id)
+    set filepath to path_join(repo_dir and filename)
+    if file_exists(filepath) == 0:
+        return ""
+    return read_file(filepath)
+
+define gitdec_broadcast_nostr with repo_id as Str and kind as Int and content as Str and secret_key_hex as Str and public_key_hex as Str returning Int:
+    set tags to create_list()
+    set r_tag to create_list()
+    set ok to append_list(r_tag and "r")
+    set ok to append_list(r_tag and repo_id)
+    set ok to append_list(tags and r_tag)
+
+    set event to nostr_create_event(public_key_hex and kind and tags and content)
+    set sign_err to nostr_sign_event(event and secret_key_hex)
+    if sign_err != 0:
+        free_list(r_tag)
+        free_list(tags)
+        return sign_err
+
+    # Try local relay on 9102
+    set conn to nostr_relay_connect("127.0.0.1" and 9102)
+    set err to map_get_val(conn and "error")
+    if err == 0:
+        set pub_err to nostr_relay_publish(conn and event)
+        set ok to nostr_relay_close(conn)
+    free_map(conn)
+    free_list(r_tag)
+    free_list(tags)
+    return 0
+
+
+define gitdec_sync_issue with repo_id as Str and issue_id as Str and author_did as Str and title as Str and body as Str and status as Str returning Int:
+    set repo_dir to path_join("config/gitdec/repos" and repo_id)
+    if file_exists(repo_dir) == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+    set issues_path to path_join(repo_dir and "issues.json")
+    set root to gitdec_load_json(issues_path)
+    set issues_list to 0
+    if root == 0:
+        set root to create_map()
+        set issues_list to create_list()
+        set ok to map_insert(root and "issues" and issues_list)
+    else:
+        set issues_list to map_get_val(root and "issues")
+        
+    set len to length_list(issues_list)
+    set i to 0
+    set found to 0
+    repeat while i < len:
+        set issue to get_list(issues_list and i)
+        set current_id to map_get_val(issue and "id")
+        if current_id equals issue_id:
+            set ok to map_insert(issue and "title" and title)
+            set ok to map_insert(issue and "body" and body)
+            set ok to map_insert(issue and "status" and status)
+            set found to 1
+            set i to len
+        set i to i + 1
+        
+    if found == 0:
+        set issue to create_map()
+        set ok to map_insert(issue and "id" and issue_id)
+        set ok to map_insert(issue and "title" and title)
+        set ok to map_insert(issue and "body" and body)
+        set ok to map_insert(issue and "author" and author_did)
+        set ok to map_insert(issue and "status" and status)
+        set ok to map_insert(issue and "comments" and create_list())
+        set ok to append_list(issues_list and issue)
+        
+    set ok to gitdec_save_issues(issues_path and root)
+    return 0
+
+define gitdec_sync_comment with repo_id as Str and issue_id as Str and author_did as Str and comment_text as Str and timestamp as Str returning Int:
+    set repo_dir to path_join("config/gitdec/repos" and repo_id)
+    if file_exists(repo_dir) == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+    set issues_path to path_join(repo_dir and "issues.json")
+    set root to gitdec_load_json(issues_path)
+    if root == 0:
+        return GITDEC_ERR_NOT_FOUND
+        
+    set issues_list to map_get_val(root and "issues")
+    set len to length_list(issues_list)
+    set i to 0
+    set found to 0
+    repeat while i < len:
+        set issue to get_list(issues_list and i)
+        set current_id to map_get_val(issue and "id")
+        if current_id equals issue_id:
+            set comments to map_get_val(issue and "comments")
+            set c_len to length_list(comments)
+            set ci to 0
+            set c_found to 0
+            repeat while ci < c_len:
+                set c_item to get_list(comments and ci)
+                set c_auth to map_get_val(c_item and "author")
+                set c_txt to map_get_val(c_item and "text")
+                set c_time to map_get_val(c_item and "timestamp")
+                if c_auth equals author_did and also c_txt equals comment_text and also c_time equals timestamp:
+                    set c_found to 1
+                    set ci to c_len
+                set ci to ci + 1
+                
+            if c_found == 0:
+                set comment to create_map()
+                set ok to map_insert(comment and "author" and author_did)
+                set ok to map_insert(comment and "text" and comment_text)
+                set ok to map_insert(comment and "timestamp" and timestamp)
+                set ok to append_list(comments and comment)
+            set found to 1
+            set i to len
+        set i to i + 1
+        
+    if found == 1:
+        set ok to gitdec_save_issues(issues_path and root)
+        return GITDEC_ERR_NONE
+    return GITDEC_ERR_NOT_FOUND
+
+define gitdec_sync_pr with repo_id as Str and pr_id as Str and author_did as Str and title as Str and source as Str and target as Str and desc as Str and status as Str returning Int:
+    set repo_dir to path_join("config/gitdec/repos" and repo_id)
+    if file_exists(repo_dir) == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+    set prs_path to path_join(repo_dir and "pull_requests.json")
+    set root to gitdec_load_json(prs_path)
+    set prs_list to 0
+    if root == 0:
+        set root to create_map()
+        set prs_list to create_list()
+        set ok to map_insert(root and "pull_requests" and prs_list)
+    else:
+        set prs_list to map_get_val(root and "pull_requests")
+        
+    set len to length_list(prs_list)
+    set i to 0
+    set found to 0
+    repeat while i < len:
+        set pr to get_list(prs_list and i)
+        set current_id to map_get_val(pr and "id")
+        if current_id equals pr_id:
+            set ok to map_insert(pr and "title" and title)
+            set ok to map_insert(pr and "source_branch" and source)
+            set ok to map_insert(pr and "target_branch" and target)
+            set ok to map_insert(pr and "description" and desc)
+            set ok to map_insert(pr and "status" and status)
+            set found to 1
+            set i to len
+        set i to i + 1
+        
+    if found == 0:
+        set pr to create_map()
+        set ok to map_insert(pr and "id" and pr_id)
+        set ok to map_insert(pr and "title" and title)
+        set ok to map_insert(pr and "source_branch" and source)
+        set ok to map_insert(pr and "target_branch" and target)
+        set ok to map_insert(pr and "description" and desc)
+        set ok to map_insert(pr and "author" and author_did)
+        set ok to map_insert(pr and "status" and status)
+        set ok to map_insert(pr and "reviews" and create_list())
+        set ok to append_list(prs_list and pr)
+        
+    set ok to gitdec_save_prs(prs_path and root)
+    return 0
+
+define gitdec_sync_review with repo_id as Str and pr_id as Str and reviewer_did as Str and decision as Str and comment_text as Str and timestamp as Str returning Int:
+    set repo_dir to path_join("config/gitdec/repos" and repo_id)
+    if file_exists(repo_dir) == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+    set prs_path to path_join(repo_dir and "pull_requests.json")
+    set root to gitdec_load_json(prs_path)
+    if root == 0:
+        return GITDEC_ERR_NOT_FOUND
+        
+    set prs_list to map_get_val(root and "pull_requests")
+    set len to length_list(prs_list)
+    set i to 0
+    set found to 0
+    repeat while i < len:
+        set pr to get_list(prs_list and i)
+        set current_id to map_get_val(pr and "id")
+        if current_id equals pr_id:
+            set reviews to map_get_val(pr and "reviews")
+            set r_len to length_list(reviews)
+            set ri to 0
+            set r_found to 0
+            repeat while ri < r_len:
+                set r_item to get_list(reviews and ri)
+                set r_rev to map_get_val(r_item and "reviewer")
+                set r_dec to map_get_val(r_item and "decision")
+                set r_txt to map_get_val(r_item and "comment")
+                set r_time to map_get_val(r_item and "timestamp")
+                if r_rev equals reviewer_did and also r_dec equals decision and also r_txt equals comment_text and also r_time equals timestamp:
+                    set r_found to 1
+                    set ri to r_len
+                set ri to ri + 1
+                
+            if r_found == 0:
+                set review to create_map()
+                set ok to map_insert(review and "reviewer" and reviewer_did)
+                set ok to map_insert(review and "decision" and decision)
+                set ok to map_insert(review and "comment" and comment_text)
+                set ok to map_insert(review and "timestamp" and timestamp)
+                set ok to append_list(reviews and review)
+                if decision equals "approve":
+                    set ok to map_insert(pr and "status" and "approved")
+                else:
+                    set ok to map_insert(pr and "status" and "changes_requested")
+            set found to 1
+            set i to len
+        set i to i + 1
+        
+    if found == 1:
+        set ok to gitdec_save_prs(prs_path and root)
+        return GITDEC_ERR_NONE
+    return GITDEC_ERR_NOT_FOUND
+
+define gitdec_cast_map_to_list with m as Map returning List:
+    return m
+
+# C4: a repo_id that arrives from the network is used in path_join and (for delete)
+# a shell `rm -rf`. Restrict it to [A-Za-z0-9_-]+ so it cannot traverse directories
+# (`..`/`/`) or inject shell metacharacters. Returns 1 if safe, 0 otherwise.
+define gitdec_repo_id_safe with repo_id as Str returning Int:
+    set n to string_length(repo_id)
+    if n == 0 or else n > 128:
+        return 0
+    set allowed to "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    set i to 0
+    repeat while i < n:
+        set c to substring(repo_id and i and 1)
+        if string_index_of(allowed and c) < 0:
+            return 0
+        set i to i + 1
+    return 1
+
+define gitdec_sync_manifest with repo_id as Str and manifest_json as Str returning Int:
+    set repo_dir to path_join("config/gitdec/repos" and repo_id)
+    if file_exists(repo_dir) == 0:
+        set ok to create_directory(repo_dir)
+        set obj_dir to path_join(repo_dir and "objects")
+        set ok to create_directory(obj_dir)
+        
+    set manifest_path to path_join(repo_dir and "gitdec.json")
+    
+    set parsed_node to json_parse(manifest_json)
+    if parsed_node == 0:
+        return GITDEC_ERR_VERIFICATION_FAILED
+        
+    set incoming_manifest to json_to_map(parsed_node)
+    if incoming_manifest == 0:
+        return GITDEC_ERR_VERIFICATION_FAILED
+        
+    set ok to gitdec_save_manifest(manifest_path and incoming_manifest)
+    free_map(incoming_manifest)
+    return GITDEC_ERR_NONE
+
+define gitdec_sync_commit with repo_id as Str and pusher_did as Str and branch as Str and commit_hash as Str and payload as Str and signature as Str returning Int:
+    set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+    set manifest to gitdec_load_json(manifest_path)
+    if manifest == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+        
+    set collaborators to map_get_val(manifest and "authorized_collaborators")
+    set role to map_get_val(collaborators and pusher_did)
+    if role == 0:
+        free_map(manifest)
+        return GITDEC_ERR_UNAUTHORIZED
+        
+    set resolve_res to did_resolve(pusher_did)
+    set err to map_get_val(resolve_res and "error")
+    if err != 0:
+        free_map(resolve_res)
+        free_map(manifest)
+        return GITDEC_ERR_VERIFICATION_FAILED
+        
+    set keys_map to map_get_val(resolve_res and "verification_method")
+    set pub_key_hex to map_get_val(keys_map and "public_key_hex")
+    
+    set verify_ok to verify_signature(payload and signature and pub_key_hex)
+    free_map(resolve_res)
+    if verify_ok != 0:
+        free_map(manifest)
+        return GITDEC_ERR_VERIFICATION_FAILED
+        
+    set obj_dir to path_join(concat("config/gitdec/repos/" and repo_id) and "objects")
+    if file_exists(obj_dir) == 0:
+        set ok to create_directory(obj_dir)
+        
+    set obj_path to path_join(obj_dir and commit_hash)
+    set ok to write_file(obj_path and payload)
+    
+    set refs to map_get_val(manifest and "ref_heads")
+    set ok to map_insert(refs and branch and commit_hash)
+    set ok to gitdec_save_manifest(manifest_path and manifest)
+    free_map(manifest)
+
+    # Auto-update: a freshly-synced commit on a WATCHED repo raises the "update
+    # available" flag the WebUI surfaces, and records the latest commit hash.
+    if storage_gitdec_get_auto_update(repo_id) == 1:
+        set sk to storage_gitdec_set_last_seen(repo_id and commit_hash)
+        set sk to storage_gitdec_set_pending(repo_id and 1)
+
+    return GITDEC_ERR_NONE
+
+define gitdec_request_history with repo_id as Str returning Int:
+    set conn to nostr_relay_connect("127.0.0.1" and 9102)
+    set err to map_get_val(conn and "error")
+    if err != 0:
+        free_map(conn)
+        return err
+        
+    set filter to create_map()
+    set kinds to create_list()
+    set ok to append_list(kinds and 20020)
+    set ok to append_list(kinds and 20021)
+    set ok to append_list(kinds and 20022)
+    set ok to append_list(kinds and 20023)
+    set ok to map_insert(filter and "kinds" and kinds)
+    
+    set r_list to create_list()
+    set ok to append_list(r_list and repo_id)
+    set ok to map_insert(filter and "#r" and r_list)
+    
+    set sub_err to nostr_relay_subscribe(conn and "gitdec_temp_sub" and filter)
+    display f"[+] GitDec historical sync: subscribed to {repo_id}"
+    
+    set running to 1
+    set count to 0
+    repeat while running == 1 and also count < 100:
+        set msg to nostr_relay_receive(conn)
+        if string_length(msg) == 0:
+            set running to 0
+        else:
+            if string_contains(msg and "\"EOSE\"") == 1:
+                set running to 0
+            else:
+                if string_contains(msg and "\"EVENT\"") == 1:
+                    set root_node to json_parse(msg)
+                    if root_node != 0:
+                        set parsed_list_map to json_to_map(root_node)
+                        set parsed_list to gitdec_cast_map_to_list(parsed_list_map)
+                        if length_list(parsed_list) >= 3:
+                            set type_str to get_list(parsed_list and 0)
+                            if type_str equals "EVENT":
+                                set event_map to get_list(parsed_list and 2)
+                                set kind_val to map_get_val(event_map and "kind")
+                                set content_str to map_get_val(event_map and "content")
+                                set content_node to json_parse(content_str)
+                                if content_node != 0:
+                                    set content_map to json_to_map(content_node)
+                                    set action to map_get_val(content_map and "action")
+                                    set event_repo_id to map_get_val(content_map and "repo_id")
+
+                                    # C1: reject any event whose Nostr signature does not verify
+                                    # against its claimed pubkey. Sentinel action => no branch runs.
+                                    # C2: the authoritative author IS the verified envelope signer.
+                                    set ev_signer_did to create_did_key_from_ed25519(ptr_to_str(map_get_val(event_map and "pubkey")))
+                                    if nostr_verify_event(event_map) == 0:
+                                        set action to "__unverified__"
+
+                                    if event_repo_id equals repo_id:
+                                        if kind_val == 20020 and also action equals "update_manifest":
+                                            set manifest_json to map_get_val(content_map and "manifest")
+                                            set ok to gitdec_sync_manifest(repo_id and manifest_json)
+                                            
+                                        else if kind_val == 20021 and also action equals "push_commit":
+                                            set pusher_did to map_get_val(content_map and "pusher_did")
+                                            set branch to map_get_val(content_map and "branch")
+                                            set commit_hash to map_get_val(content_map and "commit_hash")
+                                            set payload to map_get_val(content_map and "payload")
+                                            set signature to map_get_val(content_map and "signature")
+                                            set ok to gitdec_sync_commit(repo_id and pusher_did and branch and commit_hash and payload and signature)
+                                            
+                                        else if kind_val == 20022 and also action equals "create_issue":
+                                            set issue_id to map_get_val(content_map and "id")
+                                            set author_did to map_get_val(content_map and "author_did")
+                                            set title to map_get_val(content_map and "title")
+                                            set body to map_get_val(content_map and "body")
+                                            set ok to gitdec_sync_issue(repo_id and issue_id and ev_signer_did and title and body and "open")
+                                            
+                                        else if kind_val == 20022 and also action equals "comment_issue":
+                                            set issue_id to map_get_val(content_map and "issue_id")
+                                            set author_did to map_get_val(content_map and "author_did")
+                                            set text to map_get_val(content_map and "text")
+                                            set timestamp to map_get_val(content_map and "timestamp")
+                                            set ok to gitdec_sync_comment(repo_id and issue_id and ev_signer_did and text and timestamp)
+                                            
+                                        else if kind_val == 20023 and also action equals "create_pr":
+                                            set pr_id to map_get_val(content_map and "id")
+                                            set author_did to map_get_val(content_map and "author_did")
+                                            set title to map_get_val(content_map and "title")
+                                            set source to map_get_val(content_map and "source")
+                                            set target to map_get_val(content_map and "target")
+                                            set description to map_get_val(content_map and "description")
+                                            set ok to gitdec_sync_pr(repo_id and pr_id and ev_signer_did and title and source and target and description and "open")
+                                            
+                                        else if kind_val == 20023 and also action equals "review_pr":
+                                            set pr_id to map_get_val(content_map and "pr_id")
+                                            set reviewer_did to map_get_val(content_map and "reviewer_did")
+                                            set decision to map_get_val(content_map and "decision")
+                                            set comment to map_get_val(content_map and "comment")
+                                            set timestamp to map_get_val(content_map and "timestamp")
+                                            set ok to gitdec_sync_review(repo_id and pr_id and ev_signer_did and decision and comment and timestamp)
+                                            
+                                    free_map(content_map)
+                                free_map(event_map)
+                        free_list(parsed_list)
+            set count to count + 1
+            
+    set ok to nostr_relay_close(conn)
+    free_map(conn)
+    free_list(kinds)
+    free_list(r_list)
+    free_map(filter)
+    return 0
+
+# Auto-pull-on-join: at startup, request full history for every repo flagged for
+# auto-update, so a node that just joined the network downloads the latest of
+# each watched project without manual cloning. Spawned in its own thread.
+define gitdec_auto_pull_on_join returning Int:
+    set repos to storage_gitdec_list_auto_repos()
+    set n to length_list(repos)
+    set i to 0
+    repeat while i < n:
+        set rid to get_list(repos and i)
+        set ok to gitdec_request_history(rid)
+        set i to i + 1
+    free_list(repos)
+    return 0
+
+define gitdec_listener_loop with dht_node as Int and identity as Map returning Int:
+    sleep_ms(3000)
+    set conn to create_map()
+    set has_conn to 0
+    set filter to create_map()
+    set kinds to create_list()
+    set ok to append_list(kinds and 20020)
+    set ok to append_list(kinds and 20021)
+    set ok to append_list(kinds and 20022)
+    set ok to append_list(kinds and 20023)
+    set ok to map_insert(filter and "kinds" and kinds)
+    
+    repeat while 1 == 1:
+        if has_conn == 0:
+            free_map(conn)
+            set conn to nostr_relay_connect("127.0.0.1" and 9102)
+            set err to map_get_val(conn and "error")
+            if err == 0:
+                set sub_err to nostr_relay_subscribe(conn and "gitdec_sub" and filter)
+                display "[+] GitDec Nostr listener: connected and subscribed."
+                set has_conn to 1
+            else:
+                set has_conn to 0
+                sleep_ms(10000)
+        else:
+            set msg to nostr_relay_receive(conn)
+            if string_length(msg) == 0:
+                set ok to nostr_relay_close(conn)
+                free_map(conn)
+                set conn to create_map()
+                set has_conn to 0
+                sleep_ms(5000)
+            else:
+                if string_contains(msg and "\"EVENT\"") == 1:
+                    set root_node to json_parse(msg)
+                    if root_node != 0:
+                        set parsed_list_map to json_to_map(root_node)
+                        set parsed_list to gitdec_cast_map_to_list(parsed_list_map)
+                        if length_list(parsed_list) >= 3:
+                            set type_str to get_list(parsed_list and 0)
+                            if type_str equals "EVENT":
+                                set event_map to get_list(parsed_list and 2)
+                                set kind_val to map_get_val(event_map and "kind")
+                                set content_str to map_get_val(event_map and "content")
+                                set content_node to json_parse(content_str)
+                                if content_node != 0:
+                                    set content_map to json_to_map(content_node)
+                                    set action to map_get_val(content_map and "action")
+                                    set repo_id to ptr_to_str(map_get_val(content_map and "repo_id"))
+
+                                    # C1: reject any event whose Nostr signature does not verify
+                                    # against its claimed pubkey. C4: reject a network repo_id that
+                                    # is not [A-Za-z0-9_-]+ (it feeds path_join and a shell rm -rf).
+                                    # C2: the authoritative author IS the verified envelope signer.
+                                    # Sentinel action => no branch runs.
+                                    set ev_signer_did to create_did_key_from_ed25519(ptr_to_str(map_get_val(event_map and "pubkey")))
+                                    if nostr_verify_event(event_map) == 0 or else gitdec_repo_id_safe(repo_id) == 0:
+                                        set action to "__unverified__"
+
+                                    if kind_val == 20020 and also action equals "update_manifest":
+                                        set manifest_json to map_get_val(content_map and "manifest")
+                                        set dht_key to concat("repo:" and repo_id)
+                                        set dht_lookup to dht_lookup_value(dht_node and dht_key)
+                                        set dht_err to map_get_val(dht_lookup and "error")
+                                        set authorized to 0
+                                        if dht_err == 0:
+                                            set owner_did to ptr_to_str(map_get_val(dht_lookup and "value"))
+                                            set event_pubkey_hex to map_get_val(event_map and "pubkey")
+                                            set event_pubkey_did to create_did_key_from_ed25519(event_pubkey_hex)
+                                            if event_pubkey_did equals owner_did:
+                                                set authorized to 1
+                                        free_map(dht_lookup)
+                                        if authorized == 1:
+                                            set ok to gitdec_sync_manifest(repo_id and manifest_json)
+                                            
+                                    else if kind_val == 20020 and also action equals "delete_repo":
+                                        set dht_key to concat("repo:" and repo_id)
+                                        set dht_lookup to dht_lookup_value(dht_node and dht_key)
+                                        set dht_err to map_get_val(dht_lookup and "error")
+                                        set authorized to 0
+                                        if dht_err == 0:
+                                            set owner_did to ptr_to_str(map_get_val(dht_lookup and "value"))
+                                            set event_pubkey_hex to map_get_val(event_map and "pubkey")
+                                            set event_pubkey_did to create_did_key_from_ed25519(event_pubkey_hex)
+                                            if event_pubkey_did equals owner_did:
+                                                set authorized to 1
+                                        free_map(dht_lookup)
+                                        if authorized == 1:
+                                            set repo_dir to path_join("config/gitdec/repos" and repo_id)
+                                            if file_exists(repo_dir) == 1:
+                                                set cmd to concat("rm -rf " and repo_dir)
+                                                set ok to run_command(cmd)
+                                            
+                                    else if kind_val == 20021 and also action equals "push_commit":
+                                        set pusher_did to map_get_val(content_map and "pusher_did")
+                                        set branch to map_get_val(content_map and "branch")
+                                        set commit_hash to map_get_val(content_map and "commit_hash")
+                                        set payload to map_get_val(content_map and "payload")
+                                        set signature to map_get_val(content_map and "signature")
+                                        set event_pubkey_hex to map_get_val(event_map and "pubkey")
+                                        set event_pubkey_did to create_did_key_from_ed25519(event_pubkey_hex)
+                                        if event_pubkey_did equals pusher_did:
+                                            set ok to gitdec_sync_commit(repo_id and pusher_did and branch and commit_hash and payload and signature)
+                                            
+                                    else if kind_val == 20022 and also action equals "create_issue":
+                                        set issue_id to map_get_val(content_map and "id")
+                                        set author_did to map_get_val(content_map and "author_did")
+                                        set title to map_get_val(content_map and "title")
+                                        set body to map_get_val(content_map and "body")
+                                        set ok to gitdec_sync_issue(repo_id and issue_id and ev_signer_did and title and body and "open")
+                                        
+                                    else if action equals "comment_issue":
+                                        set issue_id to map_get_val(content_map and "issue_id")
+                                        set author_did to map_get_val(content_map and "author_did")
+                                        set text to map_get_val(content_map and "text")
+                                        set timestamp to map_get_val(content_map and "timestamp")
+                                        set ok to gitdec_sync_comment(repo_id and issue_id and ev_signer_did and text and timestamp)
+                                        
+                                    else if action equals "create_pr":
+                                        set pr_id to map_get_val(content_map and "id")
+                                        set author_did to map_get_val(content_map and "author_did")
+                                        set title to map_get_val(content_map and "title")
+                                        set source to map_get_val(content_map and "source")
+                                        set target to map_get_val(content_map and "target")
+                                        set description to map_get_val(content_map and "description")
+                                        set ok to gitdec_sync_pr(repo_id and pr_id and ev_signer_did and title and source and target and description and "open")
+                                        
+                                    else if action equals "review_pr":
+                                        set pr_id to map_get_val(content_map and "pr_id")
+                                        set reviewer_did to map_get_val(content_map and "reviewer_did")
+                                        set decision to map_get_val(content_map and "decision")
+                                        set comment to map_get_val(content_map and "comment")
+                                        set timestamp to map_get_val(content_map and "timestamp")
+                                        set ok to gitdec_sync_review(repo_id and pr_id and ev_signer_did and decision and comment and timestamp)
+                                        
+                                    free_map(content_map)
+                                free_map(event_map)
+                        free_list(parsed_list)
+    return 0

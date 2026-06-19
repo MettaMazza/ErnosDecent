@@ -1,0 +1,192 @@
+# ErnosDecent — Anonymity & Search Integration Test Suite
+# Component: decent_anon/test_anon_search.ep
+# Status: Production — OperationTrojanClaude Phase 11
+
+import "test"
+import "onion"
+import "mixnet"
+import "../decent_search/crawl"
+import "../decent_search/rank"
+import "../decent_search/query"
+
+# ================================================================
+# Onion Routing Loopback Test
+# ================================================================
+
+define test_onion_loopback returning Int:
+    set ok to onion_init()
+    assert_equal(ok and 0 and "onion_init success")
+
+    # 1. Generate keypairs for Alice, Guard, Middle, Exit
+    set alice_keys to generate_encryption_keypair()
+    set guard_keys to generate_encryption_keypair()
+    set middle_keys to generate_encryption_keypair()
+    set exit_keys to generate_encryption_keypair()
+
+    assert_equal(map_get_val(alice_keys and "error") and 0 and "alice keys gen success")
+    assert_equal(map_get_val(guard_keys and "error") and 0 and "guard keys gen success")
+    assert_equal(map_get_val(middle_keys and "error") and 0 and "middle keys gen success")
+    assert_equal(map_get_val(exit_keys and "error") and 0 and "exit keys gen success")
+
+    # 2. Extract public/secret keys
+    set alice_sk to map_get_val(alice_keys and "secret_key")
+    set alice_pk to map_get_val(alice_keys and "public_key")
+
+    set guard_sk to map_get_val(guard_keys and "secret_key")
+    set guard_pk to map_get_val(guard_keys and "public_key")
+
+    set middle_sk to map_get_val(middle_keys and "secret_key")
+    set middle_pk to map_get_val(middle_keys and "public_key")
+
+    set exit_sk to map_get_val(exit_keys and "secret_key")
+    set exit_pk to map_get_val(exit_keys and "public_key")
+
+    # 3. Derive shared secret keys (symmetrical)
+    set k1_alice to onion_derive_shared_secret(alice_sk and guard_pk)
+    set k2_alice to onion_derive_shared_secret(alice_sk and middle_pk)
+    set k3_alice to onion_derive_shared_secret(alice_sk and exit_pk)
+
+    set k1_guard to onion_derive_shared_secret(guard_sk and alice_pk)
+    set k2_middle to onion_derive_shared_secret(middle_sk and alice_pk)
+    set k3_exit to onion_derive_shared_secret(exit_sk and alice_pk)
+
+    assert_true(k1_alice equals k1_guard and "K1 shared secret matches")
+    assert_true(k2_alice equals k2_middle and "K2 shared secret matches")
+    assert_true(k3_alice equals k3_exit and "K3 shared secret matches")
+
+    # 4. Pack the lists of keys and hops
+    set circuit_keys to create_list()
+    set ok to append_list(circuit_keys and str_to_ptr(k1_alice))
+    set ok to append_list(circuit_keys and str_to_ptr(k2_alice))
+    set ok to append_list(circuit_keys and str_to_ptr(k3_alice))
+
+    set hops to create_list()
+    set ok to append_list(hops and str_to_ptr("guard_node"))
+    set ok to append_list(hops and str_to_ptr("middle_node"))
+    set ok to append_list(hops and str_to_ptr("exit_node"))
+
+    # 5. Encrypt layered onion packet
+    set original_payload to "search_query:ernos_blockchain"
+    set enc_res to onion_create_packet(circuit_keys and hops and "exit_destination" and original_payload)
+    assert_equal(map_get_val(enc_res and "error") and 0 and "onion packet encryption succeeds")
+
+    # 6. Route through Guard (N1)
+    set step1_res to onion_decrypt_step(enc_res and k1_guard)
+    assert_equal(map_get_val(step1_res and "error") and 0 and "guard decryption succeeds")
+    assert_equal(map_get_val(step1_res and "is_exit") and 0 and "guard determines not exit hop")
+    assert_true(map_get_val(step1_res and "next") equals "middle_node" and "guard routes packet to middle node")
+
+    # 7. Route through Middle (N2)
+    set step2_res to onion_decrypt_step(step1_res and k2_middle)
+    assert_equal(map_get_val(step2_res and "error") and 0 and "middle decryption succeeds")
+    assert_equal(map_get_val(step2_res and "is_exit") and 0 and "middle determines not exit hop")
+    assert_true(map_get_val(step2_res and "next") equals "exit_node" and "middle routes packet to exit node")
+
+    # 8. Decrypt at Exit (N3)
+    set step3_res to onion_decrypt_step(step2_res and k3_exit)
+    assert_equal(map_get_val(step3_res and "error") and 0 and "exit decryption succeeds")
+    assert_equal(map_get_val(step3_res and "is_exit") and 1 and "exit determines it is the exit node")
+    assert_true(map_get_val(step3_res and "next") equals "exit_destination" and "exit routes payload to final destination")
+    assert_true(map_get_val(step3_res and "payload") equals original_payload and "exit retrieves original payload")
+
+    display "  onion_loopback: PASS"
+    return 0
+
+# ================================================================
+# Mixnet Timing Delay and Shuffling Test
+# ================================================================
+
+define test_mixnet returning Int:
+    set pool to mixnet_create_pool(30 and 5)
+    assert_equal(map_get_val(pool and "delay_ms") and 30 and "mixnet pool delay_ms configured")
+
+    set ok to mixnet_add_packet(pool and "packet_1")
+    set ok to mixnet_add_packet(pool and "packet_2")
+    set ok to mixnet_add_packet(pool and "packet_3")
+    set ok to mixnet_add_packet(pool and "packet_4")
+    set trigger to mixnet_add_packet(pool and "packet_5")
+    assert_equal(trigger and 1 and "mixnet pool reaches max size and triggers flush")
+
+    set start_time to ep_time_now_ms()
+    set flushed_list to mixnet_flush_pool(pool)
+    set end_time to ep_time_now_ms()
+
+    set flushed_count to length_list(flushed_list)
+    assert_equal(flushed_count and 5 and "mixnet flushed 5 packets")
+
+    # Delay check: 5 packets * ~30ms delay = ~150ms total delay
+    set duration to end_time - start_time
+    assert_true(duration >= 100 and "mixnet pool flush introduces timing delay")
+
+    display "  mixnet_shuffling: PASS"
+    return 0
+
+# ================================================================
+# Search Index, Crawling, Ranking, and Query Merging Test
+# ================================================================
+
+define test_search_rank_query returning Int:
+    set index to crawl_create_index()
+
+    # Index 3 mock pages with outdegree links
+    set links1 to create_list()
+    set ok to append_list(links1 and str_to_ptr("news.ernos"))
+    set ok to append_list(links1 and str_to_ptr("shop.ernos"))
+    set ok to crawl_index_page(index and "wiki.ernos" and "Ernos Programming Language Wiki" and "ernos is a compiled statically-typed memory-safe programming language with plain English syntax it is self-hosting and compiles to native binaries" and links1)
+
+    set links2 to create_list()
+    set ok to append_list(links2 and str_to_ptr("wiki.ernos"))
+    set ok to crawl_index_page(index and "news.ernos" and "ErnosDecent Network Release News" and "ernosdecent is a decentralised internet system written in ernos.ep using libsodium cryptography and peer-to-peer dht networks" and links2)
+
+    set links3 to create_list()
+    set ok to crawl_index_page(index and "shop.ernos" and "Ernos Merchandise Shop" and "buy cool shirts and mugs with the official logo of the plain english programming language" and links3)
+
+    assert_equal(map_get_val(index and "page_count") and 3 and "index contains exactly 3 pages")
+
+    # Compute PageRank
+    set ok to rank_compute_pagerank(index and 5)
+
+    # Check PageRank scores updated
+    set pages to map_get_val(index and "pages")
+    set meta_wiki to map_get_val(pages and "wiki.ernos")
+    set meta_shop to map_get_val(pages and "shop.ernos")
+    set pr_wiki to map_get_val(meta_wiki and "pagerank")
+    set pr_shop to map_get_val(meta_shop and "pagerank")
+
+    assert_true(pr_wiki > 0 and "wiki page rank computed")
+    assert_true(pr_shop > 0 and "shop page rank computed")
+
+    # Execute search query
+    set search_res to query_search(index and "programming language")
+    set count_res to length_list(search_res)
+    assert_true(count_res >= 2 and "found matches for query")
+
+    # De-duplicated P2P merging
+    set remote_res to create_list()
+    set item1 to create_map()
+    set ok to map_insert(item1 and "url" and "remote_node.ernos")
+    set ok to map_insert(item1 and "score" and 50000000) # ultra-high score
+    set ok to map_insert(item1 and "title" and "Remote Node Wiki")
+    set ok to append_list(remote_res and item1)
+
+    set merged to query_merge_results(search_res and remote_res)
+    set first_merged to get_list(merged and 0)
+    set first_url to map_get_val(first_merged and "url")
+    assert_true(first_url equals "remote_node.ernos" and "remote result ranked first after merging due to higher score")
+
+    display "  search_indexing_ranking: PASS"
+    return 0
+
+# ================================================================
+# Main Executable
+# ================================================================
+
+define main returning Int:
+    set suite to create_test_suite("Phase 11: Privacy & Search Integration Suite")
+
+    set ok to test_onion_loopback()
+    set ok to test_mixnet()
+    set ok to test_search_rank_query()
+
+    display "ALL PHASE 11 TESTS PASSED SUCCESSFULLY"
+    return 0

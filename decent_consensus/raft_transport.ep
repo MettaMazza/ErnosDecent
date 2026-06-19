@@ -1,0 +1,565 @@
+# ErnosDecent — Raft Consensus Transport Layer
+# Component: decent_consensus/raft_transport.ep
+# Implements: Serialization/deserialization of Raft RPCs, TCP server thread,
+#             election timer thread, and client command proposal over TCP
+# Status: Production — Phase 3
+
+import "collections"
+import "string"
+import "../decent_net/transport"
+import "./raft"
+import "./election"
+import "./state"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set RAFT_MSG_REQUEST_VOTE to "RV"
+set RAFT_MSG_REQUEST_VOTE_RESP to "RVR"
+set RAFT_MSG_APPEND_ENTRIES to "AE"
+set RAFT_MSG_APPEND_ENTRIES_RESP to "AER"
+set RAFT_MSG_CLIENT_PROPOSE to "CP"
+set RAFT_MSG_CLIENT_PROPOSE_RESP to "CPR"
+
+set RAFT_TICK_MS to 10
+set RAFT_TRANSPORT_ERR_NONE to 0
+set RAFT_TRANSPORT_ERR_CONNECT to 1
+set RAFT_TRANSPORT_ERR_SEND to 2
+set RAFT_TRANSPORT_ERR_RECV to 3
+set RAFT_TRANSPORT_ERR_NOT_LEADER to 4
+
+# ================================================================
+# Serialization: Raft RPCs → wire format strings
+# Wire format uses pipe '|' as field delimiter
+# Log entries use semicolon ';' between entries, comma ',' between fields
+# ================================================================
+
+define raft_serialize_request_vote with term as Int and candidate_id as Str and last_log_index as Int and last_log_term as Int returning Str:
+    # Format: RV|term|candidate_id|last_log_index|last_log_term
+    set msg to concat(RAFT_MSG_REQUEST_VOTE and "|")
+    set msg to concat(msg and int_to_string(term))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and candidate_id)
+    set msg to concat(msg and "|")
+    set msg to concat(msg and int_to_string(last_log_index))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and int_to_string(last_log_term))
+    return msg
+
+define raft_serialize_request_vote_response with term as Int and vote_granted as Int and sender_id as Str returning Str:
+    # Format: RVR|term|vote_granted|sender_id
+    set msg to concat(RAFT_MSG_REQUEST_VOTE_RESP and "|")
+    set msg to concat(msg and int_to_string(term))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and int_to_string(vote_granted))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and sender_id)
+    return msg
+
+define raft_serialize_log_entry with entry as Map returning Str:
+    # Format: term,index,command
+    set term to map_get_val(entry and "term")
+    set index to map_get_val(entry and "index")
+    set command to ptr_to_str(map_get_val(entry and "command"))
+    set s to int_to_string(term)
+    set s to concat(s and ",")
+    set s to concat(s and int_to_string(index))
+    set s to concat(s and ",")
+    set s to concat(s and command)
+    return s
+
+define raft_serialize_entries with entries as List returning Str:
+    # Format: entry1;entry2;entry3 (empty string if no entries)
+    set num to length_list(entries)
+    if num == 0:
+        return ""
+    set result to ""
+    set i to 0
+    repeat while i < num:
+        set entry to get_list(entries and i)
+        set entry_str to raft_serialize_log_entry(entry)
+        if i == 0:
+            set result to entry_str
+        else:
+            set result to concat(result and ";")
+            set result to concat(result and entry_str)
+        set i to i + 1
+    return result
+
+define raft_serialize_append_entries with term as Int and leader_id as Str and prev_log_index as Int and prev_log_term as Int and entries as List and leader_commit as Int returning Str:
+    # Format: AE|term|leader_id|prev_log_index|prev_log_term|leader_commit|entries_str
+    set msg to concat(RAFT_MSG_APPEND_ENTRIES and "|")
+    set msg to concat(msg and int_to_string(term))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and leader_id)
+    set msg to concat(msg and "|")
+    set msg to concat(msg and int_to_string(prev_log_index))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and int_to_string(prev_log_term))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and int_to_string(leader_commit))
+    set msg to concat(msg and "|")
+    set entries_str to raft_serialize_entries(entries)
+    set msg to concat(msg and entries_str)
+    return msg
+
+define raft_serialize_append_entries_response with term as Int and success as Int and match_index as Int and sender_id as Str returning Str:
+    # Format: AER|term|success|match_index|sender_id
+    set msg to concat(RAFT_MSG_APPEND_ENTRIES_RESP and "|")
+    set msg to concat(msg and int_to_string(term))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and int_to_string(success))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and int_to_string(match_index))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and sender_id)
+    return msg
+
+define raft_serialize_client_propose with command as Str returning Str:
+    # Format: CP|command
+    set msg to concat(RAFT_MSG_CLIENT_PROPOSE and "|")
+    set msg to concat(msg and command)
+    return msg
+
+define raft_serialize_client_propose_response with success as Int and leader_id as Str returning Str:
+    # Format: CPR|success|leader_id
+    set msg to concat(RAFT_MSG_CLIENT_PROPOSE_RESP and "|")
+    set msg to concat(msg and int_to_string(success))
+    set msg to concat(msg and "|")
+    set msg to concat(msg and leader_id)
+    return msg
+
+# ================================================================
+# Deserialization: wire format strings → Maps
+# ================================================================
+
+define raft_deserialize_log_entry with entry_str as Str returning Map:
+    # Parse "term,index,command"
+    set parts to string_split(entry_str and ",")
+    set entry to create_map()
+    set num_parts to length_list(parts)
+    if num_parts < 3:
+        set ok to map_insert(entry and "error" and 1)
+        return entry
+    set term_str to ptr_to_str(get_list(parts and 0))
+    set index_str to ptr_to_str(get_list(parts and 1))
+    # Command may contain commas, so rejoin everything after index
+    set command to ptr_to_str(get_list(parts and 2))
+    set j to 3
+    repeat while j < num_parts:
+        set extra to ptr_to_str(get_list(parts and j))
+        set command to concat(command and ",")
+        set command to concat(command and extra)
+        set j to j + 1
+    set ok to map_insert(entry and "term" and string_to_int(term_str))
+    set ok to map_insert(entry and "index" and string_to_int(index_str))
+    set ok to map_insert(entry and "command" and command)
+    set ok to map_insert(entry and "error" and 0)
+    return entry
+
+define raft_deserialize_entries with entries_str as Str returning List:
+    # Parse "entry1;entry2;..." — returns List of entry Maps
+    set result to create_list()
+    if string_length(entries_str) == 0:
+        return result
+    set parts to string_split(entries_str and ";")
+    set num to length_list(parts)
+    set i to 0
+    repeat while i < num:
+        set part_str to ptr_to_str(get_list(parts and i))
+        if string_length(part_str) > 0:
+            set entry to raft_deserialize_log_entry(part_str)
+            set ok to append_list(result and entry)
+        set i to i + 1
+    return result
+
+define raft_deserialize_message with payload as Str returning Map:
+    # Parse any Raft wire message into a Map with "type" and fields
+    set result to create_map()
+    set parts to string_split(payload and "|")
+    set num_parts to length_list(parts)
+    if num_parts < 2:
+        set ok to map_insert(result and "error" and 1)
+        return result
+
+    set msg_type to ptr_to_str(get_list(parts and 0))
+    set ok to map_insert(result and "type" and msg_type)
+    set ok to map_insert(result and "error" and 0)
+
+    if msg_type equals RAFT_MSG_REQUEST_VOTE:
+        # RV|term|candidate_id|last_log_index|last_log_term
+        if num_parts < 5:
+            set ok to map_insert(result and "error" and 1)
+            return result
+        set ok to map_insert(result and "term" and string_to_int(ptr_to_str(get_list(parts and 1))))
+        set ok to map_insert(result and "candidate_id" and ptr_to_str(get_list(parts and 2)))
+        set ok to map_insert(result and "last_log_index" and string_to_int(ptr_to_str(get_list(parts and 3))))
+        set ok to map_insert(result and "last_log_term" and string_to_int(ptr_to_str(get_list(parts and 4))))
+
+    if msg_type equals RAFT_MSG_REQUEST_VOTE_RESP:
+        # RVR|term|vote_granted|sender_id
+        if num_parts < 4:
+            set ok to map_insert(result and "error" and 1)
+            return result
+        set ok to map_insert(result and "term" and string_to_int(ptr_to_str(get_list(parts and 1))))
+        set ok to map_insert(result and "vote_granted" and string_to_int(ptr_to_str(get_list(parts and 2))))
+        set ok to map_insert(result and "sender_id" and ptr_to_str(get_list(parts and 3)))
+
+    if msg_type equals RAFT_MSG_APPEND_ENTRIES:
+        # AE|term|leader_id|prev_log_index|prev_log_term|leader_commit|entries_str
+        if num_parts < 7:
+            set ok to map_insert(result and "error" and 1)
+            return result
+        set ok to map_insert(result and "term" and string_to_int(ptr_to_str(get_list(parts and 1))))
+        set ok to map_insert(result and "leader_id" and ptr_to_str(get_list(parts and 2)))
+        set ok to map_insert(result and "prev_log_index" and string_to_int(ptr_to_str(get_list(parts and 3))))
+        set ok to map_insert(result and "prev_log_term" and string_to_int(ptr_to_str(get_list(parts and 4))))
+        set ok to map_insert(result and "leader_commit" and string_to_int(ptr_to_str(get_list(parts and 5))))
+        set entries_str to ptr_to_str(get_list(parts and 6))
+        set entries to raft_deserialize_entries(entries_str)
+        set ok to map_insert(result and "entries" and entries)
+
+    if msg_type equals RAFT_MSG_APPEND_ENTRIES_RESP:
+        # AER|term|success|match_index|sender_id
+        if num_parts < 5:
+            set ok to map_insert(result and "error" and 1)
+            return result
+        set ok to map_insert(result and "term" and string_to_int(ptr_to_str(get_list(parts and 1))))
+        set ok to map_insert(result and "success" and string_to_int(ptr_to_str(get_list(parts and 2))))
+        set ok to map_insert(result and "match_index" and string_to_int(ptr_to_str(get_list(parts and 3))))
+        set ok to map_insert(result and "sender_id" and ptr_to_str(get_list(parts and 4)))
+
+    if msg_type equals RAFT_MSG_CLIENT_PROPOSE:
+        # CP|command — command is everything after first pipe
+        # Rejoin in case command contains pipes
+        set command to ptr_to_str(get_list(parts and 1))
+        set k to 2
+        repeat while k < num_parts:
+            set command to concat(command and "|")
+            set command to concat(command and ptr_to_str(get_list(parts and k)))
+            set k to k + 1
+        set ok to map_insert(result and "command" and command)
+
+    return result
+
+# ================================================================
+# Network RPC: Send a Raft message and receive response
+# ================================================================
+
+define raft_send_rpc with address as Str and port as Int and msg_str as Str returning Map:
+    # Connect to a peer, send CONSENSUS message, receive response, close
+    set result to create_map()
+    set conn to transport_connect(address and port)
+    set conn_err to map_get_val(conn and "error")
+    if conn_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_CONNECT)
+        return result
+
+    set send_err to transport_send(conn and MSG_TYPE_CONSENSUS and msg_str)
+    if send_err != TRANSPORT_ERR_NONE:
+        set ok to transport_close(conn)
+        set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_SEND)
+        return result
+
+    set recv_result to transport_recv(conn)
+    set recv_err to map_get_val(recv_result and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        set ok to transport_close(conn)
+        set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_RECV)
+        return result
+
+    set ok to transport_close(conn)
+
+    # Deserialize the response payload
+    set resp_payload to ptr_to_str(map_get_val(recv_result and "payload"))
+    set parsed to raft_deserialize_message(resp_payload)
+    set ok to map_insert(parsed and "error" and RAFT_TRANSPORT_ERR_NONE)
+    return parsed
+
+# ================================================================
+# Raft Server Thread: Accept consensus RPCs over TCP
+# Dispatches to raft_handle_request_vote / raft_handle_append_entries
+# ================================================================
+
+define raft_server_handle_connection with conn as Map and node as Map:
+    set recv_result to transport_recv(conn)
+    set recv_err to map_get_val(recv_result and "error")
+    if recv_err != TRANSPORT_ERR_NONE:
+        return 0
+
+    set msg_type to ptr_to_str(map_get_val(recv_result and "msg_type"))
+    set payload to ptr_to_str(map_get_val(recv_result and "payload"))
+
+    # Only handle CONSENSUS messages
+    if (msg_type equals MSG_TYPE_CONSENSUS) == 0:
+        set ok to transport_send(conn and "ERROR" and "unknown_msg_type")
+        return 0
+
+    set parsed to raft_deserialize_message(payload)
+    set parse_err to map_get_val(parsed and "error")
+    if parse_err != 0:
+        set ok to transport_send(conn and MSG_TYPE_CONSENSUS and "ERR|parse_failed")
+        return 0
+
+    set rpc_type to ptr_to_str(map_get_val(parsed and "type"))
+    set my_id to ptr_to_str(map_get_val(node and "node_id"))
+
+    if rpc_type equals RAFT_MSG_REQUEST_VOTE:
+        set term to map_get_val(parsed and "term")
+        set candidate_id to ptr_to_str(map_get_val(parsed and "candidate_id"))
+        set last_log_index to map_get_val(parsed and "last_log_index")
+        set last_log_term to map_get_val(parsed and "last_log_term")
+
+        set resp to raft_handle_request_vote(borrow node and term and candidate_id and last_log_index and last_log_term)
+        set resp_term to map_get_val(resp and "term")
+        set vote_granted to map_get_val(resp and "vote_granted")
+
+        set resp_str to raft_serialize_request_vote_response(resp_term and vote_granted and my_id)
+        set ok to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+
+    if rpc_type equals RAFT_MSG_APPEND_ENTRIES:
+        set term to map_get_val(parsed and "term")
+        set leader_id to ptr_to_str(map_get_val(parsed and "leader_id"))
+        set prev_log_index to map_get_val(parsed and "prev_log_index")
+        set prev_log_term to map_get_val(parsed and "prev_log_term")
+        set leader_commit to map_get_val(parsed and "leader_commit")
+        set entries to map_get_val(parsed and "entries")
+
+        # Reset election timer on valid AppendEntries from leader
+        set ok to map_insert(node and "election_elapsed" and 0)
+
+        set resp to raft_handle_append_entries(borrow node and term and leader_id and prev_log_index and prev_log_term and entries and leader_commit)
+        set resp_term to map_get_val(resp and "term")
+        set success to map_get_val(resp and "success")
+
+        # Apply committed entries to state machine
+        if success == 1:
+            set node_log to map_get_val(node and "log")
+            set commit_index to map_get_val(node and "commit_index")
+            set last_applied to map_get_val(node and "last_applied")
+            repeat while last_applied < commit_index:
+                set entry to get_list(node_log and last_applied)
+                set err to state_apply_log(borrow node and entry)
+                set last_applied to last_applied + 1
+
+        set match_idx to length_list(map_get_val(node and "log"))
+        set resp_str to raft_serialize_append_entries_response(resp_term and success and match_idx and my_id)
+        set ok to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+
+    if rpc_type equals RAFT_MSG_CLIENT_PROPOSE:
+        set command to ptr_to_str(map_get_val(parsed and "command"))
+        set role to ptr_to_str(map_get_val(node and "role"))
+
+        if (role equals RAFT_ROLE_LEADER) == 0:
+            # Not leader — reject with leader hint
+            set resp_str to raft_serialize_client_propose_response(0 and "")
+            set ok to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+        else:
+            # Append to leader's log
+            set log to map_get_val(node and "log")
+            set log_len to length_list(log)
+            set new_idx to log_len + 1
+            set current_term to map_get_val(node and "current_term")
+
+            set entry to create_map()
+            set ok to map_insert(entry and "term" and current_term)
+            set ok to map_insert(entry and "index" and new_idx)
+            set ok to map_insert(entry and "command" and command)
+            set ok to append_list(log and entry)
+
+            set resp_str to raft_serialize_client_propose_response(1 and my_id)
+            set ok to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+
+    return 0
+
+define raft_server_thread with node as Map and port as Int:
+    set my_id to ptr_to_str(map_get_val(node and "node_id"))
+    set listener to transport_listen(port)
+    set listen_err to map_get_val(listener and "error")
+    if listen_err != TRANSPORT_ERR_NONE:
+        display f"[RAFT] {my_id}: server failed to bind port {port}"
+        return 1
+
+    # Signal that the server is ready
+    set ok to map_insert(node and "server_ready" and 1)
+
+    repeat while map_get_val(node and "running") == 1:
+        set conn to transport_accept(listener)
+        set conn_err to map_get_val(conn and "error")
+        if conn_err == TRANSPORT_ERR_NONE:
+            raft_server_handle_connection(conn and node)
+            set ok to transport_close(conn)
+
+    set ok to transport_close(listener)
+    return 0
+
+# ================================================================
+# Election Timer Thread: Drives election ticks and sends RPCs
+# ================================================================
+
+define raft_parse_peer_address with addr_str as Str returning Map:
+    # Parse "host:port" into a map with "host" and "port"
+    set result to create_map()
+    set parts to string_split(addr_str and ":")
+    set num to length_list(parts)
+    if num < 2:
+        set ok to map_insert(result and "host" and addr_str)
+        set ok to map_insert(result and "port" and 9200)
+        return result
+    set host to ptr_to_str(get_list(parts and 0))
+    set port_str to ptr_to_str(get_list(parts and 1))
+    set ok to map_insert(result and "host" and host)
+    set ok to map_insert(result and "port" and string_to_int(port_str))
+    return result
+
+define raft_dispatch_outgoing with node as Map and requests as List and peer_addresses as Map:
+    # Send each outgoing RPC to the appropriate peer over TCP
+    set num_requests to length_list(requests)
+    set i to 0
+    repeat while i < num_requests:
+        set req to get_list(requests and i)
+        set target to ptr_to_str(map_get_val(req and "target"))
+        set msg_type to ptr_to_str(map_get_val(req and "type"))
+
+        # Look up target address
+        set addr_str to ptr_to_str(map_get_val(peer_addresses and target))
+        if string_length(addr_str) == 0:
+            set i to i + 1
+            continue
+
+        set addr_info to raft_parse_peer_address(addr_str)
+        set host to ptr_to_str(map_get_val(addr_info and "host"))
+        set port to map_get_val(addr_info and "port")
+
+        if msg_type equals "RequestVote":
+            set term to map_get_val(req and "term")
+            set candidate_id to ptr_to_str(map_get_val(req and "candidate_id"))
+            set last_log_index to map_get_val(req and "last_log_index")
+            set last_log_term to map_get_val(req and "last_log_term")
+            set wire to raft_serialize_request_vote(term and candidate_id and last_log_index and last_log_term)
+
+            set resp to raft_send_rpc(host and port and wire)
+            set rpc_err to map_get_val(resp and "error")
+            if rpc_err == RAFT_TRANSPORT_ERR_NONE:
+                set resp_type to ptr_to_str(map_get_val(resp and "type"))
+                if resp_type equals RAFT_MSG_REQUEST_VOTE_RESP:
+                    set resp_term to map_get_val(resp and "term")
+                    set vote_granted to map_get_val(resp and "vote_granted")
+                    set sender to ptr_to_str(map_get_val(resp and "sender_id"))
+                    set current_term to map_get_val(node and "current_term")
+                    if resp_term > current_term:
+                        set ok to map_insert(node and "current_term" and resp_term)
+                        set ok to map_insert(node and "role" and RAFT_ROLE_FOLLOWER)
+                        set ok to map_insert(node and "voted_for" and "")
+                    set ok to election_handle_vote_response(borrow node and sender and resp_term and vote_granted)
+
+        if msg_type equals "AppendEntries":
+            set term to map_get_val(req and "term")
+            set leader_id to ptr_to_str(map_get_val(req and "leader_id"))
+            set prev_log_index to map_get_val(req and "prev_log_index")
+            set prev_log_term to map_get_val(req and "prev_log_term")
+            set entries to map_get_val(req and "entries")
+            set leader_commit to map_get_val(req and "leader_commit")
+            set wire to raft_serialize_append_entries(term and leader_id and prev_log_index and prev_log_term and entries and leader_commit)
+
+            set resp to raft_send_rpc(host and port and wire)
+            set rpc_err to map_get_val(resp and "error")
+            if rpc_err == RAFT_TRANSPORT_ERR_NONE:
+                set resp_type to ptr_to_str(map_get_val(resp and "type"))
+                if resp_type equals RAFT_MSG_APPEND_ENTRIES_RESP:
+                    set resp_term to map_get_val(resp and "term")
+                    set success to map_get_val(resp and "success")
+                    set match_idx to map_get_val(resp and "match_index")
+                    set sender to ptr_to_str(map_get_val(resp and "sender_id"))
+
+                    set current_term to map_get_val(node and "current_term")
+                    if resp_term > current_term:
+                        set ok to map_insert(node and "current_term" and resp_term)
+                        set ok to map_insert(node and "role" and RAFT_ROLE_FOLLOWER)
+                        set ok to map_insert(node and "voted_for" and "")
+
+                    set current_term to map_get_val(node and "current_term")
+                    set role to ptr_to_str(map_get_val(node and "role"))
+                    if resp_term == current_term && (role equals RAFT_ROLE_LEADER) == 1:
+                        set match_map to map_get_val(node and "match_index")
+                        set next_map to map_get_val(node and "next_index")
+                        if success == 1:
+                            set ok to map_insert(match_map and sender and match_idx)
+                            set ok to map_insert(next_map and sender and match_idx + 1)
+
+                            # Advance commit_index if majority replicated
+                            set log to map_get_val(node and "log")
+                            set log_len to length_list(log)
+                            set commit_index to map_get_val(node and "commit_index")
+
+                            set n to log_len
+                            repeat while n > commit_index:
+                                set count to 1
+                                set peers to map_get_val(node and "peers")
+                                set num_peers to length_list(peers)
+                                set p to 0
+                                repeat while p < num_peers:
+                                    set p_id to ptr_to_str(get_list(peers and p))
+                                    if map_get_val(match_map and p_id) >= n:
+                                        set count to count + 1
+                                    set p to p + 1
+
+                                set majority to (length_list(peers) / 2) + 1
+                                if count >= majority:
+                                    set entry_at_n to get_list(log and n - 1)
+                                    if map_get_val(entry_at_n and "term") == current_term:
+                                        set ok to map_insert(node and "commit_index" and n)
+                                        set n to commit_index
+                                set n to n - 1
+
+                            # Apply committed entries on leader
+                            set commit_index to map_get_val(node and "commit_index")
+                            set last_applied to map_get_val(node and "last_applied")
+                            repeat while last_applied < commit_index:
+                                set entry to get_list(log and last_applied)
+                                set err to state_apply_log(borrow node and entry)
+                                set last_applied to last_applied + 1
+
+                        else:
+                            # Decrement next_index on failure
+                            set next_idx to map_get_val(next_map and sender)
+                            if next_idx > 1:
+                                set ok to map_insert(next_map and sender and next_idx - 1)
+
+        set i to i + 1
+    return 0
+
+define raft_election_timer_thread with node as Map and peer_addresses as Map:
+    set my_id to ptr_to_str(map_get_val(node and "node_id"))
+
+    # Wait for server to be ready before starting timer
+    set wait_count to 0
+    repeat while map_get_val(node and "server_ready") != 1:
+        set ok to ep_sleep_ms(5)
+        set wait_count to wait_count + 1
+        if wait_count > 200:
+            display f"[RAFT] {my_id}: timer gave up waiting for server"
+            return 1
+
+    repeat while map_get_val(node and "running") == 1:
+        set ok to ep_sleep_ms(RAFT_TICK_MS)
+
+        set requests to election_tick(borrow node and RAFT_TICK_MS)
+        set num to length_list(requests)
+
+        if num > 0:
+            raft_dispatch_outgoing(node and requests and peer_addresses)
+
+        free_list(requests)
+
+    return 0
+
+# ================================================================
+# Client API: Propose a command to the Raft leader
+# ================================================================
+
+define raft_client_propose with address as Str and port as Int and command as Str returning Map:
+    set wire to raft_serialize_client_propose(command)
+    set resp to raft_send_rpc(address and port and wire)
+    return resp

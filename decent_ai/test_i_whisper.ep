@@ -1,0 +1,43 @@
+# Phase I negative-control: whisper response parsing + audio-path safety.
+# (The live transcription path needs a running whisper.cpp server; these test the
+# parsing/validation logic that can run without one.)
+
+import "string"
+import "collections"
+import "speech"
+
+define check_str with label as Str and got as Str and want as Str returning Int:
+    if got equals want:
+        display concat("PASS: " and label)
+        return 1
+    display concat(concat(concat("FAIL: " and label) and " got=[") and concat(got and "]"))
+    return 0
+
+define check_int with label as Str and got as Int and want as Int returning Int:
+    if got == want:
+        display concat("PASS: " and label)
+        return 1
+    display concat(concat(concat("FAIL: " and label) and " got=") and int_to_string(got))
+    return 0
+
+define main:
+    set passes to 0
+
+    # --- whisper JSON parsing ---
+    set passes to passes + check_str("json_text" and speech_parse_whisper_json("{\"text\":\"hello world\"}") and "hello world")
+    set passes to passes + check_str("json_text_trimmed" and speech_parse_whisper_json("{\"text\":\"  spaced  \"}") and "spaced")
+    set passes to passes + check_str("plain_fallback" and speech_parse_whisper_json("just raw text") and "just raw text")
+
+    # --- path safety: accept a normal path ---
+    set passes to passes + check_int("safe_normal" and speech_path_is_safe("/home/user/clips/audio_01.wav") and 1)
+    # reject shell metacharacters / spaces / traversal
+    set passes to passes + check_int("reject_space" and speech_path_is_safe("/tmp/a b.wav") and 0)
+    set passes to passes + check_int("reject_semicolon" and speech_path_is_safe("/tmp/a.wav;rm") and 0)
+    set passes to passes + check_int("reject_subshell" and speech_path_is_safe("/tmp/$(id).wav") and 0)
+    set passes to passes + check_int("reject_backtick" and speech_path_is_safe("/tmp/x`id`.wav") and 0)
+    set passes to passes + check_int("reject_quote" and speech_path_is_safe("/tmp/a'.wav") and 0)
+    set passes to passes + check_int("reject_traversal" and speech_path_is_safe("/tmp/../etc/passwd") and 0)
+    set passes to passes + check_int("reject_empty" and speech_path_is_safe("") and 0)
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/11 passed"))
+    return 0

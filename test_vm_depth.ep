@@ -1,0 +1,29 @@
+import "decent_money/contracts"
+import "stdlib/string"
+
+# Negative-control regression for B4: a self-CALLing contract must be bounded by the
+# call-depth guard and REVERT, not overflow the C stack and crash the node.
+# (Baseline without the guard was a verified SIGSEGV / exit 139.)
+define main:
+    set initrc to contracts_init()
+    set c to contract_create("LABEL run\n  RETURN 0\n" and "alice_did" and 100000000)
+    set cid to ptr_to_str(map_get_val(c and "id"))
+
+    # Rewrite the contract so its "run" entrypoint calls ITSELF forever.
+    set newcode to concat("LABEL run\n  CALL " and concat(cid and " run res\n  RETURN res\n"))
+    set ok to map_insert(c and "code" and newcode)
+    display concat("[test] deployed self-calling contract id=" and cid)
+
+    set res to contract_call(c and "run" and create_list() and "bob_did" and 100000000)
+    set status to map_get_val(res and "status")
+    set errmsg to ptr_to_str(map_get_val(res and "error"))
+    display concat("[test] status=" and int_to_string(status))
+    display concat("[test] error=" and errmsg)
+
+    if status == 911:
+        if string_contains(errmsg and "depth") == 1:
+            display "[PASS] self-CALL bounded by depth guard: reverted, no crash."
+        else:
+            display "[FAIL] reverted but NOT via depth guard (wrong cause)."
+    else:
+        display "[FAIL] did not revert (status not REVERTED)."

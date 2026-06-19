@@ -1,0 +1,216 @@
+# ErnosDecent — P2P Collaborative Bandwidth Sharing Tiers
+# Component: decent_pool/bandwidth.ep
+# Implements: Bandwidth contribution scoring, tier allocation, proxy rate limits, and a real routing proxy
+# Status: Production — OperationTrojanClaude Phase 12
+
+import "collections"
+import "string"
+import "../decent_net/transport"
+
+# ================================================================
+# Constants and Error Codes
+# ================================================================
+
+set BANDWIDTH_ERR_NONE to 0
+set BANDWIDTH_ERR_PEER_NOT_FOUND to 801
+set BANDWIDTH_ERR_RATE_LIMITED to 802
+set BANDWIDTH_ERR_INVALID_DIRECTION to 803
+set BANDWIDTH_ERR_INVALID_TIER to 804
+set BANDWIDTH_ERR_UNREACHABLE to 805
+
+# ================================================================
+# Data Structures
+# ================================================================
+
+define structure BandwidthTier:
+    field name as Str
+    field rate_limit_kbps as Int
+    field priority as Int
+
+define structure BandwidthNode:
+    field node_id as Str
+    field bytes_uploaded as Int
+    field bytes_downloaded as Int
+    field contribution_score as Int
+    field tier_name as Str
+    field last_active as Int
+
+# ================================================================
+# Pool Management
+# ================================================================
+
+define bandwidth_create_pool returning Map:
+    set pool to create_map()
+    set peers to create_map()
+    set tiers to create_map()
+    
+    set ok to map_insert(pool and "peers" and peers)
+    set ok to map_insert(pool and "tiers" and tiers)
+    set ok to map_insert(pool and "total_pooled_bandwidth_kbps" and 0)
+
+    # Initialize standard tiers
+    # Free tier: low priority, low speed
+    set tier_free to create_map()
+    set ok to map_insert(tier_free and "name" and "free")
+    set ok to map_insert(tier_free and "rate_limit_kbps" and 100) # 100 kbps
+    set ok to map_insert(tier_free and "priority" and 0)
+    set ok to map_insert(tiers and "free" and tier_free)
+
+    # Emergency / War-Zone tier: high priority, medium speed (for restricted regions)
+    set tier_emergency to create_map()
+    set ok to map_insert(tier_emergency and "name" and "emergency")
+    set ok to map_insert(tier_emergency and "rate_limit_kbps" and 1000) # 1 Mbps
+    set ok to map_insert(tier_emergency and "priority" and 2)
+    set ok to map_insert(tiers and "emergency" and tier_emergency)
+
+    # Premium / Contributor tier: high priority, high speed (earned by sharing)
+    set tier_premium to create_map()
+    set ok to map_insert(tier_premium and "name" and "premium")
+    set ok to map_insert(tier_premium and "rate_limit_kbps" and 10000) # 10 Mbps
+    set ok to map_insert(tier_premium and "priority" and 1)
+    set ok to map_insert(tiers and "premium" and tier_premium)
+
+    return pool
+
+define bandwidth_add_peer with pool as Map and node_id as Str returning Int:
+    set peers to map_get_val(pool and "peers")
+    set existing to map_get_val(peers and node_id)
+    if existing != 0:
+        return BANDWIDTH_ERR_NONE
+
+    set peer to create_map()
+    set ok to map_insert(peer and "node_id" and node_id)
+    set ok to map_insert(peer and "bytes_uploaded" and 0)
+    set ok to map_insert(peer and "bytes_downloaded" and 0)
+    set ok to map_insert(peer and "contribution_score" and 0)
+    set ok to map_insert(peer and "tier_name" and "free")
+    set ok to map_insert(peer and "last_active" and ep_time_now_sec())
+
+    set ok to map_insert(peers and node_id and peer)
+    return BANDWIDTH_ERR_NONE
+
+# ================================================================
+# Traffic Recording & Contribution Scoring
+# ================================================================
+
+define bandwidth_record_traffic with pool as Map and node_id as Str and bytes as Int and direction as Str returning Int:
+    set peers to map_get_val(pool and "peers")
+    set peer to map_get_val(peers and node_id)
+    if peer == 0:
+        return BANDWIDTH_ERR_PEER_NOT_FOUND
+
+    set bytes_up to map_get_val(peer and "bytes_uploaded")
+    set bytes_down to map_get_val(peer and "bytes_downloaded")
+
+    if direction equals "upload":
+        set ok to map_insert(peer and "bytes_uploaded" and bytes_up + bytes)
+    else:
+        if direction equals "download":
+            set ok to map_insert(peer and "bytes_downloaded" and bytes_down + bytes)
+        else:
+            return BANDWIDTH_ERR_INVALID_DIRECTION
+
+    # Recalculate contribution score: Contribution = Upload - (Download / 2)
+    # This rewards seeding and contributing raw upstream bandwidth.
+    set current_up to map_get_val(peer and "bytes_uploaded")
+    set current_down to map_get_val(peer and "bytes_downloaded")
+    set score to current_up - (current_down / 2)
+    set ok to map_insert(peer and "contribution_score" and score)
+
+    # Dynamic Tier Upgrades based on contribution
+    # If contribution score > 50 MB, upgrade to premium tier automatically
+    # 50 MB = 50 * 1024 * 1024 = 52428800 bytes
+    set limit_threshold to 52428800
+    set current_tier to map_get_val(peer and "tier_name")
+    if current_tier equals "free":
+        if score >= limit_threshold:
+            set ok to map_insert(peer and "tier_name" and "premium")
+
+    set ok to map_insert(peer and "last_active" and ep_time_now_sec())
+    return BANDWIDTH_ERR_NONE
+
+define bandwidth_check_limit with pool as Map and node_id as Str and tier_name as Str returning Int:
+    set peers to map_get_val(pool and "peers")
+    set peer to map_get_val(peers and node_id)
+    if peer == 0:
+        return BANDWIDTH_ERR_PEER_NOT_FOUND
+
+    set tiers to map_get_val(pool and "tiers")
+    set tier to map_get_val(tiers and tier_name)
+    if tier == 0:
+        return BANDWIDTH_ERR_INVALID_TIER
+
+    set limit_kbps to map_get_val(tier and "rate_limit_kbps")
+    
+    # We check if a peer's recent consumption rate is within limits.
+    # In this simulated pooling model, a node's usage is evaluated against their tier threshold.
+    # If the tier is free, we impose a simulated limit check where if they have downloaded 
+    # more than 10MB in the current minute window, they get rate-limited.
+    # Emergency tier allows up to 50MB, and Premium allows 1GB.
+    set bytes_down to map_get_val(peer and "bytes_downloaded")
+    set limit_bytes to 0
+    
+    if tier_name equals "free":
+        set limit_bytes to 10485760 # 10 MB
+    else:
+        if tier_name equals "emergency":
+            set limit_bytes to 52428800 # 50 MB
+        else:
+            if tier_name equals "premium":
+                set limit_bytes to 1073741824 # 1 GB
+
+    if bytes_down > limit_bytes:
+        return BANDWIDTH_ERR_RATE_LIMITED
+
+    return BANDWIDTH_ERR_NONE
+
+# ================================================================
+# Collaborative Routing Proxy
+# ================================================================
+
+# Forward a sender's request to a real destination over TCP on their behalf (a real
+# bandwidth-sharing relay — previously this only echoed the payload and "simulated"
+# routing). Records the actual bytes relayed in both directions for accounting and
+# returns the destination's real reply.
+define bandwidth_route_proxy with pool as Map and sender_id as Str and dest_address as Str and dest_port as Int and msg_type as Str and payload as Str returning Map:
+    set result to create_map()
+    set ok to bandwidth_add_peer(pool and sender_id)
+
+    set peers to map_get_val(pool and "peers")
+    set peer to map_get_val(peers and sender_id)
+    set tier_name to map_get_val(peer and "tier_name")
+
+    # Check if sender is rate-limited
+    set limit_check to bandwidth_check_limit(pool and sender_id and tier_name)
+    if limit_check != 0:
+        set ok to map_insert(result and "error" and limit_check)
+        set ok to map_insert(result and "status" and "denied")
+        return result
+
+    # Open a real connection to the destination and forward the request.
+    set conn to transport_connect(dest_address and dest_port)
+    if map_get_val(conn and "error") != 0:
+        set ok to free_map(conn)
+        set ok to map_insert(result and "error" and BANDWIDTH_ERR_UNREACHABLE)
+        set ok to map_insert(result and "status" and "unreachable")
+        return result
+
+    set up_bytes to string_length(payload)
+    set ok to transport_send(conn and msg_type and payload)
+    # Sender's request egresses through us: that is upload bandwidth we contribute.
+    set ok to bandwidth_record_traffic(pool and sender_id and up_bytes and "upload")
+
+    set reply to transport_recv(conn)
+    set ok to transport_close(conn)
+    set resp_payload to ""
+    if map_get_val(reply and "error") == 0:
+        set resp_payload to ptr_to_str(map_get_val(reply and "payload"))
+    set down_bytes to string_length(resp_payload)
+    # The reply we relay back to the sender is download bandwidth.
+    set ok to bandwidth_record_traffic(pool and sender_id and down_bytes and "download")
+
+    set ok to map_insert(result and "error" and BANDWIDTH_ERR_NONE)
+    set ok to map_insert(result and "status" and "routed")
+    set ok to map_insert(result and "proxied_payload" and resp_payload)
+    set ok to map_insert(result and "allocated_tier" and tier_name)
+    return result

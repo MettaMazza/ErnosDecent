@@ -1,0 +1,174 @@
+# ErnosDecent — Production Rotating Error Logger
+# Component: logging.ep
+# Provides: Thread-safe rotating file logger with severity levels
+# Status: Production
+
+import "string"
+import "fs"
+import "os"
+
+# ================================================================
+# Constants
+# ================================================================
+
+set LOG_LEVEL_DEBUG to 0
+set LOG_LEVEL_INFO to 1
+set LOG_LEVEL_WARN to 2
+set LOG_LEVEL_ERROR to 3
+set LOG_LEVEL_FATAL to 4
+
+set LOG_MAX_FILE_SIZE to 5242880
+set LOG_MAX_FILES to 5
+set LOG_MIN_LEVEL to LOG_LEVEL_INFO
+
+set LOG_DIR to ""
+set LOG_FILE_PATH to ""
+set LOG_CURRENT_SIZE to 0
+set LOG_INITIALIZED to 0
+
+# ================================================================
+# Initialization
+# ================================================================
+
+define log_init with log_dir as Str and max_size as Int and max_files as Int returning Int:
+    set LOG_DIR to log_dir
+    set LOG_MAX_FILE_SIZE to max_size
+    set LOG_MAX_FILES to max_files
+
+    # Ensure log directory exists
+    if fs_exists(log_dir) == 0:
+        set ok to run_command(concat("mkdir -p " and log_dir))
+
+    set LOG_FILE_PATH to concat(log_dir and "/ernosdecent.log")
+
+    # Get current file size if exists
+    if fs_exists(LOG_FILE_PATH) == 1:
+        set LOG_CURRENT_SIZE to fs_get_size(LOG_FILE_PATH)
+    else:
+        set LOG_CURRENT_SIZE to 0
+
+    set LOG_INITIALIZED to 1
+    return 0
+
+define log_set_level with level as Int returning Int:
+    set LOG_MIN_LEVEL to level
+    return 0
+
+# ================================================================
+# Log Rotation
+# ================================================================
+
+define log_rotate returning Int:
+    # Rotate: ernosdecent.log.4 → delete
+    #         ernosdecent.log.3 → .4
+    #         ernosdecent.log.2 → .3
+    #         ernosdecent.log.1 → .2
+    #         ernosdecent.log   → .1
+
+    set i to LOG_MAX_FILES - 1
+    repeat while i >= 1:
+        set old_path to concat(LOG_FILE_PATH and ".")
+        set old_path to concat(old_path and int_to_string(i))
+        set new_idx to i + 1
+        set new_path to concat(LOG_FILE_PATH and ".")
+        set new_path to concat(new_path and int_to_string(new_idx))
+
+        if fs_exists(old_path) == 1:
+            if new_idx > LOG_MAX_FILES:
+                set ok to fs_delete_file(old_path)
+            else:
+                set ok to fs_move_file(old_path and new_path)
+        set i to i - 1
+
+    # Move current log to .1
+    if fs_exists(LOG_FILE_PATH) == 1:
+        set first_rotated to concat(LOG_FILE_PATH and ".1")
+        set ok to fs_move_file(LOG_FILE_PATH and first_rotated)
+
+    set LOG_CURRENT_SIZE to 0
+    return 0
+
+# ================================================================
+# Core Write
+# ================================================================
+
+define log_write with level as Int and component as Str and message as Str returning Int:
+    if LOG_INITIALIZED == 0:
+        # Fallback to display if not initialized
+        display f"[{component}] {message}"
+        return 0
+
+    if level < LOG_MIN_LEVEL:
+        return 0
+
+    # Build level string
+    set level_str to "INFO"
+    if level == LOG_LEVEL_DEBUG:
+        set level_str to "DEBUG"
+    else:
+        if level == LOG_LEVEL_WARN:
+            set level_str to "WARN"
+        else:
+            if level == LOG_LEVEL_ERROR:
+                set level_str to "ERROR"
+            else:
+                if level == LOG_LEVEL_FATAL:
+                    set level_str to "FATAL"
+
+    # Build timestamp
+    set ts_ms to ep_time_now_ms()
+    set ts_sec to ts_ms / 1000
+    set ts_frac to ts_ms - (ts_sec * 1000)
+
+    # Build log line
+    set line to concat("[" and int_to_string(ts_sec))
+    set line to concat(line and ".")
+    set frac_str to int_to_string(ts_frac)
+    # Pad fraction to 3 digits
+    if ts_frac < 10:
+        set frac_str to concat("00" and frac_str)
+    else:
+        if ts_frac < 100:
+            set frac_str to concat("0" and frac_str)
+    set line to concat(line and frac_str)
+    set line to concat(line and "] [")
+    set line to concat(line and level_str)
+    set line to concat(line and "] [")
+    set line to concat(line and component)
+    set line to concat(line and "] ")
+    set line to concat(line and message)
+    set line to concat(line and "\n")
+
+    # Check rotation
+    set line_len to string_length(line)
+    if LOG_CURRENT_SIZE + line_len > LOG_MAX_FILE_SIZE:
+        set ok to log_rotate()
+
+    # Write to file
+    set ok to file_append(LOG_FILE_PATH and line)
+    set LOG_CURRENT_SIZE to LOG_CURRENT_SIZE + line_len
+
+    # Also display errors and fatals to console
+    if level >= LOG_LEVEL_ERROR:
+        display f"[{level_str}] [{component}] {message}"
+
+    return 0
+
+# ================================================================
+# Convenience Functions
+# ================================================================
+
+define log_debug with component as Str and message as Str returning Int:
+    return log_write(LOG_LEVEL_DEBUG and component and message)
+
+define log_info with component as Str and message as Str returning Int:
+    return log_write(LOG_LEVEL_INFO and component and message)
+
+define log_warn with component as Str and message as Str returning Int:
+    return log_write(LOG_LEVEL_WARN and component and message)
+
+define log_error with component as Str and message as Str returning Int:
+    return log_write(LOG_LEVEL_ERROR and component and message)
+
+define log_fatal with component as Str and message as Str returning Int:
+    return log_write(LOG_LEVEL_FATAL and component and message)

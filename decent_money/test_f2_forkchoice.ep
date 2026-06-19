@@ -1,0 +1,74 @@
+# F2 negative-control test: block-propagation linkage, fork-choice, equivocation.
+# Exercises ledger_receive_block's gatekeeping WITHOUT needing a valid PoS block
+# (all these checks run before ledger_add_block), plus seeds seen_blocks to drive
+# the equivocation / duplicate / stale-other-validator branches.
+
+import "string"
+import "collections"
+import "../decent_id/keys"
+import "ledger"
+
+define build_block_wire with idx as Int and prev_hash as Str and merkle as Str and validator as Str returning Str:
+    set s to int_to_string(idx)
+    set s to concat(s and ";")
+    set s to concat(s and prev_hash)
+    set s to concat(s and ";")
+    set s to concat(s and merkle)
+    set s to concat(s and ";")
+    set s to concat(s and validator)
+    set s to concat(s and ";")
+    set s to concat(s and "sig0")
+    set s to concat(s and ";")
+    set s to concat(s and "1234")
+    set s to concat(s and ";")
+    set s to concat(s and "0")
+    set s to concat(s and ";")
+    return s
+
+define check_eq with label as Str and got as Int and want as Int returning Int:
+    if got == want:
+        display concat("PASS: " and label)
+        return 1
+    display concat(concat(concat(concat("FAIL: " and label) and " got=") and int_to_string(got)) and concat(" want=" and int_to_string(want)))
+    return 0
+
+define main:
+    set ok to init_crypto()
+    set ledger to ledger_create("aabbccdd")
+    set blocks to map_get_val(ledger and "blocks")
+    set genesis to get_list(blocks and 0)
+    set genesis_hash to ptr_to_str(map_get_val(genesis and "hash"))
+
+    set passes to 0
+
+    # Case B: gap — index 5 is far beyond tip+1 (=1)
+    set w_gap to build_block_wire(5 and genesis_hash and "m5" and "v1")
+    set passes to passes + check_eq("gap_rejected" and ledger_receive_block(ledger and w_gap) and LEDGER_ERR_BLOCK_GAP)
+
+    # Case C: fork — index 1 (==tip+1) but builds on the wrong parent
+    set w_fork to build_block_wire(1 and "deadbeef" and "m1" and "v1")
+    set passes to passes + check_eq("fork_rejected" and ledger_receive_block(ledger and w_fork) and LEDGER_ERR_BLOCK_FORK)
+
+    # Case A: stale — index 0 (== tip height), nothing recorded there
+    set w_stale to build_block_wire(0 and "0" and "m0" and "v1")
+    set passes to passes + check_eq("stale_rejected" and ledger_receive_block(ledger and w_stale) and LEDGER_ERR_BLOCK_STALE)
+
+    # Seed seen_blocks so height 0 is "held" by validator v1 with merkle mORIG
+    set seen to create_map()
+    set ok to map_insert(seen and "0" and "v1|mORIG")
+    set ok to map_insert(ledger and "seen_blocks" and seen)
+
+    # Equivocation — same validator v1, different content
+    set w_equiv to build_block_wire(0 and "0" and "mEVIL" and "v1")
+    set passes to passes + check_eq("equivocation_detected" and ledger_receive_block(ledger and w_equiv) and LEDGER_ERR_BLOCK_EQUIVOCATION)
+
+    # Duplicate — same validator + same merkle as recorded
+    set w_dup to build_block_wire(0 and "0" and "mORIG" and "v1")
+    set passes to passes + check_eq("duplicate_detected" and ledger_receive_block(ledger and w_dup) and LEDGER_BLOCK_DUPLICATE)
+
+    # Different validator at a height we hold — stale (not equivocation)
+    set w_other to build_block_wire(0 and "0" and "mORIG" and "v2")
+    set passes to passes + check_eq("other_validator_stale" and ledger_receive_block(ledger and w_other) and LEDGER_ERR_BLOCK_STALE)
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/6 passed"))
+    return 0

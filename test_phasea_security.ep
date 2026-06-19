@@ -1,0 +1,140 @@
+import "collections"
+import "string"
+
+# Negative-control test for the Phase-A SSRF / shell-escape logic. Byte-identical
+# copies of the pure helpers in decent_web/web_server.ep (which cannot be imported
+# standalone due to whole-program cross-module refs). Validates the exact algorithm.
+
+define url_extract_host with url as Str returning Str:
+    set host to url
+    set sp to string_index_of(host and "://")
+    if sp >= 0:
+        set host to substring(host and sp + 3 and string_length(host) - sp - 3)
+    set slp to string_index_of(host and "/")
+    if slp >= 0:
+        set host to substring(host and 0 and slp)
+    set atp to string_index_of(host and "@")
+    if atp >= 0:
+        set host to substring(host and atp + 1 and string_length(host) - atp - 1)
+    if string_index_of(host and "[") == 0:
+        set rb to string_index_of(host and "]")
+        if rb > 0:
+            return substring(host and 1 and rb - 1)
+    set cp to string_index_of(host and ":")
+    if cp >= 0:
+        set host to substring(host and 0 and cp)
+    return host
+
+define url_is_safe_external with url as Str returning Int:
+    set lower to string_lower(url)
+    if string_index_of(lower and "http://") != 0 and also string_index_of(lower and "https://") != 0:
+        return 0
+    set host to string_lower(url_extract_host(url))
+    if string_length(host) == 0:
+        return 0
+    if host equals "localhost" or else host equals "127.0.0.1" or else host equals "0.0.0.0" or else host equals "::1":
+        return 0
+    if string_index_of(host and "127.") == 0 or else string_index_of(host and "10.") == 0:
+        return 0
+    if string_index_of(host and "192.168.") == 0 or else string_index_of(host and "169.254.") == 0:
+        return 0
+    if string_index_of(host and "172.") == 0:
+        set rest to substring(host and 4 and string_length(host) - 4)
+        set dotp to string_index_of(rest and ".")
+        if dotp > 0:
+            set o2 to string_to_int(substring(rest and 0 and dotp))
+            if o2 >= 16 and also o2 <= 31:
+                return 0
+    if string_index_of(host and "fe80") == 0 or else string_index_of(host and "fc") == 0 or else string_index_of(host and "fd") == 0:
+        if string_index_of(host and ".") < 0:
+            return 0
+    return 1
+
+define web_sq with s as Str returning Str:
+    set esc to string_replace(s and "'" and "'\\''")
+    return concat("'" and concat(esc and "'"))
+
+# Each checker prints PASS/FAIL and returns 1 on pass, 0 on fail (counts are
+# summed in main's local — scalar globals do not persist reassignment in Ernos).
+define check_ssrf with url as Str and want as Int returning Int:
+    set got to url_is_safe_external(url)
+    if got == want:
+        display concat("[PASS] ssrf " and url)
+        return 1
+    display concat(concat("[FAIL] ssrf " and url) and f"  got={got} want={want}")
+    return 0
+
+define check_host with url as Str and want as Str returning Int:
+    set got to url_extract_host(url)
+    if got equals want:
+        display concat("[PASS] host " and url)
+        return 1
+    display concat(concat("[FAIL] host " and url) and concat(" got=" and got))
+    return 0
+
+define check_sq with inp as Str and want as Str returning Int:
+    set got to web_sq(inp)
+    if got equals want:
+        display concat("[PASS] sq " and inp)
+        return 1
+    display concat(concat("[FAIL] sq got=" and got) and concat(" want=" and want))
+    return 0
+
+define main returning Int:
+    set p to 0
+    set t to 0
+
+    set p to p + check_ssrf("http://example.com/x" and 1)
+    set t to t + 1
+    set p to p + check_ssrf("https://duckduckgo.com/" and 1)
+    set t to t + 1
+    set p to p + check_ssrf("http://127.0.0.1:5000/api" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://127.5.5.5/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://localhost/x" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://0.0.0.0/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://10.1.2.3/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://192.168.0.1/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://169.254.169.254/latest/meta-data/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://172.16.0.1/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://172.31.255.1/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://172.15.0.1/" and 1)
+    set t to t + 1
+    set p to p + check_ssrf("http://172.32.0.1/" and 1)
+    set t to t + 1
+    set p to p + check_ssrf("http://172.217.16.1/" and 1)
+    set t to t + 1
+    set p to p + check_ssrf("ftp://example.com/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("file:///etc/passwd" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://[::1]:8080/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://user@127.0.0.1/" and 0)
+    set t to t + 1
+    set p to p + check_ssrf("http://fcbarcelona.com/" and 1)
+    set t to t + 1
+
+    set p to p + check_host("http://example.com:8080/path" and "example.com")
+    set t to t + 1
+    set p to p + check_host("http://[fe80::1]:9/" and "fe80::1")
+    set t to t + 1
+
+    set p to p + check_sq("abc" and "'abc'")
+    set t to t + 1
+    set p to p + check_sq("x$(touch /tmp/p)" and "'x$(touch /tmp/p)'")
+    set t to t + 1
+
+    display "==================================="
+    display f"RESULT: {p}/{t} passed"
+    if p < t:
+        return 1
+    return 0

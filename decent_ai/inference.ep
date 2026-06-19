@@ -1,0 +1,839 @@
+# ErnosDecent -- Local LLM Inference Engine (GGUF Parser + Fixed-Point Transformer)
+# Component: decent_ai/inference.ep
+# Status: Production -- OperationTrojanClaude Phase 9
+
+import "string"
+import "collections"
+
+external define ep_dlopen with lib:
+external define ep_dlsym with handle and name:
+external define ep_dlcall1 with fn and a0:
+external define ep_dlcall2 with fn and a0 and a1:
+external define ep_dlcall3 with fn and a0 and a1 and a2:
+external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
+
+# ════════════════════════════════════════════════════════════════
+# Float32 to Fixed-Point Conversion Helper
+# ════════════════════════════════════════════════════════════════
+
+define float32_to_fixed with u as Int returning Int:
+    if u == 0:
+        return 0
+        
+    # Sign bit, exponent bits, mantissa bits
+    set sign_bit to (u / 2147483648) modulo 2
+    set exp_bits to (u / 8388608) modulo 256
+    set mantissa_bits to u modulo 8388608
+    
+    if exp_bits == 0:
+        return 0
+    if exp_bits == 255:
+        return 0
+        
+    set exponent to exp_bits - 127
+    set scale to 1000000
+    
+    # Calculate 2^exponent in fixed point
+    set val to 0
+    if exponent >= 0:
+        set temp to 1
+        set i to 0
+        repeat while i < exponent:
+            set temp to temp * 2
+            set i to i + 1
+        set base_val to scale * temp
+        set mant_val to (scale * mantissa_bits * temp) / 8388608
+        set val to base_val + mant_val
+    else:
+        set temp to 1
+        set i to 0
+        repeat while i < (0 - exponent):
+            set temp to temp * 2
+            set i to i + 1
+        set base_val to scale / temp
+        set mant_val to (scale * mantissa_bits) / (8388608 * temp)
+        set val to base_val + mant_val
+        
+    if sign_bit == 1:
+        return 0 - val
+    return val
+
+# ════════════════════════════════════════════════════════════════
+# Binary Buffer Readers
+# ════════════════════════════════════════════════════════════════
+
+define read_uint32 with ptr as Int and offset as Int returning Int:
+    set val to 0
+    set multiplier to 1
+    set i to 0
+    repeat while i < 4:
+        set b to peek_byte(ptr and offset + i)
+        set val to val + (b * multiplier)
+        set multiplier to multiplier * 256
+        set i to i + 1
+    return val
+
+define read_uint64 with ptr as Int and offset as Int returning Int:
+    set val to 0
+    set multiplier to 1
+    set i to 0
+    repeat while i < 8:
+        set b to peek_byte(ptr and offset + i)
+        set val to val + (b * multiplier)
+        set multiplier to multiplier * 256
+        set i to i + 1
+    return val
+
+define read_uint16 with ptr as Int and offset as Int returning Int:
+    return peek_byte(ptr and offset) + peek_byte(ptr and offset + 1) * 256
+
+# IEEE-754 half-precision (fp16) -> fixed-point (scale 1e6). Used for F16 tensors
+# and Q8_0 per-block scales.
+define fp16_to_fixed with h as Int returning Int:
+    if h == 0:
+        return 0
+    set sign_bit to (h / 32768) modulo 2
+    set exp_bits to (h / 1024) modulo 32
+    set mantissa_bits to h modulo 1024
+    if exp_bits == 31:
+        return 0
+    set scale to 1000000
+    set val to 0
+    if exp_bits == 0:
+        set temp to 1
+        set i to 0
+        repeat while i < 14:
+            set temp to temp * 2
+            set i to i + 1
+        set val to (scale * mantissa_bits) / (1024 * temp)
+    else:
+        set exponent to exp_bits - 15
+        if exponent >= 0:
+            set temp to 1
+            set i to 0
+            repeat while i < exponent:
+                set temp to temp * 2
+                set i to i + 1
+            set base_val to scale * temp
+            set mant_val to (scale * mantissa_bits * temp) / 1024
+            set val to base_val + mant_val
+        else:
+            set temp to 1
+            set i to 0
+            repeat while i < (0 - exponent):
+                set temp to temp * 2
+                set i to i + 1
+            set base_val to scale / temp
+            set mant_val to (scale * mantissa_bits) / (1024 * temp)
+            set val to base_val + mant_val
+    if sign_bit == 1:
+        return 0 - val
+    return val
+
+# Dequantize up to `count` (≤32) values of one GGUF Q8_0 block at blk_off into
+# out_list. Block layout: fp16 scale d (2 bytes) then 32 signed int8 quants;
+# value = d × q. Stride between blocks is 34 bytes.
+define dequant_q8_0_block with buf_ptr as Int and blk_off as Int and out_list as List and count as Int returning Int:
+    set d_fixed to fp16_to_fixed(read_uint16(buf_ptr and blk_off))
+    set qi to 0
+    repeat while qi < count:
+        set q_byte to peek_byte(buf_ptr and blk_off + 2 + qi)
+        set q_signed to q_byte
+        if q_signed > 127:
+            set q_signed to q_signed - 256
+        set ok to append_list(out_list and d_fixed * q_signed)
+        set qi to qi + 1
+    return 0
+
+define read_gguf_string with ptr as Int and offset_ref as List returning Str:
+    set offset to get_list(offset_ref and 0)
+    set len to read_uint64(ptr and offset)
+    set offset to offset + 8
+    
+    set str_buf to alloc_bytes(len + 1)
+    set i to 0
+    repeat while i < len:
+        poke_byte(str_buf and i and peek_byte(ptr and offset + i))
+        set i to i + 1
+    poke_byte(str_buf and len and 0)
+    
+    set res_str to ptr_to_str(str_buf)
+    free_bytes(str_buf)
+    
+    set ok to set_list(offset_ref and 0 and offset + len)
+    return res_str
+
+# ════════════════════════════════════════════════════════════════
+# Fixed-Point Math Functions
+# ════════════════════════════════════════════════════════════════
+
+define fixed_exp with x as Int returning Int:
+    if x < 0 - 20000000:
+        return 0
+    set scale to 1000000
+    if x < 0 - 2000000:
+        set half to fixed_exp(x / 2)
+        return (half * half) / scale
+        
+    set t0 to scale
+    set t1 to x
+    set t2 to (t1 * x) / (2 * scale)
+    set t3 to (t2 * x) / (3 * scale)
+    set t4 to (t3 * x) / (4 * scale)
+    set t5 to (t4 * x) / (5 * scale)
+    
+    return t0 + t1 + t2 + t3 + t4 + t5
+
+define fixed_softmax with vec as List returning Int:
+    set len to length_list(vec)
+    if len == 0:
+        return 0
+        
+    set max_val to get_list(vec and 0)
+    set i to 1
+    repeat while i < len:
+        set val to get_list(vec and i)
+        if val > max_val:
+            set max_val to val
+        set i to i + 1
+        
+    set exps to create_list()
+    set sum to 0
+    set j to 0
+    repeat while j < len:
+        set val to get_list(vec and j)
+        set shifted to val - max_val
+        set e to fixed_exp(shifted)
+        set ok to append_list(exps and e)
+        set sum to sum + e
+        set j to j + 1
+        
+    set scale to 1000000
+    set k to 0
+    repeat while k < len:
+        set e to get_list(exps and k)
+        set prob to 0
+        if sum > 0:
+            set prob to (e * scale) / sum
+        set ok to set_list(vec and k and prob)
+        set k to k + 1
+        
+    free_list(exps)
+    return 0
+
+define fixed_sqrt with x as Int returning Int:
+    if x <= 0:
+        return 0
+    set scale to 1000000
+    set y to x
+    set iter to 0
+    repeat while iter < 15:
+        set y to (y + (x * scale) / y) / 2
+        set iter to iter + 1
+    return y
+
+# Fixed-point sine (scale 1e6). Range-reduce to [-π/2, π/2] (where the series is
+# accurate) using sin(π−x)=sin(x), then 6-term Taylor series.
+define fixed_sin with x as Int returning Int:
+    set scale to 1000000
+    set pi to 3141593
+    set half_pi to 1570796
+    set two_pi to 6283185
+    set ang to x
+    repeat while ang > pi:
+        set ang to ang - two_pi
+    repeat while ang < 0 - pi:
+        set ang to ang + two_pi
+    if ang > half_pi:
+        set ang to pi - ang
+    if ang < 0 - half_pi:
+        set ang to (0 - pi) - ang
+    set a2 to (ang * ang) / scale
+    set t to ang
+    set s to t
+    set t to (0 - (t * a2) / scale) / 6
+    set s to s + t
+    set t to (0 - (t * a2) / scale) / 20
+    set s to s + t
+    set t to (0 - (t * a2) / scale) / 42
+    set s to s + t
+    set t to (0 - (t * a2) / scale) / 72
+    set s to s + t
+    set t to (0 - (t * a2) / scale) / 110
+    set s to s + t
+    return s
+
+# cos(x) = sin(x + π/2)
+define fixed_cos with x as Int returning Int:
+    return fixed_sin(x + 1570796)
+
+# Rotary positional encoding (RoPE) applied in place to a vector at sequence
+# position `pos`. inv_freq_i = 10000^(-2i/dim) = exp(-(2i/dim)·ln 10000); pairs
+# (2i, 2i+1) are rotated by pos·inv_freq_i. Matches the standard RoPE construction.
+define rope_apply with vec as List and pos as Int and dim as Int returning Int:
+    set scale to 1000000
+    set ln10k to 9210340
+    set half to dim / 2
+    set i to 0
+    repeat while i < half:
+        set expo to 0 - (2 * i * ln10k) / dim
+        set inv_freq to fixed_exp(expo)
+        set angle to pos * inv_freq
+        set c to fixed_cos(angle)
+        set s to fixed_sin(angle)
+        set x0 to get_list(vec and 2 * i)
+        set x1 to get_list(vec and 2 * i + 1)
+        set ok to set_list(vec and 2 * i and (x0 * c - x1 * s) / scale)
+        set ok to set_list(vec and 2 * i + 1 and (x0 * s + x1 * c) / scale)
+        set i to i + 1
+    return 0
+
+# ════════════════════════════════════════════════════════════════
+# Fixed-Point Tensor Operations
+# ════════════════════════════════════════════════════════════════
+
+define fixed_matrix_vector_multiply with weight as List and input_vec as List and output_vec as List and rows as Int and cols as Int returning Int:
+    set scale to 1000000
+    set i to 0
+    repeat while i < rows:
+        set sum to 0
+        set j to 0
+        repeat while j < cols:
+            set w_val to get_list(weight and i * cols + j)
+            set in_val to get_list(input_vec and j)
+            set sum to sum + (w_val * in_val) / scale
+            set j to j + 1
+        set ok to append_list(output_vec and sum)
+        set i to i + 1
+    return 0
+
+define fixed_relu with vec as List returning Int:
+    set len to length_list(vec)
+    set i to 0
+    repeat while i < len:
+        set val to get_list(vec and i)
+        if val < 0:
+            set ok to set_list(vec and i and 0)
+        set i to i + 1
+    return 0
+
+define fixed_rmsnorm with vec as List and weight as List returning Int:
+    set len to length_list(vec)
+    set scale to 1000000
+    
+    set sum_x2 to 0
+    set i to 0
+    repeat while i < len:
+        set x_val to get_list(vec and i)
+        set sum_x2 to sum_x2 + (x_val * x_val) / scale
+        set i to i + 1
+    set mean_x2 to sum_x2 / len
+    
+    set rms to fixed_sqrt(mean_x2 + 1)
+    if rms == 0:
+        return 1
+        
+    set j to 0
+    repeat while j < len:
+        set x_val to get_list(vec and j)
+        set norm_x to (x_val * scale) / rms
+        set w_val to get_list(weight and j)
+        set ok to set_list(vec and j and (norm_x * w_val) / scale)
+        set j to j + 1
+    return 0
+
+# ════════════════════════════════════════════════════════════════
+# Model Loading & Transformer Execution
+# ════════════════════════════════════════════════════════════════
+
+define inference_load_model with model_path as Str returning Map:
+    set handle to ep_dlopen("libSystem.B.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("libc.so.6")
+        
+    set fn_fopen to ep_dlsym(handle and "fopen")
+    set fn_fread to ep_dlsym(handle and "fread")
+    set fn_fclose to ep_dlsym(handle and "fclose")
+    set fn_fseek to ep_dlsym(handle and "fseek")
+    set fn_ftell to ep_dlsym(handle and "ftell")
+    
+    set model to create_map()
+    set metadata to create_map()
+    set tensors to create_map()
+    set vocab to create_list()
+    
+    set values_list to create_list()
+    set ok to map_insert(model and "values_list" and values_list)
+    set ok to append_list(values_list and metadata)
+    set ok to append_list(values_list and tensors)
+    set ok to append_list(values_list and vocab)
+    
+    set path_ptr to str_to_ptr(model_path)
+    set mode_ptr to str_to_ptr("rb")
+    set file_ptr to ep_dlcall2(fn_fopen and path_ptr and mode_ptr)
+    if file_ptr == 0:
+        return model
+        
+    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 2)
+    set size to ep_dlcall1(fn_ftell and file_ptr)
+    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 0)
+    
+    if size < 24:
+        set dummy to ep_dlcall1(fn_fclose and file_ptr)
+        return model
+        
+    set buf_ptr to alloc_bytes(size)
+    set read_bytes to ep_dlcall4(fn_fread and buf_ptr and 1 and size and file_ptr)
+    set dummy to ep_dlcall1(fn_fclose and file_ptr)
+    
+    set m0 to peek_byte(buf_ptr and 0)
+    set m1 to peek_byte(buf_ptr and 1)
+    set m2 to peek_byte(buf_ptr and 2)
+    set m3 to peek_byte(buf_ptr and 3)
+    
+    if m0 != 71 or else m1 != 71 or else m2 != 85 or else m3 != 70:
+        set dummy to free_bytes(buf_ptr)
+        return model
+        
+    set version to read_uint32(buf_ptr and 4)
+    set tensor_count to read_uint64(buf_ptr and 8)
+    set metadata_kv_count to read_uint64(buf_ptr and 16)
+    
+    set offset_ref to create_list()
+    set ok to append_list(offset_ref and 24)
+    
+    set kv_idx to 0
+    repeat while kv_idx < metadata_kv_count:
+        set key to read_gguf_string(buf_ptr and offset_ref)
+        set val_type to read_uint32(buf_ptr and get_list(offset_ref and 0))
+        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+        
+        if val_type == 8:
+            set val_str to read_gguf_string(buf_ptr and offset_ref)
+            set ok to map_insert(metadata and key and val_str)
+            set ok to append_list(values_list and val_str)
+            set ok to append_list(values_list and key)
+        else:
+            if val_type == 4 or else val_type == 5:
+                set val_int to read_uint32(buf_ptr and get_list(offset_ref and 0))
+                set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+                set ok to map_insert(metadata and key and val_int)
+                set ok to append_list(values_list and key)
+            else:
+                if val_type == 10 or else val_type == 11:
+                    set val_int2 to read_uint64(buf_ptr and get_list(offset_ref and 0))
+                    set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 8)
+                    set ok to map_insert(metadata and key and val_int2)
+                    set ok to append_list(values_list and key)
+                else:
+                    if val_type == 9:
+                        set sub_type to read_uint32(buf_ptr and get_list(offset_ref and 0))
+                        set arr_len to read_uint64(buf_ptr and get_list(offset_ref and 0) + 4)
+                        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 12)
+                        
+                        set is_tokens to string_contains(key and "tokenizer.ggml.tokens")
+                        
+                        set arr_idx to 0
+                        repeat while arr_idx < arr_len:
+                            if sub_type == 8:
+                                set item_str to read_gguf_string(buf_ptr and offset_ref)
+                                if is_tokens == 1:
+                                    set ok to append_list(vocab and item_str)
+                                    set ok to append_list(values_list and item_str)
+                            else:
+                                if sub_type == 4 or else sub_type == 5:
+                                    set item_int to read_uint32(buf_ptr and get_list(offset_ref and 0))
+                                    set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+                                else:
+                                    if sub_type == 10 or else sub_type == 11:
+                                        set item_int2 to read_uint64(buf_ptr and get_list(offset_ref and 0))
+                                        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 8)
+                                    else:
+                                        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+                            set arr_idx to arr_idx + 1
+                    else:
+                        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+        set kv_idx to kv_idx + 1
+        
+    set tensor_infos to create_list()
+    set ok to append_list(values_list and tensor_infos)
+    
+    set t_idx to 0
+    repeat while t_idx < tensor_count:
+        set t_name to read_gguf_string(buf_ptr and offset_ref)
+        set t_n_dims to read_uint32(buf_ptr and get_list(offset_ref and 0))
+        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+        
+        set t_dims to create_list()
+        set ok to append_list(values_list and t_dims)
+        
+        set d_idx to 0
+        repeat while d_idx < t_n_dims:
+            set dim_val to read_uint64(buf_ptr and get_list(offset_ref and 0))
+            set ok to append_list(t_dims and dim_val)
+            set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 8)
+            set d_idx to d_idx + 1
+            
+        set t_type to read_uint32(buf_ptr and get_list(offset_ref and 0))
+        set t_offset to read_uint64(buf_ptr and get_list(offset_ref and 0) + 4)
+        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 12)
+        
+        set t_info to create_map()
+        set ok to map_insert(t_info and "name" and t_name)
+        set ok to map_insert(t_info and "dims" and t_dims)
+        set ok to map_insert(t_info and "type" and t_type)
+        set ok to map_insert(t_info and "offset" and t_offset)
+        
+        set ok to append_list(tensor_infos and t_info)
+        set ok to append_list(values_list and t_info)
+        set ok to append_list(values_list and t_name)
+        set t_idx to t_idx + 1
+        
+    set current_offset to get_list(offset_ref and 0)
+    set alignment to 32
+    set remainder to current_offset modulo alignment
+    set data_start_offset to current_offset
+    if remainder != 0:
+        set data_start_offset to current_offset + (alignment - remainder)
+        
+    set t_info_len to length_list(tensor_infos)
+    set t_load_idx to 0
+    repeat while t_load_idx < t_info_len:
+        set t_info to get_list(tensor_infos and t_load_idx)
+        set t_name to map_get_val(t_info and "name")
+        set t_dims to map_get_val(t_info and "dims")
+        set t_offsetToData to map_get_val(t_info and "offset")
+        
+        set t_abs_offset to data_start_offset + t_offsetToData
+        
+        set total_elements to 1
+        set dims_len to length_list(t_dims)
+        set dim_i to 0
+        repeat while dim_i < dims_len:
+            set total_elements to total_elements * get_list(t_dims and dim_i)
+            set dim_i to dim_i + 1
+            
+        set t_type to map_get_val(t_info and "type")
+        set t_data_list to create_list()
+        set ok to append_list(values_list and t_data_list)
+
+        # Dequantize by GGUF tensor type. F32/F16 supported directly; Q8_0 block
+        # dequant (int8 × per-block fp16 scale). Any other quant FAILS LOUD rather
+        # than silently misreading bytes as F32 (Law 8) — real quantized models run
+        # via the llama.cpp backend, not this small-model reference engine.
+        if t_type == 0:
+            set elem_i to 0
+            repeat while elem_i < total_elements:
+                set raw_u32 to read_uint32(buf_ptr and t_abs_offset + elem_i * 4)
+                set ok to append_list(t_data_list and float32_to_fixed(raw_u32))
+                set elem_i to elem_i + 1
+        else if t_type == 1:
+            set elem_i to 0
+            repeat while elem_i < total_elements:
+                set raw_u16 to read_uint16(buf_ptr and t_abs_offset + elem_i * 2)
+                set ok to append_list(t_data_list and fp16_to_fixed(raw_u16))
+                set elem_i to elem_i + 1
+        else if t_type == 8:
+            set elems_done to 0
+            set blk to 0
+            repeat while elems_done < total_elements:
+                set remaining to total_elements - elems_done
+                set take to 32
+                if remaining < 32:
+                    set take to remaining
+                set ok to dequant_q8_0_block(buf_ptr and t_abs_offset + blk * 34 and t_data_list and take)
+                set elems_done to elems_done + take
+                set blk to blk + 1
+        else:
+            set ok to map_insert(model and "error" and concat("unsupported GGUF tensor type " and int_to_string(t_type)))
+            set ok to map_insert(model and "error_code" and 1)
+            set dummy to free_bytes(buf_ptr)
+            return model
+            
+        set tensor_map to create_map()
+        set ok to map_insert(tensor_map and "name" and t_name)
+        set ok to map_insert(tensor_map and "dims" and t_dims)
+        set ok to map_insert(tensor_map and "data" and t_data_list)
+        
+        set ok to map_insert(tensors and t_name and tensor_map)
+        set ok to append_list(values_list and tensor_map)
+        
+        set t_load_idx to t_load_idx + 1
+        
+    set ok to map_insert(model and "metadata" and metadata)
+    set ok to map_insert(model and "tensors" and tensors)
+    set ok to map_insert(model and "vocab" and vocab)
+    
+    set dummy to free_bytes(buf_ptr)
+    set dummy to free_list(offset_ref)
+    
+    return model
+
+define inference_tokenize with model as Map and text as Str returning List:
+    set vocab to map_get_val(model and "vocab")
+    set vocab_len to length_list(vocab)
+    set tokens to create_list()
+    
+    set words to string_split(text and " ")
+    set words_len to length_list(words)
+    
+    set i to 0
+    repeat while i < words_len:
+        set word to get_list(words and i)
+        set trimmed to string_trim(word)
+        if string_length(trimmed) > 0:
+            set found to 0
+            set v_idx to 0
+            repeat while v_idx < vocab_len and found == 0:
+                set vocab_word to get_list(vocab and v_idx)
+                if trimmed equals vocab_word:
+                    set ok to append_list(tokens and v_idx)
+                    set found to 1
+                set v_idx to v_idx + 1
+            if found == 0:
+                set ok to append_list(tokens and 0)
+        set i to i + 1
+        
+    free_list(words)
+    return tokens
+
+define inference_detokenize with model as Map and tokens as List returning Str:
+    set vocab to map_get_val(model and "vocab")
+    set vocab_len to length_list(vocab)
+    set res to ""
+    
+    set tokens_len to length_list(tokens)
+    set i to 0
+    repeat while i < tokens_len:
+        set tok_id to get_list(tokens and i)
+        if tok_id >= 0 and also tok_id < vocab_len:
+            set vocab_word to get_list(vocab and tok_id)
+            if string_length(res) == 0:
+                set res to vocab_word
+            else:
+                set res to concat(res and " ")
+                set res to concat(res and vocab_word)
+        set i to i + 1
+    return res
+
+define inference_run with model as Map and prompt as Str and temp as Int and max_tokens as Int returning Str:
+    set tensors to map_get_val(model and "tensors")
+    set vocab to map_get_val(model and "vocab")
+    set vocab_size to length_list(vocab)
+    
+    if map_contains(tensors and "token_embeddings.weight") == 0:
+        return ""
+    
+    set w_emb to map_get_val(map_get_val(tensors and "token_embeddings.weight") and "data")
+    set w_wq to map_get_val(map_get_val(tensors and "attention.wq.weight") and "data")
+    set w_wk to map_get_val(map_get_val(tensors and "attention.wk.weight") and "data")
+    set w_wv to map_get_val(map_get_val(tensors and "attention.wv.weight") and "data")
+    set w_wo to map_get_val(map_get_val(tensors and "attention.wo.weight") and "data")
+    set w_w1 to map_get_val(map_get_val(tensors and "feed_forward.w1.weight") and "data")
+    set w_w2 to map_get_val(map_get_val(tensors and "feed_forward.w2.weight") and "data")
+    set w_out to map_get_val(map_get_val(tensors and "output.weight") and "data")
+    
+    set w_rmsn1 to create_list()
+    set w_rmsn2 to create_list()
+    
+    set scale to 1000000
+    set hidden_dim to 16
+    set i to 0
+    repeat while i < hidden_dim:
+        set ok to append_list(w_rmsn1 and scale)
+        set ok to append_list(w_rmsn2 and scale)
+        set i to i + 1
+        
+    set tokens to inference_tokenize(model and prompt)
+    set gen_tokens to create_list()
+    
+    set t_len to length_list(tokens)
+    set t_i to 0
+    repeat while t_i < t_len:
+        set ok to append_list(gen_tokens and get_list(tokens and t_i))
+        set t_i to t_i + 1
+        
+    set step to 0
+    repeat while step < max_tokens:
+        set last_tok_idx to length_list(gen_tokens) - 1
+        if last_tok_idx < 0:
+            set last_tok to 0
+        else:
+            set last_tok to get_list(gen_tokens and last_tok_idx)
+            
+        set x to create_list()
+        set emb_idx to 0
+        repeat while emb_idx < hidden_dim:
+            set val to get_list(w_emb and last_tok * hidden_dim + emb_idx)
+            set ok to append_list(x and val)
+            set emb_idx to emb_idx + 1
+            
+        set h to create_list()
+        set copy_idx to 0
+        repeat while copy_idx < hidden_dim:
+            set ok to append_list(h and get_list(x and copy_idx))
+            set copy_idx to copy_idx + 1
+        fixed_rmsnorm(h and w_rmsn1)
+        
+        # Real causal self-attention over the whole sequence so far, with RoPE on Q/K
+        # — softmax(Q·Kᵀ/√d)·V. (The old code computed a single QK score then discarded
+        # it and emitted just V·Wo, ignoring all prior tokens.) Small-model fallback:
+        # K/V are recomputed per position (O(n²), n small). Production = llama.cpp.
+        set seq_len to length_list(gen_tokens)
+        set sqrt_d to fixed_sqrt(hidden_dim * scale)
+
+        set q to create_list()
+        fixed_matrix_vector_multiply(w_wq and h and q and hidden_dim and hidden_dim)
+        set ok to rope_apply(q and seq_len - 1 and hidden_dim)
+
+        set scores to create_list()
+        set pos to 0
+        repeat while pos < seq_len:
+            set tok_p to get_list(gen_tokens and pos)
+            set hp to create_list()
+            set epi to 0
+            repeat while epi < hidden_dim:
+                set ok to append_list(hp and get_list(w_emb and tok_p * hidden_dim + epi))
+                set epi to epi + 1
+            fixed_rmsnorm(hp and w_rmsn1)
+            set kp to create_list()
+            fixed_matrix_vector_multiply(w_wk and hp and kp and hidden_dim and hidden_dim)
+            set ok to rope_apply(kp and pos and hidden_dim)
+            set dotp to 0
+            set dpi to 0
+            repeat while dpi < hidden_dim:
+                set dotp to dotp + (get_list(q and dpi) * get_list(kp and dpi)) / scale
+                set dpi to dpi + 1
+            set ok to append_list(scores and (dotp * scale) / sqrt_d)
+            free_list(hp)
+            free_list(kp)
+            set pos to pos + 1
+
+        fixed_softmax(scores)
+
+        set attn to create_list()
+        set zi to 0
+        repeat while zi < hidden_dim:
+            set ok to append_list(attn and 0)
+            set zi to zi + 1
+        set pos2 to 0
+        repeat while pos2 < seq_len:
+            set tok_p2 to get_list(gen_tokens and pos2)
+            set hp2 to create_list()
+            set epj to 0
+            repeat while epj < hidden_dim:
+                set ok to append_list(hp2 and get_list(w_emb and tok_p2 * hidden_dim + epj))
+                set epj to epj + 1
+            fixed_rmsnorm(hp2 and w_rmsn1)
+            set vp to create_list()
+            fixed_matrix_vector_multiply(w_wv and hp2 and vp and hidden_dim and hidden_dim)
+            set wgt to get_list(scores and pos2)
+            set vmi to 0
+            repeat while vmi < hidden_dim:
+                set cur to get_list(attn and vmi)
+                set ok to set_list(attn and vmi and cur + (wgt * get_list(vp and vmi)) / scale)
+                set vmi to vmi + 1
+            free_list(hp2)
+            free_list(vp)
+            set pos2 to pos2 + 1
+
+        set attn_out to create_list()
+        fixed_matrix_vector_multiply(w_wo and attn and attn_out and hidden_dim and hidden_dim)
+
+        set res_i to 0
+        repeat while res_i < hidden_dim:
+            set x_val to get_list(x and res_i)
+            set attn_val to get_list(attn_out and res_i)
+            set ok to set_list(x and res_i and x_val + attn_val)
+            set res_i to res_i + 1
+
+        free_list(h)
+        free_list(q)
+        free_list(scores)
+        free_list(attn)
+        free_list(attn_out)
+        
+        set h2 to create_list()
+        set copy_idx2 to 0
+        repeat while copy_idx2 < hidden_dim:
+            set ok to append_list(h2 and get_list(x and copy_idx2))
+            set copy_idx2 to copy_idx2 + 1
+        fixed_rmsnorm(h2 and w_rmsn2)
+        
+        set ffn1 to create_list()
+        fixed_matrix_vector_multiply(w_w1 and h2 and ffn1 and hidden_dim and hidden_dim)
+        fixed_relu(ffn1)
+        
+        set ffn_out to create_list()
+        fixed_matrix_vector_multiply(w_w2 and ffn1 and ffn_out and hidden_dim and hidden_dim)
+        
+        set res_j to 0
+        repeat while res_j < hidden_dim:
+            set x_val to get_list(x and res_j)
+            set ffn_val to get_list(ffn_out and res_j)
+            set ok to set_list(x and res_j and x_val + ffn_val)
+            set res_j to res_j + 1
+            
+        free_list(h2)
+        free_list(ffn1)
+        free_list(ffn_out)
+        
+        set logits to create_list()
+        fixed_matrix_vector_multiply(w_out and x and logits and vocab_size and hidden_dim)
+        
+        fixed_softmax(logits)
+        
+        set next_tok to 0
+        if temp == 0:
+            set max_prob to get_list(logits and 0)
+            set max_tok to 0
+            set tok_j to 1
+            repeat while tok_j < vocab_size:
+                set prob_val to get_list(logits and tok_j)
+                if prob_val > max_prob:
+                    set max_prob to prob_val
+                    set max_tok to tok_j
+                set tok_j to tok_j + 1
+            set next_tok to max_tok
+        else:
+            set rand_val to ep_random_int(0 and scale - 1)
+            set running_sum to 0
+            set tok_k to 0
+            set found_tok to 0
+            repeat while tok_k < vocab_size and found_tok == 0:
+                set running_sum to running_sum + get_list(logits and tok_k)
+                if rand_val < running_sum:
+                    set next_tok to tok_k
+                    set found_tok to 1
+                set tok_k to tok_k + 1
+                
+        free_list(x)
+        free_list(logits)
+        
+        if next_tok == 0:
+            set step to max_tokens
+        else:
+            set ok to append_list(gen_tokens and next_tok)
+            set step to step + 1
+            
+    free_list(w_rmsn1)
+    free_list(w_rmsn2)
+    free_list(tokens)
+    
+    set gen_only to create_list()
+    set gen_len to length_list(gen_tokens)
+    set prompt_len to t_len
+    
+    set gen_idx to prompt_len
+    repeat while gen_idx < gen_len:
+        set ok to append_list(gen_only and get_list(gen_tokens and gen_idx))
+        set gen_idx to gen_idx + 1
+        
+    set response to inference_detokenize(model and gen_only)
+    
+    free_list(gen_tokens)
+    free_list(gen_only)
+    
+    return response

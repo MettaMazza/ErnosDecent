@@ -1,0 +1,688 @@
+# ErnosDecent -- Media Codecs (Opus / VP8 wrappers and ADPCM / Delta-RLE Fallbacks)
+# Component: decent_media/codec.ep
+# Status: Production -- Phase 10
+
+import "collections"
+import "math"
+
+# FFI Externals
+external define ep_dlopen with lib:
+external define ep_dlsym with handle and name:
+external define ep_dlcall0 with fn:
+external define ep_dlcall1 with fn and a0:
+external define ep_dlcall2 with fn and a0 and a1:
+external define ep_dlcall3 with fn and a0 and a1 and a2:
+external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
+external define ep_dlcall5 with fn and a0 and a1 and a2 and a3 and a4:
+external define ep_dlcall6 with fn and a0 and a1 and a2 and a3 and a4 and a5:
+# Raw byte-buffer primitives (build.sh-injected C helpers; used by webrtc.ep too).
+external define alloc_bytes with n returning Int:
+external define free_bytes with ptr:
+external define poke_byte with ptr and offset and value:
+external define peek_byte with ptr and offset returning Int:
+
+# Global lookup lists for ADPCM
+set ADPCM_STEPS to 0
+set ADPCM_INDEX_ADJUST to 0
+
+define init_adpcm_tables:
+    if ADPCM_STEPS != 0:
+        return 0
+        
+    set ADPCM_STEPS to create_list()
+    # 89 standard step sizes for IMA-ADPCM
+    set steps to create_list()
+    set ok to append_list(steps and 7)
+    set ok to append_list(steps and 8)
+    set ok to append_list(steps and 9)
+    set ok to append_list(steps and 10)
+    set ok to append_list(steps and 11)
+    set ok to append_list(steps and 12)
+    set ok to append_list(steps and 13)
+    set ok to append_list(steps and 14)
+    set ok to append_list(steps and 16)
+    set ok to append_list(steps and 17)
+    set ok to append_list(steps and 19)
+    set ok to append_list(steps and 21)
+    set ok to append_list(steps and 23)
+    set ok to append_list(steps and 25)
+    set ok to append_list(steps and 28)
+    set ok to append_list(steps and 31)
+    set ok to append_list(steps and 34)
+    set ok to append_list(steps and 37)
+    set ok to append_list(steps and 41)
+    set ok to append_list(steps and 45)
+    set ok to append_list(steps and 50)
+    set ok to append_list(steps and 55)
+    set ok to append_list(steps and 60)
+    set ok to append_list(steps and 66)
+    set ok to append_list(steps and 73)
+    set ok to append_list(steps and 80)
+    set ok to append_list(steps and 88)
+    set ok to append_list(steps and 97)
+    set ok to append_list(steps and 107)
+    set ok to append_list(steps and 118)
+    set ok to append_list(steps and 130)
+    set ok to append_list(steps and 143)
+    set ok to append_list(steps and 157)
+    set ok to append_list(steps and 173)
+    set ok to append_list(steps and 190)
+    set ok to append_list(steps and 209)
+    set ok to append_list(steps and 230)
+    set ok to append_list(steps and 253)
+    set ok to append_list(steps and 279)
+    set ok to append_list(steps and 307)
+    set ok to append_list(steps and 337)
+    set ok to append_list(steps and 371)
+    set ok to append_list(steps and 408)
+    set ok to append_list(steps and 449)
+    set ok to append_list(steps and 494)
+    set ok to append_list(steps and 544)
+    set ok to append_list(steps and 598)
+    set ok to append_list(steps and 658)
+    set ok to append_list(steps and 724)
+    set ok to append_list(steps and 796)
+    set ok to append_list(steps and 876)
+    set ok to append_list(steps and 963)
+    set ok to append_list(steps and 1060)
+    set ok to append_list(steps and 1166)
+    set ok to append_list(steps and 1282)
+    set ok to append_list(steps and 1411)
+    set ok to append_list(steps and 1552)
+    set ok to append_list(steps and 1707)
+    set ok to append_list(steps and 1878)
+    set ok to append_list(steps and 2066)
+    set ok to append_list(steps and 2272)
+    set ok to append_list(steps and 2499)
+    set ok to append_list(steps and 2749)
+    set ok to append_list(steps and 3024)
+    set ok to append_list(steps and 3327)
+    set ok to append_list(steps and 3660)
+    set ok to append_list(steps and 4026)
+    set ok to append_list(steps and 4428)
+    set ok to append_list(steps and 4871)
+    set ok to append_list(steps and 5358)
+    set ok to append_list(steps and 5894)
+    set ok to append_list(steps and 6484)
+    set ok to append_list(steps and 7132)
+    set ok to append_list(steps and 7845)
+    set ok to append_list(steps and 8630)
+    set ok to append_list(steps and 9493)
+    set ok to append_list(steps and 10442)
+    set ok to append_list(steps and 11487)
+    set ok to append_list(steps and 12635)
+    set ok to append_list(steps and 13899)
+    set ok to append_list(steps and 15289)
+    set ok to append_list(steps and 16818)
+    set ok to append_list(steps and 18500)
+    set ok to append_list(steps and 20350)
+    set ok to append_list(steps and 22385)
+    set ok to append_list(steps and 24623)
+    set ok to append_list(steps and 27086)
+    set ok to append_list(steps and 29794)
+    set ok to append_list(steps and 32767)
+    
+    set ADPCM_STEPS to steps
+    
+    set ADPCM_INDEX_ADJUST to create_list()
+    # IMA index adjustment for 4-bit codes (0-7 represent positive, 8-15 represent negative diffs)
+    # The standard adjust is based on the magnitude of the code (lower 3 bits)
+    # Index adjustments for code 0-7:
+    set ok to append_list(ADPCM_INDEX_ADJUST and -1)
+    set ok to append_list(ADPCM_INDEX_ADJUST and -1)
+    set ok to append_list(ADPCM_INDEX_ADJUST and -1)
+    set ok to append_list(ADPCM_INDEX_ADJUST and -1)
+    set ok to append_list(ADPCM_INDEX_ADJUST and 2)
+    set ok to append_list(ADPCM_INDEX_ADJUST and 4)
+    set ok to append_list(ADPCM_INDEX_ADJUST and 6)
+    set ok to append_list(ADPCM_INDEX_ADJUST and 8)
+    
+    return 0
+
+define codec_init returning Map:
+    set ctx to create_map()
+    
+    # Attempt loading libopus
+    set lib_opus to ep_dlopen("libopus.dylib")
+    if lib_opus == 0:
+        set lib_opus to ep_dlopen("libopus.so.0")
+    if lib_opus == 0:
+        set lib_opus to ep_dlopen("/opt/homebrew/lib/libopus.dylib")
+        
+    set has_opus to 0
+    if lib_opus != 0:
+        set has_opus to 1
+    set ok to map_insert(ctx and "has_opus" and has_opus)
+    set ok to map_insert(ctx and "opus_handle" and lib_opus)
+
+    # Real Opus: create a mono 48 kHz VOIP encoder/decoder pair and resolve the
+    # encode/decode entry points. 960 samples = one 20 ms frame at 48 kHz.
+    # OPUS_APPLICATION_VOIP = 2048. opus_*_create take a trailing int* error arg;
+    # passing NULL (0) is allowed (the error is simply not written).
+    set ok to map_insert(ctx and "opus_fs" and 48000)
+    set ok to map_insert(ctx and "opus_frame" and 960)
+    set ok to map_insert(ctx and "opus_enc" and 0)
+    set ok to map_insert(ctx and "opus_dec" and 0)
+    if has_opus == 1:
+        set fn_enc_create to ep_dlsym(lib_opus and "opus_encoder_create")
+        set fn_dec_create to ep_dlsym(lib_opus and "opus_decoder_create")
+        if fn_enc_create != 0 and also fn_dec_create != 0:
+            set enc to ep_dlcall4(fn_enc_create and 48000 and 1 and 2048 and 0)
+            set dec to ep_dlcall3(fn_dec_create and 48000 and 1 and 0)
+            set ok to map_insert(ctx and "opus_enc" and enc)
+            set ok to map_insert(ctx and "opus_dec" and dec)
+            set ok to map_insert(ctx and "opus_encode_fn" and ep_dlsym(lib_opus and "opus_encode"))
+            set ok to map_insert(ctx and "opus_decode_fn" and ep_dlsym(lib_opus and "opus_decode"))
+            if enc == 0 or else dec == 0:
+                set ok to map_insert(ctx and "has_opus" and 0)
+        else:
+            set ok to map_insert(ctx and "has_opus" and 0)
+    
+    # Attempt loading libvpx
+    set lib_vpx to ep_dlopen("libvpx.dylib")
+    if lib_vpx == 0:
+        set lib_vpx to ep_dlopen("libvpx.so.7")
+    if lib_vpx == 0:
+        set lib_vpx to ep_dlopen("/opt/homebrew/lib/libvpx.dylib")
+        
+    set has_vpx to 0
+    if lib_vpx != 0:
+        set has_vpx to 1
+    set ok to map_insert(ctx and "has_vpx" and has_vpx)
+    set ok to map_insert(ctx and "vpx_handle" and lib_vpx)
+
+    # Real VP8 (libvpx): resolve the encoder/decoder ifaces + entry points. Struct
+    # offsets and ABI versions below are ground-truthed from /opt/homebrew/include/vpx
+    # (VPX_ENCODER_ABI_VERSION=37, VPX_DECODER_ABI_VERSION=12, I420=258).
+    set ok to map_insert(ctx and "vpx_cx_iface" and 0)
+    set ok to map_insert(ctx and "vpx_dx_iface" and 0)
+    if has_vpx == 1:
+        set fn_cx to ep_dlsym(lib_vpx and "vpx_codec_vp8_cx")
+        set fn_dx to ep_dlsym(lib_vpx and "vpx_codec_vp8_dx")
+        if fn_cx != 0 and also fn_dx != 0:
+            set ok to map_insert(ctx and "vpx_cx_iface" and ep_dlcall0(fn_cx))
+            set ok to map_insert(ctx and "vpx_dx_iface" and ep_dlcall0(fn_dx))
+            set ok to map_insert(ctx and "vpx_enc_cfg_default_fn" and ep_dlsym(lib_vpx and "vpx_codec_enc_config_default"))
+            set ok to map_insert(ctx and "vpx_enc_init_fn" and ep_dlsym(lib_vpx and "vpx_codec_enc_init_ver"))
+            set ok to map_insert(ctx and "vpx_img_alloc_fn" and ep_dlsym(lib_vpx and "vpx_img_alloc"))
+            set ok to map_insert(ctx and "vpx_img_free_fn" and ep_dlsym(lib_vpx and "vpx_img_free"))
+            set ok to map_insert(ctx and "vpx_encode_fn" and ep_dlsym(lib_vpx and "vpx_codec_encode"))
+            set ok to map_insert(ctx and "vpx_get_cx_data_fn" and ep_dlsym(lib_vpx and "vpx_codec_get_cx_data"))
+            set ok to map_insert(ctx and "vpx_destroy_fn" and ep_dlsym(lib_vpx and "vpx_codec_destroy"))
+            set ok to map_insert(ctx and "vpx_dec_init_fn" and ep_dlsym(lib_vpx and "vpx_codec_dec_init_ver"))
+            set ok to map_insert(ctx and "vpx_decode_fn" and ep_dlsym(lib_vpx and "vpx_codec_decode"))
+            set ok to map_insert(ctx and "vpx_get_frame_fn" and ep_dlsym(lib_vpx and "vpx_codec_get_frame"))
+        else:
+            set ok to map_insert(ctx and "has_vpx" and 0)
+    
+    set dummy to init_adpcm_tables()
+    return ctx
+
+# IMA-ADPCM Audio Encoder
+# Write a signed 16-bit PCM sample (two's complement) little-endian into buf[off..off+1].
+define codec_poke_i16 with buf as Int and off as Int and sample as Int:
+    set u to sample
+    if u < 0:
+        set u to u + 65536
+    set ok to poke_byte(buf and off and u modulo 256)
+    set ok to poke_byte(buf and off + 1 and (u / 256) modulo 256)
+    return 0
+
+# Read a signed 16-bit little-endian PCM sample from buf[off..off+1].
+define codec_peek_i16 with buf as Int and off as Int returning Int:
+    set lo to peek_byte(buf and off)
+    set hi to peek_byte(buf and off + 1)
+    set u to hi * 256 + lo
+    if u >= 32768:
+        set u to u - 65536
+    return u
+
+# Real libopus encode. Frames the PCM into 20 ms (960-sample) Opus frames and emits
+# [nframes, len1, b1.., len2, b2.., ...]. The last frame is zero-padded to 960.
+define codec_opus_encode with ctx as Map and raw_samples as List returning List:
+    set enc to map_get_val(ctx and "opus_enc")
+    set encode_fn to map_get_val(ctx and "opus_encode_fn")
+    set frame to map_get_val(ctx and "opus_frame")
+    set out to create_list()
+    set total to length_list(raw_samples)
+    set nframes to 0
+    if total > 0:
+        set nframes to (total + frame - 1) / frame
+    set ok to append_list(out and nframes)
+    set pcm_buf to alloc_bytes(frame * 2)
+    set data_buf to alloc_bytes(4000)
+    set fi to 0
+    repeat while fi < nframes:
+        set s to 0
+        repeat while s < frame:
+            set idx to fi * frame + s
+            set sample to 0
+            if idx < total:
+                set sample to get_list(raw_samples and idx)
+            set ok to codec_poke_i16(pcm_buf and s * 2 and sample)
+            set s to s + 1
+        set nbytes to ep_dlcall5(encode_fn and enc and pcm_buf and frame and data_buf and 4000)
+        if nbytes < 0:
+            set nbytes to 0
+        set ok to append_list(out and nbytes)
+        set b to 0
+        repeat while b < nbytes:
+            set ok to append_list(out and peek_byte(data_buf and b))
+            set b to b + 1
+        set fi to fi + 1
+    set ok to free_bytes(pcm_buf)
+    set ok to free_bytes(data_buf)
+    return out
+
+# Real libopus decode of the framed format produced by codec_opus_encode.
+define codec_opus_decode with ctx as Map and encoded as List returning List:
+    set dec to map_get_val(ctx and "opus_dec")
+    set decode_fn to map_get_val(ctx and "opus_decode_fn")
+    set frame to map_get_val(ctx and "opus_frame")
+    set decoded to create_list()
+    set n to length_list(encoded)
+    if n == 0:
+        return decoded
+    set nframes to get_list(encoded and 0)
+    set pos to 1
+    set pcm_buf to alloc_bytes(frame * 2)
+    set fi to 0
+    repeat while fi < nframes:
+        set len to get_list(encoded and pos)
+        set pos to pos + 1
+        set data_buf to alloc_bytes(len + 1)
+        set b to 0
+        repeat while b < len:
+            set ok to poke_byte(data_buf and b and get_list(encoded and pos + b))
+            set b to b + 1
+        set pos to pos + len
+        set nsamp to ep_dlcall6(decode_fn and dec and data_buf and len and pcm_buf and frame and 0)
+        if nsamp < 0:
+            set nsamp to 0
+        set s to 0
+        repeat while s < nsamp:
+            set ok to append_list(decoded and codec_peek_i16(pcm_buf and s * 2))
+            set s to s + 1
+        set ok to free_bytes(data_buf)
+        set fi to fi + 1
+    set ok to free_bytes(pcm_buf)
+    return decoded
+
+define codec_encode_audio with ctx as Map and raw_samples as List returning List:
+    set has_opus to map_get_val(ctx and "has_opus")
+    set enc to map_get_val(ctx and "opus_enc")
+    if has_opus == 1 and also enc != 0:
+        # Real libopus path.
+        return codec_opus_encode(ctx and raw_samples)
+
+    # IMA-ADPCM encoding fallback (used only when libopus is unavailable)
+    set encoded to create_list()
+    set num_samples to length_list(raw_samples)
+    if num_samples == 0:
+        return encoded
+        
+    # State tracking: predicted sample and step index
+    set predicted_sample to get_list(raw_samples and 0)
+    set step_index to 0
+    
+    # Record starting sample in encoded stream (first 2 elements: sample and index)
+    set ok to append_list(encoded and predicted_sample)
+    set ok to append_list(encoded and step_index)
+    
+    set i to 1
+    repeat while i < num_samples:
+        set sample to get_list(raw_samples and i)
+        set diff to sample - predicted_sample
+        
+        # Determine sign bit
+        set sign to 0
+        if diff < 0:
+            set sign to 8
+            set diff to 0 - diff
+            
+        # Quantize difference into 4-bit nibble
+        set step to get_list(ADPCM_STEPS and step_index)
+        set code to 0
+        set temp_diff to step
+        
+        if diff >= temp_diff:
+            set code to code + 4
+            set diff to diff - temp_diff
+        set temp_diff to temp_diff / 2
+        
+        if diff >= temp_diff:
+            set code to code + 2
+            set diff to diff - temp_diff
+        set temp_diff to temp_diff / 2
+        
+        if diff >= temp_diff:
+            set code to code + 1
+            
+        # Final code includes sign bit
+        set final_code to sign + code
+        set ok to append_list(encoded and final_code)
+        
+        # Predict next sample using the quantized difference
+        set diff_q to step / 8
+        if (code / 4) modulo 2 == 1:
+            set diff_q to diff_q + step
+        if (code / 2) modulo 2 == 1:
+            set diff_q to diff_q + step / 2
+        if (code / 1) modulo 2 == 1:
+            set diff_q to diff_q + step / 4
+            
+        if sign == 8:
+            set predicted_sample to predicted_sample - diff_q
+        else:
+            set predicted_sample to predicted_sample + diff_q
+            
+        # Clamp predicted sample to 16-bit signed range (-32768 to 32767)
+        if predicted_sample > 32767:
+            set predicted_sample to 32767
+        if predicted_sample < -32768:
+            set predicted_sample to -32768
+            
+        # Adjust step index
+        set adjust to get_list(ADPCM_INDEX_ADJUST and code)
+        set step_index to step_index + adjust
+        if step_index < 0:
+            set step_index to 0
+        if step_index > 88:
+            set step_index to 88
+            
+        set i to i + 1
+        
+    return encoded
+
+# IMA-ADPCM Audio Decoder (fallback) / real Opus when libopus is present.
+define codec_decode_audio with ctx as Map and encoded_bytes as List returning List:
+    set has_opus to map_get_val(ctx and "has_opus")
+    set dec to map_get_val(ctx and "opus_dec")
+    if has_opus == 1 and also dec != 0:
+        return codec_opus_decode(ctx and encoded_bytes)
+    set decoded to create_list()
+    set num_elements to length_list(encoded_bytes)
+    if num_elements < 2:
+        return decoded
+        
+    set predicted_sample to get_list(encoded_bytes and 0)
+    set step_index to get_list(encoded_bytes and 1)
+    
+    set ok to append_list(decoded and predicted_sample)
+    
+    set i to 2
+    repeat while i < num_elements:
+        set final_code to get_list(encoded_bytes and i)
+        set sign to final_code / 8
+        set code to final_code modulo 8
+        
+        set step to get_list(ADPCM_STEPS and step_index)
+        
+        # Reconstruct difference
+        set diff_q to step / 8
+        if (code / 4) modulo 2 == 1:
+            set diff_q to diff_q + step
+        if (code / 2) modulo 2 == 1:
+            set diff_q to diff_q + step / 2
+        if (code / 1) modulo 2 == 1:
+            set diff_q to diff_q + step / 4
+            
+        if sign == 1:
+            set predicted_sample to predicted_sample - diff_q
+        else:
+            set predicted_sample to predicted_sample + diff_q
+            
+        # Clamp sample
+        if predicted_sample > 32767:
+            set predicted_sample to 32767
+        if predicted_sample < -32768:
+            set predicted_sample to -32768
+            
+        set ok to append_list(decoded and predicted_sample)
+        
+        # Adjust step index
+        set adjust to get_list(ADPCM_INDEX_ADJUST and code)
+        set step_index to step_index + adjust
+        if step_index < 0:
+            set step_index to 0
+        if step_index > 88:
+            set step_index to 88
+            
+        set i to i + 1
+        
+    return decoded
+
+# Video Encoder: Run-Length Encoded (RLE) Delta-Compression
+# Write a 32-bit little-endian unsigned value into buf[off..off+3].
+define codec_poke_u32 with buf as Int and off as Int and val as Int:
+    set ok to poke_byte(buf and off and val modulo 256)
+    set ok to poke_byte(buf and off + 1 and (val / 256) modulo 256)
+    set ok to poke_byte(buf and off + 2 and (val / 65536) modulo 256)
+    set ok to poke_byte(buf and off + 3 and (val / 16777216) modulo 256)
+    return 0
+
+define codec_peek_u32 with buf as Int and off as Int returning Int:
+    return peek_byte(buf and off) + peek_byte(buf and off + 1) * 256 + peek_byte(buf and off + 2) * 65536 + peek_byte(buf and off + 3) * 16777216
+
+# Read a 64-bit little-endian value (a pointer or size_t) from buf[off..off+7].
+# macOS arm64 heap pointers fit in positive 64-bit (top bytes zero).
+define codec_peek_u64 with buf as Int and off as Int returning Int:
+    set v to 0
+    set i to 7
+    repeat while i >= 0:
+        set v to v * 256 + peek_byte(buf and off + i)
+        set i to i - 1
+    return v
+
+# Real VP8 keyframe encode via libvpx. Input raw_frame is I420 bytes:
+# Y (width*height) then U then V (each (width/2)*(height/2)). Each frame is encoded as
+# a forced keyframe (no inter-frame prediction) — real VP8, simpler/larger than a full
+# GOP, which is the honest Phase-1 scope. Output: [width, height, size, byte...].
+define codec_encode_video with ctx as Map and raw_frame as List and width as Int and height as Int returning List:
+    set has_vpx to map_get_val(ctx and "has_vpx")
+    set cx_iface to map_get_val(ctx and "vpx_cx_iface")
+    if has_vpx == 1 and also cx_iface != 0:
+        return codec_vp8_encode(ctx and raw_frame and width and height)
+    # RLE fallback (used only when libvpx is unavailable)
+    set encoded to create_list()
+    set ok to append_list(encoded and width)
+    set ok to append_list(encoded and height)
+    set num_pixels to length_list(raw_frame)
+    if num_pixels == 0:
+        return encoded
+    set current_pixel to get_list(raw_frame and 0)
+    set run_len to 1
+    set i to 1
+    repeat while i < num_pixels:
+        set pixel to get_list(raw_frame and i)
+        if pixel == current_pixel:
+            set run_len to run_len + 1
+        else:
+            set ok to append_list(encoded and run_len)
+            set ok to append_list(encoded and current_pixel)
+            set current_pixel to pixel
+            set run_len to 1
+        set i to i + 1
+    set ok to append_list(encoded and run_len)
+    set ok to append_list(encoded and current_pixel)
+    return encoded
+
+define codec_vp8_encode with ctx as Map and raw_frame as List and width as Int and height as Int returning List:
+    set cx_iface to map_get_val(ctx and "vpx_cx_iface")
+    set out to create_list()
+    set ok to append_list(out and width)
+    set ok to append_list(out and height)
+
+    # configure: enc_config_default then set resolution + a target bitrate
+    set cfg to alloc_bytes(504)
+    set rc to ep_dlcall3(map_get_val(ctx and "vpx_enc_cfg_default_fn") and cx_iface and cfg and 0)
+    if rc != 0:
+        set ok to free_bytes(cfg)
+        set ok to append_list(out and 0)
+        return out
+    set ok to codec_poke_u32(cfg and 12 and width)
+    set ok to codec_poke_u32(cfg and 16 and height)
+    set ok to codec_poke_u32(cfg and 112 and 256)
+
+    set vctx to alloc_bytes(56)
+    set ir to ep_dlcall5(map_get_val(ctx and "vpx_enc_init_fn") and vctx and cx_iface and cfg and 0 and 37)
+    if ir != 0:
+        set ok to free_bytes(cfg)
+        set ok to free_bytes(vctx)
+        set ok to append_list(out and 0)
+        return out
+
+    set img to alloc_bytes(136)
+    set imgr to ep_dlcall5(map_get_val(ctx and "vpx_img_alloc_fn") and img and 258 and width and height and 1)
+    set y_ptr to codec_peek_u64(img and 48)
+    set u_ptr to codec_peek_u64(img and 56)
+    set v_ptr to codec_peek_u64(img and 64)
+    set y_st to codec_peek_u32(img and 80)
+    set u_st to codec_peek_u32(img and 84)
+    set v_st to codec_peek_u32(img and 88)
+
+    set cw to width / 2
+    set ch to height / 2
+    # Y plane
+    set r to 0
+    repeat while r < height:
+        set c to 0
+        repeat while c < width:
+            set ok to poke_byte(y_ptr and r * y_st + c and get_list(raw_frame and r * width + c))
+            set c to c + 1
+        set r to r + 1
+    set uoff to width * height
+    set voff to uoff + cw * ch
+    set r to 0
+    repeat while r < ch:
+        set c to 0
+        repeat while c < cw:
+            set ok to poke_byte(u_ptr and r * u_st + c and get_list(raw_frame and uoff + r * cw + c))
+            set ok to poke_byte(v_ptr and r * v_st + c and get_list(raw_frame and voff + r * cw + c))
+            set c to c + 1
+        set r to r + 1
+
+    # encode a forced keyframe (flags=VPX_EFLAG_FORCE_KF=1, deadline=VPX_DL_GOOD_QUALITY)
+    set er to ep_dlcall6(map_get_val(ctx and "vpx_encode_fn") and vctx and img and 0 and 1 and 1 and 1000000)
+    set total_sz to 0
+    set frame_bytes to create_list()
+    if er == 0:
+        set iter to alloc_bytes(8)
+        set ok to codec_poke_u32(iter and 0 and 0)
+        set ok to codec_poke_u32(iter and 4 and 0)
+        set looping to 1
+        repeat while looping == 1:
+            set pkt to ep_dlcall2(map_get_val(ctx and "vpx_get_cx_data_fn") and vctx and iter)
+            if pkt == 0:
+                set looping to 0
+            else:
+                set kind to codec_peek_u32(pkt and 0)
+                if kind == 0:
+                    set buf to codec_peek_u64(pkt and 8)
+                    set sz to codec_peek_u64(pkt and 16)
+                    set b to 0
+                    repeat while b < sz:
+                        set ok to append_list(frame_bytes and peek_byte(buf and b))
+                        set b to b + 1
+                    set total_sz to total_sz + sz
+        set ok to free_bytes(iter)
+
+    set ok to ep_dlcall1(map_get_val(ctx and "vpx_img_free_fn") and img)
+    set ok to ep_dlcall1(map_get_val(ctx and "vpx_destroy_fn") and vctx)
+    set ok to free_bytes(cfg)
+    set ok to free_bytes(vctx)
+    set ok to free_bytes(img)
+
+    set ok to append_list(out and total_sz)
+    set bi to 0
+    repeat while bi < total_sz:
+        set ok to append_list(out and get_list(frame_bytes and bi))
+        set bi to bi + 1
+    return out
+
+# Real VP8 decode via libvpx. Input is [width, height, size, byte...]; output is the
+# decoded I420 byte list (Y then U then V). Falls back to RLE when libvpx is absent.
+define codec_decode_video with ctx as Map and encoded_frame as List and width as Int and height as Int returning List:
+    set has_vpx to map_get_val(ctx and "has_vpx")
+    set dx_iface to map_get_val(ctx and "vpx_dx_iface")
+    if has_vpx == 1 and also dx_iface != 0:
+        return codec_vp8_decode(ctx and encoded_frame)
+    set decoded to create_list()
+    set num_elements to length_list(encoded_frame)
+    if num_elements < 2:
+        return decoded
+    set i to 2
+    repeat while i < num_elements:
+        set run_len to get_list(encoded_frame and i)
+        set pixel to get_list(encoded_frame and i + 1)
+        set r to 0
+        repeat while r < run_len:
+            set ok to append_list(decoded and pixel)
+            set r to r + 1
+        set i to i + 2
+    return decoded
+
+define codec_vp8_decode with ctx as Map and encoded_frame as List returning List:
+    set dx_iface to map_get_val(ctx and "vpx_dx_iface")
+    set decoded to create_list()
+    set n to length_list(encoded_frame)
+    if n < 3:
+        return decoded
+    set sz to get_list(encoded_frame and 2)
+    if sz <= 0:
+        return decoded
+    set data_buf to alloc_bytes(sz)
+    set b to 0
+    repeat while b < sz:
+        set ok to poke_byte(data_buf and b and get_list(encoded_frame and 3 + b))
+        set b to b + 1
+
+    set dctx to alloc_bytes(56)
+    set ir to ep_dlcall5(map_get_val(ctx and "vpx_dec_init_fn") and dctx and dx_iface and 0 and 0 and 12)
+    if ir != 0:
+        set ok to free_bytes(data_buf)
+        set ok to free_bytes(dctx)
+        return decoded
+    set dr to ep_dlcall5(map_get_val(ctx and "vpx_decode_fn") and dctx and data_buf and sz and 0 and 0)
+    if dr == 0:
+        set iter to alloc_bytes(8)
+        set ok to codec_poke_u32(iter and 0 and 0)
+        set ok to codec_poke_u32(iter and 4 and 0)
+        set img to ep_dlcall2(map_get_val(ctx and "vpx_get_frame_fn") and dctx and iter)
+        if img != 0:
+            set dw to codec_peek_u32(img and 24)
+            set dh to codec_peek_u32(img and 28)
+            set y_ptr to codec_peek_u64(img and 48)
+            set u_ptr to codec_peek_u64(img and 56)
+            set v_ptr to codec_peek_u64(img and 64)
+            set y_st to codec_peek_u32(img and 80)
+            set u_st to codec_peek_u32(img and 84)
+            set v_st to codec_peek_u32(img and 88)
+            set r to 0
+            repeat while r < dh:
+                set c to 0
+                repeat while c < dw:
+                    set ok to append_list(decoded and peek_byte(y_ptr and r * y_st + c))
+                    set c to c + 1
+                set r to r + 1
+            set cw to dw / 2
+            set chh to dh / 2
+            set r to 0
+            repeat while r < chh:
+                set c to 0
+                repeat while c < cw:
+                    set ok to append_list(decoded and peek_byte(u_ptr and r * u_st + c))
+                    set c to c + 1
+                set r to r + 1
+            set r to 0
+            repeat while r < chh:
+                set c to 0
+                repeat while c < cw:
+                    set ok to append_list(decoded and peek_byte(v_ptr and r * v_st + c))
+                    set c to c + 1
+                set r to r + 1
+        set ok to free_bytes(iter)
+    set ok to ep_dlcall1(map_get_val(ctx and "vpx_destroy_fn") and dctx)
+    set ok to free_bytes(data_buf)
+    set ok to free_bytes(dctx)
+    return decoded

@@ -1,0 +1,147 @@
+# ErnosDecent — Collaborative Resource Pooling Test Suite
+# Component: decent_pool/test_pool.ep
+# Status: Production — OperationTrojanClaude Phase 12
+
+import "test"
+import "bandwidth"
+import "compute"
+import "mesh"
+import "string"
+import "collections"
+
+# ================================================================
+# Test 1: Bandwidth Rate Limits & Contribution Tracking
+# ================================================================
+
+define test_bandwidth_pooling returning Int:
+    set pool to bandwidth_create_pool()
+    assert_equal(map_size(map_get_val(pool and "tiers")) and 3 and "pool contains 3 bandwidth tiers")
+
+    set alice_id to "node_alice"
+    set ok to bandwidth_add_peer(pool and alice_id)
+
+    set peers_map to map_get_val(pool and "peers")
+    set alice_peer to map_get_val(peers_map and alice_id)
+    assert_true(alice_peer != 0 and "alice successfully added to pool")
+
+    # Record traffic: Alice downloads 5MB
+    # 5MB = 5 * 1024 * 1024 = 5242880 bytes
+    set ok to bandwidth_record_traffic(pool and alice_id and 5242880 and "download")
+    set score1 to map_get_val(alice_peer and "contribution_score")
+    # Score should be negative because she has only downloaded: 0 - (5MB / 2) = -2621440
+    assert_true(score1 < 0 and "contribution score decreases on download")
+
+    # Record upload: Alice uploads 60MB
+    # 60MB = 62914560 bytes
+    set ok to bandwidth_record_traffic(pool and alice_id and 62914560 and "upload")
+    set score2 to map_get_val(alice_peer and "contribution_score")
+    # 60MB - (5MB / 2) = 62914560 - 2621440 = 60293120 > 50MB (52428800)
+    assert_true(score2 > 52428800 and "contribution score exceeds threshold after uploading")
+
+    # Alice should be promoted to premium tier
+    set tier_name to ptr_to_str(map_get_val(alice_peer and "tier_name"))
+    assert_true(tier_name equals "premium" and "alice upgraded to premium tier")
+
+    # Routing proxy is now a REAL relay (connects to a destination and forwards).
+    # With no destination listening, it must honestly report "unreachable" rather
+    # than fabricating a successful "routed" echo.
+    set proxy_res to bandwidth_route_proxy(pool and alice_id and "127.0.0.1" and 1 and "PROXY_REQ" and "anonymous_request_payload")
+    set proxy_status to ptr_to_str(map_get_val(proxy_res and "status"))
+    assert_true(proxy_status equals "unreachable" and "bandwidth proxy honestly reports unreachable destination")
+
+    display "  bandwidth_pooling: PASS"
+    return 0
+
+# ================================================================
+# Test 2: Compute Job Delegation & Redundant Consensus Verification
+# ================================================================
+
+define test_compute_pooling returning Int:
+    set mgr to compute_create_manager()
+    set job_id to compute_submit_job(mgr and "node_alice" and "matrix_multiply:3x3")
+    
+    assert_true(string_length(job_id) > 0 and "compute job submitted and ID returned")
+
+    # Assign to worker 1 (Bob)
+    set assigned1 to compute_assign_job(mgr and "node_bob")
+    assert_true(assigned1 equals job_id and "job assigned to worker bob")
+
+    # Bob submits result
+    set ok to compute_submit_result(mgr and job_id and "node_bob" and "matrix_res_42")
+
+    # Consensus verification requires redundancy (2 matching submissions)
+    # So verifying now should not change status to completed
+    set verify1 to compute_verify_result(mgr and job_id)
+    set jobs to map_get_val(mgr and "jobs")
+    set job to map_get_val(jobs and job_id)
+    set status1 to ptr_to_str(map_get_val(job and "status"))
+    assert_true((status1 equals "completed") == 0 and "job not completed without redundant verification")
+
+    # Assign to worker 2 (Charlie)
+    # Submit matching result
+    set ok to compute_submit_result(mgr and job_id and "node_charlie" and "matrix_res_42")
+    set verify2 to compute_verify_result(mgr and job_id)
+
+    # Now status should be completed
+    set status2 to ptr_to_str(map_get_val(job and "status"))
+    assert_true(status2 equals "completed" and "job completed after redundant consensus verification")
+
+    set final_res to ptr_to_str(map_get_val(job and "result"))
+    assert_true(final_res equals "matrix_res_42" and "job result stored matches consensus")
+
+    display "  compute_pooling: PASS"
+    return 0
+
+# ================================================================
+# Test 3: Collaborative Symbiotic Mesh Integration
+# ================================================================
+
+define test_symbiotic_mesh returning Int:
+    # Create the symbiotic mesh coordinate node
+    set mesh to mesh_create("mesh_node_alpha")
+    set alice_id to "node_alice"
+
+    # Mesh is wired to the real engines (no longer carries fake onion theater).
+    assert_true(map_contains(mesh and "compute_mgr") == 1 and "mesh exposes a real compute manager")
+    assert_true(map_contains(mesh and "bandwidth_pool") == 1 and "mesh exposes a real bandwidth pool")
+
+    # Resource allocation is real (rate-limit / authorization gated).
+    set alloc to mesh_allocate_resource(mesh and alice_id and "compute" and 1)
+    assert_equal(alloc and MESH_ERR_NONE and "mesh allocates compute resources for an authorized requestor")
+
+    # Drive the SAME redundant-result consensus mesh_execute_collaborative_ai relies on,
+    # but with deterministic worker results (the live LLM-backed path is exercised by the
+    # node binary; query_local_llm's HTTP path needs build.sh's socket patches and so is
+    # verified there, not under the raw test harness). Matching results -> consensus.
+    set cm to map_get_val(mesh and "compute_mgr")
+    set job_ok to compute_submit_job(cm and alice_id and "inference-input")
+    set a1 to compute_assign_job(cm and "node_bob")
+    set a2 to compute_assign_job(cm and "node_charlie")
+    set s1 to compute_submit_result(cm and job_ok and "node_bob" and "VERIFIED-OUTPUT")
+    set s2 to compute_submit_result(cm and job_ok and "node_charlie" and "VERIFIED-OUTPUT")
+    assert_equal(compute_verify_result(cm and job_ok) and COMPUTE_ERR_NONE and "matching worker results reach consensus")
+
+    # Diverging results must be flagged DISPUTED, not silently accepted.
+    set job_bad to compute_submit_job(cm and alice_id and "inference-input-2")
+    set b1 to compute_assign_job(cm and "node_bob")
+    set b2 to compute_assign_job(cm and "node_charlie")
+    set t1 to compute_submit_result(cm and job_bad and "node_bob" and "ANSWER-X")
+    set t2 to compute_submit_result(cm and job_bad and "node_charlie" and "ANSWER-Y")
+    assert_equal(compute_verify_result(cm and job_bad) and COMPUTE_ERR_DISPUTED and "diverging worker results are flagged disputed")
+
+    display "  symbiotic_mesh: PASS"
+    return 0
+
+# ================================================================
+# Main Executable
+# ================================================================
+
+define main returning Int:
+    set suite to create_test_suite("Phase 12: Collaborative Resource Pooling Suite")
+
+    set ok to test_bandwidth_pooling()
+    set ok to test_compute_pooling()
+    set ok to test_symbiotic_mesh()
+
+    display "ALL PHASE 12 TESTS PASSED SUCCESSFULLY"
+    return 0

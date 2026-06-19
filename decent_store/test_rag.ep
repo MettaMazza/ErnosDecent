@@ -1,0 +1,69 @@
+# Pure-logic tests for the ErnosPlain RAG port (no HTTP/SQL needed):
+# float tokenizer, embedding-array parse + float round-trip through a List,
+# Newton sqrt, cosine similarity, chunking, and Ollama-reply extraction.
+
+import "string"
+import "collections"
+import "rag"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define fabs with x as Float returning Float:
+    if x < 0.0:
+        return 0.0 - x
+    return x
+
+define main:
+    set passes to 0
+
+    # --- float tokenizer ---
+    set a to rag_token_to_float("0.5")
+    set passes to passes + pass_if("token_0.5" and (fabs(a - 0.5) < 0.0001))
+    set b to rag_token_to_float("-0.25")
+    set passes to passes + pass_if("token_-0.25" and (fabs(b + 0.25) < 0.0001))
+    set c to rag_token_to_float("1.5e-3")
+    set passes to passes + pass_if("token_1.5e-3" and (fabs(c - 0.0015) < 0.000001))
+
+    # --- parse embedding array into fixed-point ints (value*1e6) ---
+    set v to rag_parse_embedding("[0.1, 0.2, -0.3, 0.4]")
+    set passes to passes + pass_if("parse_len_4" and (length_list(v) == 4))
+    set v2 to get_list(v and 2)
+    set passes to passes + pass_if("fixedpoint_-0.3*1e6" and (v2 < -299990 and also v2 > -300010))
+
+    # --- sqrt ---
+    set passes to passes + pass_if("sqrt_9=3" and (fabs(rag_float_sqrt(9.0) - 3.0) < 0.0001))
+    set passes to passes + pass_if("sqrt_2~1.414" and (fabs(rag_float_sqrt(2.0) - 1.41421) < 0.001))
+
+    # --- cosine: identical => 1, orthogonal => 0 ---
+    set p to rag_parse_embedding("[1.0, 2.0, 3.0]")
+    set q to rag_parse_embedding("[1.0, 2.0, 3.0]")
+    set passes to passes + pass_if("cosine_identical_1" and (fabs(rag_cosine(p and q) - 1.0) < 0.0001))
+    set o1 to rag_parse_embedding("[1.0, 0.0]")
+    set o2 to rag_parse_embedding("[0.0, 1.0]")
+    set passes to passes + pass_if("cosine_orthogonal_0" and (fabs(rag_cosine(o1 and o2)) < 0.0001))
+
+    # --- chunking: 2500 chars, size 1000 overlap 200 => step 800 => 4 chunks ---
+    set big to ""
+    set i to 0
+    repeat while i < 2500:
+        set big to concat(big and "x")
+        set i to i + 1
+    set chunks to rag_chunk_text(big and 1000 and 200)
+    set passes to passes + pass_if("chunk_count_4" and (length_list(chunks) == 4))
+    set passes to passes + pass_if("chunk0_len_1000" and (string_length(ptr_to_str(get_list(chunks and 0))) == 1000))
+
+    # --- extract embedding string from an Ollama-style reply ---
+    set es to rag_extract_embedding_str("{\"embedding\":[0.1,0.2,0.3],\"model\":\"x\"}")
+    set passes to passes + pass_if("extract_embedding_arr" and (es equals "[0.1,0.2,0.3]"))
+
+    # --- base64 decode ("SGVsbG8sIE1hcmlh" = "Hello, Maria") ---
+    set dec to rag_base64_decode("SGVsbG8sIE1hcmlh")
+    set passes to passes + pass_if("base64_decode" and (dec equals "Hello, Maria"))
+
+    display concat("RESULT: " and concat(int_to_string(passes) and "/13 passed"))
+    return 0

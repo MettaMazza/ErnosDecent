@@ -1,0 +1,475 @@
+# ErnosDecent -- Test Suite for decent_id/keys.ep
+# Tests: Key generation, signing, verification, encryption, decryption,
+#        key derivation, keystore create/unlock, error paths
+# Status: Production -- OperationTrojanClaude Phase 1
+
+import "keys"
+import "string"
+import "test"
+
+# ================================================================
+# Test 1: Ed25519 signing keypair
+# ================================================================
+
+define test_signing_keypair:
+    display "TEST 1: Ed25519 signing keypair generation"
+    set kp to generate_signing_keypair()
+    assert_true(map_get_val(kp and "error") == ERR_NONE and "signing keypair should generate without error")
+
+    set pub_key to map_get_val(kp and "public_key")
+    set sec_key to map_get_val(kp and "secret_key")
+    set fp to map_get_val(kp and "fingerprint")
+
+    assert_true(string_length(pub_key) == 64 and "Ed25519 public key should be 64 hex chars (32 bytes)")
+    assert_true(string_length(sec_key) == 128 and "Ed25519 secret key should be 128 hex chars (64 bytes)")
+    assert_true(string_length(fp) == 32 and "fingerprint should be 32 hex chars")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 2: X25519 encryption keypair
+# ================================================================
+
+define test_encryption_keypair:
+    display "TEST 2: X25519 encryption keypair generation"
+    set kp to generate_encryption_keypair()
+    assert_true(map_get_val(kp and "error") == ERR_NONE and "encryption keypair should generate without error")
+
+    set pub_key to map_get_val(kp and "public_key")
+    set sec_key to map_get_val(kp and "secret_key")
+
+    assert_true(string_length(pub_key) == 64 and "X25519 public key should be 64 hex chars")
+    assert_true(string_length(sec_key) == 64 and "X25519 secret key should be 64 hex chars")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 3: Full identity keypair
+# ================================================================
+
+define test_identity_keypair:
+    display "TEST 3: Full identity keypair generation"
+    set id to generate_identity_keypair()
+    assert_true(map_get_val(id and "error") == ERR_NONE and "identity generation should succeed")
+
+    set id_hash to map_get_val(id and "identity_hash")
+    assert_true(string_length(id_hash) == 64 and "identity hash (SHA256) should be 64 hex chars")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 4: Two keypairs must differ
+# ================================================================
+
+define test_keypair_uniqueness:
+    display "TEST 4: Two keypairs must differ"
+    set kp1 to generate_signing_keypair()
+    set kp2 to generate_signing_keypair()
+
+    set pub1 to map_get_val(kp1 and "public_key")
+    set pub2 to map_get_val(kp2 and "public_key")
+
+    if string_equals(pub1 and pub2) == 1:
+        display "  FAIL: Two keypairs have identical public keys"
+        return 1
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 5: Sign and verify
+# ================================================================
+
+define test_sign_and_verify:
+    display "TEST 5: Sign and verify a message"
+    set kp to generate_signing_keypair()
+    set pub_key to map_get_val(kp and "public_key")
+    set sec_key to map_get_val(kp and "secret_key")
+
+    set message to "ErnosDecent: The builder exit begins."
+
+    set sig_result to sign_message(message and sec_key)
+    assert_true(map_get_val(sig_result and "error") == ERR_NONE and "signing should succeed")
+
+    set signature to map_get_val(sig_result and "signature")
+    assert_true(string_length(signature) == 128 and "Ed25519 signature should be 128 hex chars")
+
+    set verify_result to verify_signature(message and signature and pub_key)
+    assert_true(verify_result == ERR_NONE and "verification of valid signature should succeed")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 6: Verify with wrong message -- must fail
+# ================================================================
+
+define test_verify_wrong_message:
+    display "TEST 6: Verify against tampered message"
+    set kp to generate_signing_keypair()
+    set sec_key to map_get_val(kp and "secret_key")
+    set pub_key to map_get_val(kp and "public_key")
+
+    set sig_result to sign_message("original message" and sec_key)
+    set signature to map_get_val(sig_result and "signature")
+
+    set verify_result to verify_signature("tampered message" and signature and pub_key)
+    assert_true(verify_result == ERR_VERIFICATION_FAILED and "tampered message verification must fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 7: Verify with wrong key -- must fail
+# ================================================================
+
+define test_verify_wrong_key:
+    display "TEST 7: Verify with wrong public key"
+    set kp1 to generate_signing_keypair()
+    set kp2 to generate_signing_keypair()
+
+    set sig_result to sign_message("signed by kp1" and map_get_val(kp1 and "secret_key"))
+    set signature to map_get_val(sig_result and "signature")
+
+    set verify_result to verify_signature("signed by kp1" and signature and map_get_val(kp2 and "public_key"))
+    assert_true(verify_result == ERR_VERIFICATION_FAILED and "wrong key verification must fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 8: Symmetric encrypt + decrypt roundtrip
+# ================================================================
+
+define test_symmetric_roundtrip:
+    display "TEST 8: Symmetric encrypt/decrypt roundtrip"
+    set key_info to generate_symmetric_key()
+    set key_hex to map_get_val(key_info and "key")
+
+    set plaintext to "This is a secret message for ErnosDecent testing."
+
+    set enc_result to encrypt_symmetric(plaintext and key_hex)
+    assert_true(map_get_val(enc_result and "error") == ERR_NONE and "encryption should succeed")
+
+    set ciphertext to map_get_val(enc_result and "ciphertext")
+    set nonce to map_get_val(enc_result and "nonce")
+    assert_true(string_length(ciphertext) > 0 and "ciphertext must not be empty")
+
+    set dec_result to decrypt_symmetric(ciphertext and nonce and key_hex)
+    assert_true(map_get_val(dec_result and "error") == ERR_NONE and "decryption should succeed")
+
+    set recovered to map_get_val(dec_result and "plaintext")
+    if recovered equals plaintext:
+        display "  PASS"
+    else:
+        display "  FAIL: plaintext mismatch"
+        return 1
+    return 0
+
+# ================================================================
+# Test 9: Symmetric decrypt with wrong key -- must fail
+# ================================================================
+
+define test_symmetric_wrong_key:
+    display "TEST 9: Symmetric decrypt with wrong key"
+    set key1 to map_get_val(generate_symmetric_key() and "key")
+    set key2 to map_get_val(generate_symmetric_key() and "key")
+
+    set enc_result to encrypt_symmetric("secret" and key1)
+    set ciphertext to map_get_val(enc_result and "ciphertext")
+    set nonce to map_get_val(enc_result and "nonce")
+
+    set dec_result to decrypt_symmetric(ciphertext and nonce and key2)
+    assert_true(map_get_val(dec_result and "error") == ERR_DECRYPTION_FAILED and "wrong key must fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 10: Public-key encrypt + decrypt roundtrip
+# ================================================================
+
+define test_public_key_roundtrip:
+    display "TEST 10: Public-key encrypt/decrypt roundtrip"
+    set alice to generate_encryption_keypair()
+    set bob to generate_encryption_keypair()
+
+    set plaintext to "Hello Bob, this is Alice. The exit is operational."
+
+    set enc_result to encrypt_to_recipient(plaintext and map_get_val(bob and "public_key") and map_get_val(alice and "secret_key"))
+    assert_true(map_get_val(enc_result and "error") == ERR_NONE and "public-key encryption should succeed")
+
+    set ciphertext to map_get_val(enc_result and "ciphertext")
+    set nonce to map_get_val(enc_result and "nonce")
+
+    set dec_result to decrypt_from_sender(ciphertext and nonce and map_get_val(alice and "public_key") and map_get_val(bob and "secret_key"))
+    assert_true(map_get_val(dec_result and "error") == ERR_NONE and "public-key decryption should succeed")
+
+    set recovered to map_get_val(dec_result and "plaintext")
+    if recovered equals plaintext:
+        display "  PASS"
+    else:
+        display "  FAIL: plaintext mismatch"
+        return 1
+    return 0
+
+# ================================================================
+# Test 11: Public-key decrypt with wrong sender -- must fail
+# ================================================================
+
+define test_public_key_wrong_sender:
+    display "TEST 11: Public-key decrypt with wrong sender key"
+    set alice to generate_encryption_keypair()
+    set bob to generate_encryption_keypair()
+    set eve to generate_encryption_keypair()
+
+    set enc_result to encrypt_to_recipient("intercepted?" and map_get_val(bob and "public_key") and map_get_val(alice and "secret_key"))
+    set ciphertext to map_get_val(enc_result and "ciphertext")
+    set nonce to map_get_val(enc_result and "nonce")
+
+    set dec_result to decrypt_from_sender(ciphertext and nonce and map_get_val(eve and "public_key") and map_get_val(bob and "secret_key"))
+    assert_true(map_get_val(dec_result and "error") == ERR_DECRYPTION_FAILED and "wrong sender key must fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 12: HKDF key derivation
+# ================================================================
+
+define test_key_derivation:
+    display "TEST 12: HKDF key derivation"
+    set master to map_get_val(generate_symmetric_key() and "key")
+
+    set dk1 to map_get_val(derive_key(master and "signing" and 0) and "derived_key")
+    set dk2 to map_get_val(derive_key(master and "encryption" and 0) and "derived_key")
+    set dk3 to map_get_val(derive_key(master and "signing" and 1) and "derived_key")
+
+    # Different purpose -> different key
+    if string_equals(dk1 and dk2) == 1:
+        display "  FAIL: different purposes produced same key"
+        return 1
+
+    # Different index -> different key
+    if string_equals(dk1 and dk3) == 1:
+        display "  FAIL: different indices produced same key"
+        return 1
+
+    # Deterministic -- same inputs -> same output
+    set dk1_again to map_get_val(derive_key(master and "signing" and 0) and "derived_key")
+    if string_equals(dk1 and dk1_again) == 1:
+        display "  PASS"
+    else:
+        display "  FAIL: same inputs produced different keys (not deterministic)"
+        return 1
+    return 0
+
+# ================================================================
+# Test 13: Keystore create and unlock roundtrip
+# ================================================================
+
+define test_keystore_roundtrip:
+    display "TEST 13: Keystore create and unlock"
+    set passphrase to "ErnosDecent-test-passphrase-2026"
+    set filepath to "/tmp/ernosdecent_test_keystore.json"
+
+    set create_result to keystore_create(passphrase and filepath)
+    assert_true(map_get_val(create_result and "error") == ERR_NONE and "keystore creation should succeed")
+
+    set id_hash to map_get_val(create_result and "identity_hash")
+    set sign_pub to map_get_val(create_result and "signing_public_key")
+    set enc_pub to map_get_val(create_result and "encryption_public_key")
+
+    assert_true(string_length(id_hash) == 64 and "identity hash should be 64 hex chars")
+    assert_true(string_length(sign_pub) == 64 and "signing public key should be 64 hex chars")
+    assert_true(string_length(enc_pub) == 64 and "encryption public key should be 64 hex chars")
+
+    # Unlock with correct passphrase
+    set unlock_result to keystore_unlock(passphrase and filepath)
+    assert_true(map_get_val(unlock_result and "error") == ERR_NONE and "keystore unlock should succeed")
+
+    # Public keys must match
+    set unlocked_sign_pub to map_get_val(unlock_result and "signing_public_key")
+    if string_equals(unlocked_sign_pub and sign_pub) == 1:
+        set ok to 1
+    else:
+        display "  FAIL: signing public key mismatch after unlock"
+        return 1
+
+    set unlocked_id to map_get_val(unlock_result and "identity_hash")
+    if string_equals(unlocked_id and id_hash) == 1:
+        set ok to 1
+    else:
+        display "  FAIL: identity hash mismatch after unlock"
+        return 1
+
+    # Verify unlocked secret key can sign and the stored public key verifies
+    set unlocked_sk to map_get_val(unlock_result and "signing_secret_key")
+    set test_msg to "keystore roundtrip verification"
+    set sig_result to sign_message(test_msg and unlocked_sk)
+    assert_true(map_get_val(sig_result and "error") == ERR_NONE and "signing with unlocked key should work")
+
+    set signature to map_get_val(sig_result and "signature")
+    set verify_result to verify_signature(test_msg and signature and unlocked_sign_pub)
+    assert_true(verify_result == ERR_NONE and "verification with stored public key should work")
+
+    # H2 GUARD: a keystore with no "salt" field must be REJECTED, not silently
+    # downgraded to the weak unsalted-single-SHA256 KDF. Only the fixed code
+    # returns ERR_KEYSTORE_CORRUPT here; the old fallback returned a passphrase
+    # mismatch, so this assertion can only pass with the downgrade removed.
+    set nosalt_path to "/tmp/ernosdecent_test_keystore_nosalt.json"
+    set nosalt_json to "{\"version\": 1, \"passphrase_verify\": \"deadbeef\", \"signing_public_key\": \"00\"}"
+    set wok to file_write(nosalt_path and nosalt_json)
+    set nosalt_unlock to keystore_unlock(passphrase and nosalt_path)
+    assert_true(map_get_val(nosalt_unlock and "error") == ERR_KEYSTORE_CORRUPT and "keystore with no salt must be rejected, not downgraded")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 14: Keystore unlock with wrong passphrase -- must fail
+# ================================================================
+
+define test_keystore_wrong_passphrase:
+    display "TEST 14: Keystore unlock with wrong passphrase"
+    set filepath to "/tmp/ernosdecent_test_keystore_wrong.json"
+
+    set create_result to keystore_create("correct-passphrase" and filepath)
+    assert_true(map_get_val(create_result and "error") == ERR_NONE and "creation should succeed")
+
+    set unlock_result to keystore_unlock("wrong-passphrase" and filepath)
+    assert_true(map_get_val(unlock_result and "error") == ERR_PASSPHRASE_WRONG and "wrong passphrase must fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 15: Sign empty message
+# ================================================================
+
+define test_sign_empty_message:
+    display "TEST 15: Sign and verify empty message"
+    set kp to generate_signing_keypair()
+    set sig_result to sign_message("" and map_get_val(kp and "secret_key"))
+    assert_true(map_get_val(sig_result and "error") == ERR_NONE and "signing empty message should succeed")
+
+    set verify_result to verify_signature("" and map_get_val(sig_result and "signature") and map_get_val(kp and "public_key"))
+    assert_true(verify_result == ERR_NONE and "verifying empty message signature should succeed")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 16: Symmetric encrypt empty plaintext
+# ================================================================
+
+define test_encrypt_empty:
+    display "TEST 16: Symmetric encrypt/decrypt empty string"
+    set key to map_get_val(generate_symmetric_key() and "key")
+    set enc to encrypt_symmetric("" and key)
+    assert_true(map_get_val(enc and "error") == ERR_NONE and "encrypting empty should succeed")
+
+    set dec to decrypt_symmetric(map_get_val(enc and "ciphertext") and map_get_val(enc and "nonce") and key)
+    assert_true(map_get_val(dec and "error") == ERR_NONE and "decrypting empty should succeed")
+
+    set recovered to map_get_val(dec and "plaintext")
+    if recovered equals "":
+        display "  PASS"
+    else:
+        display "  FAIL: expected empty string"
+        return 1
+    return 0
+
+# ================================================================
+# Test 17: Shamir's Secret Sharing roundtrip
+# ================================================================
+
+define test_shamir_secret_sharing:
+    display "TEST 17: Shamir's Secret Sharing (3-of-5 threshold) split/reconstruct"
+    
+    # 32-byte test secret (64 hex characters)
+    set secret to "486c00ca3fa575eb2fecf26bf0d16813124c1dc3f6a67f6db973a2958e0b8772"
+    
+    set shares to shamir_split_key(secret)
+    assert_true(length_list(shares) == 5 and "should generate exactly 5 shares")
+    
+    # Test reconstruction with shares 1, 2, 3
+    set list1 to create_list()
+    set ok to append_list(list1 and get_list(shares and 0))
+    set ok to append_list(list1 and get_list(shares and 1))
+    set ok to append_list(list1 and get_list(shares and 2))
+    
+    set rec1 to shamir_reconstruct_key(list1)
+    assert_true(string_equals(rec1 and secret) == 1 and "reconstruction with shares 1,2,3 should recover the original secret")
+    free_list(list1)
+    
+    # Test reconstruction with shares 2, 3, 5
+    set list2 to create_list()
+    set ok to append_list(list2 and get_list(shares and 1))
+    set ok to append_list(list2 and get_list(shares and 2))
+    set ok to append_list(list2 and get_list(shares and 4))
+    
+    set rec2 to shamir_reconstruct_key(list2)
+    assert_true(string_equals(rec2 and secret) == 1 and "reconstruction with shares 2,3,5 should recover the original secret")
+    free_list(list2)
+
+    # Test reconstruction with shares 1, 4, 5
+    set list3 to create_list()
+    set ok to append_list(list3 and get_list(shares and 0))
+    set ok to append_list(list3 and get_list(shares and 3))
+    set ok to append_list(list3 and get_list(shares and 4))
+    
+    set rec3 to shamir_reconstruct_key(list3)
+    assert_true(string_equals(rec3 and secret) == 1 and "reconstruction with shares 1,4,5 should recover the original secret")
+    free_list(list3)
+    
+    # Test that less than 3 shares returns empty string
+    set list_short to create_list()
+    set ok to append_list(list_short and get_list(shares and 0))
+    set ok to append_list(list_short and get_list(shares and 1))
+    
+    set rec_short to shamir_reconstruct_key(list_short)
+    assert_true(string_length(rec_short) == 0 and "reconstruction with < 3 shares should fail (return empty string)")
+    free_list(list_short)
+    
+    free_list(shares)
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Main -- Run all tests
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_id/keys.ep Test Suite"
+    display "  OperationTrojanClaude Phase 1"
+    display "==================================================="
+    display ""
+
+    set ok to test_signing_keypair()
+    set ok to test_encryption_keypair()
+    set ok to test_identity_keypair()
+    set ok to test_keypair_uniqueness()
+    set ok to test_sign_and_verify()
+    set ok to test_verify_wrong_message()
+    set ok to test_verify_wrong_key()
+    set ok to test_symmetric_roundtrip()
+    set ok to test_symmetric_wrong_key()
+    set ok to test_public_key_roundtrip()
+    set ok to test_public_key_wrong_sender()
+    set ok to test_key_derivation()
+    set ok to test_keystore_roundtrip()
+    set ok to test_keystore_wrong_passphrase()
+    set ok to test_sign_empty_message()
+    set ok to test_encrypt_empty()
+    set ok to test_shamir_secret_sharing()
+
+    display ""
+    display "==================================================="
+    display "  17 tests executed."
+    display "==================================================="
+    return 0

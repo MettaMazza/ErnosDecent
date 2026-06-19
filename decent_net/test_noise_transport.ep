@@ -1,0 +1,258 @@
+# ErnosDecent -- Noise-over-Transport Test Suite
+# Component: decent_net/test_noise_transport.ep
+# Tests: Full Noise_XX handshake over TCP, encrypted messaging
+
+import "noise_transport"
+import "transport"
+import "noise"
+import "../decent_id/keys"
+import "string"
+import "collections"
+import "net"
+
+define responder_thread with listen_fd as Int and resp_s_sec as Int and resp_s_pub as Int:
+    # Accept connection, perform Noise handshake as responder, echo encrypted messages
+    set client_fd to ep_net_accept(listen_fd)
+    if client_fd < 0:
+        display "  RESPONDER: accept failed"
+        return 0
+
+    set conn to create_map()
+    set ok to map_insert(conn and "fd" and client_fd)
+    set ok to map_insert(conn and "connected" and 1)
+
+    # Perform handshake
+    set hs_result to noise_net_handshake_respond(conn and resp_s_sec and resp_s_pub)
+    set hs_err to map_get_val(hs_result and "error")
+    if hs_err != NOISE_NET_ERR_NONE:
+        display f"  RESPONDER: handshake failed with error {hs_err}"
+        transport_close(conn)
+        free_map(conn)
+        return 0
+
+    set session to map_get_val(hs_result and "session")
+
+    # Echo loop: receive, decrypt, re-encrypt with "ECHO:" prefix, send back
+    set running to 1
+    repeat while running == 1:
+        set recv_result to noise_net_recv(session)
+        set recv_err to map_get_val(recv_result and "error")
+        if recv_err != NOISE_NET_ERR_NONE:
+            set running to 0
+        else:
+            set msg_type to map_get_val(recv_result and "msg_type")
+            set plaintext to map_get_val(recv_result and "plaintext")
+
+            if msg_type equals "STOP":
+                set ok to noise_net_send(session and "STOP_ACK" and "bye")
+                set running to 0
+            else:
+                set echo_text to concat("ECHO:" and plaintext)
+                set ok to noise_net_send(session and msg_type and echo_text)
+        free_map(recv_result)
+
+    noise_net_close(session)
+    free_map(conn)
+    return 0
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- Noise-over-Transport Test Suite"
+    display "  Encrypted TCP Communication — Phase 2"
+    display "==================================================="
+    display ""
+
+    set tests_passed to 0
+    set tests_failed to 0
+
+    # Generate static keypairs for both sides
+    set init_err to init_crypto()
+    if init_err != 0:
+        display "FATAL: Cryptography initialization failed!"
+        return 1
+
+    set init_keys to generate_encryption_keypair()
+    set init_pub_hex to map_get_val(init_keys and "public_key")
+    set init_sec_hex to map_get_val(init_keys and "secret_key")
+    set init_s_sec to alloc_bytes(32)
+    set init_s_pub to alloc_bytes(32)
+    set ok to hex_to_raw(init_sec_hex and init_s_sec and 32)
+    set ok to hex_to_raw(init_pub_hex and init_s_pub and 32)
+
+    set resp_keys to generate_encryption_keypair()
+    set resp_pub_hex to map_get_val(resp_keys and "public_key")
+    set resp_sec_hex to map_get_val(resp_keys and "secret_key")
+    set resp_s_sec to alloc_bytes(32)
+    set resp_s_pub to alloc_bytes(32)
+    set ok to hex_to_raw(resp_sec_hex and resp_s_sec and 32)
+    set ok to hex_to_raw(resp_pub_hex and resp_s_pub and 32)
+
+    # ===========================================================
+    # TEST 1: Full Noise_XX handshake over TCP
+    # ===========================================================
+    display "TEST 1: Full Noise_XX handshake over TCP"
+    set t1_ok to 1
+
+    set listen_fd to ep_net_listen(19101)
+    if listen_fd < 0:
+        display "  FAIL: could not listen on port 19101"
+        set t1_ok to 0
+
+    if t1_ok == 1:
+        # Start responder in background
+        spawn responder_thread(listen_fd and resp_s_sec and resp_s_pub)
+        set ok to ep_sleep_ms(100)
+
+        # Initiator connects
+        set conn to transport_connect("127.0.0.1" and 19101)
+        set conn_err to map_get_val(conn and "error")
+        if conn_err != TRANSPORT_ERR_NONE:
+            display "  FAIL: initiator connect failed"
+            set t1_ok to 0
+
+        if t1_ok == 1:
+            # Perform handshake as initiator
+            set hs_result to noise_net_handshake_initiate(conn and init_s_sec and init_s_pub)
+            set hs_err to map_get_val(hs_result and "error")
+            if hs_err != NOISE_NET_ERR_NONE:
+                display f"  FAIL: initiator handshake failed with error {hs_err}"
+                set t1_ok to 0
+            else:
+                set remote_static to map_get_val(hs_result and "remote_static")
+                if string_length(remote_static) != 64:
+                    display f"  FAIL: remote static key hex should be 64 chars, got {string_length(remote_static)}"
+                    set t1_ok to 0
+
+        if t1_ok == 1:
+            set session to map_get_val(hs_result and "session")
+
+            # Send an encrypted message
+            set send_err to noise_net_send(session and "DHT_PING" and "hello_encrypted")
+            if send_err != NOISE_NET_ERR_NONE:
+                display f"  FAIL: encrypted send failed with error {send_err}"
+                set t1_ok to 0
+
+        if t1_ok == 1:
+            # Receive encrypted echo
+            set recv_result to noise_net_recv(session)
+            set recv_err to map_get_val(recv_result and "error")
+            if recv_err != NOISE_NET_ERR_NONE:
+                display f"  FAIL: encrypted recv failed with error {recv_err}"
+                set t1_ok to 0
+            else:
+                set recv_type to map_get_val(recv_result and "msg_type")
+                set recv_text to map_get_val(recv_result and "plaintext")
+                if recv_type equals "DHT_PING":
+                    set ok to 1
+                else:
+                    display f"  FAIL: expected DHT_PING, got {recv_type}"
+                    set t1_ok to 0
+                if recv_text equals "ECHO:hello_encrypted":
+                    set ok to 1
+                else:
+                    display f"  FAIL: expected ECHO:hello_encrypted, got {recv_text}"
+                    set t1_ok to 0
+            free_map(recv_result)
+
+            # Clean shutdown
+            set ok to noise_net_send(session and "STOP" and "done")
+            set stop_r to noise_net_recv(session)
+            free_map(stop_r)
+            noise_net_close(session)
+
+        free_map(conn)
+
+    if t1_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(200)
+    set ok to ep_net_close(listen_fd)
+
+    # ===========================================================
+    # TEST 2: Multiple encrypted messages on same session
+    # ===========================================================
+    display "TEST 2: Multiple encrypted messages on same session"
+    set t2_ok to 1
+
+    set listen_fd2 to ep_net_listen(19102)
+    if listen_fd2 < 0:
+        display "  FAIL: could not listen on port 19102"
+        set t2_ok to 0
+
+    if t2_ok == 1:
+        spawn responder_thread(listen_fd2 and resp_s_sec and resp_s_pub)
+        set ok to ep_sleep_ms(100)
+
+        set conn2 to transport_connect("127.0.0.1" and 19102)
+        if map_get_val(conn2 and "error") != TRANSPORT_ERR_NONE:
+            display "  FAIL: connect failed"
+            set t2_ok to 0
+
+        if t2_ok == 1:
+            set hs_result2 to noise_net_handshake_initiate(conn2 and init_s_sec and init_s_pub)
+            if map_get_val(hs_result2 and "error") != NOISE_NET_ERR_NONE:
+                display "  FAIL: handshake failed"
+                set t2_ok to 0
+
+        if t2_ok == 1:
+            set session2 to map_get_val(hs_result2 and "session")
+
+            # Send 3 messages
+            set mi to 0
+            repeat while mi < 3:
+                set body to concat("secret_msg_" and int_to_string(mi))
+                set err to noise_net_send(session2 and "CONSENSUS" and body)
+                if err != NOISE_NET_ERR_NONE:
+                    display f"  FAIL: send {mi} failed"
+                    set t2_ok to 0
+                set mi to mi + 1
+
+            # Receive 3 echoed messages
+            set ri to 0
+            repeat while ri < 3:
+                set recv_r to noise_net_recv(session2)
+                set recv_e to map_get_val(recv_r and "error")
+                if recv_e != NOISE_NET_ERR_NONE:
+                    display f"  FAIL: recv {ri} failed"
+                    set t2_ok to 0
+                else:
+                    set expected to concat("ECHO:secret_msg_" and int_to_string(ri))
+                    set got to map_get_val(recv_r and "plaintext")
+                    if got equals expected:
+                        set ok to 1
+                    else:
+                        display f"  FAIL: msg {ri}: expected {expected}, got {got}"
+                        set t2_ok to 0
+                free_map(recv_r)
+                set ri to ri + 1
+
+            set ok to noise_net_send(session2 and "STOP" and "done")
+            set stop_r to noise_net_recv(session2)
+            free_map(stop_r)
+            noise_net_close(session2)
+
+        free_map(conn2)
+
+    if t2_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    set ok to ep_sleep_ms(200)
+    set ok to ep_net_close(listen_fd2)
+
+    # ===========================================================
+    # Summary
+    # ===========================================================
+    display ""
+    display "==================================================="
+    set total to tests_passed + tests_failed
+    display f"  {tests_passed}/{total} tests passed."
+    if tests_failed > 0:
+        display f"  {tests_failed} FAILED!"
+    display "==================================================="
+    return 0

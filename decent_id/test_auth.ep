@@ -1,0 +1,366 @@
+# ErnosDecent -- Test Suite for decent_id/auth.ep
+# Tests: Session tokens, capabilities, device authorization
+# Status: Production -- OperationTrojanClaude Phase 2
+
+import "auth"
+import "did"
+import "keys"
+import "string"
+import "test"
+
+# ================================================================
+# Test 1: Create and verify session token
+# ================================================================
+
+define test_session_token_create:
+    display "TEST 1: Create and verify session token"
+    set id to create_identity()
+    assert_true(map_get_val(id and "error") == DID_ERR_NONE and "identity creation should succeed")
+
+    set did to map_get_val(id and "did")
+    set sec_key to map_get_val(id and "signing_secret_key")
+    set pub_key to map_get_val(id and "signing_public_key")
+
+    set token_result to create_session_token(did and sec_key and 3600)
+    assert_true(map_get_val(token_result and "error") == AUTH_ERR_NONE and "token creation should succeed")
+
+    set token to map_get_val(token_result and "token")
+    assert_true(string_length(token) > 0 and "token should be non-empty")
+    assert_true(string_contains(token and ".") == 1 and "token should contain separator")
+
+    set payload_hash to map_get_val(token_result and "payload_hash")
+
+    # Verify the token
+    set verify_result to verify_session_token(token and pub_key and payload_hash)
+    assert_true(map_get_val(verify_result and "error") == AUTH_ERR_NONE and "verification should succeed")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 2: Session token with wrong key must fail
+# ================================================================
+
+define test_session_token_wrong_key:
+    display "TEST 2: Session token with wrong key must fail"
+    set id1 to create_identity()
+    set id2 to create_identity()
+
+    set did to map_get_val(id1 and "did")
+    set sec_key to map_get_val(id1 and "signing_secret_key")
+    set wrong_pub to map_get_val(id2 and "signing_public_key")
+
+    set token_result to create_session_token(did and sec_key and 3600)
+    set token to map_get_val(token_result and "token")
+    set payload_hash to map_get_val(token_result and "payload_hash")
+
+    set verify_result to verify_session_token(token and wrong_pub and payload_hash)
+    assert_true(map_get_val(verify_result and "error") == AUTH_ERR_INVALID_TOKEN and "wrong key should fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 3: Token expiry check
+# ================================================================
+
+define test_token_expiry:
+    display "TEST 3: Token expiry check"
+    # Token issued in the past should be expired
+    set past_time to ep_time_now_sec() - 100
+    set expired to is_token_expired(past_time)
+    assert_true(expired == 1 and "past time should be expired")
+
+    # Token expiring in the future should not be expired
+    set future_time to ep_time_now_sec() + 3600
+    set not_expired to is_token_expired(future_time)
+    assert_true(not_expired == 0 and "future time should not be expired")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 4: Create and verify capability
+# ================================================================
+
+define test_capability_create:
+    display "TEST 4: Create and verify capability"
+    set granter to create_identity()
+    set grantee to create_identity()
+
+    set granter_did to map_get_val(granter and "did")
+    set granter_sec to map_get_val(granter and "signing_secret_key")
+    set granter_pub to map_get_val(granter and "signing_public_key")
+    set grantee_did to map_get_val(grantee and "did")
+
+    set cap_result to create_capability(granter_did and grantee_did and "/data/files" and "read,write" and granter_sec and 3600)
+    assert_true(map_get_val(cap_result and "error") == AUTH_ERR_NONE and "capability creation should succeed")
+
+    set cap_resource to map_get_val(cap_result and "resource")
+    if cap_resource equals "/data/files":
+        set ok to 1
+    else:
+        display "  FAIL: resource mismatch"
+        return 1
+
+    set cap_actions to map_get_val(cap_result and "actions")
+    if cap_actions equals "read,write":
+        set ok to 1
+    else:
+        display "  FAIL: actions mismatch"
+        return 1
+
+    # Serialize and verify
+    set wire to serialize_capability(cap_result)
+    assert_true(string_length(wire) > 0 and "serialized capability should be non-empty")
+
+    set verify_result to verify_capability(wire and granter_pub and grantee_did and "/data/files" and "read")
+    assert_true(map_get_val(verify_result and "error") == AUTH_ERR_NONE and "verification should succeed for read")
+
+    set verify_result2 to verify_capability(wire and granter_pub and grantee_did and "/data/files" and "write")
+    assert_true(map_get_val(verify_result2 and "error") == AUTH_ERR_NONE and "verification should succeed for write")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 5: Capability with wrong grantee must fail
+# ================================================================
+
+define test_capability_wrong_grantee:
+    display "TEST 5: Capability with wrong grantee must fail"
+    set granter to create_identity()
+    set grantee to create_identity()
+    set intruder to create_identity()
+
+    set granter_did to map_get_val(granter and "did")
+    set granter_sec to map_get_val(granter and "signing_secret_key")
+    set granter_pub to map_get_val(granter and "signing_public_key")
+    set grantee_did to map_get_val(grantee and "did")
+    set intruder_did to map_get_val(intruder and "did")
+
+    set cap_result to create_capability(granter_did and grantee_did and "/secret" and "read" and granter_sec and 3600)
+    set wire to serialize_capability(cap_result)
+
+    # Intruder tries to use the capability
+    set verify_result to verify_capability(wire and granter_pub and intruder_did and "/secret" and "read")
+    assert_true(map_get_val(verify_result and "error") == AUTH_ERR_INSUFFICIENT_PERMISSION and "wrong grantee should fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 6: Capability with unauthorized action must fail
+# ================================================================
+
+define test_capability_wrong_action:
+    display "TEST 6: Capability with unauthorized action must fail"
+    set granter to create_identity()
+    set grantee to create_identity()
+
+    set granter_did to map_get_val(granter and "did")
+    set granter_sec to map_get_val(granter and "signing_secret_key")
+    set granter_pub to map_get_val(granter and "signing_public_key")
+    set grantee_did to map_get_val(grantee and "did")
+
+    # Grant only read
+    set cap_result to create_capability(granter_did and grantee_did and "/data" and "read" and granter_sec and 3600)
+    set wire to serialize_capability(cap_result)
+
+    # Try to delete (not granted)
+    set verify_result to verify_capability(wire and granter_pub and grantee_did and "/data" and "delete")
+    assert_true(map_get_val(verify_result and "error") == AUTH_ERR_INSUFFICIENT_PERMISSION and "unauthorized action should fail")
+
+    # Action substring must NOT authorize: "rea" is a substring of "read".
+    set vr_sub_action to verify_capability(wire and granter_pub and grantee_did and "/data" and "rea")
+    assert_true(map_get_val(vr_sub_action and "error") == AUTH_ERR_INSUFFICIENT_PERMISSION and "action substring must not authorize")
+
+    # Resource substring must NOT authorize: a cap for "/data" must not grant "/database".
+    set vr_sub_res to verify_capability(wire and granter_pub and grantee_did and "/database" and "read")
+    assert_true(map_get_val(vr_sub_res and "error") == AUTH_ERR_INSUFFICIENT_PERMISSION and "resource substring must not authorize")
+
+    # Expiry must be enforced: hand-craft a validly-signed cap whose expires_at
+    # is far in the past (epoch 2000) -- create_capability clamps ttl>0, so it
+    # cannot be produced normally. A valid signature must NOT bypass expiry.
+    set exp_body to concat(granter_did and "|")
+    set exp_body to concat(exp_body and grantee_did)
+    set exp_body to concat(exp_body and "|/data|read|1000|2000")
+    set exp_hash to ep_sha256(exp_body)
+    set exp_sig_res to sign_message(exp_hash and granter_sec)
+    set exp_sig to map_get_val(exp_sig_res and "signature")
+    set exp_wire to concat(exp_body and concat("." and exp_sig))
+    set vr_exp to verify_capability(exp_wire and granter_pub and grantee_did and "/data" and "read")
+    assert_true(map_get_val(vr_exp and "error") == AUTH_ERR_TOKEN_EXPIRED and "expired capability must be rejected")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 7: Admin capability grants all actions
+# ================================================================
+
+define test_capability_admin:
+    display "TEST 7: Admin capability grants all actions"
+    set granter to create_identity()
+    set grantee to create_identity()
+
+    set granter_did to map_get_val(granter and "did")
+    set granter_sec to map_get_val(granter and "signing_secret_key")
+    set granter_pub to map_get_val(granter and "signing_public_key")
+    set grantee_did to map_get_val(grantee and "did")
+
+    # Grant admin
+    set cap_result to create_capability(granter_did and grantee_did and "/everything" and "admin" and granter_sec and 3600)
+    set wire to serialize_capability(cap_result)
+
+    # Admin should allow any action
+    set v1 to verify_capability(wire and granter_pub and grantee_did and "/everything" and "read")
+    assert_true(map_get_val(v1 and "error") == AUTH_ERR_NONE and "admin should allow read")
+
+    set v2 to verify_capability(wire and granter_pub and grantee_did and "/everything" and "delete")
+    assert_true(map_get_val(v2 and "error") == AUTH_ERR_NONE and "admin should allow delete")
+
+    set v3 to verify_capability(wire and granter_pub and grantee_did and "/everything" and "write")
+    assert_true(map_get_val(v3 and "error") == AUTH_ERR_NONE and "admin should allow write")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 8: Tampered capability must fail
+# ================================================================
+
+define test_capability_tampered:
+    display "TEST 8: Tampered capability must fail"
+    set granter to create_identity()
+    set grantee to create_identity()
+
+    set granter_did to map_get_val(granter and "did")
+    set granter_sec to map_get_val(granter and "signing_secret_key")
+    set granter_pub to map_get_val(granter and "signing_public_key")
+    set grantee_did to map_get_val(grantee and "did")
+
+    set cap_result to create_capability(granter_did and grantee_did and "/data" and "read" and granter_sec and 3600)
+    set wire to serialize_capability(cap_result)
+
+    # Tamper: replace "read" with "admin" in the wire format
+    set tampered to string_replace(wire and "read" and "admin")
+
+    set verify_result to verify_capability(tampered and granter_pub and grantee_did and "/data" and "admin")
+    assert_true(map_get_val(verify_result and "error") != AUTH_ERR_NONE and "tampered capability should fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 9: Device authorization
+# ================================================================
+
+define test_device_auth:
+    display "TEST 9: Device authorization"
+    set device1 to create_identity()
+    set device2 to create_identity()
+
+    set d1_did to map_get_val(device1 and "did")
+    set d1_sec to map_get_val(device1 and "signing_secret_key")
+    set d1_pub to map_get_val(device1 and "signing_public_key")
+    set d2_did to map_get_val(device2 and "did")
+
+    # Device 1 authorizes device 2
+    set auth_result to authorize_device(d1_did and d1_sec and d2_did)
+    assert_true(map_get_val(auth_result and "error") == AUTH_ERR_NONE and "device auth should succeed")
+
+    set timestamp to map_get_val(auth_result and "timestamp")
+    set signature to map_get_val(auth_result and "signature")
+
+    # Verify the authorization
+    set verify_result to verify_device_authorization(d1_did and d1_pub and d2_did and timestamp and signature)
+    assert_true(verify_result == AUTH_ERR_NONE and "device auth verification should succeed")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 10: Device authorization with wrong verifier must fail
+# ================================================================
+
+define test_device_auth_wrong_key:
+    display "TEST 10: Device auth with wrong key must fail"
+    set device1 to create_identity()
+    set device2 to create_identity()
+    set device3 to create_identity()
+
+    set d1_did to map_get_val(device1 and "did")
+    set d1_sec to map_get_val(device1 and "signing_secret_key")
+    set d2_did to map_get_val(device2 and "did")
+    set d3_pub to map_get_val(device3 and "signing_public_key")
+
+    set auth_result to authorize_device(d1_did and d1_sec and d2_did)
+    set timestamp to map_get_val(auth_result and "timestamp")
+    set signature to map_get_val(auth_result and "signature")
+
+    # Verify with wrong public key
+    set verify_result to verify_device_authorization(d1_did and d3_pub and d2_did and timestamp and signature)
+    assert_true(verify_result == AUTH_ERR_DEVICE_NOT_AUTHORIZED and "wrong key should fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Test 11: Empty/invalid inputs must be rejected
+# ================================================================
+
+define test_invalid_inputs:
+    display "TEST 11: Empty/invalid inputs must be rejected"
+
+    # Empty DID for session token
+    set r1 to create_session_token("" and "abc" and 3600)
+    assert_true(map_get_val(r1 and "error") == AUTH_ERR_INVALID_DID and "empty DID should fail")
+
+    # Empty token for verification
+    set r2 to verify_session_token("" and "abc" and "")
+    assert_true(map_get_val(r2 and "error") == AUTH_ERR_INVALID_TOKEN and "empty token should fail")
+
+    # Token without separator
+    set r3 to verify_session_token("noseparator" and "abc" and "")
+    assert_true(map_get_val(r3 and "error") == AUTH_ERR_INVALID_TOKEN and "no separator should fail")
+
+    # Empty DID for capability
+    set r4 to create_capability("" and "" and "/data" and "read" and "abc" and 3600)
+    assert_true(map_get_val(r4 and "error") == AUTH_ERR_INVALID_DID and "empty DID for cap should fail")
+
+    # Empty DID for device auth
+    set r5 to authorize_device("" and "abc" and "def")
+    assert_true(map_get_val(r5 and "error") == AUTH_ERR_INVALID_DID and "empty DID for device auth should fail")
+
+    display "  PASS"
+    return 0
+
+# ================================================================
+# Main -- Run all tests
+# ================================================================
+
+define main:
+    display "==================================================="
+    display "  ErnosDecent -- decent_id/auth.ep Test Suite"
+    display "  OperationTrojanClaude Phase 2"
+    display "==================================================="
+    display ""
+
+    set ok to test_session_token_create()
+    set ok to test_session_token_wrong_key()
+    set ok to test_token_expiry()
+    set ok to test_capability_create()
+    set ok to test_capability_wrong_grantee()
+    set ok to test_capability_wrong_action()
+    set ok to test_capability_admin()
+    set ok to test_capability_tampered()
+    set ok to test_device_auth()
+    set ok to test_device_auth_wrong_key()
+    set ok to test_invalid_inputs()
+
+    display ""
+    display "==================================================="
+    display "  11 tests executed."
+    display "==================================================="
+    return 0

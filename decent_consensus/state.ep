@@ -1,0 +1,131 @@
+# ErnosDecent — Raft Replicated State Machine
+# Component: decent_consensus/state.ep
+# Implements: Log entry creation, replicated state machine execution, and log rollback
+# Status: Production — OperationTrojanClaude Phase 13
+
+import "collections"
+import "string"
+
+# ================================================================
+# Constants and Error Codes
+# ================================================================
+
+set STATE_ERR_NONE to 0
+set STATE_ERR_MALFORMED_COMMAND to 921
+set STATE_ERR_INDEX_OUT_OF_BOUNDS to 922
+
+# ================================================================
+# Data Structures
+# ================================================================
+
+define structure LogEntry:
+    field term as Int
+    field index as Int
+    field command as Str
+
+# ================================================================
+# State Machine Application
+# ================================================================
+
+define state_apply_log with borrow node as Map and entry as Map returning Int:
+    # Check if node has a state machine initialized
+    set sm to map_get_val(node and "state_machine")
+    if sm == 0:
+        set sm to create_map()
+        set ok to map_insert(node and "state_machine" and sm)
+
+    set command to map_get_val(entry and "command")
+    
+    # Parse command format: "SET key=value"
+    set len to string_length(command)
+    if len < 5:
+        return STATE_ERR_MALFORMED_COMMAND
+
+    set prefix to substring(command and 0 and 4)
+    if (prefix equals "SET ") == 0:
+        return STATE_ERR_MALFORMED_COMMAND
+
+    set kv_pair to substring(command and 4 and len)
+    set kv_split to string_split(kv_pair and "=")
+    set num_parts to length_list(kv_split)
+    if num_parts < 2:
+        return STATE_ERR_MALFORMED_COMMAND
+
+    set key_ptr to get_list(kv_split and 0)
+    set val_ptr to get_list(kv_split and 1)
+
+    set key to string_trim(ptr_to_str(key_ptr))
+    set val to string_trim(ptr_to_str(val_ptr))
+
+    set entry_idx to map_get_val(entry and "index")
+
+    # Record undo info before mutation
+    set undo_stack to map_get_val(node and "undo_stack")
+    if undo_stack == 0:
+        set undo_stack to create_list()
+        set ok to map_insert(node and "undo_stack" and undo_stack)
+
+    set undo_entry to create_map()
+    set ok to map_insert(undo_entry and "index" and entry_idx)
+    set ok to map_insert(undo_entry and "key" and key)
+    if map_contains(sm and key) == 1:
+        set ok to map_insert(undo_entry and "has_old" and 1)
+        set ok to map_insert(undo_entry and "old_val" and map_get_val(sm and key))
+    else:
+        set ok to map_insert(undo_entry and "has_old" and 0)
+    set ok to append_list(undo_stack and undo_entry)
+
+    # Apply to local state machine map
+    set ok to map_insert(sm and key and val)
+
+    # Update last applied index
+    set ok to map_insert(node and "last_applied" and entry_idx)
+
+    return STATE_ERR_NONE
+
+# ================================================================
+# Log Rollback (Handling leader displacement)
+# ================================================================
+
+define state_rollback_log with borrow node as Map and index as Int returning Int:
+    # Truncate the log back to the specified index (inclusive, i.e., delete everything from index onwards)
+    set log to map_get_val(node and "log")
+    set log_len to length_list(log)
+    if index < 1 || index > log_len + 1:
+        return STATE_ERR_INDEX_OUT_OF_BOUNDS
+
+    # Revert state machine mutations for indices >= index
+    set undo_stack to map_get_val(node and "undo_stack")
+    if undo_stack != 0:
+        set sm to map_get_val(node and "state_machine")
+        set stack_len to length_list(undo_stack)
+        repeat while stack_len > 0:
+            set last_entry to get_list(undo_stack and stack_len - 1)
+            set entry_idx to map_get_val(last_entry and "index")
+            if entry_idx >= index:
+                set key to ptr_to_str(map_get_val(last_entry and "key"))
+                set has_old to map_get_val(last_entry and "has_old")
+                if has_old == 1:
+                    set old_val to ptr_to_str(map_get_val(last_entry and "old_val"))
+                    set ok to map_insert(sm and key and old_val)
+                else:
+                    set ok to map_delete(sm and key)
+                set dummy to pop_list(undo_stack)
+                set stack_len to stack_len - 1
+            else:
+                set stack_len to 0
+
+    # Revert last_applied if needed
+    set last_applied to map_get_val(node and "last_applied")
+    if last_applied >= index:
+        set ok to map_insert(node and "last_applied" and index - 1)
+
+    set new_log to create_list()
+    set i to 0
+    repeat while i < index - 1:
+        set entry to get_list(log and i)
+        set ok to append_list(new_log and entry)
+        set i to i + 1
+
+    set ok to map_insert(node and "log" and new_log)
+    return STATE_ERR_NONE
