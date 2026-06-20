@@ -9,6 +9,95 @@
 import "string"
 import "collections"
 
+# ── FFI primitives (resolved at runtime; same as codec.ep / inference.ep) ──
+external define ep_dlopen with lib:
+external define ep_dlsym with handle and name:
+external define ep_dlcall1 with fn and a0:
+external define ep_dlcall3 with fn and a0 and a1 and a2:
+external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
+external define alloc_bytes with n returning Int:
+external define free_bytes with ptr:
+external define poke_byte with ptr and offset and value:
+external define peek_byte with ptr and offset returning Int:
+
+# Copy an EP string into a fresh NUL-terminated C buffer; returns its address.
+define tts_str_to_buf with s as Str returning Int:
+    set n to string_length(s)
+    set buf to alloc_bytes(n + 1)
+    set i to 0
+    repeat while i < n:
+        set ok to poke_byte(buf and i and get_character(s and i))
+        set i to i + 1
+    set ok to poke_byte(buf and n and 0)
+    return buf
+
+# Write a 64-bit little-endian pointer value into buf at off.
+define tts_poke_ptr with buf as Int and off as Int and ptr as Int returning Int:
+    set p to ptr
+    set j to 0
+    repeat while j < 8:
+        set ok to poke_byte(buf and off + j and (p modulo 256))
+        set p to p / 256
+        set j to j + 1
+    return 0
+
+# Read a NUL-terminated C string at ptr into an EP string.
+define tts_cstr_at with ptr as Int returning Str:
+    set bytes to create_list()
+    set i to 0
+    set b to peek_byte(ptr and i)
+    repeat while b != 0 and also i < 200000:
+        set ok to append_list(bytes and b)
+        set i to i + 1
+        set b to peek_byte(ptr and i)
+    set s to string_from_list(bytes)
+    free_list(bytes)
+    return s
+
+# ── Phonemize via libespeak-ng: text -> IPA phonemes (British voice for Fable) ──
+define tts_phonemize with text as Str returning Str:
+    set lib to ep_dlopen("/opt/homebrew/lib/libespeak-ng.dylib")
+    if lib == 0:
+        return ""
+    set f_init to ep_dlsym(lib and "espeak_Initialize")
+    set path_buf to tts_str_to_buf("/opt/homebrew/share/espeak-ng-data")
+    # output=2 (SYNCHRONOUS — no audio device opened), buflength=0, path, options=0
+    set sr to ep_dlcall4(f_init and 2 and 0 and path_buf and 0)
+    # British English voice (for Fable). The language code "en-gb" is NOT accepted by
+    # SetVoiceByName (returns NOT_FOUND) — the VoiceName form is required, else no voice
+    # loads and TextToPhonemes segfaults.
+    set f_voice to ep_dlsym(lib and "espeak_SetVoiceByName")
+    set voice_buf to tts_str_to_buf("English (Great Britain)")
+    set vr to ep_dlcall1(f_voice and voice_buf)
+    set text_buf to tts_str_to_buf(text)
+    set textptr to alloc_bytes(8)
+    set ok to tts_poke_ptr(textptr and 0 and text_buf)
+    set f_ph to ep_dlsym(lib and "espeak_TextToPhonemes")
+    # TextToPhonemes returns ONE clause and advances *textptr; loop until consumed.
+    # textmode=1 (UTF8), phonememode=2 (IPA, no separator).
+    set phonemes to ""
+    set guard to 0
+    set more to 1
+    repeat while more == 1 and also guard < 1000:
+        set ph_ptr to ep_dlcall3(f_ph and textptr and 1 and 2)
+        if ph_ptr != 0:
+            set phonemes to concat(phonemes and tts_cstr_at(ph_ptr))
+            set phonemes to concat(phonemes and " ")
+        # read *textptr (the advanced pointer); 0 => done
+        set nextp to 0
+        set k to 7
+        repeat while k >= 0:
+            set nextp to nextp * 256 + peek_byte(textptr and k)
+            set k to k - 1
+        if nextp == 0:
+            set more to 0
+        set guard to guard + 1
+    free_bytes(path_buf)
+    free_bytes(voice_buf)
+    free_bytes(text_buf)
+    free_bytes(textptr)
+    return phonemes
+
 # ── Kokoro vocab: phoneme codepoint -> token id (from kokoro_onnx config.json) ──
 define tts_vocab_put with v as Map and cp as Int and id as Int returning Int:
     set ok to map_insert(v and int_to_string(cp) and id)
