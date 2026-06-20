@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import socket
+import discord
+import asyncio
+import signal
+
+import urllib.request
+import base64
+import subprocess
+
+CONFIG_PATH = 'config/platforms.json'
+
+def load_config():
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[Discord Bridge] Error loading config: {e}", flush=True)
+    return {}
+
+def update_status(status_str):
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r') as f:
+                data = json.load(f)
+            if 'discord' in data:
+                # Only update if status is actually changing
+                if data['discord'].get('status') != status_str:
+                    data['discord']['status'] = status_str
+                    with open(CONFIG_PATH, 'w') as f:
+                        json.dump(data, f)
+                    print(f"[Discord Bridge] Status updated to {status_str}", flush=True)
+    except Exception as e:
+        print(f"[Discord Bridge] Error updating status: {e}", flush=True)
+
+# Clean up status on shutdown
+def sig_handler(signum, frame):
+    print(f"[Discord Bridge] Received signal {signum}. Shutting down...", flush=True)
+    update_status("OFFLINE")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, sig_handler)
+signal.signal(signal.SIGINT, sig_handler)
+
+# Load configuration
+config = load_config()
+discord_cfg = config.get('discord', {})
+enabled = discord_cfg.get('enabled', False)
+token = discord_cfg.get('token', '')
+channel_id_str = discord_cfg.get('channel', '')
+
+# Admin user ID — this user gets sender_role=admin; everyone else is guest
+ADMIN_ID = int(discord_cfg.get('admin_id', '1299810741984956449'))
+
+if not enabled or not token or not channel_id_str:
+    print("[Discord Bridge] Discord connection is not enabled or missing details. Exiting.", flush=True)
+    update_status("OFFLINE")
+    sys.exit(0)
+
+try:
+    channel_id = int(channel_id_str)
+except ValueError:
+    print(f"[Discord Bridge] Invalid channel ID: {channel_id_str}. Exiting.", flush=True)
+    update_status("OFFLINE")
+    sys.exit(1)
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.reactions = True
+client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
+
+@tree.command(name="new", description="Start a new AI session and reset context")
+@discord.app_commands.describe(title="Optional title for the new session")
+async def new_session_cmd(interaction: discord.Interaction, title: str = "Discord Session"):
+    # Ensure it's in the configured channel
+    is_target_channel = interaction.channel.id == channel_id
+    is_thread_in_target_channel = getattr(interaction.channel, 'parent_id', None) == channel_id
+    if not is_target_channel and not is_thread_in_target_channel:
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+        
+    await interaction.response.defer()
+    
+    import time
+    session_id = f"session_{int(time.time() * 1000)}"
+    
+    # Start a new session
+    new_payload = {
+        "id": session_id,
+        "title": f"{title} {int(time.time())}",
+        "model": "",
+        "system_prompt": "You are ErnOS Agent — a digital cognitive system running on a local decentralized node."
+    }
+    new_cmd = f"SESSION NEW {json.dumps(new_payload)}"
+    resp_new = await send_daemon_ipc(new_cmd)
+    
+    # Switch to the new session on the daemon
+    set_cmd = f"SESSION SET {session_id}"
+    resp_set = await send_daemon_ipc(set_cmd)
+    
+    if "session:set_ok" in resp_set or "session:ok" in resp_new:
+        global active_session_id
+        active_session_id = session_id
+        await interaction.followup.send(f"✨ Started a new AI session: **{title}** (ID: `{session_id}`). Current context has been reset.")
+    else:
+        await interaction.followup.send(f"❌ Failed to start new session. Daemon response: {resp_set}")
+
+# Approval timeout in seconds
+# No timeout — user said "WAIT" (indefinite)
+APPROVAL_TIMEOUT = None
+
+active_session_id = "default"
+
+async def get_active_session_id():
+    resp = await send_daemon_ipc("SESSION ACTIVE")
+    if resp.startswith("session:active_id,id:"):
+        return resp[len("session:active_id,id:"):]
+    return "default"
+
+def upload_file_to_daemon(filename, file_bytes):
+    try:
+        base64_content = base64.b64encode(file_bytes).decode('utf-8')
+        payload = {
+            'filename': filename,
+            'content': base64_content
+        }
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            'http://127.0.0.1:8080/api/upload',
+            data=data,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        with urllib.request.urlopen(req) as response:
+            resp_data = json.loads(response.read().decode('utf-8'))
+            return resp_data.get('success', False), resp_data.get('message', '')
+    except Exception as e:
+        return False, str(e)
+
+def _read_ipc_token():
+    """Read the daemon's IPC auth token (0600 file). The daemon rejects any command
+    that isn't prefixed with 'AUTH <token>' (error:unknown_command:IPC_UNAUTHORIZED)."""
+    try:
+        with open(os.path.expanduser('~/.ernosdecent/ipc-token'), 'r') as tf:
+            return tf.read().strip()
+    except Exception:
+        return ''
+
+
+async def send_daemon_ipc(cmd_str):
+    """Send a raw IPC command to the daemon and return the response."""
+    try:
+        token = _read_ipc_token()
+        if token:
+            cmd_str = 'AUTH ' + token + ' ' + cmd_str
+        reader, writer = await asyncio.open_connection('127.0.0.1', 5000)
+        writer.write(cmd_str.encode('utf-8'))
+        await writer.drain()
+        # Read in chunks — AI responses can be very long
+        chunks = []
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        writer.close()
+        await writer.wait_closed()
+        return b''.join(chunks).decode('utf-8', errors='ignore').strip()
+    except Exception as e:
+        print(f"[Discord Bridge] IPC send failed: {e}", flush=True)
+        return "error:daemon_offline"
+
+async def search_rag_database(query_text):
+    """RAG search via the ErnosPlain daemon, scoped to the ACTIVE SESSION.
+    Replaces the old Python rag_manager.py subprocess. The daemon's session-scoped
+    search means a session only auto-retrieves documents ingested in that session;
+    older/other-session documents are reached only via the agent's explicit tools."""
+    try:
+        global active_session_id
+        sess = active_session_id or ""
+        q = query_text.replace('\r', ' ').replace('\n', ' ').replace('|', ' ')
+        resp = await send_daemon_ipc(f"RAG SEARCH {sess}|{q}")
+        if resp and resp.lstrip().startswith("{"):
+            return json.loads(resp)
+    except Exception as e:
+        print(f"[Discord Bridge] RAG search failed: {e}", flush=True)
+    return None
+
+def format_rag_context(rag_res):
+    formatted = []
+    results = rag_res.get("results", [])
+    if results:
+        formatted.append("Context from retrieved document segments:")
+        for r in results:
+            doc = r["document"]
+            idx = r["chunk_index"]
+            content = r["content"]
+            formatted.append(f"\n[Document: {doc}, Segment: {idx}]\n{content}\n")
+    return "\n".join(formatted)
+
+async def query_daemon_ipc(prompt, author=None):
+    try:
+        # Prepare query (avoid newlines inside query to keep it clean)
+        clean_prompt = prompt.replace('\r', ' ').replace('\n', ' ')
+        
+        # Build IPC command with sender identity and role tags
+        global active_session_id
+        tags = ""
+        if active_session_id:
+            tags = f"[SESSION:{active_session_id}] "
+        if author is not None:
+            username = str(author.display_name).replace('[', '(').replace(']', ')')
+            role = "admin" if author.id == ADMIN_ID else "guest"
+            tags += f"[SENDER:{username}] [ROLE:{role}] "
+            
+        # Search the RAG database using the query
+        rag_res = await search_rag_database(clean_prompt)
+        if rag_res and (rag_res.get("results") or rag_res.get("structural_chunks")):
+            # Format and sanitize brackets to prevent option parsing issues
+            context_str = format_rag_context(rag_res).replace('[', '(').replace(']', ')')
+            tags += f"[IN_MEMORY_CONTEXT:{context_str}] "
+        
+        cmd = f"AI INFER {tags}{clean_prompt}"
+        return await send_daemon_ipc(cmd)
+    except Exception as e:
+        print(f"[Discord Bridge] IPC query failed: {e}", flush=True)
+        return "error:daemon_offline"
+
+async def send_discord_reply(message, text):
+    """Send a reply, splitting into chunks if it exceeds Discord's 2000-char limit."""
+    try:
+        if not text or not text.strip():
+            text = "..."
+        if len(text) > 2000:
+            for chunk in [text[i:i+2000] for i in range(0, len(text), 2000)]:
+                await message.reply(chunk)
+        else:
+            await message.reply(text)
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to send reply message: {e}", flush=True)
+
+def parse_pending_approval(resp):
+    """Parse 'ai:pending_approval,tool:<name>,summary:<args>' into (tool, summary)."""
+    tool_name = "unknown"
+    summary = ""
+    parts = resp.split(",")
+    for part in parts:
+        if part.startswith("tool:"):
+            tool_name = part[len("tool:"):]
+        elif part.startswith("summary:"):
+            summary = part[len("summary:"):]
+    return tool_name, summary
+
+class ApprovalView(discord.ui.View):
+    def __init__(self, author, timeout=None):
+        super().__init__(timeout=timeout)
+        self.author = author
+        self.value = None
+
+    @discord.ui.button(label="Approve", emoji="✅", style=discord.ButtonStyle.green)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.author:
+            await interaction.response.send_message("❌ Only the original sender can approve/deny this request.", ephemeral=True)
+            return
+        self.value = True
+        # Disable all items in the view after click
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=interaction.message.content, view=self)
+        self.stop()
+
+    @discord.ui.button(label="Approve All", emoji="⚡", style=discord.ButtonStyle.blurple)
+    async def approve_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.author:
+            await interaction.response.send_message("❌ Only the original sender can approve/deny this request.", ephemeral=True)
+            return
+        self.value = "all"
+        # Disable all items in the view after click
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=interaction.message.content, view=self)
+        self.stop()
+
+    @discord.ui.button(label="Deny", emoji="❌", style=discord.ButtonStyle.red)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.author:
+            await interaction.response.send_message("❌ Only the original sender can approve/deny this request.", ephemeral=True)
+            return
+        self.value = False
+        # Disable all items in the view after click
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=interaction.message.content, view=self)
+        self.stop()
+
+async def handle_tool_approval(message, resp):
+    """Handle a pending tool approval: show a card with interactive buttons and wait for user decision."""
+    tool_name, summary = parse_pending_approval(resp)
+    
+    # Build the approval card
+    card_text = (
+        f"🔒 **Tool Approval Required**\n"
+        f"```\n"
+        f"Tool:  {tool_name}\n"
+        f"Args:  {summary}\n"
+        f"```\n"
+        f"Please approve or deny this action."
+    )
+    
+    view = ApprovalView(author=message.author, timeout=APPROVAL_TIMEOUT)
+    approval_msg = await message.reply(card_text, view=view)
+    
+    timed_out = await view.wait()
+    
+    if timed_out or view.value is None:
+        for item in view.children:
+            item.disabled = True
+        await approval_msg.edit(content=f"⏰ **Timed out** — `{tool_name}` was auto-denied.", view=view)
+        await send_daemon_ipc("AI DENY")
+        return
+        
+    if view.value is True:
+        await approval_msg.edit(content=f"✅ **Approved** `{tool_name}` — executing...", view=view)
+        ipc_resp = await send_daemon_ipc("AI APPROVE")
+    elif view.value == "all":
+        await approval_msg.edit(content=f"⚡ **Approved All** `{tool_name}` — executing subsequent actions automatically...", view=view)
+        ipc_resp = await send_daemon_ipc("AI APPROVE_ALL")
+    else:
+        await approval_msg.edit(content=f"❌ **Denied** `{tool_name}` — cancelled.", view=view)
+        ipc_resp = await send_daemon_ipc("AI DENY")
+        
+    # Process the result from the daemon after approval/denial
+    if ipc_resp.startswith("ai:pending_approval,"):
+        # Chained approval — another gated tool in the same ReAct loop
+        await handle_tool_approval(message, ipc_resp)
+    elif ipc_resp.startswith("ai:ok,response:"):
+        ai_resp = ipc_resp[len("ai:ok,response:"):]
+        await send_discord_reply(message, ai_resp)
+    elif ipc_resp == "error:daemon_offline":
+        await send_discord_reply(message, "❌ Daemon went offline during approval.")
+    else:
+        await send_discord_reply(message, f"Agent response: {ipc_resp}")
+
+async def _exec_bridge_command(action, args):
+    """Execute one agent->bridge command via discord.py. Returns a result string.
+    This is the live half of the node<->bridge RPC; only runs with a real bot token."""
+    try:
+        if action == "list_channels":
+            out = []
+            for g in client.guilds:
+                for c in g.text_channels:
+                    out.append(f"{c.id}: #{c.name} ({g.name})")
+            return "\n".join(out) if out else "(no text channels visible)"
+        if action == "read_channel":
+            ch = client.get_channel(int(args.strip()))
+            if ch is None:
+                return f"error: channel {args} not found"
+            msgs = []
+            async for m in ch.history(limit=20):
+                msgs.append(f"{m.author.display_name}: {m.content}")
+            msgs.reverse()
+            return "\n".join(msgs) if msgs else "(no recent messages)"
+        if action == "add_reaction":
+            parts = args.split("|")
+            if len(parts) < 3:
+                return "error: add_reaction needs channel_id|message_id|emoji"
+            ch = client.get_channel(int(parts[0].strip()))
+            if ch is None:
+                return f"error: channel {parts[0]} not found"
+            msg = await ch.fetch_message(int(parts[1].strip()))
+            await msg.add_reaction(parts[2].strip())
+            return "reaction added"
+        return f"error: unknown action {action}"
+    except Exception as e:
+        return f"error: {e}"
+
+async def bridge_poll_loop():
+    """Poll the daemon for queued agent->bridge commands, execute them, and return
+    results — making the otherwise one-way bridge bidirectional (node<->bridge RPC).
+    The daemon side is decent_net/bridge_rpc.ep (DISCORD POLL / DISCORD RESULT)."""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            resp = await send_daemon_ipc("DISCORD POLL")
+            if resp and resp.startswith("["):
+                cmds = json.loads(resp)
+                for cmd in cmds:
+                    cid = cmd.get("id")
+                    result = await _exec_bridge_command(cmd.get("action", ""), cmd.get("args", ""))
+                    # data may contain newlines/pipes; the daemon splits on the FIRST '|'.
+                    await send_daemon_ipc(f"DISCORD RESULT {cid}|{result}")
+        except Exception as e:
+            print(f"[Discord Bridge] poll loop error: {e}", flush=True)
+        await asyncio.sleep(1.0)
+
+@client.event
+async def on_ready():
+    global active_session_id
+    active_session_id = await get_active_session_id()
+    print(f"[Discord Bridge] Bot is logged in and ready as {client.user}", flush=True)
+    print(f"[Discord Bridge] Active session ID is: {active_session_id}", flush=True)
+    update_status("ONLINE")
+
+    # Start the node<->bridge RPC poll loop (idempotent — guard against double-start).
+    if not getattr(client, "_bridge_poll_started", False):
+        client._bridge_poll_started = True
+        asyncio.create_task(bridge_poll_loop())
+        print("[Discord Bridge] node<->bridge RPC poll loop started.", flush=True)
+    
+    # Sync slash commands globally
+    try:
+        synced = await tree.sync()
+        print(f"[Discord Bridge] Synced {len(synced)} command(s) with Discord API.", flush=True)
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to sync command tree: {e}", flush=True)
+
+@client.event
+async def on_message(message):
+    # Ignore bot's own messages
+    if message.author == client.user:
+        return
+    
+    # Listen only to the configured channel or threads within it
+    is_target_channel = message.channel.id == channel_id
+    is_thread_in_target_channel = getattr(message.channel, 'parent_id', None) == channel_id
+    if not is_target_channel and not is_thread_in_target_channel:
+        return
+    
+    has_text = message.content and message.content.strip()
+    has_attachments = len(message.attachments) > 0
+    if not has_text and not has_attachments:
+        return
+        
+    # Process all attachments first
+    if has_attachments:
+        for attachment in message.attachments:
+            ext = os.path.splitext(attachment.filename)[1].lower()
+            supported_extensions = ['.pdf', '.txt', '.md', '.markdown']
+            if ext not in supported_extensions:
+                await message.reply(f"⚠️ Unsupported attachment format: `{attachment.filename}`. Supported types: `pdf, txt, md, markdown`.")
+                continue
+            
+            async with message.channel.typing():
+                try:
+                    file_bytes = await attachment.read()
+                    loop = asyncio.get_running_loop()
+                    success, upload_msg = await loop.run_in_executor(
+                        None, upload_file_to_daemon, attachment.filename, file_bytes
+                    )
+                    if success:
+                        await message.reply(f"✅ Indexed `{attachment.filename}` into local RAG storage successfully!")
+                    else:
+                        await message.reply(f"❌ Failed to index `{attachment.filename}`: {upload_msg}")
+                except Exception as e:
+                    await message.reply(f"❌ Error processing `{attachment.filename}`: {str(e)}")
+
+    # Now process text if present
+    if has_text:
+        print(f"[Discord Bridge] Processing message from {message.author}: {message.content}", flush=True)
+        
+        # Check if the message is the /new command
+        if message.content.strip().startswith("/new"):
+            parts = message.content.strip().split(maxsplit=1)
+            title = parts[1] if len(parts) > 1 else "Discord Session"
+            import time
+            session_id = f"session_{int(time.time() * 1000)}"
+            
+            # Start a new session
+            new_payload = {
+                "id": session_id,
+                "title": f"{title} {int(time.time())}",
+                "model": "",
+                "system_prompt": "You are ErnOS Agent — a digital cognitive system running on a local decentralized node."
+            }
+            new_cmd = f"SESSION NEW {json.dumps(new_payload)}"
+            resp_new = await send_daemon_ipc(new_cmd)
+            
+            # Switch to the new session on the daemon
+            set_cmd = f"SESSION SET {session_id}"
+            resp_set = await send_daemon_ipc(set_cmd)
+            
+            if "session:set_ok" in resp_set or "session:ok" in resp_new:
+                global active_session_id
+                active_session_id = session_id
+                await send_discord_reply(message, f"✨ Started a new AI session: **{title}** (ID: `{session_id}`). Current context has been reset.")
+            else:
+                await send_discord_reply(message, f"❌ Failed to start new session. Daemon response: {resp_set}")
+            return
+
+        # Indicate typing while waiting for the AI response
+        async with message.channel.typing():
+            resp = await query_daemon_ipc(message.content, author=message.author)
+            
+            # Parse the standard daemon response format
+            if resp.startswith("ai:pending_approval,"):
+                # Tool requires user approval before execution
+                await handle_tool_approval(message, resp)
+                return
+            elif resp.startswith("ai:ok,response:"):
+                ai_resp = resp[len("ai:ok,response:"):]
+            elif resp == "error:daemon_offline":
+                ai_resp = "❌ Error: Cognitive AI Agent daemon is offline or unreachable."
+            else:
+                ai_resp = f"Error processing request: {resp}"
+                
+            # Ensure we don't send an empty reply
+            if not ai_resp or not ai_resp.strip():
+                ai_resp = "..."
+                
+            # Send reply on Discord
+            await send_discord_reply(message, ai_resp)
+
+if __name__ == "__main__":
+    try:
+        print("[Discord Bridge] Logging in to Discord...", flush=True)
+        client.run(token)
+    except Exception as e:
+        print(f"[Discord Bridge] Login/run failed: {e}", flush=True)
+        update_status("OFFLINE")
+        sys.exit(1)
+    finally:
+        update_status("OFFLINE")
