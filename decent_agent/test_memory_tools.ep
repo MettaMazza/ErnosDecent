@@ -1,0 +1,159 @@
+# Phase 1 gate — agent-facing memory tools (memory/scratchpad/timeline/lessons/reasoning).
+# Exercises the REAL tools end-to-end through tools_execute (RBAC + dispatch + live
+# memory structures). No mocks.
+
+import "string"
+import "collections"
+import "./tools"
+import "./memory"
+import "./learning"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define mk_args1 with a as Str returning List:
+    set l to create_list()
+    set ok to append_list(l and a)
+    return l
+
+define mk_args2 with a as Str and b as Str returning List:
+    set l to create_list()
+    set ok to append_list(l and a)
+    set ok to append_list(l and b)
+    return l
+
+define mk_args3 with a as Str and b as Str and c as Str returning List:
+    set l to create_list()
+    set ok to append_list(l and a)
+    set ok to append_list(l and b)
+    set ok to append_list(l and c)
+    return l
+
+define has with haystack as Str and needle as Str returning Int:
+    return string_contains(haystack and needle)
+
+define main:
+    set passes to 0
+    set total to 0
+
+    set tools_mgr to tools_create()
+    set mem to memory_create()
+
+    set ctx to create_map()
+    set ok to map_insert(ctx and "memory" and mem)
+    set ok to map_insert(ctx and "sender_role" and "owner")
+
+    set guest_ctx to create_map()
+    set ok to map_insert(guest_ctx and "memory" and mem)
+    set ok to map_insert(guest_ctx and "sender_role" and "guest")
+
+    # --- scratchpad write + read ---
+    set r to tools_execute(tools_mgr and ctx and "scratchpad_tool" and mk_args3("write" and "color" and "blue"))
+    set total to total + 1
+    set passes to passes + pass_if("scratchpad write ok" and has(r and "scratchpad:set"))
+
+    set r to tools_execute(tools_mgr and ctx and "scratchpad_tool" and mk_args2("read" and "color"))
+    set total to total + 1
+    set passes to passes + pass_if("scratchpad read key -> value" and has(r and "blue"))
+
+    # --- memory_tool list + get (sees the scratchpad entry) ---
+    set r to tools_execute(tools_mgr and ctx and "memory_tool" and mk_args1("list"))
+    set total to total + 1
+    set passes to passes + pass_if("memory list shows key" and has(r and "color"))
+
+    set r to tools_execute(tools_mgr and ctx and "memory_tool" and mk_args2("get" and "color"))
+    set total to total + 1
+    set passes to passes + pass_if("memory get -> value" and has(r and "blue"))
+
+    # --- lessons add + list ---
+    set r to tools_execute(tools_mgr and ctx and "lessons_tool" and mk_args3("add" and "rule1" and "always verify by compiling"))
+    set total to total + 1
+    set passes to passes + pass_if("lessons add ok" and has(r and "lessons:added"))
+
+    set r to tools_execute(tools_mgr and ctx and "lessons_tool" and mk_args1("list"))
+    set total to total + 1
+    set passes to passes + pass_if("lessons list shows text" and has(r and "verify by compiling"))
+
+    # --- timeline add + recent ---
+    set r to tools_execute(tools_mgr and ctx and "timeline_tool" and mk_args2("add" and "node booted"))
+    set total to total + 1
+    set passes to passes + pass_if("timeline add ok" and has(r and "timeline:added"))
+
+    set r to tools_execute(tools_mgr and ctx and "timeline_tool" and mk_args2("recent" and "5"))
+    set total to total + 1
+    set passes to passes + pass_if("timeline recent shows entry" and has(r and "node booted"))
+
+    # --- reasoning note x2 + read (numbered) + clear ---
+    set r to tools_execute(tools_mgr and ctx and "reasoning_tool" and mk_args2("note" and "first step"))
+    set r to tools_execute(tools_mgr and ctx and "reasoning_tool" and mk_args2("note" and "second step"))
+    set r to tools_execute(tools_mgr and ctx and "reasoning_tool" and mk_args1("read"))
+    set total to total + 1
+    set passes to passes + pass_if("reasoning read shows step 2" and (has(r and "2.") and also has(r and "second step")))
+
+    set r to tools_execute(tools_mgr and ctx and "reasoning_tool" and mk_args1("clear"))
+    set r to tools_execute(tools_mgr and ctx and "reasoning_tool" and mk_args1("read"))
+    set total to total + 1
+    set passes to passes + pass_if("reasoning clear empties chain" and has(r and "empty"))
+
+    # --- RBAC: guest cannot clear, owner can ---
+    set r to tools_execute(tools_mgr and guest_ctx and "scratchpad_tool" and mk_args1("clear"))
+    set total to total + 1
+    set passes to passes + pass_if("guest clear denied" and has(r and "Access Denied"))
+
+    set r to tools_execute(tools_mgr and ctx and "scratchpad_tool" and mk_args1("clear"))
+    set total to total + 1
+    set passes to passes + pass_if("owner clear allowed" and has(r and "scratchpad:cleared"))
+
+    # --- forget removes a key ---
+    set r to tools_execute(tools_mgr and ctx and "scratchpad_tool" and mk_args3("write" and "temp" and "x"))
+    set r to tools_execute(tools_mgr and ctx and "memory_tool" and mk_args2("forget" and "temp"))
+    set r to tools_execute(tools_mgr and ctx and "memory_tool" and mk_args2("get" and "temp"))
+    set total to total + 1
+    set passes to passes + pass_if("forget removes key" and has(r and "no memory entry"))
+
+    # --- guest CAN do a non-destructive write (working memory during reasoning) ---
+    set r to tools_execute(tools_mgr and guest_ctx and "reasoning_tool" and mk_args2("note" and "guest thought"))
+    set total to total + 1
+    set passes to passes + pass_if("guest non-destructive write allowed" and has(r and "reasoning:noted"))
+
+    # --- performance_review reflects recorded learning buffers ---
+    set ok to learning_record_golden("hello" and "a good, approved reply")
+    set ok to learning_record_rejection("bad prompt" and "a blocked reply")
+    set r to tools_execute(tools_mgr and ctx and "performance_review" and create_list())
+    set total to total + 1
+    set passes to passes + pass_if("performance_review shows golden count" and has(r and "golden"))
+    set total to total + 1
+    set passes to passes + pass_if("performance_review not empty after recording" and (has(r and "empty") == 0))
+
+    # --- autonomy_history lists scheduled jobs (defaults when no config) ---
+    set r to tools_execute(tools_mgr and ctx and "autonomy_history" and create_list())
+    set total to total + 1
+    set passes to passes + pass_if("autonomy_history lists a job with last-run" and has(r and "last run"))
+
+    # --- git_tool: read-only status works; writes rejected; metachars rejected ---
+    set r to tools_execute(tools_mgr and ctx and "git_tool" and mk_args1("status"))
+    set total to total + 1
+    set passes to passes + pass_if("git_tool status runs in repo" and has(r and "branch"))
+
+    set r to tools_execute(tools_mgr and ctx and "git_tool" and mk_args1("commit"))
+    set total to total + 1
+    set passes to passes + pass_if("git_tool rejects write subcommand" and has(r and "read-only subcommands"))
+
+    set r to tools_execute(tools_mgr and ctx and "git_tool" and mk_args2("log" and "; rm -rf /"))
+    set total to total + 1
+    set passes to passes + pass_if("git_tool rejects shell metacharacters" and has(r and "disallowed shell metacharacters"))
+
+    # --- download_tool: gated (approval) + scheme-validated (no network in unit test) ---
+    set empty_args to create_list()
+    set total to total + 1
+    set passes to passes + pass_if("download_tool requires approval" and (tools_requires_approval("download_tool" and empty_args) == 1))
+
+    set r to tools_execute(tools_mgr and ctx and "download_tool" and mk_args1("ftp://example.com/x"))
+    set total to total + 1
+    set passes to passes + pass_if("download_tool rejects non-http scheme" and has(r and "only accepts http"))
+
+    display concat("agent-tools: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))

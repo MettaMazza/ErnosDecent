@@ -20,6 +20,9 @@ import "./scheduler_tool"
 import "./compiler_tool"
 import "./web_search"
 import "./session"
+import "./memory"
+import "./learning"
+import "../decent_store/content"
 
 define append_string_to_char_list with char_list as List and s as Str returning Int:
     set len to string_length(s)
@@ -44,7 +47,15 @@ define tools_create:
     set schemas to concat(schemas and "- operate_scheduler([action: 'list', args: List]) -> Str: List scheduled tasks.\n")
     set schemas to concat(schemas and "- manage_reading_progress([action: 'get_bookmark' or 'get_notes' or 'auto_read', doc_name: Str, count_or_empty: Int/Str]) -> Str: Read document chunks or view bookmarks/notes. Use 'get_bookmark' to find where you left off, 'get_notes' to review notes, 'auto_read' to read the next count chunks (defaults to 3).\n")
     set schemas to concat(schemas and "- web_search([query: Str]) -> Str: Search the live web. Use for fact checking, looking up news, or validating claims.\n")
-    set schemas to concat(schemas and "- web_visit([url: Str]) -> Str: Visit a specific URL directly to read its text contents.\n\n")
+    set schemas to concat(schemas and "- web_visit([url: Str]) -> Str: Visit a specific URL directly to read its text contents.\n")
+    set schemas to concat(schemas and "- memory_tool([action: 'get'|'list'|'store'|'forget', key: Str, value: Str]) -> Str: CRUD over your private working memory (scratchpad + lessons). 'list' shows all; 'get' reads a key; 'store' saves key/value; 'forget' removes a key. LOCAL AND PRIVATE.\n")
+    set schemas to concat(schemas and "- scratchpad_tool([action: 'read'|'write'|'forget'|'clear', key: Str, value: Str]) -> Str: Your short-term scratchpad. 'read' (all or one key), 'write' key/value, 'forget' a key, 'clear' all.\n")
+    set schemas to concat(schemas and "- timeline_tool([action: 'recent'|'add', n_or_text: Int/Str]) -> Str: Your episodic timeline. 'recent' returns the last N entries (default 10); 'add' appends an entry.\n")
+    set schemas to concat(schemas and "- lessons_tool([action: 'list'|'get'|'add', key: Str, text: Str]) -> Str: Your distilled lessons. 'list' all, 'get' one by key, 'add' a new lesson (key + text).\n")
+    set schemas to concat(schemas and "- reasoning_tool([action: 'note'|'read'|'clear', text: Str]) -> Str: An explicit chain-of-thought scratch buffer. 'note' appends a reasoning step, 'read' replays the chain, 'clear' resets it. Use to think step by step before acting.\n")
+    set schemas to concat(schemas and "- performance_review([]) -> Str: Summarize your learning buffers — counts of golden (kept), preference corrections, rejections, and audits. Use to reflect on how you've been doing.\n")
+    set schemas to concat(schemas and "- autonomy_history([]) -> Str: List your scheduled/autonomous jobs and when each last ran. Use to review your autonomous activity.\n")
+    set schemas to concat(schemas and "- git_tool([subcommand: Str, args: Str]) -> Str: Run a READ-ONLY git query in the node's repo (status, log, diff, show, branch, remote, rev-parse, tag, describe). For commits/pushes use run_command (approval required).\n\n")
     set schemas to concat(schemas and "WRITE OPERATIONS (requires user approval before execution):\n")
     set schemas to concat(schemas and "- codebase_write([path: Str, content: Str]) -> Str: Overwrite a file. APPROVAL REQUIRED. Use only when explicitly asked to modify code.\n")
     set schemas to concat(schemas and "- run_command([cmd: Str]) -> Str: Execute a shell command. APPROVAL REQUIRED. Use for builds, tests, file operations.\n")
@@ -55,7 +66,8 @@ define tools_create:
     set schemas to concat(schemas and "- operate_scheduler([action: Str, args: List]) -> Str: 'create', 'delete', 'toggle' require APPROVAL. 'run_now' requires APPROVAL.\n")
     set schemas to concat(schemas and "- turing_grid_op([op: Str, args: Str]) -> Str: 'write', 'move', 'execute' on Turing Grid. APPROVAL REQUIRED for write/execute.\n")
     set schemas to concat(schemas and "- manage_reading_progress([action: 'bookmark' or 'take_note', doc_name: Str, value: Int/Str]) -> Str: Save progress or notes. 'bookmark' saves the current chunk index (Int). 'take_note' appends note text (Str). APPROVAL REQUIRED.\n")
-    set schemas to concat(schemas and "- system_recompile([]) -> Str: Rebuild the node binary and hot-swap. APPROVAL REQUIRED.\n\n")
+    set schemas to concat(schemas and "- system_recompile([]) -> Str: Rebuild the node binary and hot-swap. APPROVAL REQUIRED.\n")
+    set schemas to concat(schemas and "- download_tool([url: Str]) -> Str: Fetch an http(s) URL and save it into the content-addressed store, returning its hash. APPROVAL REQUIRED. Size-capped; only http/https.\n\n")
     set schemas to concat(schemas and "TERMINAL:\n")
     set schemas to concat(schemas and "- reply_request([response: Str]) -> Str: Present the final response to the user. Always use this to end your turn.\n")
     
@@ -77,6 +89,8 @@ define tools_requires_approval with tool_name as Str and args_list as List retur
     if tool_name equals "run_command":
         return 1
     if tool_name equals "system_recompile":
+        return 1
+    if tool_name equals "download_tool":
         return 1
     if tool_name equals "operate_synaptic_graph":
         if length_list(args_list) > 0:
@@ -266,8 +280,38 @@ define tools_is_action_allowed with role as Str and action_name as Str and args_
         return 1
     if action_name equals "web_visit":
         return 1
+    # Read-only self-reflection tools — safe for any role (no writes, local only).
+    if action_name equals "performance_review":
+        return 1
+    if action_name equals "autonomy_history":
+        return 1
+    # Private working-memory tools: reads and non-destructive writes are allowed for
+    # any role (they only touch the agent's own local cognition — no network, no
+    # filesystem). Destructive ops (clear/forget/del) are admin/owner-only so a
+    # guest-channel injection cannot wipe the agent's memory.
+    if action_name equals "memory_tool" or else action_name equals "scratchpad_tool" or else action_name equals "timeline_tool" or else action_name equals "lessons_tool" or else action_name equals "reasoning_tool":
+        if length_list(args_list) > 0:
+            set mem_sub to get_list(args_list and 0)
+            if mem_sub equals "clear" or else mem_sub equals "forget" or else mem_sub equals "del":
+                return 0
+        return 1
     # E6: read_transcripts removed from the non-admin allowlist (was guest-exfiltration).
     return 0
+
+define tools_memory_dispatch with ctx as Map and domain as Str and args_list as List returning Str:
+    if length_list(args_list) < 1:
+        return concat("Error: " and concat(domain and "_tool requires at least 1 argument (action)."))
+    set action to get_list(args_list and 0)
+    set sub_args to create_list()
+    set s_len to length_list(args_list)
+    set s_idx to 1
+    repeat while s_idx < s_len:
+        set ok to append_list(sub_args and get_list(args_list and s_idx))
+        set s_idx to s_idx + 1
+    set memory_mgr to map_get_val(ctx and "memory")
+    set res to memory_tier_tool(memory_mgr and domain and action and sub_args)
+    free_list(sub_args)
+    return res
 
 define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str and args_list as List returning Str:
     set sender_role to ""
@@ -615,6 +659,67 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: web_visit requires 1 argument (url)."
         set url to get_list(args_list and 0)
         return web_search_visit(url)
+
+    if action_name equals "memory_tool":
+        return tools_memory_dispatch(ctx and "memory" and args_list)
+    if action_name equals "scratchpad_tool":
+        return tools_memory_dispatch(ctx and "scratchpad" and args_list)
+    if action_name equals "timeline_tool":
+        return tools_memory_dispatch(ctx and "timeline" and args_list)
+    if action_name equals "lessons_tool":
+        return tools_memory_dispatch(ctx and "lessons" and args_list)
+    if action_name equals "reasoning_tool":
+        return tools_memory_dispatch(ctx and "reasoning" and args_list)
+
+    if action_name equals "performance_review":
+        return learning_performance_review()
+    if action_name equals "autonomy_history":
+        return scheduler_autonomy_history()
+
+    if action_name equals "git_tool":
+        if length_list(args_list) < 1:
+            return "Error: git_tool requires a subcommand (e.g. 'status', 'log', 'diff')."
+        set sub to get_list(args_list and 0)
+        # Read-only subcommands only — writes go through run_command (approval-gated).
+        if sub equals "status" == 0 and also sub equals "log" == 0 and also sub equals "diff" == 0 and also sub equals "show" == 0 and also sub equals "branch" == 0 and also sub equals "remote" == 0 and also sub equals "rev-parse" == 0 and also sub equals "tag" == 0 and also sub equals "describe" == 0:
+            return concat("Error: git_tool only permits read-only subcommands (status/log/diff/show/branch/remote/rev-parse/tag/describe), not '" and concat(sub and "'. Use run_command for writes."))
+        set git_args to ""
+        if length_list(args_list) >= 2:
+            set git_args to get_list(args_list and 1)
+        # Reject shell metacharacters so a subcommand's args can't break out.
+        if tools_cmd_is_dangerous(git_args) == 1:
+            return "Error: git_tool args contain disallowed shell metacharacters."
+        set git_cmd to concat("git " and sub)
+        if string_length(git_args) > 0:
+            set git_cmd to concat(git_cmd and concat(" " and git_args))
+        return run_command(git_cmd)
+
+    if action_name equals "download_tool":
+        if length_list(args_list) < 1:
+            return "Error: download_tool requires 1 argument (url)."
+        set url to get_list(args_list and 0)
+        set is_http to 0
+        if string_length(url) >= 7:
+            if substring(url and 0 and 7) equals "http://":
+                set is_http to 1
+        if string_length(url) >= 8:
+            if substring(url and 0 and 8) equals "https://":
+                set is_http to 1
+        if is_http == 0:
+            return "Error: download_tool only accepts http:// or https:// URLs."
+        set dl_headers to create_list()
+        set body to web_search_http_get(url and dl_headers)
+        free_list(dl_headers)
+        set blen to string_length(body)
+        if blen == 0:
+            return concat("download:error,reason:empty_or_failed,url:" and url)
+        if blen > 5242880:
+            return concat("download:error,reason:too_large,bytes:" and int_to_string(blen))
+        set dhash to cas_hash_content(body)
+        set put_err to storage_content_put(dhash and body and "application/octet-stream")
+        if put_err != 0:
+            return concat("download:error,reason:store_failed,code:" and int_to_string(put_err))
+        return concat("download:ok,hash:" and concat(dhash and concat(",bytes:" and int_to_string(blen))))
 
     if action_name equals "reply_request":
         if length_list(args_list) < 1:

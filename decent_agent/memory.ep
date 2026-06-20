@@ -12,13 +12,15 @@ define memory_create:
     set scratchpad to create_map()
     set lessons to create_map()
     set timeline to create_list()
+    set reasoning to create_list()
     set synaptic_graph to create_map()
     set edges to create_map()
     set permanent_edges to create_map()
-    
+
     set ok to map_insert(memory_mgr and "scratchpad" and scratchpad)
     set ok to map_insert(memory_mgr and "lessons" and lessons)
     set ok to map_insert(memory_mgr and "timeline" and timeline)
+    set ok to map_insert(memory_mgr and "reasoning" and reasoning)
     set ok to map_insert(memory_mgr and "synaptic_graph" and synaptic_graph)
     set ok to map_insert(memory_mgr and "edges" and edges)
     set ok to map_insert(memory_mgr and "permanent_edges" and permanent_edges)
@@ -41,6 +43,7 @@ define memory_create:
     set ok to append_list(values_list and scratchpad)
     set ok to append_list(values_list and lessons)
     set ok to append_list(values_list and timeline)
+    set ok to append_list(values_list and reasoning)
     set ok to append_list(values_list and synaptic_graph)
     set ok to append_list(values_list and edges)
     set ok to append_list(values_list and permanent_edges)
@@ -83,6 +86,189 @@ define memory_store with memory_mgr as Map and tier as Int and key as Str and va
         return 0
         
     return 1 # Error: Unsupported tier
+
+# ── Agent-facing memory tool backing ────────────────────────────────────────
+# Exposes the key-value tiers (scratchpad / lessons / timeline) and an explicit
+# reasoning buffer to the ReAct tool layer. Real CRUD over the live structures —
+# no mocks. Dispatched from decent_agent/tools.ep.
+
+define memory_dump_map with m as Map and header as Str returning Str:
+    set keys to map_keys(m)
+    set n to length_list(keys)
+    set out to header
+    set count to 0
+    set i to 0
+    repeat while i < n:
+        set k to get_list(keys and i)
+        set v to map_get_val(m and k)
+        if string_length(v) > 0:
+            set out to concat(out and concat(k and concat(": " and concat(v and "\n"))))
+            set count to count + 1
+        set i to i + 1
+    free_list(keys)
+    if count == 0:
+        return concat(header and "(empty)\n")
+    return out
+
+define memory_tier_tool with memory_mgr as Map and domain as Str and action as Str and args_list as List returning Str:
+    if memory_mgr == 0:
+        return "Error: cognitive memory not available in context."
+
+    if domain equals "scratchpad":
+        set sp to map_get_val(memory_mgr and "scratchpad")
+        if action equals "read" or else action equals "get" or else action equals "list":
+            if length_list(args_list) >= 1:
+                set key to get_list(args_list and 0)
+                if map_contains(sp and key) == 1:
+                    return concat(key and concat(": " and map_get_val(sp and key)))
+                return concat("Error: no scratchpad entry for '" and concat(key and "'."))
+            return memory_dump_map(sp and "Scratchpad:\n")
+        if action equals "write" or else action equals "set":
+            if length_list(args_list) < 2:
+                return "Error: scratchpad write requires key and value."
+            set key to get_list(args_list and 0)
+            set val to get_list(args_list and 1)
+            set ok to memory_store(memory_mgr and 1 and key and val)
+            return concat("scratchpad:set," and key)
+        if action equals "forget" or else action equals "del":
+            if length_list(args_list) < 1:
+                return "Error: scratchpad forget requires a key."
+            set key to get_list(args_list and 0)
+            set ok to map_delete(sp and key)
+            return concat("scratchpad:forgot," and key)
+        if action equals "clear":
+            set keys to map_keys(sp)
+            set n to length_list(keys)
+            set i to 0
+            repeat while i < n:
+                set ok to map_delete(sp and get_list(keys and i))
+                set i to i + 1
+            free_list(keys)
+            return "scratchpad:cleared"
+        return concat("Error: unknown scratchpad action '" and concat(action and "'."))
+
+    if domain equals "lessons":
+        set les to map_get_val(memory_mgr and "lessons")
+        if action equals "list" or else action equals "read":
+            return memory_dump_map(les and "Lessons:\n")
+        if action equals "get":
+            if length_list(args_list) < 1:
+                return "Error: lessons get requires a key."
+            set key to get_list(args_list and 0)
+            if map_contains(les and key) == 1:
+                return map_get_val(les and key)
+            return concat("Error: no lesson '" and concat(key and "'."))
+        if action equals "add" or else action equals "record":
+            if length_list(args_list) < 2:
+                return "Error: lessons add requires key and text."
+            set key to get_list(args_list and 0)
+            set val to get_list(args_list and 1)
+            set ok to memory_store(memory_mgr and 2 and key and val)
+            return concat("lessons:added," and key)
+        return concat("Error: unknown lessons action '" and concat(action and "'."))
+
+    if domain equals "timeline":
+        set tl to map_get_val(memory_mgr and "timeline")
+        if action equals "recent" or else action equals "read" or else action equals "list":
+            set n to 10
+            if length_list(args_list) >= 1:
+                set n to string_to_int(get_list(args_list and 0))
+            if n <= 0:
+                set n to 10
+            set total to length_list(tl)
+            if total == 0:
+                return "Timeline (recent):\n(empty)\n"
+            set start to total - n
+            if start < 0:
+                set start to 0
+            set out to "Timeline (recent):\n"
+            set i to start
+            repeat while i < total:
+                set out to concat(out and concat(get_list(tl and i) and "\n"))
+                set i to i + 1
+            return out
+        if action equals "add":
+            if length_list(args_list) < 1:
+                return "Error: timeline add requires text."
+            set txt to get_list(args_list and 0)
+            set ok to memory_store(memory_mgr and 3 and "note" and txt)
+            return "timeline:added"
+        return concat("Error: unknown timeline action '" and concat(action and "'."))
+
+    if domain equals "reasoning":
+        # Lazy-create the buffer, then access it INLINE. Do not fetch the list through
+        # a helper that returns it — a borrowed list passed up through `return` goes
+        # bad when mutated (the cast-borrow hazard). Inline map_get_val is stable.
+        if map_contains(memory_mgr and "reasoning") == 0:
+            set fresh to create_list()
+            set ok to map_insert(memory_mgr and "reasoning" and fresh)
+            set vl0 to map_get_val(memory_mgr and "values_list")
+            if vl0 != 0:
+                set ok to append_list(vl0 and fresh)
+        set rz to map_get_val(memory_mgr and "reasoning")
+        if action equals "add" or else action equals "note" or else action equals "think":
+            if length_list(args_list) < 1:
+                return "Error: reasoning add requires text."
+            # Own the string (concat copies) so it survives the caller freeing its
+            # args list. Append only to the reasoning list — that list is itself
+            # tracked in values_list, so its elements are reachable for GC. Appending
+            # the same pointer into two lists corrupts the heap.
+            set entry to concat(get_list(args_list and 0) and "")
+            set ok to append_list(rz and entry)
+            return "reasoning:noted"
+        if action equals "read" or else action equals "get" or else action equals "list":
+            set total to length_list(rz)
+            if total == 0:
+                return "Reasoning chain:\n(empty)\n"
+            set out to "Reasoning chain:\n"
+            set i to 0
+            repeat while i < total:
+                set num to i + 1
+                set out to concat(out and concat(int_to_string(num) and concat(". " and concat(get_list(rz and i) and "\n"))))
+                set i to i + 1
+            return out
+        if action equals "clear":
+            set fresh to create_list()
+            set ok to map_insert(memory_mgr and "reasoning" and fresh)
+            set vl to map_get_val(memory_mgr and "values_list")
+            if vl != 0:
+                set ok to append_list(vl and fresh)
+            return "reasoning:cleared"
+        return concat("Error: unknown reasoning action '" and concat(action and "'."))
+
+    # default domain: general memory CRUD over scratchpad + lessons
+    if action equals "store" or else action equals "set":
+        if length_list(args_list) < 2:
+            return "Error: memory store requires key and value."
+        set key to get_list(args_list and 0)
+        set val to get_list(args_list and 1)
+        set ok to memory_store(memory_mgr and 1 and key and val)
+        return concat("memory:stored," and key)
+    if action equals "get":
+        if length_list(args_list) < 1:
+            return "Error: memory get requires a key."
+        set key to get_list(args_list and 0)
+        set sp to map_get_val(memory_mgr and "scratchpad")
+        if map_contains(sp and key) == 1:
+            return map_get_val(sp and key)
+        set les to map_get_val(memory_mgr and "lessons")
+        if map_contains(les and key) == 1:
+            return map_get_val(les and key)
+        return concat("Error: no memory entry for '" and concat(key and "'."))
+    if action equals "list":
+        set sp to map_get_val(memory_mgr and "scratchpad")
+        set les to map_get_val(memory_mgr and "lessons")
+        set out to memory_dump_map(sp and "Scratchpad:\n")
+        set out to concat(out and memory_dump_map(les and "Lessons:\n"))
+        return out
+    if action equals "forget" or else action equals "del":
+        if length_list(args_list) < 1:
+            return "Error: memory forget requires a key."
+        set key to get_list(args_list and 0)
+        set sp to map_get_val(memory_mgr and "scratchpad")
+        set ok to map_delete(sp and key)
+        return concat("memory:forgot," and key)
+    return concat("Error: unknown memory action '" and concat(action and "'."))
 
 define string_compare with s1 as Str and s2 as Str returning Int:
     set len1 to string_length(s1)
