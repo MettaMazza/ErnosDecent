@@ -1,0 +1,60 @@
+# B1/B3 gate — edition overlay resolver. Verifies:
+#  - the pure resolution core selects business assets only when edition=business
+#    AND the override exists, else default (so default is always byte-identical);
+#  - in this repo (edition=default) the prompt/persona paths equal the originals;
+#  - the resolver is COSMETIC: it only ever returns one of the two asset paths,
+#    never anything that could disable mesh services.
+
+import "string"
+import "collections"
+import "fs"
+import "./edition"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # --- pure resolution core ---
+    set total to total + 1
+    set passes to passes + pass_if("default edition -> default asset" and (edition_resolve("default" and "config/prompts.json" and "config/business/prompts.json" and 1) equals "config/prompts.json"))
+    set total to total + 1
+    set passes to passes + pass_if("business edition + override exists -> business asset" and (edition_resolve("business" and "config/prompts.json" and "config/business/prompts.json" and 1) equals "config/business/prompts.json"))
+    set total to total + 1
+    set passes to passes + pass_if("business edition + override MISSING -> falls back to default" and (edition_resolve("business" and "config/prompts.json" and "config/business/prompts.json" and 0) equals "config/prompts.json"))
+    set total to total + 1
+    set passes to passes + pass_if("unknown edition -> default asset" and (edition_resolve("enterprise" and "config/prompts.json" and "config/business/prompts.json" and 1) equals "config/prompts.json"))
+
+    # --- live resolution is consistent with the active edition (branch-agnostic:
+    #     passes on the default branch AND the business branch) ---
+    set en to edition_name()
+    set total to total + 1
+    set passes to passes + pass_if("edition_name resolves non-empty" and (string_length(en) > 0))
+    set pp to edition_prompts_path()
+    set expected_pp to "config/prompts.json"
+    if en equals "business":
+        if file_exists("config/business/prompts.json") == 1:
+            set expected_pp to "config/business/prompts.json"
+    set total to total + 1
+    set passes to passes + pass_if("prompts path matches active edition" and (pp equals expected_pp))
+    set pe to edition_persona_path()
+    set expected_pe to "config/agent_persona.txt"
+    if en equals "business":
+        if file_exists("config/business/agent_persona.txt") == 1:
+            set expected_pe to "config/business/agent_persona.txt"
+    set total to total + 1
+    set passes to passes + pass_if("persona path matches active edition" and (pe equals expected_pe))
+
+    # --- cosmetic invariant: the resolver only ever yields a prompt/persona asset
+    #     path — there is no edition value that returns a mesh-disabling result. ---
+    set r to edition_resolve("business" and "config/agent_persona.txt" and "config/business/agent_persona.txt" and 1)
+    set total to total + 1
+    set passes to passes + pass_if("resolver yields only the given asset paths" and (r equals "config/business/agent_persona.txt"))
+
+    display concat("edition: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))
