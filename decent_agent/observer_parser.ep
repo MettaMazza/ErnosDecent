@@ -1,0 +1,34 @@
+# ErnosPlain Observer — verdict parser.
+# Component: decent_agent/observer_parser.ep
+#
+# Deterministic, FAIL-CLOSED extraction of the audit verdict from the LLM's raw
+# output. The model is told to emit {"verdict": "...", "reason": "..."} but often
+# wraps it in prose or ```json fences; this robustly pulls the {...} object and
+# reads the real verdict. If it cannot parse, the verdict stays BLOCKED — an
+# unreadable audit is treated as a block, never silently allowed. (Logic is
+# identical to the previous inline parser in observer_audit.)
+
+import "string"
+import "collections"
+import "json"
+
+define observer_parse_verdict with audit_raw as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "verdict" and "BLOCKED")
+    set ok to map_insert(result and "reason" and "Audit unavailable (no/invalid LLM verdict) — failing closed.")
+    if string_length(audit_raw) == 0:
+        return result
+    set obj_start to string_index_of(audit_raw and "{")
+    set obj_end to string_last_index_of(audit_raw and "}")
+    set audit_json to audit_raw
+    if obj_start >= 0 and also obj_end > obj_start:
+        set audit_json to substring(audit_raw and obj_start and obj_end - obj_start + 1)
+    set audit_node to json_parse(audit_json)
+    if audit_node != 0:
+        set verd_node to get_json_object_value(audit_node and "verdict")
+        set reason_node to get_json_object_value(audit_node and "reason")
+        if verd_node != 0:
+            set ok to map_insert(result and "verdict" and get_json_value(verd_node))
+        if reason_node != 0:
+            set ok to map_insert(result and "reason" and get_json_value(reason_node))
+    return result

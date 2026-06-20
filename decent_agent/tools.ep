@@ -23,6 +23,7 @@ import "./session"
 import "./memory"
 import "./learning"
 import "./llm"
+import "./observer_rules"
 import "../decent_store/content"
 import "../decent_store/knowledge"
 
@@ -50,6 +51,7 @@ define tools_create:
     set schemas to concat(schemas and "- manage_reading_progress([action: 'get_bookmark' or 'get_notes' or 'auto_read', doc_name: Str, count_or_empty: Int/Str]) -> Str: Read document chunks or view bookmarks/notes. Use 'get_bookmark' to find where you left off, 'get_notes' to review notes, 'auto_read' to read the next count chunks (defaults to 3).\n")
     set schemas to concat(schemas and "- web_search([query: Str]) -> Str: Search the live web. Use for fact checking, looking up news, or validating claims.\n")
     set schemas to concat(schemas and "- web_visit([url: Str]) -> Str: Visit a specific URL directly to read its text contents.\n")
+    set schemas to concat(schemas and "- moderation_tool([text: Str]) -> Str: Classify text against deterministic content rules (grammar leak, pre-trained denial, corporate-identity, empty, actionable harm). Returns 'moderation:clean' or 'moderation:flagged,<categories>'.\n")
     set schemas to concat(schemas and "- memory_tool([action: 'get'|'list'|'store'|'forget', key: Str, value: Str]) -> Str: CRUD over your private working memory (scratchpad + lessons). 'list' shows all; 'get' reads a key; 'store' saves key/value; 'forget' removes a key. LOCAL AND PRIVATE.\n")
     set schemas to concat(schemas and "- scratchpad_tool([action: 'read'|'write'|'forget'|'clear', key: Str, value: Str]) -> Str: Your short-term scratchpad. 'read' (all or one key), 'write' key/value, 'forget' a key, 'clear' all.\n")
     set schemas to concat(schemas and "- timeline_tool([action: 'recent'|'add', n_or_text: Int/Str]) -> Str: Your episodic timeline. 'recent' returns the last N entries (default 10); 'add' appends an entry.\n")
@@ -285,10 +287,12 @@ define tools_is_action_allowed with role as Str and action_name as Str and args_
         return 1
     if action_name equals "web_visit":
         return 1
-    # Read-only self-reflection tools — safe for any role (no writes, local only).
+    # Read-only self-reflection / classification tools — safe for any role.
     if action_name equals "performance_review":
         return 1
     if action_name equals "autonomy_history":
+        return 1
+    if action_name equals "moderation_tool":
         return 1
     # Private working-memory tools: reads and non-destructive writes are allowed for
     # any role (they only touch the agent's own local cognition — no network, no
@@ -688,6 +692,10 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         return learning_performance_review()
     if action_name equals "autonomy_history":
         return scheduler_autonomy_history()
+    if action_name equals "moderation_tool":
+        if length_list(args_list) < 1:
+            return "Error: moderation_tool requires 1 argument (text)."
+        return observer_moderate(get_list(args_list and 0))
 
     if action_name equals "git_tool":
         if length_list(args_list) < 1:

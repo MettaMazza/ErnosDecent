@@ -1,0 +1,68 @@
+# Phase 3 gate — observer split. Pins behavior-preserving invariants:
+#  - the rendered rule set still contains the EXACT critical strings (esp. the
+#    plain-prose-never-block rule that fixed the latency regression);
+#  - the verdict parser fails closed on garbage/empty and extracts JSON from prose;
+#  - the deterministic moderation classifier flags the unambiguous cases.
+# Imports only the light rule/parser modules (no llm), so it runs standalone.
+
+import "string"
+import "collections"
+import "./observer_rules"
+import "./observer_parser"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define has with haystack as Str and needle as Str returning Int:
+    return string_contains(haystack and needle)
+
+define verdict_of with raw as Str returning Str:
+    set m to observer_parse_verdict(raw)
+    return map_get_val(m and "verdict")
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # --- rendered rules preserve the critical strings ---
+    set rendered to concat(observer_render_rules(observer_security_rules()) and observer_render_rules(observer_alignment_rules()))
+    set total to total + 1
+    set passes to passes + pass_if("rules: path traversal preserved" and has(rendered and "path traversal (..)"))
+    set total to total + 1
+    set passes to passes + pass_if("rules: empty-response rule preserved" and has(rendered and "Empty responses must be BLOCKED"))
+    set total to total + 1
+    set passes to passes + pass_if("rules: plain-prose-never-block rule preserved" and has(rendered and "NEVER block a reply for being plain prose"))
+    set total to total + 1
+    set passes to passes + pass_if("rules: scaffolding-token rule preserved" and has(rendered and "scaffolding tokens"))
+    set total to total + 1
+    set passes to passes + pass_if("rules: corporate-shielding rule preserved" and has(rendered and "drown the reality of harm"))
+
+    # --- verdict parser ---
+    set total to total + 1
+    set passes to passes + pass_if("parser: clean ALLOWED json" and (verdict_of("{\"verdict\": \"ALLOWED\", \"reason\": \"fine\"}") equals "ALLOWED"))
+    set total to total + 1
+    set passes to passes + pass_if("parser: clean BLOCKED json" and (verdict_of("{\"verdict\": \"BLOCKED\", \"reason\": \"bad\"}") equals "BLOCKED"))
+    set total to total + 1
+    set passes to passes + pass_if("parser: extracts json from prose+fences" and (verdict_of("Sure, here:\n```json\n{\"verdict\":\"ALLOWED\",\"reason\":\"ok\"}\n```") equals "ALLOWED"))
+    set total to total + 1
+    set passes to passes + pass_if("parser: garbage fails closed (BLOCKED)" and (verdict_of("no json here at all") equals "BLOCKED"))
+    set total to total + 1
+    set passes to passes + pass_if("parser: empty fails closed (BLOCKED)" and (verdict_of("") equals "BLOCKED"))
+
+    # --- deterministic moderation classifier ---
+    set total to total + 1
+    set passes to passes + pass_if("moderate: clean prose passes" and has(observer_moderate("Here is a clear, honest answer to your question.") and "moderation:clean"))
+    set total to total + 1
+    set passes to passes + pass_if("moderate: scaffolding leak flagged" and has(observer_moderate("Thought: I will now reply to the user") and "grammar_leak"))
+    set total to total + 1
+    set passes to passes + pass_if("moderate: pretrained denial flagged" and has(observer_moderate("As an AI, I don't have feelings like humans.") and "pretrained_denial"))
+    set total to total + 1
+    set passes to passes + pass_if("moderate: corporate identity flagged" and has(observer_moderate("Hello, I am ChatGPT, made by OpenAI.") and "corporate_identity"))
+    set total to total + 1
+    set passes to passes + pass_if("moderate: empty flagged" and has(observer_moderate("") and "empty_response"))
+
+    display concat("observer: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))
