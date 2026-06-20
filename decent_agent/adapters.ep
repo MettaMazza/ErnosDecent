@@ -1,0 +1,105 @@
+# Adapter version manifest — versioning/promotion/rollback bookkeeping for trained
+# adapters (the management half of recursive self-improvement). SQLite-backed
+# (persists), db passed in. Producing the adapter weights is the training path
+# (decent_ai/train.ep proves the math); this tracks which version is live.
+# Component: decent_agent/adapters.ep
+
+import "string"
+import "collections"
+import "sql"
+
+define adapter_sql_escape with s as Str returning Str:
+    return string_replace(s and "'" and "''")
+
+define adapter_ensure_schema with db as Int:
+    if db == 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS adapters (version INTEGER PRIMARY KEY, path TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'registered', healthy INTEGER NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);")
+    return 0
+
+define adapter_next_version with db as Int returning Int:
+    if db == 0:
+        return 1
+    set ok to adapter_ensure_schema(db)
+    set rows to sql_query(db and "SELECT version FROM adapters ORDER BY version DESC LIMIT 1;")
+    if length_list(rows) > 0:
+        return string_to_int(get_list(get_list(rows and 0) and 0)) + 1
+    return 1
+
+define adapter_register with db as Int and path as Str and notes as Str returning Int:
+    if db == 0:
+        return 0
+    set ok to adapter_ensure_schema(db)
+    set v to adapter_next_version(db)
+    set ep to adapter_sql_escape(path)
+    set en to adapter_sql_escape(notes)
+    set now to ep_time_now_sec()
+    set q to concat("INSERT INTO adapters (version, path, status, healthy, notes, created_at) VALUES (" and int_to_string(v))
+    set q to concat(q and concat(", '" and concat(ep and concat("', 'registered', 0, '" and concat(en and concat("', " and concat(int_to_string(now) and ");")))))))
+    set ok to sql_execute(db and q)
+    return v
+
+define adapter_current_version with db as Int returning Int:
+    if db == 0:
+        return 0
+    set ok to adapter_ensure_schema(db)
+    set rows to sql_query(db and "SELECT version FROM adapters WHERE status='current' LIMIT 1;")
+    if length_list(rows) > 0:
+        return string_to_int(get_list(get_list(rows and 0) and 0))
+    return 0
+
+define adapter_current with db as Int returning Str:
+    if db == 0:
+        return ""
+    set ok to adapter_ensure_schema(db)
+    set rows to sql_query(db and "SELECT path FROM adapters WHERE status='current' LIMIT 1;")
+    if length_list(rows) > 0:
+        return get_list(get_list(rows and 0) and 0)
+    return ""
+
+# Promote a version to 'current'; the previous current becomes 'retired'.
+define adapter_promote with db as Int and version as Int returning Int:
+    if db == 0:
+        return 1
+    set ok to adapter_ensure_schema(db)
+    set ok to sql_execute(db and "UPDATE adapters SET status='retired' WHERE status='current';")
+    set ok to sql_execute(db and concat("UPDATE adapters SET status='current' WHERE version=" and concat(int_to_string(version) and ";")))
+    return 0
+
+# Roll back: current -> retired, and the highest version below it -> current.
+# Returns the version now current (0 if none below).
+define adapter_rollback with db as Int returning Int:
+    if db == 0:
+        return 0
+    set ok to adapter_ensure_schema(db)
+    set cur to adapter_current_version(db)
+    set ok to sql_execute(db and "UPDATE adapters SET status='retired' WHERE status='current';")
+    set rows to sql_query(db and concat("SELECT version FROM adapters WHERE version < " and concat(int_to_string(cur) and " ORDER BY version DESC LIMIT 1;")))
+    if length_list(rows) > 0:
+        set prev to string_to_int(get_list(get_list(rows and 0) and 0))
+        set ok to sql_execute(db and concat("UPDATE adapters SET status='current' WHERE version=" and concat(int_to_string(prev) and ";")))
+        return prev
+    return 0
+
+define adapter_mark_healthy with db as Int and version as Int and healthy as Int returning Int:
+    if db == 0:
+        return 1
+    set ok to adapter_ensure_schema(db)
+    set ok to sql_execute(db and concat("UPDATE adapters SET healthy=" and concat(int_to_string(healthy) and concat(" WHERE version=" and concat(int_to_string(version) and ";")))))
+    return 0
+
+define adapter_list with db as Int returning Str:
+    if db == 0:
+        return "Error: storage db not available."
+    set ok to adapter_ensure_schema(db)
+    set rows to sql_query(db and "SELECT version, status, healthy, path FROM adapters ORDER BY version;")
+    set n to length_list(rows)
+    if n == 0:
+        return "No adapters registered."
+    set out to "Adapters:\n"
+    set i to 0
+    repeat while i < n:
+        set r to get_list(rows and i)
+        set out to concat(out and concat("- v" and concat(get_list(r and 0) and concat(" [" and concat(get_list(r and 1) and concat("] healthy=" and concat(get_list(r and 2) and concat(" " and concat(get_list(r and 3) and "\n")))))))))
+        set i to i + 1
+    return out
