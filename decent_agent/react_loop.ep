@@ -172,7 +172,7 @@ define react_simulate_inference with prompt as Str and loop_idx as Int returning
     return "Thought: I will answer the user request directly.\nAction: reply_request([\"ai:agent_rebuild,response:Hello! I am the ErnOS Agent rebuilt in ErnosPlain. How can I help you today?\"])"
 
 
-define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and current_prompt as Str and start_loop_idx as Int and values_list as List returning Str:
+define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and current_prompt as Str and start_loop_idx as Int and values_list as List and auto_approve_flag as Int returning Str:
     set loop_idx to start_loop_idx
     set final_answer to ""
     set finished to 0
@@ -255,10 +255,15 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 if map_contains(ctx and "tool_approved") == 1:
                     set has_approval to map_get_val(ctx and "tool_approved")
                 
-                # Check request-scoped auto_approve
+                # Check request-scoped auto_approve. The threaded auto_approve_flag is the
+                # reliable source (it survives across tool executions); the ctx read is kept
+                # as a secondary path but is unreliable when ctx is a borrow view — that was
+                # the "Approve all approves the first then denies the rest" bug.
                 set auto_approve_val to 0
                 if map_contains(ctx and "auto_approve") == 1:
                     set auto_approve_val to map_get_val(ctx and "auto_approve")
+                if auto_approve_flag == 1:
+                    set auto_approve_val to 1
                 if auto_approve_val == 1:
                     set has_approval to 1
                 
@@ -402,7 +407,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
     return final_answer
 
 
-define react_resume_approved with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and approved as Int returning Str:
+define react_resume_approved with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and approved as Int and auto_approve_flag as Int returning Str:
     # Resume execution after a tool approval/denial decision
     set pending to map_get_val(ctx and "pending_action")
     if pending == 0:
@@ -490,7 +495,7 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
     set values_list to create_list()
     set ok to append_list(values_list and current_prompt)
     
-    return react_run_loop(model and memory_mgr and tools_mgr and ctx and current_prompt and loop_idx + 1 and values_list)
+    return react_run_loop(model and memory_mgr and tools_mgr and ctx and current_prompt and loop_idx + 1 and values_list and auto_approve_flag)
 
 
 define react_run with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and user_prompt as Str returning Str:
@@ -532,7 +537,7 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set assembled_prompt to prompt_assemble(memory_mgr and ctx and sanitized_user_prompt and tools_schema)
     set ok to append_list(values_list and assembled_prompt)
     
-    set res to react_run_loop(model and memory_mgr and tools_mgr and ctx and assembled_prompt and 0 and values_list)
+    set res to react_run_loop(model and memory_mgr and tools_mgr and ctx and assembled_prompt and 0 and values_list and 0)
     
     set active_runs to map_get_val(ctx and "active_runs")
     if active_runs > 0:
