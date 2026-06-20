@@ -1,0 +1,64 @@
+# Stage A gate — Kokoro tokenizer + chunker (pure, no FFI yet).
+# Verifies the EP tokenizer reproduces kokoro's phoneme->id mapping exactly, and
+# the chunker keeps chunks under the phoneme-limit ceiling.
+
+import "string"
+import "collections"
+import "tts"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set passes to 0
+    set total to 0
+    set vocab to tts_build_vocab()
+
+    # --- UTF-8 decode of a multibyte IPA char (ə = U+0259 = 601) ---
+    set cps to tts_utf8_codepoints("ə")
+    set total to total + 1
+    set passes to passes + pass_if("utf8 decodes ə -> 601" and (length_list(cps) == 1 and also get_list(cps and 0) == 601))
+
+    # --- tokenize known espeak IPA "həlˈəʊ" (Hello) -> [0,50,83,54,156,83,135,0] ---
+    set toks to tts_tokenize(vocab and "həlˈəʊ")
+    set total to total + 1
+    set passes to passes + pass_if("tokenize length (padded) = 8" and (length_list(toks) == 8))
+    set total to total + 1
+    set passes to passes + pass_if("token[0] boundary 0" and (get_list(toks and 0) == 0))
+    set total to total + 1
+    set passes to passes + pass_if("h -> 50" and (get_list(toks and 1) == 50))
+    set total to total + 1
+    set passes to passes + pass_if("ə -> 83" and (get_list(toks and 2) == 83))
+    set total to total + 1
+    set passes to passes + pass_if("l -> 54" and (get_list(toks and 3) == 54))
+    set total to total + 1
+    set passes to passes + pass_if("ˈ stress -> 156" and (get_list(toks and 4) == 156))
+    set total to total + 1
+    set passes to passes + pass_if("ʊ -> 135" and (get_list(toks and 6) == 135))
+    set total to total + 1
+    set passes to passes + pass_if("token[last] boundary 0" and (get_list(toks and 7) == 0))
+
+    # --- unknown chars (espeak '_' separators) are skipped, not mis-tokenized ---
+    set toks2 to tts_tokenize(vocab and "h_ə")
+    set total to total + 1
+    set passes to passes + pass_if("unknown '_' skipped" and (length_list(toks2) == 4))
+
+    # --- chunker keeps every chunk <= 200 chars ---
+    set longtext to "This is the first sentence of a fairly long message. Here is a second sentence that adds more words. And a third one to push us along. Now a fourth sentence appears here as well to extend things. Finally a fifth sentence wraps it all up nicely for the test."
+    set ch to tts_chunk_text(longtext)
+    set okmax to 1
+    set ci to 0
+    repeat while ci < length_list(ch):
+        if string_length(get_list(ch and ci)) > tts_chunk_max():
+            set okmax to 0
+        set ci to ci + 1
+    set total to total + 1
+    set passes to passes + pass_if("chunker produced multiple chunks" and (length_list(ch) >= 2))
+    set total to total + 1
+    set passes to passes + pass_if("every chunk <= 200 chars" and (okmax == 1))
+
+    display concat("tts-stageA: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))

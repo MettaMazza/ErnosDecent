@@ -1,0 +1,217 @@
+# ErnosDecent — Kokoro TTS (EP-native).
+# Drives the raw kokoro-v1.0.onnx model via FFI: text -> (libespeak-ng) IPA phonemes
+# -> kokoro vocab tokens -> (libonnxruntime) Run(tokens, bm_fable style, speed) ->
+# 24kHz float audio -> PCM16 WAV. This file is STAGE A: the pure, testable foundation
+# (chunker + vocab + tokenizer). Audio is kept on raw byte buffers, never EP float
+# Lists (which mangle floats). FFI + WAV land in the next stage.
+# Component: decent_ai/tts.ep
+
+import "string"
+import "collections"
+
+# ── Kokoro vocab: phoneme codepoint -> token id (from kokoro_onnx config.json) ──
+define tts_vocab_put with v as Map and cp as Int and id as Int returning Int:
+    set ok to map_insert(v and int_to_string(cp) and id)
+    return 0
+
+define tts_build_vocab returning Map:
+    set v to create_map()
+    set ok to tts_vocab_put(v and 59 and 1)
+    set ok to tts_vocab_put(v and 58 and 2)
+    set ok to tts_vocab_put(v and 44 and 3)
+    set ok to tts_vocab_put(v and 46 and 4)
+    set ok to tts_vocab_put(v and 33 and 5)
+    set ok to tts_vocab_put(v and 63 and 6)
+    set ok to tts_vocab_put(v and 8212 and 9)
+    set ok to tts_vocab_put(v and 8230 and 10)
+    set ok to tts_vocab_put(v and 34 and 11)
+    set ok to tts_vocab_put(v and 40 and 12)
+    set ok to tts_vocab_put(v and 41 and 13)
+    set ok to tts_vocab_put(v and 8220 and 14)
+    set ok to tts_vocab_put(v and 8221 and 15)
+    set ok to tts_vocab_put(v and 32 and 16)
+    set ok to tts_vocab_put(v and 771 and 17)
+    set ok to tts_vocab_put(v and 675 and 18)
+    set ok to tts_vocab_put(v and 677 and 19)
+    set ok to tts_vocab_put(v and 678 and 20)
+    set ok to tts_vocab_put(v and 680 and 21)
+    set ok to tts_vocab_put(v and 7517 and 22)
+    set ok to tts_vocab_put(v and 43879 and 23)
+    set ok to tts_vocab_put(v and 65 and 24)
+    set ok to tts_vocab_put(v and 73 and 25)
+    set ok to tts_vocab_put(v and 79 and 31)
+    set ok to tts_vocab_put(v and 81 and 33)
+    set ok to tts_vocab_put(v and 83 and 35)
+    set ok to tts_vocab_put(v and 84 and 36)
+    set ok to tts_vocab_put(v and 87 and 39)
+    set ok to tts_vocab_put(v and 89 and 41)
+    set ok to tts_vocab_put(v and 7498 and 42)
+    set ok to tts_vocab_put(v and 97 and 43)
+    set ok to tts_vocab_put(v and 98 and 44)
+    set ok to tts_vocab_put(v and 99 and 45)
+    set ok to tts_vocab_put(v and 100 and 46)
+    set ok to tts_vocab_put(v and 101 and 47)
+    set ok to tts_vocab_put(v and 102 and 48)
+    set ok to tts_vocab_put(v and 104 and 50)
+    set ok to tts_vocab_put(v and 105 and 51)
+    set ok to tts_vocab_put(v and 106 and 52)
+    set ok to tts_vocab_put(v and 107 and 53)
+    set ok to tts_vocab_put(v and 108 and 54)
+    set ok to tts_vocab_put(v and 109 and 55)
+    set ok to tts_vocab_put(v and 110 and 56)
+    set ok to tts_vocab_put(v and 111 and 57)
+    set ok to tts_vocab_put(v and 112 and 58)
+    set ok to tts_vocab_put(v and 113 and 59)
+    set ok to tts_vocab_put(v and 114 and 60)
+    set ok to tts_vocab_put(v and 115 and 61)
+    set ok to tts_vocab_put(v and 116 and 62)
+    set ok to tts_vocab_put(v and 117 and 63)
+    set ok to tts_vocab_put(v and 118 and 64)
+    set ok to tts_vocab_put(v and 119 and 65)
+    set ok to tts_vocab_put(v and 120 and 66)
+    set ok to tts_vocab_put(v and 121 and 67)
+    set ok to tts_vocab_put(v and 122 and 68)
+    set ok to tts_vocab_put(v and 593 and 69)
+    set ok to tts_vocab_put(v and 592 and 70)
+    set ok to tts_vocab_put(v and 594 and 71)
+    set ok to tts_vocab_put(v and 230 and 72)
+    set ok to tts_vocab_put(v and 946 and 75)
+    set ok to tts_vocab_put(v and 596 and 76)
+    set ok to tts_vocab_put(v and 597 and 77)
+    set ok to tts_vocab_put(v and 231 and 78)
+    set ok to tts_vocab_put(v and 598 and 80)
+    set ok to tts_vocab_put(v and 240 and 81)
+    set ok to tts_vocab_put(v and 676 and 82)
+    set ok to tts_vocab_put(v and 601 and 83)
+    set ok to tts_vocab_put(v and 602 and 85)
+    set ok to tts_vocab_put(v and 603 and 86)
+    set ok to tts_vocab_put(v and 604 and 87)
+    set ok to tts_vocab_put(v and 607 and 90)
+    set ok to tts_vocab_put(v and 609 and 92)
+    set ok to tts_vocab_put(v and 613 and 99)
+    set ok to tts_vocab_put(v and 616 and 101)
+    set ok to tts_vocab_put(v and 618 and 102)
+    set ok to tts_vocab_put(v and 669 and 103)
+    set ok to tts_vocab_put(v and 623 and 110)
+    set ok to tts_vocab_put(v and 624 and 111)
+    set ok to tts_vocab_put(v and 331 and 112)
+    set ok to tts_vocab_put(v and 627 and 113)
+    set ok to tts_vocab_put(v and 626 and 114)
+    set ok to tts_vocab_put(v and 628 and 115)
+    set ok to tts_vocab_put(v and 248 and 116)
+    set ok to tts_vocab_put(v and 632 and 118)
+    set ok to tts_vocab_put(v and 952 and 119)
+    set ok to tts_vocab_put(v and 339 and 120)
+    set ok to tts_vocab_put(v and 633 and 123)
+    set ok to tts_vocab_put(v and 638 and 125)
+    set ok to tts_vocab_put(v and 635 and 126)
+    set ok to tts_vocab_put(v and 641 and 128)
+    set ok to tts_vocab_put(v and 637 and 129)
+    set ok to tts_vocab_put(v and 642 and 130)
+    set ok to tts_vocab_put(v and 643 and 131)
+    set ok to tts_vocab_put(v and 648 and 132)
+    set ok to tts_vocab_put(v and 679 and 133)
+    set ok to tts_vocab_put(v and 650 and 135)
+    set ok to tts_vocab_put(v and 651 and 136)
+    set ok to tts_vocab_put(v and 652 and 138)
+    set ok to tts_vocab_put(v and 611 and 139)
+    set ok to tts_vocab_put(v and 612 and 140)
+    set ok to tts_vocab_put(v and 967 and 142)
+    set ok to tts_vocab_put(v and 654 and 143)
+    set ok to tts_vocab_put(v and 658 and 147)
+    set ok to tts_vocab_put(v and 660 and 148)
+    set ok to tts_vocab_put(v and 712 and 156)
+    set ok to tts_vocab_put(v and 716 and 157)
+    set ok to tts_vocab_put(v and 720 and 158)
+    set ok to tts_vocab_put(v and 688 and 162)
+    set ok to tts_vocab_put(v and 690 and 164)
+    set ok to tts_vocab_put(v and 8595 and 169)
+    set ok to tts_vocab_put(v and 8594 and 171)
+    set ok to tts_vocab_put(v and 8599 and 172)
+    set ok to tts_vocab_put(v and 8600 and 173)
+    set ok to tts_vocab_put(v and 7547 and 177)
+    return v
+
+# ── UTF-8 decode: phoneme string (bytes) -> List of Unicode codepoints ──
+define tts_utf8_codepoints with s as Str returning List:
+    set out to create_list()
+    set n to string_length(s)
+    set i to 0
+    repeat while i < n:
+        set b0 to get_character(s and i)
+        set cp to b0
+        set adv to 1
+        if b0 >= 240:
+            set cp to b0 modulo 8
+            set cp to cp * 64 + (get_character(s and i + 1) modulo 64)
+            set cp to cp * 64 + (get_character(s and i + 2) modulo 64)
+            set cp to cp * 64 + (get_character(s and i + 3) modulo 64)
+            set adv to 4
+        else:
+            if b0 >= 224:
+                set cp to b0 modulo 16
+                set cp to cp * 64 + (get_character(s and i + 1) modulo 64)
+                set cp to cp * 64 + (get_character(s and i + 2) modulo 64)
+                set adv to 3
+            else:
+                if b0 >= 192:
+                    set cp to b0 modulo 32
+                    set cp to cp * 64 + (get_character(s and i + 1) modulo 64)
+                    set adv to 2
+        set ok to append_list(out and cp)
+        set i to i + adv
+    return out
+
+# ── Tokenize IPA phonemes -> kokoro token ids (padded [0] ... [0]) ──
+define tts_tokenize with vocab as Map and phonemes as Str returning List:
+    set tokens to create_list()
+    set ok to append_list(tokens and 0)
+    set cps to tts_utf8_codepoints(phonemes)
+    set n to length_list(cps)
+    set i to 0
+    repeat while i < n:
+        set key to int_to_string(get_list(cps and i))
+        if map_contains(vocab and key) == 1:
+            set ok to append_list(tokens and map_get_val(vocab and key))
+        set i to i + 1
+    free_list(cps)
+    set ok to append_list(tokens and 0)
+    return tokens
+
+# ── Text chunker: split into <=200-char chunks on sentence, then clause, then word
+#    boundaries (ports the kokoro 510-phoneme-limit splitter). ──
+define tts_chunk_max returning Int:
+    return 200
+
+define tts_is_sentence_end with c as Int returning Int:
+    if c == 46 or else c == 33 or else c == 63:
+        return 1
+    return 0
+
+define tts_chunk_text with text as Str returning List:
+    set chunks to create_list()
+    set n to string_length(text)
+    set cur to ""
+    set i to 0
+    repeat while i < n:
+        set ch to substring(text and i and 1)
+        set cur to concat(cur and ch)
+        set c to get_character(text and i)
+        # flush on sentence end when at/over a reasonable size, or when over the cap
+        if tts_is_sentence_end(c) == 1 and also string_length(cur) >= 40:
+            set ok to append_list(chunks and string_trim(cur))
+            set cur to ""
+        else:
+            if string_length(cur) >= tts_chunk_max():
+                # hard cap: back off to the last space for a cleaner break
+                set sp to string_last_index_of(cur and " ")
+                if sp > 0:
+                    set ok to append_list(chunks and string_trim(substring(cur and 0 and sp)))
+                    set cur to substring(cur and sp + 1 and string_length(cur) - sp - 1)
+                else:
+                    set ok to append_list(chunks and string_trim(cur))
+                    set cur to ""
+        set i to i + 1
+    if string_length(string_trim(cur)) > 0:
+        set ok to append_list(chunks and string_trim(cur))
+    return chunks
