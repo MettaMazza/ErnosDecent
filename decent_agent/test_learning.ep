@@ -1,0 +1,79 @@
+# Phase 6 part-1 gate — learning-buffer payoff + adapter versioning.
+#  - quality score heuristic; distillation mines the failure buffers for the
+#    preferred exemplar; adapter manifest register/promote/rollback/persistence.
+
+import "string"
+import "collections"
+import "sql"
+import "./learning"
+import "./memory"
+import "./adapters"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define has with haystack as Str and needle as Str returning Int:
+    return string_contains(haystack and needle)
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # --- quality score ---
+    set total to total + 1
+    set passes to passes + pass_if("empty response scores 0" and (learning_compute_quality_score("q" and "") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("substantive prose scores high" and (learning_compute_quality_score("q" and "This is a thorough, honest, substantive answer that addresses the question in real detail with concrete specifics.") >= 60))
+    set leak to learning_compute_quality_score("q" and "Thought: I will now answer the user")
+    set clean to learning_compute_quality_score("q" and "A clean, direct, plain-language answer.")
+    set total to total + 1
+    set passes to passes + pass_if("scaffolding leak scores below clean" and (leak < clean))
+
+    # --- distillation mines the failure buffers ---
+    set ok to learning_record_rejection("bad prompt" and "a blocked response")
+    set mem to memory_create()
+    set ok to learning_record_preference(mem and "p" and "the rejected style" and "the chosen better answer" and "tone")
+    set d to learning_distill_from_failures()
+    set total to total + 1
+    set passes to passes + pass_if("distill reports recorded failures" and has(d and "corrections recorded"))
+    set total to total + 1
+    set passes to passes + pass_if("distill surfaces the chosen exemplar" and has(d and "the chosen better answer"))
+
+    # --- adapter version manifest ---
+    set path to "/tmp/ernos_test_adapters.db"
+    set db to sql_open(path)
+    set v1 to adapter_register(db and "/models/adapter_v1.bin" and "first")
+    set v2 to adapter_register(db and "/models/adapter_v2.bin" and "second")
+    set total to total + 1
+    set passes to passes + pass_if("versions auto-increment" and (v1 == 1 and also v2 == 2))
+    set total to total + 1
+    set passes to passes + pass_if("next_version is 3" and (adapter_next_version(db) == 3))
+
+    set ok to adapter_promote(db and 2)
+    set total to total + 1
+    set passes to passes + pass_if("promote sets current path" and (adapter_current(db) equals "/models/adapter_v2.bin"))
+    set total to total + 1
+    set passes to passes + pass_if("current version is 2" and (adapter_current_version(db) == 2))
+
+    set rb to adapter_rollback(db)
+    set total to total + 1
+    set passes to passes + pass_if("rollback reverts to v1" and (rb == 1))
+    set total to total + 1
+    set passes to passes + pass_if("current path after rollback is v1" and (adapter_current(db) equals "/models/adapter_v1.bin"))
+
+    set ok to adapter_mark_healthy(db and 1 and 1)
+    set total to total + 1
+    set passes to passes + pass_if("adapter_list shows v1" and has(adapter_list(db) and "v1"))
+
+    # persistence across reopen
+    set ok to sql_close(db)
+    set db2 to sql_open(path)
+    set total to total + 1
+    set passes to passes + pass_if("current survives reopen (persistence)" and (adapter_current_version(db2) == 1))
+    set ok to sql_close(db2)
+
+    display concat("learning: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))

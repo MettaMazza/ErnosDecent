@@ -1,0 +1,87 @@
+# Fixed-point training core — proves the backward pass + optimizer are REAL on the
+# same 1e6 fixed-point representation the inference forward path uses (decent_ai/
+# inference.ep). A tiny linear layer y = W·x with squared loss: analytic gradient is
+# checked against central finite-difference, and SGD is shown to reduce the loss.
+# This is the "training is a build, not a capability gap" gate (Phase 6).
+# Component: decent_ai/train.ep
+
+import "string"
+import "collections"
+
+# Fixed-point scale: value_fixed = value_real * 1e6 (matches inference.ep).
+define fixed_scale returning Int:
+    return 1000000
+
+# Fixed-point multiply: real(a)*real(b) as fixed = (a*b)/1e6.
+define fixed_mul with a as Int and b as Int returning Int:
+    return (a * b) / 1000000
+
+# Forward: y = sum_i w_i * x_i   (fixed-point dot product)
+define linear_forward with w as List and x as List returning Int:
+    set n to length_list(w)
+    set acc to 0
+    set i to 0
+    repeat while i < n:
+        set acc to acc + fixed_mul(get_list(w and i) and get_list(x and i))
+        set i to i + 1
+    return acc
+
+# Loss = (y - t)^2   (fixed-point)
+define loss_sq with y as Int and t as Int returning Int:
+    set d to y - t
+    return fixed_mul(d and d)
+
+# Analytic gradient: dL/dw_i = 2*(y - t)*x_i
+define grad_analytic with w as List and x as List and t as Int returning List:
+    set y to linear_forward(w and x)
+    set d to y - t
+    set two_d to 2 * d
+    set out to create_list()
+    set n to length_list(w)
+    set i to 0
+    repeat while i < n:
+        set ok to append_list(out and fixed_mul(two_d and get_list(x and i)))
+        set i to i + 1
+    return out
+
+# Numeric gradient at weight idx via central finite difference:
+# dL/dw ≈ (L(w+eps) - L(w-eps)) / (2*eps), expressed in fixed-point.
+define grad_numeric_i with w as List and x as List and t as Int and idx as Int and eps as Int returning Int:
+    set wp to create_list()
+    set wm to create_list()
+    set n to length_list(w)
+    set i to 0
+    repeat while i < n:
+        set wi to get_list(w and i)
+        if i == idx:
+            set ok to append_list(wp and (wi + eps))
+            set ok to append_list(wm and (wi - eps))
+        else:
+            set ok to append_list(wp and wi)
+            set ok to append_list(wm and wi)
+        set i to i + 1
+    set lp to loss_sq(linear_forward(wp and x) and t)
+    set lm to loss_sq(linear_forward(wm and x) and t)
+    # derivative_fixed = (lp - lm) * 1e6 / (2*eps)
+    return ((lp - lm) * 1000000) / (2 * eps)
+
+# One SGD step: w_i := w_i - lr * grad_i   (returns a fresh weight list)
+define sgd_step with w as List and grads as List and lr as Int returning List:
+    set out to create_list()
+    set n to length_list(w)
+    set i to 0
+    repeat while i < n:
+        set wi to get_list(w and i)
+        set ok to append_list(out and (wi - fixed_mul(lr and get_list(grads and i))))
+        set i to i + 1
+    return out
+
+# Train for `steps` SGD iterations; returns the final loss (fixed-point).
+define train_loop with w0 as List and x as List and t as Int and lr as Int and steps as Int returning Int:
+    set w to w0
+    set s to 0
+    repeat while s < steps:
+        set g to grad_analytic(w and x and t)
+        set w to sgd_step(w and g and lr)
+        set s to s + 1
+    return loss_sq(linear_forward(w and x) and t)

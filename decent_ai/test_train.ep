@@ -1,0 +1,72 @@
+# Phase 6 gate — proves the fixed-point training math is REAL:
+#  - analytic gradient agrees with central finite-difference (within fixed-point tol);
+#  - SGD measurably reduces the loss.
+# Tiny linear layer y = W·x, W=[0.5,0.5], x=[2,3], target t=1.
+
+import "string"
+import "collections"
+import "train"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define iabs with x as Int returning Int:
+    if x < 0:
+        return 0 - x
+    return x
+
+define mk2 with a as Int and b as Int returning List:
+    set l to create_list()
+    set ok to append_list(l and a)
+    set ok to append_list(l and b)
+    return l
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # fixed-point inputs (×1e6)
+    set w to mk2(500000 and 500000)      # [0.5, 0.5]
+    set x to mk2(2000000 and 3000000)    # [2.0, 3.0]
+    set t to 1000000                     # target 1.0
+    set eps to 1000                      # 0.001
+
+    # forward: y = 0.5*2 + 0.5*3 = 2.5 ; loss = (2.5-1)^2 = 2.25
+    set y to linear_forward(w and x)
+    set total to total + 1
+    set passes to passes + pass_if("forward y = 2.5" and (iabs(y - 2500000) < 100))
+    set l0 to loss_sq(y and t)
+    set total to total + 1
+    set passes to passes + pass_if("loss = 2.25" and (iabs(l0 - 2250000) < 2000))
+
+    # analytic gradient: dL/dw0 = 2*1.5*2 = 6.0 ; dL/dw1 = 2*1.5*3 = 9.0
+    set ga to grad_analytic(w and x and t)
+    set total to total + 1
+    set passes to passes + pass_if("analytic grad0 = 6.0" and (iabs(get_list(ga and 0) - 6000000) < 2000))
+    set total to total + 1
+    set passes to passes + pass_if("analytic grad1 = 9.0" and (iabs(get_list(ga and 1) - 9000000) < 2000))
+
+    # analytic vs central finite-difference (the real proof the backward is correct)
+    set gn0 to grad_numeric_i(w and x and t and 0 and eps)
+    set gn1 to grad_numeric_i(w and x and t and 1 and eps)
+    set total to total + 1
+    set passes to passes + pass_if("grad0: analytic ~ numeric" and (iabs(get_list(ga and 0) - gn0) < 50000))
+    set total to total + 1
+    set passes to passes + pass_if("grad1: analytic ~ numeric" and (iabs(get_list(ga and 1) - gn1) < 50000))
+
+    # one SGD step must reduce the loss
+    set w1 to sgd_step(w and ga and 10000)   # lr = 0.01
+    set l1 to loss_sq(linear_forward(w1 and x) and t)
+    set total to total + 1
+    set passes to passes + pass_if("one SGD step reduces loss" and (l1 < l0))
+
+    # training loop drives the loss toward zero
+    set lf to train_loop(w and x and t and 10000 and 40)
+    set total to total + 1
+    set passes to passes + pass_if("40 steps drive loss far below start" and (lf < (l0 / 10)))
+
+    display concat("train: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))

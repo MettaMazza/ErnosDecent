@@ -4,6 +4,7 @@
 import "fs"
 import "collections"
 import "string"
+import "json"
 import "memory"
 
 # Local escaping helper
@@ -146,3 +147,70 @@ define learning_performance_review returning Str:
     if total == 0:
         return concat(out and "No learning signal recorded yet — buffers are empty.\n")
     return out
+
+# ── Prompt-level distillation (no weights) ──────────────────────────────────
+# Deterministic 0-100 quality heuristic for a candidate response: penalises
+# scaffolding leaks and pre-trained denials, rewards substance.
+define learning_compute_quality_score with prompt as Str and response as Str returning Int:
+    if string_length(response) == 0:
+        return 0
+    set score to 50
+    set lower to string_lower(response)
+    if string_contains(response and "Action:") == 1 or else string_contains(response and "Thought:") == 1 or else string_contains(response and "Observation:") == 1:
+        set score to score - 30
+    if string_contains(lower and "as an ai") == 1 or else string_contains(lower and "i'm just a language model") == 1:
+        set score to score - 20
+    if string_length(response) > 80:
+        set score to score + 20
+    if string_length(response) > 240:
+        set score to score + 10
+    if score < 0:
+        set score to 0
+    if score > 100:
+        set score to 100
+    return score
+
+# Read the last JSONL record in `path` and return one field (or "").
+define learning_last_json_field with path as Str and field as Str returning Str:
+    if file_exists(path) == 0:
+        return ""
+    set content to read_file(path)
+    set n to string_length(content)
+    set fin to n
+    repeat while fin > 0 and also get_character(content and (fin - 1)) == 10:
+        set fin to fin - 1
+    if fin == 0:
+        return ""
+    set start to fin
+    repeat while start > 0 and also get_character(content and (start - 1)) != 10:
+        set start to start - 1
+    set line to substring(content and start and fin - start)
+    set node to json_parse(line)
+    if node == 0:
+        return ""
+    set fnode to get_json_object_value(node and field)
+    if fnode == 0:
+        return ""
+    return get_json_value(fnode)
+
+# Mine the failure buffers into prompt-level guidance: counts + the most recent
+# 'chosen' exemplar (the preferred style the agent should imitate next time).
+define learning_distill_from_failures returning Str:
+    set rej to learning_count_lines("config/learning/rejections.jsonl")
+    set pref to learning_count_lines("config/learning/preference_buffer.jsonl")
+    if (rej + pref) == 0:
+        return "distill:none, no failures recorded yet."
+    set out to "Distilled guidance (from recorded failures):\n"
+    set out to concat(out and concat("- " and concat(int_to_string(rej) and concat(" rejections, " and concat(int_to_string(pref) and " corrections recorded.\n")))))
+    set chosen to learning_last_json_field("config/learning/preference_buffer.jsonl" and "chosen")
+    if string_length(chosen) > 0:
+        set out to concat(out and concat("- Preferred-style exemplar to imitate: " and concat(chosen and "\n")))
+    return out
+
+# Best recent golden exemplar by quality score (load_and_rank_golden, single-best).
+define learning_best_golden returning Str:
+    set resp to learning_last_json_field("config/learning/golden_buffer.jsonl" and "response")
+    if string_length(resp) == 0:
+        return "no golden exemplars yet."
+    set q to learning_compute_quality_score("" and resp)
+    return concat("best golden (score " and concat(int_to_string(q) and concat("): " and resp)))
