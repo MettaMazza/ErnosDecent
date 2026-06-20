@@ -1,0 +1,64 @@
+# Phase 5b gate — node<->bridge RPC queue. Full round-trip over real SQLite:
+# enqueue -> poll (marks sent) -> submit_result -> get/wait -> done; plus persistence.
+
+import "string"
+import "collections"
+import "sql"
+import "bridge_rpc"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define has with haystack as Str and needle as Str returning Int:
+    return string_contains(haystack and needle)
+
+define main:
+    set passes to 0
+    set total to 0
+    set path to "/tmp/ernos_test_bridge.db"
+    set db to sql_open(path)
+
+    # enqueue
+    set id1 to bridge_enqueue(db and "discord" and "read_channel" and "123")
+    set total to total + 1
+    set passes to passes + pass_if("enqueue returns id" and (id1 > 0))
+    set total to total + 1
+    set passes to passes + pass_if("freshly enqueued is pending" and has(bridge_get_result(db and id1) and "pending:pending"))
+
+    # poll returns it + marks sent
+    set polled to bridge_poll(db)
+    set total to total + 1
+    set passes to passes + pass_if("poll returns the action" and (has(polled and "read_channel") and also has(polled and "123")))
+    set total to total + 1
+    set passes to passes + pass_if("poll marks sent" and has(bridge_get_result(db and id1) and "pending:sent"))
+    set total to total + 1
+    set passes to passes + pass_if("poll again is empty (already sent)" and (bridge_poll(db) equals "[]"))
+
+    # bridge returns result
+    set ok to bridge_submit_result(db and id1 and "msgA\nmsgB")
+    set total to total + 1
+    set passes to passes + pass_if("get_result returns submitted data" and has(bridge_get_result(db and id1) and "msgA"))
+    set total to total + 1
+    set passes to passes + pass_if("wait_result returns immediately when done" and has(bridge_wait_result(db and id1 and 3) and "msgB"))
+
+    # not-yet-answered command: wait times out to queued marker
+    set id2 to bridge_enqueue(db and "discord" and "list_channels" and "")
+    set total to total + 1
+    set passes to passes + pass_if("wait on unanswered -> queued marker" and has(bridge_wait_result(db and id2 and 2) and "discord:queued,id:"))
+
+    # unknown id
+    set total to total + 1
+    set passes to passes + pass_if("unknown id -> not_found" and has(bridge_get_result(db and 99999) and "not_found"))
+
+    # persistence across reopen
+    set ok to sql_close(db)
+    set db2 to sql_open(path)
+    set total to total + 1
+    set passes to passes + pass_if("result survives reopen (persistence)" and has(bridge_get_result(db2 and id1) and "msgA"))
+    set ok to sql_close(db2)
+
+    display concat("bridge-rpc: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))

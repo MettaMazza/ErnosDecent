@@ -1,0 +1,123 @@
+# Node <-> bridge RPC. The Discord/platform bridge is otherwise one-way (client ->
+# node); this gives the node an outbound command channel so agent tools can drive the
+# bridge (read a channel, list channels, add a reaction, send). Backed by a SQLite
+# queue (persists, survives restart) so the whole protocol is deterministic + testable.
+# The bridge polls DISCORD POLL, executes, and returns via DISCORD RESULT.
+# Component: decent_net/bridge_rpc.ep
+
+import "string"
+import "collections"
+import "sql"
+import "datetime"
+
+define bridge_sql_escape with s as Str returning Str:
+    return string_replace(s and "'" and "''")
+
+define bridge_json_escape with s as Str returning Str:
+    set out to ""
+    set n to string_length(s)
+    set i to 0
+    repeat while i < n:
+        set c to get_character(s and i)
+        if c == 92:
+            set out to concat(out and "\\\\")
+        else:
+            if c == 34:
+                set out to concat(out and "\\\"")
+            else:
+                if c == 10:
+                    set out to concat(out and "\\n")
+                else:
+                    if c == 13:
+                        set out to concat(out and "\\r")
+                    else:
+                        set out to concat(out and substring(s and i and 1))
+        set i to i + 1
+    return out
+
+define bridge_ensure_schema with db as Int:
+    if db == 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS bridge_commands (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL DEFAULT 'discord', action TEXT NOT NULL, args TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', result TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);")
+    return 0
+
+# Enqueue a command for the bridge; returns the new command id (0 on failure).
+define bridge_enqueue with db as Int and platform as Str and action as Str and args as Str returning Int:
+    if db == 0:
+        return 0
+    set ok to bridge_ensure_schema(db)
+    set ep to bridge_sql_escape(platform)
+    set ea to bridge_sql_escape(action)
+    set eg to bridge_sql_escape(args)
+    set now to ep_time_now_sec()
+    set q to concat("INSERT INTO bridge_commands (platform, action, args, status, result, created_at) VALUES ('" and ep)
+    set q to concat(q and concat("', '" and concat(ea and concat("', '" and concat(eg and concat("', 'pending', '', " and concat(int_to_string(now) and ");")))))))
+    set ok to sql_execute(db and q)
+    set rows to sql_query(db and "SELECT id FROM bridge_commands ORDER BY id DESC LIMIT 1;")
+    if length_list(rows) > 0:
+        return string_to_int(get_list(get_list(rows and 0) and 0))
+    return 0
+
+# Pending commands as a JSON array; each returned command is marked 'sent'.
+define bridge_poll with db as Int returning Str:
+    if db == 0:
+        return "[]"
+    set ok to bridge_ensure_schema(db)
+    set rows to sql_query(db and "SELECT id, platform, action, args FROM bridge_commands WHERE status='pending' ORDER BY id LIMIT 50;")
+    set n to length_list(rows)
+    set out to "["
+    set i to 0
+    repeat while i < n:
+        set r to get_list(rows and i)
+        set id_str to get_list(r and 0)
+        if i > 0:
+            set out to concat(out and ",")
+        set out to concat(out and concat("{\"id\":" and id_str))
+        set out to concat(out and concat(",\"platform\":\"" and concat(bridge_json_escape(get_list(r and 1)) and "\"")))
+        set out to concat(out and concat(",\"action\":\"" and concat(bridge_json_escape(get_list(r and 2)) and "\"")))
+        set out to concat(out and concat(",\"args\":\"" and concat(bridge_json_escape(get_list(r and 3)) and "\"}")))
+        set ok to sql_execute(db and concat("UPDATE bridge_commands SET status='sent' WHERE id=" and concat(id_str and ";")))
+        set i to i + 1
+    set out to concat(out and "]")
+    return out
+
+# Bridge returns a command's output.
+define bridge_submit_result with db as Int and id as Int and data as Str returning Int:
+    if db == 0:
+        return 1
+    set ok to bridge_ensure_schema(db)
+    set ed to bridge_sql_escape(data)
+    set q to concat("UPDATE bridge_commands SET status='done', result='" and concat(ed and concat("' WHERE id=" and concat(int_to_string(id) and ";"))))
+    set ok to sql_execute(db and q)
+    return 0
+
+# Result for a command: the data if done, "pending:<status>" while in flight,
+# "error:not_found" if the id is unknown.
+define bridge_get_result with db as Int and id as Int returning Str:
+    if db == 0:
+        return "error:no_db"
+    set ok to bridge_ensure_schema(db)
+    set rows to sql_query(db and concat("SELECT status, result FROM bridge_commands WHERE id=" and concat(int_to_string(id) and ";")))
+    if length_list(rows) > 0:
+        set r to get_list(rows and 0)
+        set status to get_list(r and 0)
+        if status equals "done":
+            return get_list(r and 1)
+        return concat("pending:" and status)
+    return "error:not_found"
+
+# Poll for a result up to max_tries (50ms apart). Returns the data when ready, or
+# "discord:queued,id:<id>" if the bridge hasn't answered yet (non-blocking-ish).
+define bridge_wait_result with db as Int and id as Int and max_tries as Int returning Str:
+    set i to 0
+    repeat while i < max_tries:
+        set res to bridge_get_result(db and id)
+        set is_pending to 0
+        if string_length(res) >= 8:
+            if substring(res and 0 and 8) equals "pending:":
+                set is_pending to 1
+        if is_pending == 0:
+            return res
+        set ok to sleep_ms(50)
+        set i to i + 1
+    return concat("discord:queued,id:" and int_to_string(id))

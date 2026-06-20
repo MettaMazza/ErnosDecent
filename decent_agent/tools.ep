@@ -26,6 +26,7 @@ import "./llm"
 import "./observer_rules"
 import "../decent_store/content"
 import "../decent_store/knowledge"
+import "../decent_net/bridge_rpc"
 
 define append_string_to_char_list with char_list as List and s as Str returning Int:
     set len to string_length(s)
@@ -74,7 +75,10 @@ define tools_create:
     set schemas to concat(schemas and "- turing_grid_op([op: Str, args: Str]) -> Str: 'write', 'move', 'execute' on Turing Grid. APPROVAL REQUIRED for write/execute.\n")
     set schemas to concat(schemas and "- manage_reading_progress([action: 'bookmark' or 'take_note', doc_name: Str, value: Int/Str]) -> Str: Save progress or notes. 'bookmark' saves the current chunk index (Int). 'take_note' appends note text (Str). APPROVAL REQUIRED.\n")
     set schemas to concat(schemas and "- system_recompile([]) -> Str: Rebuild the node binary and hot-swap. APPROVAL REQUIRED.\n")
-    set schemas to concat(schemas and "- download_tool([url: Str]) -> Str: Fetch an http(s) URL and save it into the content-addressed store, returning its hash. APPROVAL REQUIRED. Size-capped; only http/https.\n\n")
+    set schemas to concat(schemas and "- download_tool([url: Str]) -> Str: Fetch an http(s) URL and save it into the content-addressed store, returning its hash. APPROVAL REQUIRED. Size-capped; only http/https.\n")
+    set schemas to concat(schemas and "- discord_read_channel([channel_id: Str]) -> Str: Read recent messages from a Discord channel via the bridge. Returns the messages, or a queued marker if the bridge is slow.\n")
+    set schemas to concat(schemas and "- discord_list_channels([]) -> Str: List the Discord channels the bridge can see.\n")
+    set schemas to concat(schemas and "- discord_add_reaction([channel_id: Str, message_id: Str, emoji: Str]) -> Str: Add an emoji reaction to a Discord message via the bridge. APPROVAL REQUIRED (outward action).\n\n")
     set schemas to concat(schemas and "TERMINAL:\n")
     set schemas to concat(schemas and "- reply_request([response: Str]) -> Str: Present the final response to the user. Always use this to end your turn.\n")
     
@@ -98,6 +102,8 @@ define tools_requires_approval with tool_name as Str and args_list as List retur
     if tool_name equals "system_recompile":
         return 1
     if tool_name equals "download_tool":
+        return 1
+    if tool_name equals "discord_add_reaction":
         return 1
     if tool_name equals "operate_synaptic_graph":
         if length_list(args_list) > 0:
@@ -842,6 +848,24 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set ok to record_consolidation(cdb and summary and tcount)
         set ok to memory_store(memory_mgr and 2 and "consolidated" and summary)
         return concat("consolidate:ok,entries:" and concat(int_to_string(tcount) and concat(",summary:" and summary)))
+
+    if action_name equals "discord_read_channel":
+        if length_list(args_list) < 1:
+            return "Error: discord_read_channel requires 1 argument (channel_id)."
+        set ddb to storage_get_db()
+        set did to bridge_enqueue(ddb and "discord" and "read_channel" and get_list(args_list and 0))
+        return bridge_wait_result(ddb and did and 30)
+    if action_name equals "discord_list_channels":
+        set ddb to storage_get_db()
+        set did to bridge_enqueue(ddb and "discord" and "list_channels" and "")
+        return bridge_wait_result(ddb and did and 30)
+    if action_name equals "discord_add_reaction":
+        if length_list(args_list) < 3:
+            return "Error: discord_add_reaction requires channel_id, message_id and emoji."
+        set dargs to concat(get_list(args_list and 0) and concat("|" and concat(get_list(args_list and 1) and concat("|" and get_list(args_list and 2)))))
+        set ddb to storage_get_db()
+        set did to bridge_enqueue(ddb and "discord" and "add_reaction" and dargs)
+        return bridge_wait_result(ddb and did and 30)
 
     if action_name equals "reply_request":
         if length_list(args_list) < 1:
