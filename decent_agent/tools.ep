@@ -22,7 +22,9 @@ import "./web_search"
 import "./session"
 import "./memory"
 import "./learning"
+import "./llm"
 import "../decent_store/content"
+import "../decent_store/knowledge"
 
 define append_string_to_char_list with char_list as List and s as Str returning Int:
     set len to string_length(s)
@@ -55,7 +57,10 @@ define tools_create:
     set schemas to concat(schemas and "- reasoning_tool([action: 'note'|'read'|'clear', text: Str]) -> Str: An explicit chain-of-thought scratch buffer. 'note' appends a reasoning step, 'read' replays the chain, 'clear' resets it. Use to think step by step before acting.\n")
     set schemas to concat(schemas and "- performance_review([]) -> Str: Summarize your learning buffers — counts of golden (kept), preference corrections, rejections, and audits. Use to reflect on how you've been doing.\n")
     set schemas to concat(schemas and "- autonomy_history([]) -> Str: List your scheduled/autonomous jobs and when each last ran. Use to review your autonomous activity.\n")
-    set schemas to concat(schemas and "- git_tool([subcommand: Str, args: Str]) -> Str: Run a READ-ONLY git query in the node's repo (status, log, diff, show, branch, remote, rev-parse, tag, describe). For commits/pushes use run_command (approval required).\n\n")
+    set schemas to concat(schemas and "- git_tool([subcommand: Str, args: Str]) -> Str: Run a READ-ONLY git query in the node's repo (status, log, diff, show, branch, remote, rev-parse, tag, describe). For commits/pushes use run_command (approval required).\n")
+    set schemas to concat(schemas and "- kg_tool([action: 'add_entity'|'add_relation'|'query'|'find', a: Str, b: Str, c: Str]) -> Str: Your persistent knowledge graph. add_entity(name,type,attrs); add_relation(src,rel,dst); query(name) returns facts/edges; find(text) searches names. Survives restart.\n")
+    set schemas to concat(schemas and "- procedure_tool([action: 'store'|'get'|'list'|'pin'|'unpin'|'archive', name: Str, steps: Str]) -> Str: Your procedural memory of named multi-step procedures. store(name,steps); get(name); list; pin/unpin/archive(name). Survives restart.\n")
+    set schemas to concat(schemas and "- consolidate_tool([mode: ''|'force']) -> Str: Summarize recent episodic timeline entries into durable lessons (consolidation). Runs the LLM; records a consolidation and a lesson. Use during quiet/autonomous time.\n\n")
     set schemas to concat(schemas and "WRITE OPERATIONS (requires user approval before execution):\n")
     set schemas to concat(schemas and "- codebase_write([path: Str, content: Str]) -> Str: Overwrite a file. APPROVAL REQUIRED. Use only when explicitly asked to modify code.\n")
     set schemas to concat(schemas and "- run_command([cmd: Str]) -> Str: Execute a shell command. APPROVAL REQUIRED. Use for builds, tests, file operations.\n")
@@ -293,6 +298,14 @@ define tools_is_action_allowed with role as Str and action_name as Str and args_
         if length_list(args_list) > 0:
             set mem_sub to get_list(args_list and 0)
             if mem_sub equals "clear" or else mem_sub equals "forget" or else mem_sub equals "del":
+                return 0
+        return 1
+    # Knowledge-graph / procedural tiers: reads + non-destructive writes for any role;
+    # 'archive' is destructive-ish (hides data) so admin/owner-only.
+    if action_name equals "kg_tool" or else action_name equals "procedure_tool":
+        if length_list(args_list) > 0:
+            set kg_sub to get_list(args_list and 0)
+            if kg_sub equals "archive":
                 return 0
         return 1
     # E6: read_transcripts removed from the non-admin allowlist (was guest-exfiltration).
@@ -720,6 +733,107 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if put_err != 0:
             return concat("download:error,reason:store_failed,code:" and int_to_string(put_err))
         return concat("download:ok,hash:" and concat(dhash and concat(",bytes:" and int_to_string(blen))))
+
+    if action_name equals "kg_tool":
+        if length_list(args_list) < 1:
+            return "Error: kg_tool requires an action (add_entity/add_relation/query/find)."
+        set kga to get_list(args_list and 0)
+        set kdb to storage_get_db()
+        if kdb == 0:
+            return "Error: storage database is not initialized."
+        if kga equals "add_entity":
+            if length_list(args_list) < 2:
+                return "Error: add_entity requires a name."
+            set kname to get_list(args_list and 1)
+            set ktype to ""
+            if length_list(args_list) >= 3:
+                set ktype to get_list(args_list and 2)
+            set kattrs to ""
+            if length_list(args_list) >= 4:
+                set kattrs to get_list(args_list and 3)
+            set ok to kg_add_entity(kdb and kname and ktype and kattrs)
+            return concat("kg:entity_added," and kname)
+        if kga equals "add_relation":
+            if length_list(args_list) < 4:
+                return "Error: add_relation requires src, rel, dst."
+            set ok to kg_add_relation(kdb and get_list(args_list and 1) and get_list(args_list and 2) and get_list(args_list and 3))
+            return "kg:relation_added"
+        if kga equals "query":
+            if length_list(args_list) < 2:
+                return "Error: query requires an entity name."
+            return kg_query(kdb and get_list(args_list and 1))
+        if kga equals "find":
+            if length_list(args_list) < 2:
+                return "Error: find requires a search string."
+            return knowledge_find_by_name(kdb and get_list(args_list and 1))
+        return concat("Error: unknown kg_tool action '" and concat(kga and "'."))
+
+    if action_name equals "procedure_tool":
+        if length_list(args_list) < 1:
+            return "Error: procedure_tool requires an action (store/get/list/pin/unpin/archive)."
+        set pa to get_list(args_list and 0)
+        set pdb to storage_get_db()
+        if pdb == 0:
+            return "Error: storage database is not initialized."
+        if pa equals "list":
+            return procedure_list(pdb)
+        if pa equals "store":
+            if length_list(args_list) < 3:
+                return "Error: store requires name and steps."
+            set ok to procedure_store(pdb and get_list(args_list and 1) and get_list(args_list and 2))
+            return concat("procedure:stored," and get_list(args_list and 1))
+        if pa equals "get":
+            if length_list(args_list) < 2:
+                return "Error: get requires a name."
+            return procedure_get(pdb and get_list(args_list and 1))
+        if pa equals "pin":
+            if length_list(args_list) < 2:
+                return "Error: pin requires a name."
+            set ok to procedure_set_flag(pdb and get_list(args_list and 1) and "pinned" and 1)
+            return concat("procedure:pinned," and get_list(args_list and 1))
+        if pa equals "unpin":
+            if length_list(args_list) < 2:
+                return "Error: unpin requires a name."
+            set ok to procedure_set_flag(pdb and get_list(args_list and 1) and "pinned" and 0)
+            return concat("procedure:unpinned," and get_list(args_list and 1))
+        if pa equals "archive":
+            if length_list(args_list) < 2:
+                return "Error: archive requires a name."
+            set ok to procedure_set_flag(pdb and get_list(args_list and 1) and "archived" and 1)
+            return concat("procedure:archived," and get_list(args_list and 1))
+        return concat("Error: unknown procedure_tool action '" and concat(pa and "'."))
+
+    if action_name equals "consolidate_tool":
+        set memory_mgr to map_get_val(ctx and "memory")
+        if memory_mgr == 0:
+            return "Error: cognitive memory not available in context."
+        set cdb to storage_get_db()
+        set timeline to map_get_val(memory_mgr and "timeline")
+        set tcount to length_list(timeline)
+        set forced to 0
+        if length_list(args_list) >= 1:
+            if get_list(args_list and 0) equals "force":
+                set forced to 1
+        if forced == 0:
+            if needs_consolidation(tcount and 10) == 0:
+                return concat("consolidate:skipped,entries:" and concat(int_to_string(tcount) and ",threshold:10"))
+        # gather the recent timeline entries
+        set items to ""
+        set start to tcount - 20
+        if start < 0:
+            set start to 0
+        set ci to start
+        repeat while ci < tcount:
+            set items to concat(items and concat(get_list(timeline and ci) and "\n"))
+            set ci to ci + 1
+        set cprompt to build_summary_prompt(items)
+        set summary to query_local_llm(cprompt and "")
+        if string_length(summary) == 0:
+            return "consolidate:error,reason:empty_llm_response"
+        if cdb != 0:
+            set ok to record_consolidation(cdb and summary and tcount)
+        set ok to memory_store(memory_mgr and 2 and "consolidated" and summary)
+        return concat("consolidate:ok,entries:" and concat(int_to_string(tcount) and concat(",summary:" and summary)))
 
     if action_name equals "reply_request":
         if length_list(args_list) < 1:

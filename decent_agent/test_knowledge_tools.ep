@@ -1,0 +1,95 @@
+# Phase 2 gate (agent path) — kg_tool / procedure_tool / consolidate_tool through
+# tools_execute against a real initialized storage DB. Exercises dispatch + RBAC.
+
+import "string"
+import "collections"
+import "./tools"
+import "./memory"
+import "../storage"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define has with haystack as Str and needle as Str returning Int:
+    return string_contains(haystack and needle)
+
+define a1 with a as Str returning List:
+    set l to create_list()
+    set ok to append_list(l and a)
+    return l
+
+define a2 with a as Str and b as Str returning List:
+    set l to create_list()
+    set ok to append_list(l and a)
+    set ok to append_list(l and b)
+    return l
+
+define a3 with a as Str and b as Str and c as Str returning List:
+    set l to create_list()
+    set ok to append_list(l and a)
+    set ok to append_list(l and b)
+    set ok to append_list(l and c)
+    return l
+
+define a4 with a as Str and b as Str and c as Str and d as Str returning List:
+    set l to create_list()
+    set ok to append_list(l and a)
+    set ok to append_list(l and b)
+    set ok to append_list(l and c)
+    set ok to append_list(l and d)
+    return l
+
+define main:
+    set passes to 0
+    set total to 0
+
+    set ok to storage_init("/tmp/ernos_test_storage")
+    set tools_mgr to tools_create()
+    set mem to memory_create()
+    set ctx to create_map()
+    set ok to map_insert(ctx and "memory" and mem)
+    set ok to map_insert(ctx and "sender_role" and "owner")
+    set guest_ctx to create_map()
+    set ok to map_insert(guest_ctx and "memory" and mem)
+    set ok to map_insert(guest_ctx and "sender_role" and "guest")
+
+    # --- kg_tool ---
+    set r to tools_execute(tools_mgr and ctx and "kg_tool" and a4("add_entity" and "maria" and "person" and "role=author"))
+    set total to total + 1
+    set passes to passes + pass_if("kg_tool add_entity" and has(r and "entity_added"))
+    set r to tools_execute(tools_mgr and ctx and "kg_tool" and a4("add_relation" and "maria" and "authors" and "ernosdecent"))
+    set total to total + 1
+    set passes to passes + pass_if("kg_tool add_relation" and has(r and "relation_added"))
+    set r to tools_execute(tools_mgr and ctx and "kg_tool" and a2("query" and "maria"))
+    set total to total + 1
+    set passes to passes + pass_if("kg_tool query shows relation" and has(r and "authors"))
+    set r to tools_execute(tools_mgr and ctx and "kg_tool" and a2("find" and "mar"))
+    set total to total + 1
+    set passes to passes + pass_if("kg_tool find locates entity" and has(r and "maria"))
+
+    # --- procedure_tool ---
+    set r to tools_execute(tools_mgr and ctx and "procedure_tool" and a3("store" and "release" and "1. branch\n2. test\n3. push"))
+    set total to total + 1
+    set passes to passes + pass_if("procedure_tool store" and has(r and "stored"))
+    set r to tools_execute(tools_mgr and ctx and "procedure_tool" and a2("get" and "release"))
+    set total to total + 1
+    set passes to passes + pass_if("procedure_tool get returns steps" and has(r and "push"))
+    set r to tools_execute(tools_mgr and ctx and "procedure_tool" and a1("list"))
+    set total to total + 1
+    set passes to passes + pass_if("procedure_tool list" and has(r and "release"))
+
+    # --- RBAC: guest cannot archive (destructive) ---
+    set r to tools_execute(tools_mgr and guest_ctx and "procedure_tool" and a2("archive" and "release"))
+    set total to total + 1
+    set passes to passes + pass_if("guest archive denied" and has(r and "Access Denied"))
+
+    # --- consolidate_tool: under threshold -> skipped (deterministic, no LLM) ---
+    set r to tools_execute(tools_mgr and ctx and "consolidate_tool" and create_list())
+    set total to total + 1
+    set passes to passes + pass_if("consolidate skips under threshold" and has(r and "consolidate:skipped"))
+
+    display concat("knowledge-tools: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))

@@ -1,0 +1,224 @@
+# ErnosPlain agent memory tiers — knowledge graph, procedural memory, and
+# consolidation — persisted in the node's SQLite store (survives restart, like rag.ep).
+# Component: decent_store/knowledge.ep
+
+import "string"
+import "collections"
+import "sql"
+
+define kg_sql_escape with s as Str returning Str:
+    return string_replace(s and "'" and "''")
+
+define kg_ensure_schema with db as Int:
+    if db == 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS kg_entities (name TEXT PRIMARY KEY, etype TEXT NOT NULL DEFAULT '', attrs TEXT NOT NULL DEFAULT '', pinned INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0);")
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS kg_relations (src TEXT NOT NULL, rel TEXT NOT NULL, dst TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0, UNIQUE(src, rel, dst));")
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS procedures (name TEXT PRIMARY KEY, steps TEXT NOT NULL DEFAULT '', pinned INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0);")
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS consolidations (id INTEGER PRIMARY KEY AUTOINCREMENT, summary TEXT NOT NULL, source_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0);")
+    return 0
+
+define kg_available with db as Int returning Int:
+    if db == 0:
+        return 0
+    set rows to sql_query(db and "SELECT name FROM sqlite_master WHERE type='table' AND name='kg_entities';")
+    set n to length_list(rows)
+    if n > 0:
+        return 1
+    return 0
+
+# ── Knowledge graph ─────────────────────────────────────────────────────────
+
+define kg_add_entity with db as Int and name as Str and etype as Str and attrs as Str returning Int:
+    if db == 0:
+        return 1
+    set ok to kg_ensure_schema(db)
+    set en to kg_sql_escape(name)
+    set et to kg_sql_escape(etype)
+    set ea to kg_sql_escape(attrs)
+    set now to ep_time_now_sec()
+    set q to concat("INSERT INTO kg_entities (name, etype, attrs, created_at) VALUES ('" and en)
+    set q to concat(q and concat("', '" and concat(et and concat("', '" and concat(ea and concat("', " and concat(int_to_string(now) and ")")))))))
+    set q to concat(q and concat(" ON CONFLICT(name) DO UPDATE SET etype='" and concat(et and concat("', attrs='" and concat(ea and "';")))))
+    set ok to sql_execute(db and q)
+    return 0
+
+define kg_add_relation with db as Int and src as Str and rel as Str and dst as Str returning Int:
+    if db == 0:
+        return 1
+    set ok to kg_ensure_schema(db)
+    set es to kg_sql_escape(src)
+    set er to kg_sql_escape(rel)
+    set ed to kg_sql_escape(dst)
+    set now to ep_time_now_sec()
+    set q to concat("INSERT OR IGNORE INTO kg_relations (src, rel, dst, created_at) VALUES ('" and es)
+    set q to concat(q and concat("', '" and concat(er and concat("', '" and concat(ed and concat("', " and concat(int_to_string(now) and ");")))))))
+    set ok to sql_execute(db and q)
+    return 0
+
+define kg_query with db as Int and entity as Str returning Str:
+    if db == 0:
+        return "Error: storage db not available."
+    set ok to kg_ensure_schema(db)
+    set ee to kg_sql_escape(entity)
+    set out to concat("Knowledge for '" and concat(entity and "':\n"))
+    set found to 0
+
+    # entity attributes
+    set arows to sql_query(db and concat("SELECT etype, attrs FROM kg_entities WHERE name='" and concat(ee and "' AND archived=0;")))
+    if length_list(arows) > 0:
+        set r0 to get_list(arows and 0)
+        set et to get_list(r0 and 0)
+        set ea to get_list(r0 and 1)
+        set out to concat(out and concat("- type: " and concat(et and "\n")))
+        if string_length(ea) > 0:
+            set out to concat(out and concat("- attrs: " and concat(ea and "\n")))
+        set found to 1
+
+    # outgoing relations
+    set orows to sql_query(db and concat("SELECT rel, dst FROM kg_relations WHERE src='" and concat(ee and "' ORDER BY rel;")))
+    set ocount to length_list(orows)
+    set i to 0
+    repeat while i < ocount:
+        set rr to get_list(orows and i)
+        set rel to get_list(rr and 0)
+        set dst to get_list(rr and 1)
+        set out to concat(out and concat("- " and concat(entity and concat(" " and concat(rel and concat(" " and concat(dst and "\n")))))))
+        set found to 1
+        set i to i + 1
+
+    # incoming relations
+    set irows to sql_query(db and concat("SELECT src, rel FROM kg_relations WHERE dst='" and concat(ee and "' ORDER BY rel;")))
+    set icount to length_list(irows)
+    set j to 0
+    repeat while j < icount:
+        set rr to get_list(irows and j)
+        set s2 to get_list(rr and 0)
+        set rel2 to get_list(rr and 1)
+        set out to concat(out and concat("- " and concat(s2 and concat(" " and concat(rel2 and concat(" " and concat(entity and "\n")))))))
+        set found to 1
+        set j to j + 1
+
+    if found == 0:
+        return concat("No knowledge stored for '" and concat(entity and "'."))
+    return out
+
+# ── Procedural memory ───────────────────────────────────────────────────────
+
+define procedure_store with db as Int and name as Str and steps as Str returning Int:
+    if db == 0:
+        return 1
+    set ok to kg_ensure_schema(db)
+    set en to kg_sql_escape(name)
+    set es to kg_sql_escape(steps)
+    set now to ep_time_now_sec()
+    set q to concat("INSERT INTO procedures (name, steps, created_at) VALUES ('" and en)
+    set q to concat(q and concat("', '" and concat(es and concat("', " and concat(int_to_string(now) and ")")))))
+    set q to concat(q and concat(" ON CONFLICT(name) DO UPDATE SET steps='" and concat(es and "';")))
+    set ok to sql_execute(db and q)
+    return 0
+
+define procedure_get with db as Int and name as Str returning Str:
+    if db == 0:
+        return "Error: storage db not available."
+    set ok to kg_ensure_schema(db)
+    set en to kg_sql_escape(name)
+    set rows to sql_query(db and concat("SELECT steps FROM procedures WHERE name='" and concat(en and "' AND archived=0;")))
+    if length_list(rows) > 0:
+        set r0 to get_list(rows and 0)
+        return concat("Procedure '" and concat(name and concat("':\n" and get_list(r0 and 0))))
+    return concat("No procedure named '" and concat(name and "'."))
+
+define procedure_list with db as Int returning Str:
+    if db == 0:
+        return "Error: storage db not available."
+    set ok to kg_ensure_schema(db)
+    set rows to sql_query(db and "SELECT name, pinned FROM procedures WHERE archived=0 ORDER BY pinned DESC, name;")
+    set n to length_list(rows)
+    if n == 0:
+        return "No procedures stored."
+    set out to "Procedures:\n"
+    set i to 0
+    repeat while i < n:
+        set r to get_list(rows and i)
+        set nm to get_list(r and 0)
+        set pin to get_list(r and 1)
+        set tag to ""
+        if pin equals "1":
+            set tag to " [pinned]"
+        set out to concat(out and concat("- " and concat(nm and concat(tag and "\n"))))
+        set i to i + 1
+    return out
+
+# ── Consolidation ───────────────────────────────────────────────────────────
+
+define needs_consolidation with item_count as Int and threshold as Int returning Int:
+    if threshold <= 0:
+        return 0
+    if item_count >= threshold:
+        return 1
+    return 0
+
+define build_summary_prompt with items as Str returning Str:
+    set p to "Summarize the following recent episodic memory entries into a few durable, factual lessons. Keep only what is worth remembering long-term. Be concise.\n\nEntries:\n"
+    set p to concat(p and items)
+    set p to concat(p and "\n\nSummary:")
+    return p
+
+define record_consolidation with db as Int and summary as Str and source_count as Int returning Int:
+    if db == 0:
+        return 1
+    set ok to kg_ensure_schema(db)
+    set es to kg_sql_escape(summary)
+    set now to ep_time_now_sec()
+    set q to concat("INSERT INTO consolidations (summary, source_count, created_at) VALUES ('" and es)
+    set q to concat(q and concat("', " and concat(int_to_string(source_count) and concat(", " and concat(int_to_string(now) and ");")))))
+    set ok to sql_execute(db and q)
+    return 0
+
+# ── Lifecycle (pin / archive / find_by_name) ────────────────────────────────
+
+define procedure_set_flag with db as Int and name as Str and column as Str and val as Int returning Int:
+    if db == 0:
+        return 1
+    set ok to kg_ensure_schema(db)
+    set en to kg_sql_escape(name)
+    set q to concat("UPDATE procedures SET " and concat(column and concat("=" and concat(int_to_string(val) and concat(" WHERE name='" and concat(en and "';"))))))
+    set ok to sql_execute(db and q)
+    return 0
+
+define entity_set_flag with db as Int and name as Str and column as Str and val as Int returning Int:
+    if db == 0:
+        return 1
+    set ok to kg_ensure_schema(db)
+    set en to kg_sql_escape(name)
+    set q to concat("UPDATE kg_entities SET " and concat(column and concat("=" and concat(int_to_string(val) and concat(" WHERE name='" and concat(en and "';"))))))
+    set ok to sql_execute(db and q)
+    return 0
+
+define knowledge_find_by_name with db as Int and query as Str returning Str:
+    if db == 0:
+        return "Error: storage db not available."
+    set ok to kg_ensure_schema(db)
+    set eq to kg_sql_escape(query)
+    set out to concat("Matches for '" and concat(query and "':\n"))
+    set found to 0
+    set erows to sql_query(db and concat("SELECT name, etype FROM kg_entities WHERE archived=0 AND name LIKE '%" and concat(eq and "%' ORDER BY name LIMIT 25;")))
+    set en2 to length_list(erows)
+    set i to 0
+    repeat while i < en2:
+        set r to get_list(erows and i)
+        set out to concat(out and concat("- entity: " and concat(get_list(r and 0) and concat(" (" and concat(get_list(r and 1) and ")\n")))))
+        set found to 1
+        set i to i + 1
+    set prows to sql_query(db and concat("SELECT name FROM procedures WHERE archived=0 AND name LIKE '%" and concat(eq and "%' ORDER BY name LIMIT 25;")))
+    set pn to length_list(prows)
+    set j to 0
+    repeat while j < pn:
+        set r to get_list(prows and j)
+        set out to concat(out and concat("- procedure: " and concat(get_list(r and 0) and "\n")))
+        set found to 1
+        set j to j + 1
+    if found == 0:
+        return concat("No matches for '" and concat(query and "'."))
+    return out

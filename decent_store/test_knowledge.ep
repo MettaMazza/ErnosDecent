@@ -1,0 +1,95 @@
+# Phase 2 gate — agent memory tiers (knowledge graph, procedural memory,
+# consolidation, lifecycle) over real SQLite. Includes a persist-across-restart
+# check: write -> close db -> reopen -> data still there.
+
+import "string"
+import "collections"
+import "sql"
+import "knowledge"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define has with haystack as Str and needle as Str returning Int:
+    return string_contains(haystack and needle)
+
+define main:
+    set passes to 0
+    set total to 0
+    set path to "/tmp/ernos_test_knowledge.db"
+    set db to sql_open(path)
+
+    # --- knowledge graph ---
+    set ok to kg_add_entity(db and "alice" and "person" and "role=engineer")
+    set ok to kg_add_entity(db and "ernosdecent" and "project" and "")
+    set ok to kg_add_relation(db and "alice" and "works_on" and "ernosdecent")
+
+    set total to total + 1
+    set passes to passes + pass_if("kg_available" and (kg_available(db) == 1))
+
+    set r to kg_query(db and "alice")
+    set total to total + 1
+    set passes to passes + pass_if("kg_query shows attrs" and has(r and "engineer"))
+    set total to total + 1
+    set passes to passes + pass_if("kg_query shows outgoing relation" and has(r and "works_on"))
+
+    set r to kg_query(db and "ernosdecent")
+    set total to total + 1
+    set passes to passes + pass_if("kg_query shows incoming relation" and has(r and "alice works_on"))
+
+    # --- procedural memory ---
+    set ok to procedure_store(db and "deploy" and "1. build\n2. test\n3. ship")
+    set r to procedure_get(db and "deploy")
+    set total to total + 1
+    set passes to passes + pass_if("procedure_get returns steps" and has(r and "ship"))
+    set r to procedure_list(db)
+    set total to total + 1
+    set passes to passes + pass_if("procedure_list shows deploy" and has(r and "deploy"))
+
+    # --- consolidation ---
+    set total to total + 1
+    set passes to passes + pass_if("needs_consolidation over threshold" and (needs_consolidation(5 and 3) == 1))
+    set total to total + 1
+    set passes to passes + pass_if("needs_consolidation under threshold" and (needs_consolidation(2 and 3) == 0))
+    set sp to build_summary_prompt("entry a\nentry b")
+    set total to total + 1
+    set passes to passes + pass_if("build_summary_prompt well-formed" and (has(sp and "Summary:") and also has(sp and "entry a")))
+    set ok to record_consolidation(db and "Lesson: ship after tests pass." and 2)
+    set total to total + 1
+    set passes to passes + pass_if("record_consolidation ok" and (ok == 0))
+
+    # --- lifecycle: pin / archive / find_by_name ---
+    set ok to procedure_set_flag(db and "deploy" and "pinned" and 1)
+    set r to procedure_list(db)
+    set total to total + 1
+    set passes to passes + pass_if("pin shows in list" and has(r and "pinned"))
+
+    set r to knowledge_find_by_name(db and "ali")
+    set total to total + 1
+    set passes to passes + pass_if("find_by_name finds entity" and has(r and "alice"))
+    set total to total + 1
+    set passes to passes + pass_if("find_by_name finds procedure" and (has(knowledge_find_by_name(db and "depl") and "deploy")))
+
+    set ok to procedure_set_flag(db and "deploy" and "archived" and 1)
+    set r to procedure_list(db)
+    set total to total + 1
+    set passes to passes + pass_if("archive hides from list" and (has(r and "deploy") == 0))
+
+    # --- PERSISTENCE across restart: close, reopen the same file, data survives ---
+    # (un-archive deploy first — archived rows are correctly hidden by procedure_get)
+    set ok to procedure_set_flag(db and "deploy" and "archived" and 0)
+    set ok to sql_close(db)
+    set db2 to sql_open(path)
+    set r to kg_query(db2 and "alice")
+    set total to total + 1
+    set passes to passes + pass_if("kg survives reopen (persistence)" and has(r and "works_on"))
+    set r to procedure_get(db2 and "deploy")
+    set total to total + 1
+    set passes to passes + pass_if("procedure survives reopen (persistence)" and has(r and "ship"))
+    set ok to sql_close(db2)
+
+    display concat("knowledge-tiers: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))
