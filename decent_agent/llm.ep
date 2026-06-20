@@ -7,6 +7,7 @@ import "collections"
 import "string"
 import "json"
 import "../stdlib/http"
+import "./model_registry"
 
 external define ep_net_connect with host and port
 external define ep_net_close with fd
@@ -405,8 +406,43 @@ define agent_list_models returning Str:
     free_list(models_list)
     return out_json
 
+# Registry/router-driven query: consults model_registry (which local providers are
+# up, in priority order) and tries each via the same try_chat_completion request
+# path. This is the structured replacement for the flat cascade; query_local_llm
+# delegates its selected-model phase here and keeps the original cascade as an
+# unchanged fallback, so offline/failure behavior is identical.
+define query_via_router with prompt as Str and selected_model as Str returning Str:
+    set reg to model_registry_default()
+    set available to create_list()
+    if is_port_open("127.0.0.1" and 8080) == 1:
+        set ok to append_list(available and "llamacpp_8080")
+    if is_port_open("127.0.0.1" and 8081) == 1:
+        set ok to append_list(available and "llamacpp_8081")
+    if is_port_open("127.0.0.1" and 11434) == 1:
+        set ok to append_list(available and "ollama")
+    if is_port_open("127.0.0.1" and 1234) == 1:
+        set ok to append_list(available and "lmstudio")
+    set order to model_router_order(reg and available)
+    set n to length_list(order)
+    set i to 0
+    repeat while i < n:
+        set pname to get_list(order and i)
+        set spec to registry_find(reg and pname)
+        set endpoint to model_spec_endpoint(spec and selected_model)
+        set res to try_chat_completion(endpoint and selected_model and prompt)
+        if string_length(res) > 0:
+            return res
+        set i to i + 1
+    return ""
+
 define query_local_llm with prompt as Str and selected_model as Str returning Str:
     if string_length(selected_model) > 0:
+        # Structured router path first (model_registry). On any miss, fall through to
+        # the original cascade below — fully preserved, including the gemma4:26b default.
+        set routed to query_via_router(prompt and selected_model)
+        if string_length(routed) > 0:
+            return routed
+
         # 1. Try selected_model on LM Studio (1234)
         if is_port_open("127.0.0.1" and 1234) == 1:
             display f"[LLM] Trying selected model '{selected_model}' on LM Studio (1234)..."

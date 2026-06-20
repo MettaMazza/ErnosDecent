@@ -1,0 +1,55 @@
+# OpenAI-style SSE stream parser — turns a chunked "data: {json}\n\n ... data: [DONE]"
+# stream into the assembled assistant text by concatenating each
+# choices[0].delta.content. Pure + deterministic (testable from a sample stream).
+# Component: decent_agent/provider_stream_parser.ep
+
+import "string"
+import "collections"
+import "json"
+
+# Extract the delta content from a single SSE line ("data: {json}"); "" otherwise.
+define stream_extract_delta with line as Str returning Str:
+    if string_length(line) < 6:
+        return ""
+    set pfx to substring(line and 0 and 5)
+    if pfx equals "data:" == 0:
+        return ""
+    set payload to string_trim(substring(line and 5 and string_length(line) - 5))
+    if payload equals "[DONE]":
+        return ""
+    set node to json_parse(payload)
+    if node == 0:
+        return ""
+    set choices to get_json_object_value(node and "choices")
+    if choices == 0:
+        return ""
+    set clist to get_json_value(choices)
+    if length_list(clist) == 0:
+        return ""
+    set c0 to get_list(clist and 0)
+    if c0 == 0:
+        return ""
+    set delta to get_json_object_value(c0 and "delta")
+    if delta == 0:
+        return ""
+    set content to get_json_object_value(delta and "content")
+    if content == 0:
+        return ""
+    return get_json_value(content)
+
+define stream_parse_sse with raw as Str returning Str:
+    set out to ""
+    set line to ""
+    set n to string_length(raw)
+    set i to 0
+    repeat while i < n:
+        set c to get_character(raw and i)
+        if c == 10:
+            set out to concat(out and stream_extract_delta(line))
+            set line to ""
+        else:
+            set line to concat(line and substring(raw and i and 1))
+        set i to i + 1
+    # trailing line with no newline
+    set out to concat(out and stream_extract_delta(line))
+    return out

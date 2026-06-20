@@ -1,0 +1,93 @@
+# OpenAI-compatible chat provider (LM Studio :1234, llama.cpp :8080/8081,
+# Ollama :11434/v1, and any generic OpenAI-compatible endpoint all share this
+# request/response shape). Request-body building and response parsing are pure
+# and testable; the network call is a thin wrapper over stdlib/http.
+# Component: decent_agent/provider_openai_compat.ep
+
+import "string"
+import "collections"
+import "json"
+import "../stdlib/http"
+
+# Minimal JSON string escape (quotes, backslash, newline, tab, CR).
+define provider_json_escape with s as Str returning Str:
+    set out to ""
+    set n to string_length(s)
+    set i to 0
+    repeat while i < n:
+        set c to get_character(s and i)
+        if c == 92:
+            # backslash -> \\  (two backslash chars)
+            set out to concat(out and "\\\\")
+        else:
+            if c == 34:
+                # quote -> \"  (backslash + quote)
+                set out to concat(out and "\\\"")
+            else:
+                if c == 10:
+                    # newline -> \n  (backslash + n)
+                    set out to concat(out and "\\n")
+                else:
+                    if c == 13:
+                        set out to concat(out and "\\r")
+                    else:
+                        if c == 9:
+                            set out to concat(out and "\\t")
+                        else:
+                            set out to concat(out and substring(s and i and 1))
+        set i to i + 1
+    return out
+
+# Build an OpenAI chat-completions request body. num_ctx > 0 adds Ollama's
+# options.num_ctx (Ollama native respects it; others ignore the field).
+define provider_openai_build_body with model as Str and prompt as Str and num_ctx as Int returning Str:
+    set body to "{\"model\": \""
+    set body to concat(body and model)
+    set body to concat(body and "\", \"messages\": [{\"role\": \"user\", \"content\": \"")
+    set body to concat(body and provider_json_escape(prompt))
+    if num_ctx > 0:
+        set body to concat(body and "\"}], \"options\": {\"num_ctx\": ")
+        set body to concat(body and int_to_string(num_ctx))
+        set body to concat(body and "}}")
+    else:
+        set body to concat(body and "\"}]}")
+    return body
+
+# Parse choices[0].message.content from an OpenAI chat response. Returns "" on
+# any error or an error-bearing payload.
+define provider_openai_parse with response as Str returning Str:
+    if string_length(response) == 0:
+        return ""
+    if string_contains(response and "\"error\":") == 1:
+        return ""
+    set root to json_parse(response)
+    if root == 0:
+        return ""
+    set choices to get_json_object_value(root and "choices")
+    if choices == 0:
+        return ""
+    set clist to get_json_value(choices)
+    if length_list(clist) == 0:
+        return ""
+    set c0 to get_list(clist and 0)
+    if c0 == 0:
+        return ""
+    set msg to get_json_object_value(c0 and "message")
+    if msg == 0:
+        return ""
+    set content to get_json_object_value(msg and "content")
+    if content == 0:
+        return ""
+    return get_json_value(content)
+
+# Live one-shot chat. base_url like "http://127.0.0.1:1234"; api_key "" if none.
+define provider_openai_chat with base_url as Str and model as Str and prompt as Str and api_key as Str and num_ctx as Int returning Str:
+    set url to concat(base_url and "/v1/chat/completions")
+    set headers to "Content-Type: application/json"
+    if string_length(api_key) > 0:
+        set headers to concat(headers and concat("\nAuthorization: Bearer " and api_key))
+    set body to provider_openai_build_body(model and prompt and num_ctx)
+    set resp to http_post(url and headers and body)
+    if string_length(resp) == 0:
+        return ""
+    return provider_openai_parse(resp)

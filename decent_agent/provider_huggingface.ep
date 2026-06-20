@@ -1,0 +1,51 @@
+# HuggingFace Inference API provider — a genuinely distinct shape from the
+# OpenAI-compatible providers: POST {"inputs": "..."} to /models/<model>, Bearer
+# auth, response is [{"generated_text": "..."}]. Body building + parsing are pure
+# and testable; the network call is a thin wrapper.
+# Component: decent_agent/provider_huggingface.ep
+
+import "string"
+import "collections"
+import "json"
+import "../stdlib/http"
+import "./provider_openai_compat"
+
+define provider_hf_build_body with prompt as Str returning Str:
+    set body to "{\"inputs\": \""
+    set body to concat(body and provider_json_escape(prompt))
+    set body to concat(body and "\", \"parameters\": {\"return_full_text\": false}}")
+    return body
+
+# HF text-generation returns [{"generated_text": "..."}]; errors as {"error": ...}.
+define provider_hf_parse with response as Str returning Str:
+    if string_length(response) == 0:
+        return ""
+    if string_contains(response and "\"error\":") == 1:
+        return ""
+    set root to json_parse(response)
+    if root == 0:
+        return ""
+    # json_parse returns a node; extract the array's list value before indexing.
+    set arr to get_json_value(root)
+    if arr == 0:
+        return ""
+    if length_list(arr) == 0:
+        return ""
+    set first to get_list(arr and 0)
+    if first == 0:
+        return ""
+    set gt to get_json_object_value(first and "generated_text")
+    if gt == 0:
+        return ""
+    return get_json_value(gt)
+
+define provider_hf_generate with model as Str and prompt as Str and api_key as Str returning Str:
+    set url to concat("https://api-inference.huggingface.co/models/" and model)
+    set headers to "Content-Type: application/json"
+    if string_length(api_key) > 0:
+        set headers to concat(headers and concat("\nAuthorization: Bearer " and api_key))
+    set body to provider_hf_build_body(prompt)
+    set resp to http_post(url and headers and body)
+    if string_length(resp) == 0:
+        return ""
+    return provider_hf_parse(resp)

@@ -1,0 +1,92 @@
+# Phase 4 gate — model registry/router + providers + stream parser.
+# All deterministic (no network): routing over a given registry+availability,
+# request-body builders, response parsers, and SSE stream assembly.
+
+import "string"
+import "collections"
+import "./model_registry"
+import "./provider_openai_compat"
+import "./provider_huggingface"
+import "./provider_stream_parser"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define has with haystack as Str and needle as Str returning Int:
+    return string_contains(haystack and needle)
+
+define mk2 with a as Str and b as Str returning List:
+    set l to create_list()
+    set ok to append_list(l and a)
+    set ok to append_list(l and b)
+    return l
+
+define main:
+    set passes to 0
+    set total to 0
+    set reg to model_registry_default()
+
+    # --- registry / router ---
+    set total to total + 1
+    set passes to passes + pass_if("registry has 5 specs" and (length_list(reg) == 5))
+
+    set order to model_router_order(reg and mk2("lmstudio" and "ollama"))
+    set total to total + 1
+    set passes to passes + pass_if("router order respects registry priority (ollama before lmstudio)" and (get_list(order and 0) equals "ollama"))
+
+    set sel to model_router_select(reg and mk2("lmstudio" and "ollama") and "large")
+    set total to total + 1
+    set passes to passes + pass_if("router selects first available by priority" and (map_get_val(sel and "name") equals "ollama"))
+
+    set none to model_router_select(reg and create_list() and "any")
+    set total to total + 1
+    set passes to passes + pass_if("router returns empty when nothing available" and (map_contains(none and "name") == 0))
+
+    set ospec to registry_find(reg and "ollama")
+    set total to total + 1
+    set passes to passes + pass_if("ollama endpoint" and (model_spec_endpoint(ospec and "gemma") equals "http://127.0.0.1:11434/v1/chat/completions"))
+    set hspec to registry_find(reg and "huggingface")
+    set total to total + 1
+    set passes to passes + pass_if("hf endpoint embeds model" and (model_spec_endpoint(hspec and "gpt2") equals "https://api-inference.huggingface.co/models/gpt2"))
+    set total to total + 1
+    set passes to passes + pass_if("hf requires key" and (map_get_val(hspec and "requires_key") == 1))
+
+    # --- openai-compat provider ---
+    set body to provider_openai_build_body("mymodel" and "hi there" and 0)
+    set total to total + 1
+    set passes to passes + pass_if("openai body has model+content" and (has(body and "mymodel") and also has(body and "hi there")))
+    set total to total + 1
+    set passes to passes + pass_if("openai body no num_ctx when 0" and (has(body and "num_ctx") == 0))
+    set body2 to provider_openai_build_body("m" and "x" and 4096)
+    set total to total + 1
+    set passes to passes + pass_if("openai body adds num_ctx when set" and (has(body2 and "4096")))
+    set total to total + 1
+    set passes to passes + pass_if("json escape handles quotes" and has(provider_json_escape("say \"hi\"") and "\\\""))
+    set r to provider_openai_parse("{\"choices\":[{\"message\":{\"content\":\"hello world\"}}]}")
+    set total to total + 1
+    set passes to passes + pass_if("openai parse extracts content" and (r equals "hello world"))
+    set total to total + 1
+    set passes to passes + pass_if("openai parse rejects error payload" and (provider_openai_parse("{\"error\":\"bad\"}") equals ""))
+    set total to total + 1
+    set passes to passes + pass_if("openai parse rejects garbage" and (provider_openai_parse("not json") equals ""))
+
+    # --- huggingface provider ---
+    set hb to provider_hf_build_body("summarize this")
+    set total to total + 1
+    set passes to passes + pass_if("hf body has inputs+prompt" and (has(hb and "inputs") and also has(hb and "summarize this")))
+    set total to total + 1
+    set passes to passes + pass_if("hf parse extracts generated_text" and (provider_hf_parse("[{\"generated_text\":\"hi there\"}]") equals "hi there"))
+    set total to total + 1
+    set passes to passes + pass_if("hf parse rejects error" and (provider_hf_parse("{\"error\":\"loading\"}") equals ""))
+
+    # --- SSE stream parser ---
+    set sse to "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\ndata: [DONE]\n"
+    set assembled to stream_parse_sse(sse)
+    set total to total + 1
+    set passes to passes + pass_if("SSE stream assembles tokens" and (assembled equals "Hello world"))
+
+    display concat("providers: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))

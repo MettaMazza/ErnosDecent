@@ -1,0 +1,100 @@
+# ErnosPlain model registry / router — the spec + registry + router layer the
+# flat cascade in llm.ep lacked. Pure data + selection logic (no network), so it
+# is fully deterministic and testable. llm.ep consults it for provider endpoints
+# and routing; the proven live cascade is preserved.
+# Component: decent_agent/model_registry.ep
+
+import "string"
+import "collections"
+
+# ── spec ────────────────────────────────────────────────────────────────────
+# A provider spec: name, base_url, port, api_style ("openai" | "hf"),
+# size_class ("small"|"medium"|"large"), requires_key (0/1).
+define model_spec with name as Str and base_url as Str and port as Int and api_style as Str and size_class as Str and requires_key as Int returning Map:
+    set s to create_map()
+    set ok to map_insert(s and "name" and name)
+    set ok to map_insert(s and "base_url" and base_url)
+    set ok to map_insert(s and "port" and port)
+    set ok to map_insert(s and "api_style" and api_style)
+    set ok to map_insert(s and "size_class" and size_class)
+    set ok to map_insert(s and "requires_key" and requires_key)
+    return s
+
+# Chat endpoint for a spec (openai-style providers serve /v1/chat/completions;
+# hf serves /models/<model>).
+define model_spec_endpoint with spec as Map and model as Str returning Str:
+    set style to map_get_val(spec and "api_style")
+    set base to map_get_val(spec and "base_url")
+    if style equals "hf":
+        return concat(base and concat("/models/" and model))
+    return concat(base and "/v1/chat/completions")
+
+# ── registry ────────────────────────────────────────────────────────────────
+# Default registry — encodes the local providers the cascade uses (in priority
+# order) plus HuggingFace as a routable cloud provider (opt-in, needs a key).
+define model_registry_default returning List:
+    set reg to create_list()
+    set ok to append_list(reg and model_spec("llamacpp_8080" and "http://127.0.0.1:8080" and 8080 and "openai" and "large" and 0))
+    set ok to append_list(reg and model_spec("llamacpp_8081" and "http://127.0.0.1:8081" and 8081 and "openai" and "large" and 0))
+    set ok to append_list(reg and model_spec("ollama" and "http://127.0.0.1:11434" and 11434 and "openai" and "large" and 0))
+    set ok to append_list(reg and model_spec("lmstudio" and "http://127.0.0.1:1234" and 1234 and "openai" and "large" and 0))
+    set ok to append_list(reg and model_spec("huggingface" and "https://api-inference.huggingface.co" and 443 and "hf" and "large" and 1))
+    return reg
+
+# Return an OWNED copy of the matching spec (never the borrowed list element —
+# returning a borrowed map up through `return` and then reading it crashes; the
+# fields are read shallowly in this frame and rebuilt via model_spec).
+define spec_copy_at with registry as List and i as Int returning Map:
+    set s to get_list(registry and i)
+    return model_spec(concat(map_get_val(s and "name") and "") and concat(map_get_val(s and "base_url") and "") and map_get_val(s and "port") and concat(map_get_val(s and "api_style") and "") and concat(map_get_val(s and "size_class") and "") and map_get_val(s and "requires_key"))
+
+define registry_find with registry as List and name as Str returning Map:
+    set n to length_list(registry)
+    set i to 0
+    repeat while i < n:
+        set s to get_list(registry and i)
+        if map_get_val(s and "name") equals name:
+            return spec_copy_at(registry and i)
+        set i to i + 1
+    return create_map()
+
+# ── router ──────────────────────────────────────────────────────────────────
+# Availability is passed in as data (a List of provider names that are up), so
+# routing is deterministic and unit-testable without touching the network. The
+# caller (llm.ep) builds `available` from is_port_open / configured-key checks.
+
+# Names of available providers, in registry priority order.
+define model_router_order with registry as List and available as List returning List:
+    set out to create_list()
+    set n to length_list(registry)
+    set i to 0
+    repeat while i < n:
+        set s to get_list(registry and i)
+        set nm to map_get_val(s and "name")
+        if list_contains_str(available and nm) == 1:
+            set ok to append_list(out and concat(nm and ""))
+        set i to i + 1
+    return out
+
+# First available spec that matches the wanted size_class ("any" = no filter),
+# in registry priority order. Returns an empty map if none.
+define model_router_select with registry as List and available as List and want_size as Str returning Map:
+    set n to length_list(registry)
+    set i to 0
+    repeat while i < n:
+        set s to get_list(registry and i)
+        set nm to map_get_val(s and "name")
+        if list_contains_str(available and nm) == 1:
+            if want_size equals "any" or else want_size equals map_get_val(s and "size_class"):
+                return spec_copy_at(registry and i)
+        set i to i + 1
+    return create_map()
+
+define list_contains_str with lst as List and needle as Str returning Int:
+    set n to length_list(lst)
+    set i to 0
+    repeat while i < n:
+        if get_list(lst and i) equals needle:
+            return 1
+        set i to i + 1
+    return 0
