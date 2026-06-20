@@ -1,0 +1,62 @@
+# WhatsApp Cloud API connector. Body building + webhook parsing are pure/testable;
+# the network send is a thin wrapper.
+# Component: decent_net/platform_whatsapp.ep
+
+import "string"
+import "collections"
+import "json"
+import "../stdlib/http"
+import "./platform_adapter"
+
+define whatsapp_api_url with phone_id as Str returning Str:
+    return concat("https://graph.facebook.com/v17.0/" and concat(phone_id and "/messages"))
+
+define whatsapp_build_send_body with recipient as Str and text as Str returning Str:
+    set body to "{\"messaging_product\": \"whatsapp\", \"to\": \""
+    set body to concat(body and platform_json_escape(recipient))
+    set body to concat(body and "\", \"type\": \"text\", \"text\": {\"body\": \"")
+    set body to concat(body and platform_json_escape(text))
+    set body to concat(body and "\"}}")
+    return body
+
+# Parse a WhatsApp Cloud API webhook into the normalised message shape:
+# entry[0].changes[0].value.messages[0].{from, text.body}
+define whatsapp_parse_webhook with raw as Str returning Map:
+    set root to json_parse(raw)
+    if root == 0:
+        return platform_msg("whatsapp" and "" and "" and "")
+    set entry to get_json_value(get_json_object_value(root and "entry"))
+    if entry == 0:
+        return platform_msg("whatsapp" and "" and "" and "")
+    if length_list(entry) == 0:
+        return platform_msg("whatsapp" and "" and "" and "")
+    set e0 to get_list(entry and 0)
+    set changes to get_json_value(get_json_object_value(e0 and "changes"))
+    if changes == 0:
+        return platform_msg("whatsapp" and "" and "" and "")
+    if length_list(changes) == 0:
+        return platform_msg("whatsapp" and "" and "" and "")
+    set c0 to get_list(changes and 0)
+    set value to get_json_object_value(c0 and "value")
+    if value == 0:
+        return platform_msg("whatsapp" and "" and "" and "")
+    set messages to get_json_value(get_json_object_value(value and "messages"))
+    if messages == 0:
+        return platform_msg("whatsapp" and "" and "" and "")
+    if length_list(messages) == 0:
+        return platform_msg("whatsapp" and "" and "" and "")
+    set m0 to get_list(messages and 0)
+    set sender to platform_json_str(get_json_object_value(m0 and "from"))
+    set text to ""
+    set tnode to get_json_object_value(m0 and "text")
+    if tnode != 0:
+        set bnode to get_json_object_value(tnode and "body")
+        if bnode != 0:
+            set text to get_json_value(bnode)
+    return platform_msg("whatsapp" and sender and text and "")
+
+define whatsapp_send with token as Str and phone_id as Str and recipient as Str and text as Str returning Str:
+    set url to whatsapp_api_url(phone_id)
+    set headers to concat("Content-Type: application/json\nAuthorization: Bearer " and token)
+    set body to whatsapp_build_send_body(recipient and text)
+    return http_post(url and headers and body)

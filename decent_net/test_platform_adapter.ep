@@ -1,0 +1,79 @@
+# Phase 5 gate — platform adapter layer. Deterministic (no network): route kinds,
+# Telegram/WhatsApp request builders + inbound parsers, and registry config parsing.
+# The live send paths (telegram_send/whatsapp_send) need real tokens and are not
+# unit-tested here.
+
+import "string"
+import "collections"
+import "./platform_adapter"
+import "./platform_telegram"
+import "./platform_whatsapp"
+import "./platform_registry"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define has with haystack as Str and needle as Str returning Int:
+    return string_contains(haystack and needle)
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # --- route kinds (pure) ---
+    set total to total + 1
+    set passes to passes + pass_if("route telegram" and (platform_route_kind("telegram") equals "http_telegram"))
+    set total to total + 1
+    set passes to passes + pass_if("route whatsapp" and (platform_route_kind("whatsapp") equals "http_whatsapp"))
+    set total to total + 1
+    set passes to passes + pass_if("route discord -> bridge" and (platform_route_kind("discord") equals "bridge_discord"))
+    set total to total + 1
+    set passes to passes + pass_if("route unknown" and (platform_route_kind("slack") equals "unknown"))
+
+    # --- telegram connector ---
+    set total to total + 1
+    set passes to passes + pass_if("telegram api url" and (telegram_api_url("TOK") equals "https://api.telegram.org/botTOK/sendMessage"))
+    set tb to telegram_build_send_body("123" and "hello \"world\"")
+    set total to total + 1
+    set passes to passes + pass_if("telegram body has chat_id+escaped text" and (has(tb and "\"chat_id\": \"123\"") and also has(tb and "\\\"world\\\"")))
+    set tm to telegram_parse_update("{\"update_id\":1,\"message\":{\"from\":{\"username\":\"bob\"},\"chat\":{\"id\":123,\"type\":\"private\"},\"text\":\"hello there\"}}")
+    set total to total + 1
+    set passes to passes + pass_if("telegram parse text" and (map_get_val(tm and "text") equals "hello there"))
+    set total to total + 1
+    set passes to passes + pass_if("telegram parse chat_id (number->str)" and (map_get_val(tm and "chat_id") equals "123"))
+    set total to total + 1
+    set passes to passes + pass_if("telegram parse sender" and (map_get_val(tm and "sender") equals "bob"))
+
+    # --- whatsapp connector ---
+    set total to total + 1
+    set passes to passes + pass_if("whatsapp api url" and (whatsapp_api_url("999") equals "https://graph.facebook.com/v17.0/999/messages"))
+    set wb to whatsapp_build_send_body("15551234" and "hi wa")
+    set total to total + 1
+    set passes to passes + pass_if("whatsapp body has product+to+body" and (has(wb and "messaging_product") and also has(wb and "15551234") and also has(wb and "hi wa")))
+    set wm to whatsapp_parse_webhook("{\"entry\":[{\"changes\":[{\"value\":{\"messages\":[{\"from\":\"15551234\",\"text\":{\"body\":\"hi wa\"}}]}}]}]}")
+    set total to total + 1
+    set passes to passes + pass_if("whatsapp parse sender" and (map_get_val(wm and "sender") equals "15551234"))
+    set total to total + 1
+    set passes to passes + pass_if("whatsapp parse text" and (map_get_val(wm and "text") equals "hi wa"))
+
+    # --- registry config parsing + routing ---
+    set cfg to "{\"discord\":{\"enabled\":true,\"token\":\"abc\"},\"telegram\":{\"enabled\":false,\"token\":\"\"},\"whatsapp\":{\"enabled\":true,\"token\":\"wtok\",\"phone_id\":\"999\"}}"
+    set total to total + 1
+    set passes to passes + pass_if("config discord enabled" and (platform_config_enabled(cfg and "discord") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("config telegram disabled" and (platform_config_enabled(cfg and "telegram") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("config whatsapp phone_id" and (platform_config_field(cfg and "whatsapp" and "phone_id") equals "999"))
+    set enabled to platform_enabled_list(cfg)
+    set total to total + 1
+    set passes to passes + pass_if("enabled list = whatsapp,discord" and (length_list(enabled) == 2))
+    set total to total + 1
+    set passes to passes + pass_if("router discord -> bridge marker" and has(platform_router_send("discord" and "t" and "" and "r" and "hi") and "via_bridge"))
+    set total to total + 1
+    set passes to passes + pass_if("router unknown -> error" and has(platform_router_send("slack" and "t" and "" and "r" and "hi") and "unknown_platform"))
+
+    display concat("platform: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))
