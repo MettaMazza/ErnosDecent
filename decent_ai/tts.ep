@@ -12,13 +12,257 @@ import "collections"
 # ── FFI primitives (resolved at runtime; same as codec.ep / inference.ep) ──
 external define ep_dlopen with lib:
 external define ep_dlsym with handle and name:
+external define ep_dlcall0 with fn:
 external define ep_dlcall1 with fn and a0:
+external define ep_dlcall2 with fn and a0 and a1:
 external define ep_dlcall3 with fn and a0 and a1 and a2:
 external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
+external define ep_dlcall7 with fn and a0 and a1 and a2 and a3 and a4 and a5 and a6:
+external define ep_dlcall8 with fn and a0 and a1 and a2 and a3 and a4 and a5 and a6 and a7:
 external define alloc_bytes with n returning Int:
 external define free_bytes with ptr:
 external define poke_byte with ptr and offset and value:
 external define peek_byte with ptr and offset returning Int:
+
+# ── byte/buffer helpers for FFI marshalling ──
+define tts_peek_ptr_buf with buf as Int and off as Int returning Int:
+    set v to 0
+    set i to 7
+    repeat while i >= 0:
+        set v to v * 256 + peek_byte(buf and off + i)
+        set i to i - 1
+    return v
+
+define tts_poke_i64 with buf as Int and off as Int and val as Int returning Int:
+    set p to val
+    set j to 0
+    repeat while j < 8:
+        set ok to poke_byte(buf and off + j and (p modulo 256))
+        set p to p / 256
+        set j to j + 1
+    return 0
+
+define tts_peek_u32 with buf as Int and off as Int returning Int:
+    return peek_byte(buf and off) + peek_byte(buf and off + 1) * 256 + peek_byte(buf and off + 2) * 65536 + peek_byte(buf and off + 3) * 16777216
+
+define tts_poke_u32 with buf as Int and off as Int and val as Int returning Int:
+    set ok to poke_byte(buf and off and (val modulo 256))
+    set ok to poke_byte(buf and off + 1 and ((val / 256) modulo 256))
+    set ok to poke_byte(buf and off + 2 and ((val / 65536) modulo 256))
+    set ok to poke_byte(buf and off + 3 and ((val / 16777216) modulo 256))
+    return 0
+
+define tts_poke_i16 with buf as Int and off as Int and val as Int returning Int:
+    set v to val
+    if v < 0:
+        set v to v + 65536
+    set ok to poke_byte(buf and off and (v modulo 256))
+    set ok to poke_byte(buf and off + 1 and ((v / 256) modulo 256))
+    return 0
+
+# IEEE-754 float32 bits (a u32) -> fixed-point value*1e6 (from inference.ep).
+define tts_f32_to_fixed with u as Int returning Int:
+    if u == 0:
+        return 0
+    set sign_bit to (u / 2147483648) modulo 2
+    set exp_bits to (u / 8388608) modulo 256
+    set mantissa_bits to u modulo 8388608
+    if exp_bits == 0:
+        return 0
+    if exp_bits == 255:
+        return 0
+    set exponent to exp_bits - 127
+    set scale to 1000000
+    set val to 0
+    if exponent >= 0:
+        set temp to 1
+        set i to 0
+        repeat while i < exponent:
+            set temp to temp * 2
+            set i to i + 1
+        set val to scale * temp + (scale * mantissa_bits * temp) / 8388608
+    else:
+        set temp to 1
+        set i to 0
+        repeat while i < (0 - exponent):
+            set temp to temp * 2
+            set i to i + 1
+        set val to scale / temp + (scale * mantissa_bits) / (8388608 * temp)
+    if sign_bit == 1:
+        return 0 - val
+    return val
+
+define tts_ort_fn with api as Int and idx as Int returning Int:
+    return tts_peek_ptr_buf(api and idx * 8)
+
+# Load bm_fable's style vector for a token sequence of length `token_count`:
+# 256 float32 (1024 bytes) at absolute offset 13060938 + idx*1024 in voices-v1.0.bin
+# (verified: matches numpy bm_fable[idx]). Uses libc fopen/fseek/fread.
+define tts_load_style with token_count as Int returning Int:
+    set idx to token_count
+    if idx > 509:
+        set idx to 509
+    set buf to alloc_bytes(1024)
+    set libc to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    set fp to ep_dlcall2(ep_dlsym(libc and "fopen") and tts_str_to_buf("/Users/mettamazza/.ernosagent/models/voices-v1.0.bin") and tts_str_to_buf("rb"))
+    if fp == 0:
+        return buf
+    set ok to ep_dlcall3(ep_dlsym(libc and "fseek") and fp and (13060938 + idx * 1024) and 0)
+    set rd to ep_dlcall4(ep_dlsym(libc and "fread") and buf and 1 and 1024 and fp)
+    set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
+    return buf
+
+# Synthesize `text` (single chunk) to a 24kHz mono PCM16 WAV at wav_path via the
+# raw kokoro ONNX model. Returns 0 on success, or an error code per stage.
+define tts_speak_chunk with text as Str and wav_path as Str returning Int:
+    set vocab to tts_build_vocab()
+    set phon to tts_phonemize(text)
+    set tokens to tts_tokenize(vocab and phon)
+    set n to length_list(tokens)
+    if n < 3:
+        return 1
+
+    set lib to ep_dlopen("/Users/mettamazza/.ernos/kokoro-venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime.1.24.4.dylib")
+    if lib == 0:
+        return 2
+    set api to ep_dlcall1(tts_peek_ptr_buf(ep_dlcall0(ep_dlsym(lib and "OrtGetApiBase")) and 0) and 24)
+
+    # CreateEnv(level=2, "tts", &env)
+    set env_out to alloc_bytes(8)
+    set st to ep_dlcall3(tts_ort_fn(api and 3) and 2 and tts_str_to_buf("tts") and env_out)
+    set env to tts_peek_ptr_buf(env_out and 0)
+    # CreateSessionOptions(&opts)
+    set opt_out to alloc_bytes(8)
+    set st to ep_dlcall1(tts_ort_fn(api and 10) and opt_out)
+    set opts to tts_peek_ptr_buf(opt_out and 0)
+    # CreateSession(env, model, opts, &session)
+    set sess_out to alloc_bytes(8)
+    set st to ep_dlcall4(tts_ort_fn(api and 7) and env and tts_str_to_buf("/Users/mettamazza/.ernosagent/models/kokoro-v1.0.onnx") and opts and sess_out)
+    if st != 0:
+        return 3
+    set session to tts_peek_ptr_buf(sess_out and 0)
+    # CreateCpuMemoryInfo(OrtDeviceAllocator=0, OrtMemTypeDefault=0, &info)
+    set mem_out to alloc_bytes(8)
+    set st to ep_dlcall3(tts_ort_fn(api and 69) and 0 and 0 and mem_out)
+    set mem_info to tts_peek_ptr_buf(mem_out and 0)
+
+    # tokens tensor int64[1,n]
+    set tok_data to alloc_bytes(n * 8)
+    set i to 0
+    repeat while i < n:
+        set ok to tts_poke_i64(tok_data and i * 8 and get_list(tokens and i))
+        set i to i + 1
+    set tok_shape to alloc_bytes(16)
+    set ok to tts_poke_i64(tok_shape and 0 and 1)
+    set ok to tts_poke_i64(tok_shape and 8 and n)
+    set tok_vout to alloc_bytes(8)
+    set st to ep_dlcall7(tts_ort_fn(api and 49) and mem_info and tok_data and (n * 8) and tok_shape and 2 and 7 and tok_vout)
+    set tok_val to tts_peek_ptr_buf(tok_vout and 0)
+    # style tensor f32[1,256]
+    set style_buf to tts_load_style(n)
+    set style_shape to alloc_bytes(16)
+    set ok to tts_poke_i64(style_shape and 0 and 1)
+    set ok to tts_poke_i64(style_shape and 8 and 256)
+    set style_vout to alloc_bytes(8)
+    set st to ep_dlcall7(tts_ort_fn(api and 49) and mem_info and style_buf and 1024 and style_shape and 2 and 1 and style_vout)
+    set style_val to tts_peek_ptr_buf(style_vout and 0)
+    # speed tensor f32[1] = 1.15 (IEEE bits 0x3F933333, LE)
+    set speed_buf to alloc_bytes(4)
+    set ok to poke_byte(speed_buf and 0 and 51)
+    set ok to poke_byte(speed_buf and 1 and 51)
+    set ok to poke_byte(speed_buf and 2 and 147)
+    set ok to poke_byte(speed_buf and 3 and 63)
+    set speed_shape to alloc_bytes(8)
+    set ok to tts_poke_i64(speed_shape and 0 and 1)
+    set speed_vout to alloc_bytes(8)
+    set st to ep_dlcall7(tts_ort_fn(api and 49) and mem_info and speed_buf and 4 and speed_shape and 1 and 1 and speed_vout)
+    set speed_val to tts_peek_ptr_buf(speed_vout and 0)
+
+    # input/output name + value arrays
+    set in_names to alloc_bytes(24)
+    set ok to tts_poke_i64(in_names and 0 and tts_str_to_buf("tokens"))
+    set ok to tts_poke_i64(in_names and 8 and tts_str_to_buf("style"))
+    set ok to tts_poke_i64(in_names and 16 and tts_str_to_buf("speed"))
+    set in_vals to alloc_bytes(24)
+    set ok to tts_poke_i64(in_vals and 0 and tok_val)
+    set ok to tts_poke_i64(in_vals and 8 and style_val)
+    set ok to tts_poke_i64(in_vals and 16 and speed_val)
+    set out_names to alloc_bytes(8)
+    set ok to tts_poke_i64(out_names and 0 and tts_str_to_buf("audio"))
+    set out_vals to alloc_bytes(8)
+    # Run(session, NULL, in_names, in_vals, 3, out_names, 1, out_vals)
+    set st to ep_dlcall8(tts_ort_fn(api and 9) and session and 0 and in_names and in_vals and 3 and out_names and 1 and out_vals)
+    if st != 0:
+        return 4
+    set audio_val to tts_peek_ptr_buf(out_vals and 0)
+
+    # audio length + data pointer
+    set sinfo_out to alloc_bytes(8)
+    set st to ep_dlcall2(tts_ort_fn(api and 65) and audio_val and sinfo_out)
+    set count_out to alloc_bytes(8)
+    set st to ep_dlcall2(tts_ort_fn(api and 64) and tts_peek_ptr_buf(sinfo_out and 0) and count_out)
+    set audio_len to tts_peek_ptr_buf(count_out and 0)
+    set data_out to alloc_bytes(8)
+    set st to ep_dlcall2(tts_ort_fn(api and 51) and audio_val and data_out)
+    set audio_ptr to tts_peek_ptr_buf(data_out and 0)
+    if audio_len < 1:
+        return 5
+
+    set wr to tts_write_wav_f32(wav_path and audio_ptr and audio_len and 24000)
+    return 0
+
+# Write float32 audio samples (at audio_ptr) as a 24kHz mono PCM16 WAV via libc.
+define tts_write_wav_f32 with path as Str and audio_ptr as Int and n_samples as Int and rate as Int returning Int:
+    set libc to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    set fp to ep_dlcall2(ep_dlsym(libc and "fopen") and tts_str_to_buf(path) and tts_str_to_buf("wb"))
+    if fp == 0:
+        return 1
+    set data_bytes to n_samples * 2
+    set hdr to alloc_bytes(44)
+    set ok to poke_byte(hdr and 0 and 82)
+    set ok to poke_byte(hdr and 1 and 73)
+    set ok to poke_byte(hdr and 2 and 70)
+    set ok to poke_byte(hdr and 3 and 70)
+    set ok to tts_poke_u32(hdr and 4 and (36 + data_bytes))
+    set ok to poke_byte(hdr and 8 and 87)
+    set ok to poke_byte(hdr and 9 and 65)
+    set ok to poke_byte(hdr and 10 and 86)
+    set ok to poke_byte(hdr and 11 and 69)
+    set ok to poke_byte(hdr and 12 and 102)
+    set ok to poke_byte(hdr and 13 and 109)
+    set ok to poke_byte(hdr and 14 and 116)
+    set ok to poke_byte(hdr and 15 and 32)
+    set ok to tts_poke_u32(hdr and 16 and 16)
+    set ok to poke_byte(hdr and 20 and 1)
+    set ok to poke_byte(hdr and 21 and 0)
+    set ok to poke_byte(hdr and 22 and 1)
+    set ok to poke_byte(hdr and 23 and 0)
+    set ok to tts_poke_u32(hdr and 24 and rate)
+    set ok to tts_poke_u32(hdr and 28 and (rate * 2))
+    set ok to poke_byte(hdr and 32 and 2)
+    set ok to poke_byte(hdr and 33 and 0)
+    set ok to poke_byte(hdr and 34 and 16)
+    set ok to poke_byte(hdr and 35 and 0)
+    set ok to poke_byte(hdr and 36 and 100)
+    set ok to poke_byte(hdr and 37 and 97)
+    set ok to poke_byte(hdr and 38 and 116)
+    set ok to poke_byte(hdr and 39 and 97)
+    set ok to tts_poke_u32(hdr and 40 and data_bytes)
+    set wr to ep_dlcall4(ep_dlsym(libc and "fwrite") and hdr and 1 and 44 and fp)
+    set pcm to alloc_bytes(data_bytes)
+    set i to 0
+    repeat while i < n_samples:
+        set fixed to tts_f32_to_fixed(tts_peek_u32(audio_ptr and i * 4))
+        set s16 to (fixed * 32767) / 1000000
+        if s16 > 32767:
+            set s16 to 32767
+        if s16 < (0 - 32768):
+            set s16 to (0 - 32768)
+        set ok to tts_poke_i16(pcm and i * 2 and s16)
+        set i to i + 1
+    set wr to ep_dlcall4(ep_dlsym(libc and "fwrite") and pcm and 1 and data_bytes and fp)
+    set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
+    return 0
 
 # Copy an EP string into a fresh NUL-terminated C buffer; returns its address.
 define tts_str_to_buf with s as Str returning Int:
