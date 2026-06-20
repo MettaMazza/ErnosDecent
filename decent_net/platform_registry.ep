@@ -1,0 +1,65 @@
+# Platform registry + router. Reads the platforms config (which connectors are
+# enabled + their credentials) and dispatches an outbound message to the right
+# connector by name. Config parsing + route selection are pure/testable.
+# Component: decent_net/platform_registry.ep
+
+import "string"
+import "collections"
+import "json"
+import "./platform_adapter"
+import "./platform_telegram"
+import "./platform_whatsapp"
+
+# Is <name> enabled in a platforms.json payload? (enabled: true/false)
+define platform_config_enabled with raw as Str and name as Str returning Int:
+    set root to json_parse(raw)
+    if root == 0:
+        return 0
+    set node to get_json_object_value(root and name)
+    if node == 0:
+        return 0
+    set en to get_json_object_value(node and "enabled")
+    if en == 0:
+        return 0
+    # json.ep parses true->int(1), false->int(0) (tag 1). Tolerate string "true" too.
+    set t to get_json_type(en)
+    if t == 1:
+        return get_json_value(en)
+    if t == 2:
+        if get_json_value(en) equals "true":
+            return 1
+    return 0
+
+# A platform field (token / phone_id / channel) from a platforms.json payload.
+define platform_config_field with raw as Str and name as Str and field as Str returning Str:
+    set root to json_parse(raw)
+    if root == 0:
+        return ""
+    set node to get_json_object_value(root and name)
+    if node == 0:
+        return ""
+    return platform_json_str(get_json_object_value(node and field))
+
+# Names of enabled platforms (telegram/whatsapp/discord), in a stable order.
+define platform_enabled_list with raw as Str returning List:
+    set out to create_list()
+    if platform_config_enabled(raw and "telegram") == 1:
+        set ok to append_list(out and "telegram")
+    if platform_config_enabled(raw and "whatsapp") == 1:
+        set ok to append_list(out and "whatsapp")
+    if platform_config_enabled(raw and "discord") == 1:
+        set ok to append_list(out and "discord")
+    return out
+
+# Dispatch an outbound message to the connector for <name>. `extra` carries the
+# secondary id a platform needs (WhatsApp phone_id); ignored otherwise. Discord
+# routes via the bridge (node->bridge RPC pending) rather than a direct HTTP send.
+define platform_router_send with name as Str and token as Str and extra as Str and recipient as Str and text as Str returning Str:
+    set kind to platform_route_kind(name)
+    if kind equals "http_telegram":
+        return telegram_send(token and recipient and text)
+    if kind equals "http_whatsapp":
+        return whatsapp_send(token and extra and recipient and text)
+    if kind equals "bridge_discord":
+        return "platform:discord_routes_via_bridge"
+    return concat("platform:error,unknown_platform," and name)

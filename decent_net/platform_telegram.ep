@@ -1,0 +1,50 @@
+# Telegram Bot API connector. Request-body building + update parsing are pure and
+# testable; the network send is a thin wrapper over stdlib/http.
+# Component: decent_net/platform_telegram.ep
+
+import "string"
+import "collections"
+import "json"
+import "../stdlib/http"
+import "./platform_adapter"
+
+define telegram_api_url with token as Str returning Str:
+    return concat("https://api.telegram.org/bot" and concat(token and "/sendMessage"))
+
+define telegram_build_send_body with chat_id as Str and text as Str returning Str:
+    set body to "{\"chat_id\": \""
+    set body to concat(body and platform_json_escape(chat_id))
+    set body to concat(body and "\", \"text\": \"")
+    set body to concat(body and platform_json_escape(text))
+    set body to concat(body and "\"}")
+    return body
+
+# Parse a Telegram getUpdates/webhook update into the normalised message shape.
+define telegram_parse_update with raw as Str returning Map:
+    set root to json_parse(raw)
+    if root == 0:
+        return platform_msg("telegram" and "" and "" and "")
+    set message to get_json_object_value(root and "message")
+    if message == 0:
+        return platform_msg("telegram" and "" and "" and "")
+    set text_node to get_json_object_value(message and "text")
+    set text to ""
+    if text_node != 0:
+        set text to get_json_value(text_node)
+    set chat to get_json_object_value(message and "chat")
+    set chat_id to ""
+    if chat != 0:
+        set chat_id to platform_json_str(get_json_object_value(chat and "id"))
+    set sender to ""
+    set from_node to get_json_object_value(message and "from")
+    if from_node != 0:
+        set uname to get_json_object_value(from_node and "username")
+        if uname != 0:
+            set sender to get_json_value(uname)
+    return platform_msg("telegram" and sender and text and chat_id)
+
+define telegram_send with token as Str and chat_id as Str and text as Str returning Str:
+    set url to telegram_api_url(token)
+    set headers to "Content-Type: application/json"
+    set body to telegram_build_send_body(chat_id and text)
+    return http_post(url and headers and body)

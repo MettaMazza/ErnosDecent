@@ -1,0 +1,69 @@
+# Pluggable platform adapter layer — a common interface so the agent can receive
+# from and send to many chat platforms (Discord, Telegram, WhatsApp, custom) behind
+# one shape. Connectors (platform_telegram.ep, platform_whatsapp.ep) implement the
+# request-building + parsing; the registry/router dispatches by platform name.
+# Component: decent_net/platform_adapter.ep
+
+import "string"
+import "collections"
+import "json"
+
+# Normalised inbound message shape shared by every connector.
+define platform_msg with platform as Str and sender as Str and text as Str and chat_id as Str returning Map:
+    set m to create_map()
+    set ok to map_insert(m and "platform" and platform)
+    set ok to map_insert(m and "sender" and sender)
+    set ok to map_insert(m and "text" and text)
+    set ok to map_insert(m and "chat_id" and chat_id)
+    return m
+
+# Minimal JSON string escape (shared by the connectors' body builders).
+define platform_json_escape with s as Str returning Str:
+    set out to ""
+    set n to string_length(s)
+    set i to 0
+    repeat while i < n:
+        set c to get_character(s and i)
+        if c == 92:
+            set out to concat(out and "\\\\")
+        else:
+            if c == 34:
+                set out to concat(out and "\\\"")
+            else:
+                if c == 10:
+                    set out to concat(out and "\\n")
+                else:
+                    if c == 13:
+                        set out to concat(out and "\\r")
+                    else:
+                        if c == 9:
+                            set out to concat(out and "\\t")
+                        else:
+                            set out to concat(out and substring(s and i and 1))
+        set i to i + 1
+    return out
+
+# Read a JSON value as a string regardless of whether it parsed as a string or a
+# number (chat ids arrive as either). Returns "" for absent/object/array.
+define platform_json_str with node as Int returning Str:
+    if node == 0:
+        return ""
+    # json.ep type tags are ints: 1=int/number (and bools), 2=string, 3=array, 4=object.
+    set t to get_json_type(node)
+    if t == 1:
+        return int_to_string(get_json_value(node))
+    if t == 2:
+        return get_json_value(node)
+    return ""
+
+# Route kind for a platform name — pure, so routing is testable without network.
+# "http_telegram" / "http_whatsapp" send directly; "bridge_discord" must go via the
+# Discord bridge (node->bridge RPC, pending); "unknown" otherwise.
+define platform_route_kind with name as Str returning Str:
+    if name equals "telegram":
+        return "http_telegram"
+    if name equals "whatsapp":
+        return "http_whatsapp"
+    if name equals "discord":
+        return "bridge_discord"
+    return "unknown"
