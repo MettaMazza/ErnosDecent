@@ -1673,8 +1673,118 @@ define ipc_server_loop with listen_fd as Int and borrow raft_node as Map and bor
     return 0
 
 # ================================================================
-# Bootstrap -- connect to a seed peer for multi-node operation
+# Bootstrap -- distributed, no single point of failure
+#
+# A brand-new node has no peers, so it needs at least one reachable contact to enter
+# the mesh. We deliberately do NOT depend on a single seed host:
+#   1. ernos_default_seeds() is a SMALL LIST of well-known entry points (add more over
+#      time so no one of them is load-bearing).
+#   2. Every node REMEMBERS the peers it discovers (peers.txt) and tries those FIRST on
+#      the next launch — so once the mesh has a handful of members it self-sustains
+#      even if every original seed goes offline. The default list is only training
+#      wheels for a node's first-ever connection.
+# Every node is a HOST BY DEFAULT: it always runs the P2P/DHT/relay servers (so it can
+# seed others) AND auto-bootstraps to join — no flag required. Resolution order:
+# explicit --seed/config > remembered peers > default seeds. A node that reaches nobody
+# simply becomes the root others join. --solo forces pure standalone; the root seed
+# skips its own address via config network.public_host.
 # ================================================================
+
+# Well-known default entry points, "host:port" (DHT port). A DNS hostname is fine —
+# ep_net_connect resolves names — and is preferred so a seed survives IP changes.
+# REPLACE the placeholder with your real seed(s); add as many independent, reliably
+# reachable nodes as you can so the network never leans on a single host.
+define ernos_default_seeds returning List:
+    set seeds to create_list()
+    set ok to append_list(seeds and "seed.REPLACE-ME.example:9101")
+    return seeds
+
+# Where a node remembers good peers between launches.
+define peers_cache_path returning Str:
+    return concat(storage_get_default_dir() and "/peers.txt")
+
+# Load remembered "host:port" peers (one per line) from the previous run.
+define peers_cache_load returning List:
+    set out to create_list()
+    set p to peers_cache_path()
+    if file_exists(p) == 0:
+        return out
+    set data to read_file(p)
+    set n to string_length(data)
+    set line to ""
+    set i to 0
+    repeat while i < n:
+        if get_character(data and i) == 10:
+            set t to string_trim(line)
+            if string_length(t) > 0:
+                set ok to append_list(out and t)
+            set line to ""
+        else:
+            set line to concat(line and substring(data and i and 1))
+        set i to i + 1
+    set t to string_trim(line)
+    if string_length(t) > 0:
+        set ok to append_list(out and t)
+    return out
+
+# Persist up to 64 de-duplicated "host:port" peers for the next launch.
+define peers_cache_save with entries as List returning Int:
+    set out to ""
+    set seen to create_map()
+    set n to length_list(entries)
+    set i to 0
+    set cnt to 0
+    repeat while i < n and also cnt < 64:
+        set e to string_trim(get_list(entries and i))
+        if string_length(e) > 0:
+            if map_contains(seen and e) == 0:
+                set ok to map_insert(seen and e and 1)
+                set out to concat(out and concat(e and "\n"))
+                set cnt to cnt + 1
+        set i to i + 1
+    free_map(seen)
+    set ok to write_file(peers_cache_path() and out)
+    return cnt
+
+# Try a list of "host:port" candidates until one DHT-bootstraps successfully. Returns
+# the bootstrap_to_seed result of the first that connects (connected=1), else a result
+# with connected=0. On success, seed_addr/seed_port of the winner are placed under
+# "host"/"port" in the returned map so the caller can adopt them.
+define auto_bootstrap with candidates as List and dht_node as Int and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int returning Map:
+    set out to create_map()
+    set ok to map_insert(out and "connected" and 0)
+    set nc to length_list(candidates)
+    display f"[*] Auto-bootstrap: trying {nc} known peer(s)/seed(s)..."
+    set ci to 0
+    repeat while ci < nc:
+        set cand to string_trim(get_list(candidates and ci))
+        set colon to string_last_index_of(cand and ":")
+        if colon > 0:
+            set chost to substring(cand and 0 and colon)
+            set cport to string_to_int(substring(cand and colon + 1 and string_length(cand) - colon - 1))
+            if cport > 0:
+                set br to bootstrap_to_seed(chost and cport and dht_node and raft_node and peers and node_id and pub_hex and raft_port)
+                if map_get_val(br and "connected") == 1:
+                    set ok to map_insert(br and "host" and chost)
+                    set ok to map_insert(br and "port" and cport)
+                    return br
+                free_map(br)
+        set ci to ci + 1
+    return out
+
+# Is the "host:port" candidate our OWN node? Every node is a host that may appear in
+# the default-seed list, so the mesh root must not bootstrap to itself. Matches
+# loopback and the node's own advertised name (config network.public_host).
+define bootstrap_is_self with cand as Str and self_host as Str returning Int:
+    set colon to string_last_index_of(cand and ":")
+    set h to cand
+    if colon > 0:
+        set h to substring(cand and 0 and colon)
+    if h equals "127.0.0.1" or else h equals "localhost":
+        return 1
+    if string_length(self_host) > 0 and also h equals self_host:
+        return 1
+    return 0
 
 define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node as Int and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int returning Map:
     display f"[*] Bootstrapping to seed peer {seed_addr}:{seed_port}..."
@@ -1682,33 +1792,40 @@ define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node
 
     set result to create_map()
     set ok to map_insert(result and "connected" and 0)
+    # "discovered" collects reachable "host:port" peers (the seed + any it returns) so
+    # the caller can persist them for future launches (distributed bootstrap).
+    set discovered to create_list()
+    set ok to map_insert(result and "discovered" and discovered)
 
-    # DHT bootstrap - ping the seed's DHT port
+    # DHT bootstrap - ping the seed's DHT port. If it does NOT answer, this seed is
+    # unreachable: report connected=0 and let the caller try the next candidate.
     set ping_err to dht_rpc_ping(dht_node and seed_addr and seed_port)
-    if ping_err == 0:
-        display f"[+] DHT bootstrap: seed peer responded (PONG)"
-        log_info("node" and "DHT bootstrap successful - peer added to routing table")
-        # Also do a FIND_NODE for our own ID to discover more peers
-        set find_result to dht_rpc_find_node(dht_node and seed_addr and seed_port and node_id)
-        set find_err to map_get_val(find_result and "error")
-        if find_err == 0:
-            set found_nodes to map_get_val(find_result and "nodes")
-            set found_count to length_list(found_nodes)
-            display f"[+] DHT bootstrap: discovered {found_count} additional peer(s)"
-            set fi to 0
-            repeat while fi < found_count:
-                set node_entry to get_list(found_nodes and fi)
-                set peer_id to ptr_to_str(map_get_val(node_entry and "id"))
-                set peer_addr to ptr_to_str(map_get_val(node_entry and "address"))
-                set peer_port to map_get_val(node_entry and "port")
-                set ok to dht_node_add_peer(dht_node and peer_id and peer_addr and peer_port)
-                set fi to fi + 1
-        free_map(find_result)
-    else:
+    if ping_err != 0:
         display f"[-] DHT bootstrap: seed peer did not respond (err:{ping_err})"
         log_info("node" and f"DHT bootstrap failed - seed {seed_addr}:{seed_port} unreachable")
+        return result
+    display f"[+] DHT bootstrap: seed peer responded (PONG)"
+    log_info("node" and "DHT bootstrap successful - peer added to routing table")
+    set ok to append_list(discovered and concat(seed_addr and concat(":" and int_to_string(seed_port))))
+    # Also do a FIND_NODE for our own ID to discover more peers
+    set find_result to dht_rpc_find_node(dht_node and seed_addr and seed_port and node_id)
+    set find_err to map_get_val(find_result and "error")
+    if find_err == 0:
+        set found_nodes to map_get_val(find_result and "nodes")
+        set found_count to length_list(found_nodes)
+        display f"[+] DHT bootstrap: discovered {found_count} additional peer(s)"
+        set fi to 0
+        repeat while fi < found_count:
+            set node_entry to get_list(found_nodes and fi)
+            set peer_id to ptr_to_str(map_get_val(node_entry and "id"))
+            set peer_addr to ptr_to_str(map_get_val(node_entry and "address"))
+            set peer_port to map_get_val(node_entry and "port")
+            set ok to dht_node_add_peer(dht_node and peer_id and peer_addr and peer_port)
+            set ok to append_list(discovered and concat(peer_addr and concat(":" and int_to_string(peer_port))))
+            set fi to fi + 1
+    free_map(find_result)
 
-    # Raft peer setup - add seed as a consensus peer
+    # Raft peer setup - add seed as a consensus peer (only now that it is reachable)
     set seed_peer_id to concat("node@" and seed_addr)
     set ok to append_list(peers and seed_peer_id)
     set peer_addresses to create_map()
@@ -1752,6 +1869,7 @@ define main:
     set cli_seed_port to 0
     set cli_base_port to 0
     set cli_is_host to 0
+    set cli_solo to 0
     set argc to get_argument_count()
     set argi to 1
     repeat while argi < argc:
@@ -1772,10 +1890,13 @@ define main:
             if arg equals "--host":
                 set cli_is_host to 1
             else:
-                if arg equals "--port":
-                    set argi to argi + 1
-                    if argi < argc:
-                        set cli_base_port to string_to_int(get_argument(argi))
+                if arg equals "--solo":
+                    set cli_solo to 1
+                else:
+                    if arg equals "--port":
+                        set argi to argi + 1
+                        if argi < argc:
+                            set cli_base_port to string_to_int(get_argument(argi))
         set argi to argi + 1
 
     # 0b. Initialize Logging
@@ -2019,18 +2140,57 @@ define main:
     set ok to onion_publish_self(cast_map_to_int(dht_node) and node_id and onion_ip and p2p_port and onion_enc_pub)
     log_info("node" and "Onion relay descriptor published to DHT.")
 
-    # 12. Bootstrap to seed peer if configured
+    # 12. Join the mesh. Every node is a HOST BY DEFAULT — it always runs the P2P/DHT/
+    # relay servers AND auto-bootstraps to join. No flag needed. Order: explicit
+    # --seed/config > remembered peers > default seeds. A node that reaches nobody just
+    # becomes the root others join. Only --solo forces pure standalone. The root seed
+    # skips bootstrapping to its own advertised address (config network.public_host).
     set has_seed to 0
     set boot_result to create_map()
+    set self_host to config_get_str(cfg and "network.public_host")
     if string_length(seed_addr) > 0:
+        # Explicit seed from --seed or config.network.seed_addr (operator override).
         if seed_port > 0:
             set boot_result to bootstrap_to_seed(seed_addr and seed_port and dht_node and borrow raft_node and peers and node_id and pub_hex and raft_port)
             set has_seed to map_get_val(boot_result and "connected")
+            if has_seed == 1:
+                set sv to peers_cache_save(map_get_val(boot_result and "discovered"))
         else:
             display "[*] Seed address configured but no port - running standalone."
     else:
-        display "[*] No seed peer configured. Running as standalone node."
-        log_info("node" and "No seed peer - standalone mode")
+        if cli_solo == 1:
+            display "[*] --solo: standalone node, not joining the mesh."
+            log_info("node" and "Solo node - no outbound bootstrap")
+        else:
+            # Remembered peers FIRST, then default seeds; drop any that are us.
+            set raw_cands to peers_cache_load()
+            set defs to ernos_default_seeds()
+            set di to 0
+            repeat while di < length_list(defs):
+                set ok to append_list(raw_cands and get_list(defs and di))
+                set di to di + 1
+            set candidates to create_list()
+            set ri to 0
+            repeat while ri < length_list(raw_cands):
+                set cand to string_trim(get_list(raw_cands and ri))
+                if string_length(cand) > 0 and also bootstrap_is_self(cand and self_host) == 0:
+                    set ok to append_list(candidates and cand)
+                set ri to ri + 1
+            if length_list(candidates) == 0:
+                display "[*] No external seeds configured — this node is the mesh root."
+                log_info("node" and "No non-self candidates - root node")
+            else:
+                set boot_result to auto_bootstrap(candidates and dht_node and borrow raft_node and peers and node_id and pub_hex and raft_port)
+                set has_seed to map_get_val(boot_result and "connected")
+                if has_seed == 1:
+                    set seed_addr to ptr_to_str(map_get_val(boot_result and "host"))
+                    set seed_port to map_get_val(boot_result and "port")
+                    set sv to peers_cache_save(map_get_val(boot_result and "discovered"))
+                    display f"[+] Joined the mesh via {seed_addr}:{seed_port}; remembered {sv} peer(s) for next launch."
+                    log_info("node" and f"Auto-bootstrapped via {seed_addr}:{seed_port}")
+                else:
+                    display "[*] No peers or seeds reachable - this node is the mesh root."
+                    log_info("node" and "Auto-bootstrap found no reachable peers - root")
 
     # 12b. Start the Raft consensus engine for real (F1). Previously raft_node was
     # created but neither the server nor the election timer thread was ever spawned —
