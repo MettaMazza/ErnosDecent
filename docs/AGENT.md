@@ -257,7 +257,8 @@ ernosdecent/
 │   ├── embeddings.ep    # Cosine-similarity vector calculations
 │   ├── inference.ep     # GGUF parser & fixed-point transformer
 │   ├── models.ep        # Model verification & registry
-│   └── speech.ep        # Speech-to-text CTC audio transcriber
+│   ├── speech.ep        # Speech-to-text (whisper.cpp backend)
+│   └── tts.ep           # Kokoro text-to-speech (espeak-ng + onnxruntime FFI → WAV)
 ├── decent_agent/        # Cognitive Agent Subsystems
 │   ├── memory.ep        # 7-Tier Hebbian memory concept graph
 │   ├── observer.ep      # Quality auditor and filter gate

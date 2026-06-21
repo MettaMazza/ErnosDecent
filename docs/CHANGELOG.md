@@ -7,14 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] - 2026-06-21
+
+Verified on the `agent-parity` branch. The stack now spans **17 subsystems**, ~103 source
+modules (~30,300 source code-lines plus ~12,700 test lines across 94 test files). Each subsystem
+ships its own test suite; the node builds with `bash build.sh` and boots, and the core paths are
+verified.
+
+### Added
+
+- **Kokoro text-to-speech** (`decent_ai/tts.ep`) — local neural voice via FFI: text → IPA
+  phonemes (libespeak-ng) → vocab tokens → onnxruntime → 24 kHz audio → PCM16 WAV. A 🔊 button
+  appears on AI messages in the Web UI and Discord; node exposes a `TTS SPEAK` IPC verb and the
+  Web UI a `tts_request` WebSocket route. AI is now speech-to-text **and** text-to-speech (was STT
+  only). Verified end-to-end this session (Web UI 🔊 confirmed; Discord button wired but not
+  bot-connected live).
+- **Agent-parity Phases 1–6** (in `decent_agent/`, gated):
+  - 9-tool surface with a guarded tool executor.
+  - Memory tiers: knowledge graph (Hebbian), procedural memory (adapter version manifest),
+    and a consolidation/"sleep" sweep.
+  - Observer split: `observer_rules.ep` / `observer_parser.ep` / `observer_audit.ep` (fail-closed
+    LLM audit, default verdict BLOCKED) plus a deterministic moderation classifier.
+  - Providers + model registry/router (OpenAI-compatible and Hugging Face adapters; pure,
+    deterministic selection).
+  - Platform adapters (Discord bridge; Telegram/WhatsApp registry) and a node↔bridge RPC channel
+    (`bridge_poll` / `bridge_submit_result`).
+  - Fixed-point learning payoff (Phase 6 proves the training math is real).
+  - **Partial:** the full recursive self-improvement loop (SAE interpretability, steering vectors,
+    LoRA training-and-promotion) is not yet at parity with the original ErnosAgent.
+- **GitDec** — a decentralised, in-repo issue/PR tracker. Repositories live on local disk; manifests,
+  pushes, issues, and PRs sync over Nostr relays (event kinds 20020–20023); access enforced by
+  Ed25519 signatures against per-repo collaborator DIDs. Create/clone/comment/close and collaborator
+  roles work, including escaping and id-collision fixes.
+- **Business edition** — exists on the public `business` branch as a cosmetic overlay (prompt /
+  persona / branding via `decent_agent/edition.ep`). Default is byte-identical to the standard node;
+  the edition cannot disable P2P/DHT/relay, so a business node is always a full mesh node (AGPL +
+  anti-capture). Not present on `main`/`agent-parity`.
+
+### Known limitations
+
+- Production QUIC transport and real STUN/TURN NAT traversal are post-1.0; the transport degrades
+  under repeated short-lived connections (onion lookups can work once then fall back).
+- Platforms: macOS + Linux native; Windows via WSL2. Mobile clients and the plugin system are not
+  started.
+- The build can ship a stale binary if `node.ep` fails its whole-program type-check — confirm new
+  symbols are present in the fresh binary.
+
+---
+
 ## [1.0.0-beta] - 2026-05-29
 
-**The first public release of ErnosDecent.** This release represents the completion of the full decentralised internet stack — 15 build phases, 16 subsystems, 48 source modules, 20 integration test suites, and 191 passing tests.
+**The first public release of ErnosDecent.** This release represents the completion of the full decentralised internet stack across identity, networking, storage, messaging, social, naming, hosting, finance, AI, media, privacy, search, resource pooling, consensus, CLI, and web UI. (See the 2026-06-21 entry above for the current, verified subsystem and module counts.)
 
 ### Highlights
 
-- **48 production source modules** implementing identity, networking, storage, messaging, social, naming, hosting, finance, AI, media, privacy, search, resource pooling, consensus, CLI, and web UI
-- **191/191 integration tests** passing across all subsystems
+- **Production source modules** implementing identity, networking, storage, messaging, social, naming, hosting, finance, AI, media, privacy, search, resource pooling, consensus, CLI, and web UI
+- **Per-subsystem integration test suites** across all subsystems
 - **Sovereign Node Daemon** (`node.ep`) — single binary coordinating all subsystems
 - **Glassmorphic Web Dashboard** (`decent_web/`) — real-time telemetry, wallet, DEX, CDN, and AI playground
 - **CLI Control Client** (`decent_cli/`) — local IPC command interface for daemon management
@@ -45,7 +93,7 @@ decent_web    → Web UI (glassmorphic dashboard, HTTP/WebSocket server)
 
 ## [0.5.0-research] - 2026-05-29
 
-This release completes Phase 15 (Sovereign Dashboard App & UI Integration), concluding the ErnosDecent project interface stack. It adds a premium glassmorphic Single-Page Application (SPA) dashboard served natively by the node daemon, bringing the total to 48 modules with 191 passing integration tests/verifications.
+This release completes Phase 15 (Sovereign Dashboard App & UI Integration), concluding the ErnosDecent project interface stack. It adds a premium glassmorphic Single-Page Application (SPA) dashboard served natively by the node daemon. (See the 2026-06-21 entry above for the current, verified module and test-file counts.)
 
 ### Added
 

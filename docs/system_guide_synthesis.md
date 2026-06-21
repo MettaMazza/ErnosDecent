@@ -1,6 +1,6 @@
 # ErnosDecent System Guide Synthesis
 
-This document provides a comprehensive technical guide to the ErnosDecent decentralized codebase, detailing the purpose, operational flows, database/persistence schemas, APIs, and key mathematical formulas and algorithms for all 8 core subsystems.
+This document provides a comprehensive technical guide to the ErnosDecent decentralized codebase, detailing the purpose, operational flows, database/persistence schemas, APIs, and key mathematical formulas and algorithms for a selection of the core subsystems. (ErnosDecent comprises 17 subsystems in total; this synthesis covers the nine detailed below. For TTS and the wider AI/agent surface, see the AI guide and `book/notes/system-bible.md`.)
 
 ---
 
@@ -220,7 +220,9 @@ Provides distributed domain name mapping for `.decent` TLD domains to DIDs. Name
 ## 7. decent_agent (AI Coordinator & Hebbian Memory)
 
 ### Core Purpose & Operational Flow
-Runs an AI agent execution coordinator loop implementing the **ReAct (Reasoning and Acting)** framework. Memory is split into tiers: scratchpad (short-term), lessons (long-term semantic), and timeline (episodic log). Synaptic connections between core conceptual namespaces are updated dynamically via Hebbian learning. It also features a 3D Turing Grid tape for system actions.
+Runs an AI agent execution coordinator loop implementing the **ReAct (Reasoning and Acting)** framework. Memory is split into tiers: scratchpad (short-term), lessons (long-term semantic), timeline (episodic log), and a Hebbian knowledge graph; a consolidation/"sleep" sweep synthesises and prunes. Synaptic connections between core conceptual namespaces are updated dynamically via Hebbian learning. It also features a 3D Turing Grid tape for system actions.
+
+Agent-parity (Phases 1–6, gated) adds: a **9-tool** surface with a guarded executor; **procedural memory** (an adapter version manifest with promote/rollback); an **observer split** — `observer_rules.ep` / `observer_parser.ep` / `observer_audit.ep`, a fail-closed LLM audit gate (default verdict BLOCKED) for dangerous tools, plus a deterministic moderation classifier; **providers + a model registry/router** (OpenAI-compatible and Hugging Face adapters with pure, deterministic selection); and **platform bridges** (Discord; Telegram/WhatsApp registry) over a node↔bridge RPC channel (`bridge_poll` / `bridge_submit_result`). The full recursive self-improvement loop (SAE interpretability, steering vectors, LoRA training-and-promotion) is **partial** — Phase 6 proves the fixed-point training math, but parity with the original ErnosAgent is not reached.
 
 ```mermaid
 graph TD
