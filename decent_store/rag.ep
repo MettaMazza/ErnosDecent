@@ -144,23 +144,31 @@ define rag_float_sqrt with x as Float returning Float:
 # integer — the 1e6 factor cancels in the cosine ratio, leaving the true cosine.
 define rag_parse_embedding with arr_str as Str returning List:
     set out to create_list()
-    set n to string_length(arr_str)
-    set tok to ""
+    # O(n) parse. The previous version walked the string char-by-char with
+    # get_character(); that builtin strlen()s the whole string on EVERY call, so the
+    # loop was O(n^2) per embedding. At 434 chunks x 768 dims (~7.6 KB each) that is
+    # ~25 billion ops -> a multi-minute IPC hang the moment a large doc is searched.
+    # Split once (single C-level pass) and convert the short tokens instead.
+    set s to string_trim(arr_str)
+    set n to string_length(s)
+    set lo to 0
+    set hi to n
+    if n > 0 and also get_character(s and 0) == 91:
+        set lo to 1
+    if hi > lo and also get_character(s and (hi - 1)) == 93:
+        set hi to hi - 1
+    if hi > lo:
+        set s to substring(s and lo and hi - lo)
+    else:
+        set s to ""
+    set parts to string_split(s and ",")
+    set np to length_list(parts)
     set i to 0
-    repeat while i < n:
-        set c to get_character(arr_str and i)
-        if c == 91 or else c == 93 or else c == 32:
-            set i to i + 1
-        else if c == 44:
-            if string_length(tok) > 0:
-                set ok to append_list(out and rag_token_to_fixed(tok))
-                set tok to ""
-            set i to i + 1
-        else:
-            set tok to concat(tok and substring(arr_str and i and 1))
-            set i to i + 1
-    if string_length(tok) > 0:
-        set ok to append_list(out and rag_token_to_float(tok) * 1000000.0)
+    repeat while i < np:
+        set tok to string_trim(ptr_to_str(get_list(parts and i)))
+        if string_length(tok) > 0:
+            set ok to append_list(out and rag_token_to_fixed(tok))
+        set i to i + 1
     return out
 
 # Extract the raw "embedding":[ ... ] array (as a string) from an Ollama reply.
