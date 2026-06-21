@@ -15,7 +15,7 @@
 [![Version](https://img.shields.io/badge/version-v1.0.0--beta-8B5CF6?style=for-the-badge)](https://github.com/MettaMazza/ErnosDecent/releases)
 [![Language](https://img.shields.io/badge/language-Ernos%20(.ep)-A855F7?style=for-the-badge)](https://github.com/MettaMazza/Ernos-Programming-Language)
 [![Backend](https://img.shields.io/badge/backend-Clang%20Native-EF4444?style=for-the-badge)]()
-[![Tests](https://img.shields.io/badge/tests-191%2F191%20passing-10B981?style=for-the-badge)]()
+[![Subsystems](https://img.shields.io/badge/subsystems-17-10B981?style=for-the-badge)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0-3B82F6?style=for-the-badge)](LICENSE)
 
 ---
@@ -42,7 +42,7 @@ Every service on the current internet requires you to trust a third party with y
 
 ### Current state
 
-**v1.0.0-beta.** The core architecture is implemented and verified across 15 build phases. 48 source modules and 20 integration test suites produce **191 passing tests** across 16 subsystems. The code compiles and runs. It is served with a local control CLI client and a premium glassmorphic Web UI dashboard.
+**v1.0.0-beta.** The core architecture is implemented and verified. **17 subsystems** comprise roughly **103 source modules** (~30,300 source code-lines plus ~12,700 test lines). Each subsystem ships its own test suite (**94 test files** in total); the node builds with `bash build.sh` and boots, and the core paths are verified. It is served with a local control CLI client and a premium glassmorphic Web UI dashboard.
 
 ---
 
@@ -57,7 +57,9 @@ Every service on the current internet requires you to trust a third party with y
 | 📢 **Federated social publishing** — Nostr + ActivityPub | Twitter/X, Instagram, Facebook |
 | 🏠 **Self-hosted services** — HTTP, email, Git, DNS | GitHub, Gmail, GoDaddy |
 | 💰 **Native financial system** — HD wallets, UTXO ledger, DEX, smart contracts | Ethereum, Coinbase, PayPal |
-| 🤖 **Local AI inference** — GGUF transformer, embeddings, speech-to-text | OpenAI, Anthropic, Google Cloud AI |
+| 🤖 **Local AI** — GGUF transformer, embeddings, speech-to-text, **Kokoro text-to-speech** (🔊 local neural voice) | OpenAI, Anthropic, Google Cloud AI |
+| 🧠 **Sovereign agent** — ReAct loop, 9 tools, tiered/Hebbian memory, fail-closed observer gate, model router, platform bridges | Cloud agent platforms |
+| 🗂️ **GitDec** — decentralised in-repo issue/PR tracker over Nostr | GitHub Issues/PRs |
 | 📡 **P2P media streaming** — WebRTC, adaptive HLS, codec layer, CDN | YouTube, Twitch, Zoom |
 | 🕵️ **Anonymity layer** — onion routing, mix networks | Tor (external), VPNs |
 | 🔍 **Decentralised search** — crawler, BM25 + PageRank ranking | Google Search |
@@ -147,7 +149,7 @@ bash test_multinode_live.sh
 
 ## Architecture
  
-ErnosDecent is organised into 16 subsystems, each in its own directory. Every `.ep` file is a self-contained module compiled to a native binary.
+ErnosDecent is organised into 17 subsystems, each in its own directory. Every `.ep` file is a self-contained module compiled to a native binary.
  
 ```
 ErnosDecent/
@@ -159,8 +161,8 @@ ErnosDecent/
 ├── decent_name/       Naming — decentralised DNS, .ernos TLD registry
 ├── decent_host/       Hosting — HTTP server, static content, SMTP, Git
 ├── decent_money/      Finance — HD wallets, UTXO ledger, tokens, NFTs, DEX, smart contracts
-├── decent_ai/         AI — GGUF model parser, transformer inference, embeddings, speech-to-text
-├── decent_agent/      Cognitive Agent — prompt context builder, ReAct loop, Hebbian memory graph, Turing grid workspace, quality gate observer
+├── decent_ai/         AI — GGUF inference, embeddings, speech-to-text, Kokoro text-to-speech
+├── decent_agent/      Cognitive Agent — ReAct loop, 9-tool surface, tiered/Hebbian memory, Turing grid, observer gate, model router, platform bridges
 ├── decent_media/      Media — WebRTC, adaptive streaming, codecs, P2P CDN
 ├── decent_anon/       Privacy — onion routing, mixnet traffic analysis resistance
 ├── decent_search/     Search — distributed crawler, BM25 & PageRank ranking engine, query merge
@@ -227,7 +229,7 @@ ErnosDecent/
 | `mem.ep` | Raw C heap memory allocator wrappers (`calloc`/`free`/`memset`) for libsodium FFI. |
 | `sodium_ffi.ep` | Low-level libsodium FFI function pointer bridge logic. |
 
-**Tests:** 41/41 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -244,7 +246,7 @@ ErnosDecent/
 | `relay_transport.ep` | Encrypted relay data framing and multi-hop transport circuits. |
 | `security.ep` | Core security gate enforcing IP rate limits, ban timers, and query argument validators. |
 
-**Tests:** 39/39 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -255,7 +257,7 @@ ErnosDecent/
 | `content.ep` | Content-addressed storage engine. BLAKE3 hashing, deduplication, SQLite-backed chunk storage, garbage collection, CAR archive export/import, Merkle tree generation. |
 | `crdt.ep` | Conflict-free Replicated Data Types. G-Counter, PN-Counter, LWW-Register, OR-Set, MV-Register — deterministic merging for eventual consistency. |
 
-**Tests:** 28/28 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -266,7 +268,7 @@ ErnosDecent/
 | `message.ep` | E2E encrypted direct messaging. Message signing/verification, body encryption/decryption, conversation histories with unread tracking and pagination. |
 | `channel.ep` | Group messaging with secure membership. Channel creation, member management, group symmetric encryption, key distribution envelopes. |
 
-**Tests:** 23/23 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -279,7 +281,7 @@ ErnosDecent/
 | `feed.ep` | Unified feed aggregation normalising Nostr events and ActivityPub activities into chronological order. |
 | `publish.ep` | Multi-protocol broadcasting to target feeds with publisher follow flows. |
 
-**Tests:** 8/8 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -301,7 +303,7 @@ ErnosDecent/
 | `email.ep` | SMTP/IMAP protocol hosting. Maps email addresses to DIDs and cryptographically verifies signatures. |
 | `git.ep` | Secure P2P git repository hosting. Authorizes collaborator roles and verifies commit signatures. |
 
-**Tests (combined with naming):** 21/21 passing. (Email and Git verified in `decent_consensus/test_consensus.ep`).
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -316,7 +318,7 @@ ErnosDecent/
 | `exchange.ep` | Hybrid DEX. Constant-product AMM liquidity pools and price-time priority orderbook matching. |
 | `contracts.ep` | Smart contract execution engine. Persistent state, variable evaluation, event logging, instruction execution, state rollback on REVERT. |
 
-**Tests:** 6/6 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -327,9 +329,10 @@ ErnosDecent/
 | `models.ep` | Model registry with SHA-256 hash verification via libc/OpenSSL FFI. |
 | `inference.ep` | GGUF v3 binary parser and fixed-point transformer executor. Token-by-token text generation with attention, feedforward networks, ReLU, and softmax. |
 | `embeddings.ep` | Vector embedding generator with fixed-point cosine similarity. |
-| `speech.ep` | Speech-to-text transcription. Audio feature pooling, vocabulary projection, CTC decoding. |
+| `speech.ep` | Speech-to-text transcription (whisper.cpp backend, with a fixed-point reference path). |
+| `tts.ep` | Kokoro text-to-speech via FFI: text → IPA phonemes (libespeak-ng) → vocab tokens → onnxruntime → 24 kHz audio → PCM16 WAV. Delivered to the Web UI 🔊 button and Discord. |
 
-**Tests:** 6/6 passing.
+Speech-to-text and Kokoro text-to-speech both ship; TTS was verified end-to-end (Web UI 🔊 confirmed).
 
 ---
 
@@ -338,13 +341,15 @@ ErnosDecent/
 | Module | What it does |
 |--------|-------------|
 | `prompt.ep` | Assembles prompt context, combining core identity instructions, task details, and relevant memory tiers. |
-| `react_loop.ep` | ReAct reasoning coordinator. Manages reasoning steps, local model server dispatch (LM Studio/Ollama), and observation feedback. |
-| `memory.ep` | 7-Tier Cognitive Memory. Handles scratchpad (Tier 1), lessons learned (Tier 2), timeline event logs (Tier 3), and Hebbian Synaptic Graph association updates (Tier 4). |
-| `tools.ep` | Schema registry and execution dispatcher for 11+ system tools (DHT, Name, Wallet, Turing Grid, Command, Files). |
+| `react_loop.ep` | ReAct reasoning coordinator. Manages reasoning steps, model dispatch, and observation feedback. |
+| `memory.ep` | Tiered cognitive memory: scratchpad, lessons (semantic recall), timeline, knowledge graph, with a consolidation/"sleep" sweep. |
+| `tools.ep` | Schema registry and guarded execution dispatcher for the 9-tool surface (DHT, Name, Wallet, Turing Grid, Command, Files, etc.). |
 | `turing_grid.ep` | 3D Turing Grid machine tape workspace. Tracks active HEAD position across (X, Y, Z) space and reads/writes cell states. |
-| `observer.ep` | Multi-rule quality audit gate. Intercepts agent replies to enforce safety constraints and prevent reasoning trace leaks to the user. |
+| `observer_rules.ep` / `observer_parser.ep` / `observer_audit.ep` | Safety supervisor, split into rule data, parser, and a fail-closed LLM audit gate (default verdict BLOCKED) for dangerous tools; a deterministic moderation classifier backs the moderation tool. |
+| providers / model registry & router | Provider specs (OpenAI-compatible + Hugging Face) and pure, deterministic model selection. |
+| platform bridge | Adapters for Discord, Telegram, WhatsApp; node↔bridge RPC (`bridge_poll` / `bridge_submit_result`). |
 
-**Tests:** 5/5 passing.
+Agent-parity Phases 1–6 are done and gated; the full recursive self-improvement loop (SAE/steering/LoRA promotion) is **partial**.
 
 ---
 
@@ -357,7 +362,7 @@ ErnosDecent/
 | `codec.ep` | Opus/VP8 FFI wrappers with native IMA-ADPCM audio and RLE video fallbacks. |
 | `cdn.ep` | P2P content delivery. DHT-based piece announcement, peer discovery, concurrent chunk download with hash verification. |
 
-**Tests:** 7/7 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -368,7 +373,7 @@ ErnosDecent/
 | `onion.ep` | Multi-hop layered onion routing. Ephemeral X25519 shared key agreement, packet wrapping/unwrapping, and exit destination relaying. |
 | `mixnet.ep` | Traffic mixing and packet delay jitter. Fisher-Yates packet queue shuffling and randomized delays to prevent timing correlation attacks. |
 
-**Tests:** 2/2 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -380,7 +385,7 @@ ErnosDecent/
 | `rank.ep` | Search ranking engine. Computes BM25 keyword relevance and PageRank authority scores via power iteration using fixed-point math. |
 | `query.ep` | Query merging and result formatting. Parses search query terms, calculates combined BM25+PageRank scores, and merges de-duplicated local/remote P2P results. |
 
-**Tests:** 1/1 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -392,7 +397,7 @@ ErnosDecent/
 | `compute.ep` | Compute pooling manager. Job submission queue, worker scheduling, contribution tracking, and redundant execution consensus verification. |
 | `mesh.ep` | Symbiotic mesh coordinate layer. Orchestrates bandwidth sharing, compute delegation, and onion-routed anonymous AI inference execution. |
 
-**Tests:** 3/3 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -405,7 +410,7 @@ ErnosDecent/
 | `election.ep` | Election loops with randomized timeouts, heartbeats, and candidate transitions. |
 | `raft_transport.ep` | TCP socket handling, connection pooling, and log updates delivery for Raft cluster peers. |
 
-**Tests:** 4/4 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -421,7 +426,7 @@ ErnosDecent/
 | `decent_web/app.js` | WebSocket client logic connecting all UI panels to live daemon data. |
 | `decent_web/web_server.ep` | Native HTTP & WebSocket gateway serving Web UI assets, REST JSON APIs, and WS handlers for DHT/Name/Wallet/AI/Messaging. |
 
-**Tests:** 2/2 passing.
+**Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
 ---
 
@@ -471,18 +476,13 @@ See [ERNOS_REFERENCE.md](docs/ERNOS_REFERENCE.md) for the full language specific
 
 | Metric | Value |
 |--------|-------|
-| Source modules | 48 |
-| Test suites | 20 + 2 live test harnesses |
-| Total `.ep` files | 68 |
-| Source lines (non-test) | 11,726 |
-| Test lines | 7,453 |
-| Total lines | 19,179 |
-| Unit/integration tests | 191/191 |
-| Live E2E assertions | 100+ |
-| Stress tests | 5/5 |
-| Multi-node stress tests | 50+ assertions |
-| Build phases completed | 15/15 |
-| External dependencies | libsodium |
+| Subsystems | 17 |
+| Source modules | ~103 |
+| Source lines (non-test) | ~30,300 |
+| Test files | 94 |
+| Test lines | ~12,700 |
+| Test coverage | each subsystem ships its own suite; node builds and boots, core paths verified |
+| External dependencies | libsodium (plus optional FFI: libespeak-ng, onnxruntime, libopus, libvpx, libsrtp2, whisper.cpp) |
 | Target platforms | macOS (ARM64, x86_64) · Linux (x86_64, aarch64) · Windows via WSL2 (runs the Linux build) |
 
 ---

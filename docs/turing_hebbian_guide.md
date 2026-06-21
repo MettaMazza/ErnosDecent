@@ -58,3 +58,17 @@ The synaptic graph implements Hebbian reinforcement learning and weight decay us
    - Non-permanent edges decay by $5\%$ during each consolidation sweep:
      $$\text{decayed\_weight} = \frac{\text{old\_weight} \times 950,000}{1,000,000}$$
    - If an edge's weight drops below $10,000$ (representing $0.01$), the connection is considered weak and is pruned (deleted) from the graph.
+
+---
+
+## 3. Related agent subsystems (agent-parity)
+
+This guide covers the Turing Grid and the Hebbian memory tiers. The agent also ships, on the gated `agent-parity` branch:
+
+- **Procedural memory** — an adapter version manifest (promote/rollback bookkeeping) plus a fixed-point learning payoff. The full recursive self-improvement loop (SAE interpretability, steering vectors, LoRA training-and-promotion) is **partial**.
+- **Observer gate** — split into `observer_rules.ep` / `observer_parser.ep` / `observer_audit.ep`: a fail-closed LLM audit (default verdict BLOCKED) for dangerous tools (`run_command`, `codebase_write`), plus a deterministic moderation classifier.
+- **Providers + model registry/router** — provider specs and pure, deterministic model selection across OpenAI-compatible and Hugging Face adapters.
+- **Platform bridge** — Discord adapter plus a Telegram/WhatsApp registry, over a node↔bridge RPC channel (`bridge_poll` / `bridge_submit_result`).
+- **Tooling** — a 9-tool surface dispatched through a guarded executor.
+
+For the full picture, see `book/notes/system-bible.md` and the `decent_agent/` section of `docs/system_guide_synthesis.md`.
