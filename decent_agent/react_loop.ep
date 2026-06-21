@@ -292,6 +292,15 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         set ok to map_insert(pending and "prompt_state" and current_prompt)
                         set ok to map_insert(pending and "raw_output" and raw_output)
                         set ok to map_insert(pending and "loop_idx" and loop_idx)
+                        # Bind the caller's role to this pending action. The IPC layer
+                        # deletes sender_role from ctx after the initiating turn, so the
+                        # approval (a separate IPC round) would otherwise execute the tool
+                        # with no role and fail the admin gate -> "restricted to
+                        # administrators" on every approved tool since approve-all landed.
+                        set pend_role to ""
+                        if map_contains(ctx and "sender_role") == 1:
+                            set pend_role to map_get_val(ctx and "sender_role")
+                        set ok to map_insert(pending and "sender_role" and pend_role)
                         set ok to map_insert(ctx and "pending_action" and pending)
                         
                         # Store the parsed args list for later execution
@@ -421,7 +430,16 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
     set loop_idx to 0
     if map_contains(pending and "loop_idx") == 1:
         set loop_idx to map_get_val(pending and "loop_idx")
-    
+
+    # Restore the role captured when this action was queued, so the approved tool
+    # runs with the original caller's authority (admin/owner) instead of the empty
+    # role the IPC layer left behind. Without this, every approved admin tool is
+    # denied. Must happen before pending is cleared below.
+    set saved_role to ""
+    if map_contains(pending and "sender_role") == 1:
+        set saved_role to map_get_val(pending and "sender_role")
+    set ok to map_insert(ctx and "sender_role" and saved_role)
+
     # Clear the pending action
     set ok to map_delete(ctx and "pending_action")
     
