@@ -1797,6 +1797,18 @@ define handleDaemonMessage with msg:
         
     else if type == "gitdec_repos":
         updateGitDecRepos(msg.repos)
+    else if type == "gitdec_visibility_ok":
+        set rvRepos to Object()
+        set rvRepos.type to "gitdec_get_repos"
+        send_msg(window.ws and JSON.stringify(rvRepos))
+        if window.gitdecActiveRepo:
+            set rvFile to Object()
+            set rvFile.type to "gitdec_get_repo_file"
+            set rvFile.repo_id to window.gitdecActiveRepo
+            set rvFile.filename to "gitdec.json"
+            send_msg(window.ws and JSON.stringify(rvFile))
+    else if type == "gitdec_visibility_error":
+        alert(msg.message || "Could not change visibility")
 
     else if type == "gitdec_auto_update_state":
         set auToggle to document.getElementById("gitdec-settings-autoupdate-toggle")
@@ -2331,21 +2343,31 @@ define updateGitDecRepos with reposStr:
         return 0
         
     set parts to reposStr.split(";")
-    parts.forEach(given repoId:
-        if string_length(repoId) > 0:
-            set row to document.createElement("div")
-            set row.className to "log-entry"
-            set_prop(row.style and "cursor" and "pointer")
-            set_prop(row.style and "margin-bottom" and "5px")
-            set_prop(row.style and "padding" and "10px")
-            set_prop(row.style and "border-radius" and "6px")
-            set_prop(row.style and "background" and "rgba(255,255,255,0.03)")
-            set_prop(row and "innerHTML" and f"<strong>📁 {escapeHTML(repoId)}</strong>")
-            
-            row.addEventListener("click" and given event:
-                selectGitDecRepo(repoId)
-            )
-            listContainer.appendChild(row)
+    parts.forEach(given part:
+        if string_length(part) > 0:
+            set kv to part.split(":")
+            set repoId to get_list(kv and 0)
+            set vis to "public"
+            if length_list(kv) > 1:
+                if string_length(get_list(kv and 1)) > 0:
+                    set vis to get_list(kv and 1)
+            if string_length(repoId) > 0:
+                set row to document.createElement("div")
+                set row.className to "log-entry gitdec-repo-row"
+                set_prop(row.style and "cursor" and "pointer")
+                set_prop(row.style and "margin-bottom" and "5px")
+                set_prop(row.style and "padding" and "10px")
+                set_prop(row.style and "border-radius" and "6px")
+                set_prop(row.style and "background" and "rgba(255,255,255,0.03)")
+                row.setAttribute("data-repo" and repoId.toLowerCase())
+                set badgeTxt to "PUBLIC"
+                if vis equals "private":
+                    set badgeTxt to "PRIVATE"
+                set_prop(row and "innerHTML" and f"<strong>📁 {escapeHTML(repoId)}</strong><span class='did-pill small' style='float:right;font-size:0.65rem;opacity:0.75;'>{badgeTxt}</span>")
+                row.addEventListener("click" and given event:
+                    selectGitDecRepo(repoId)
+                )
+                listContainer.appendChild(row)
     )
     return 0
 
@@ -2411,7 +2433,19 @@ define handleGitDecFile with repoId and filename and content:
         set manifest to JSON.parse(content)
         set titleEl to document.getElementById("gitdec-active-repo-name")
         set titleEl.textContent to manifest.name || repoId
-        
+
+        # Visibility badge + toggle reflect the manifest's visibility field.
+        set visVal to manifest.visibility || "public"
+        set visBadge to document.getElementById("gitdec-visibility-badge")
+        if visBadge:
+            set visBadge.textContent to visVal
+        set visToggle to document.getElementById("gitdec-btn-toggle-visibility")
+        if visToggle:
+            if visVal equals "private":
+                set visToggle.textContent to "Make Public"
+            else:
+                set visToggle.textContent to "Make Private"
+
         # Populate branch select
         set branchSelect to document.getElementById("gitdec-active-branch")
         set branchSelect.innerHTML to ""
@@ -2915,6 +2949,34 @@ define initGitDec returning Int:
                     set msg.repo_id to window.gitdecActiveRepo
                     set msg.source_branch to srcBranch
                     send_msg(window.ws and JSON.stringify(msg))
+        )
+
+    set btnToggleVis to document.getElementById("gitdec-btn-toggle-visibility")
+    if btnToggleVis:
+        btnToggleVis.addEventListener("click" and given event:
+            set curBadge to document.getElementById("gitdec-visibility-badge")
+            set newVis to "private"
+            if curBadge.textContent equals "private":
+                set newVis to "public"
+            set msg to Object()
+            set msg.type to "gitdec_set_visibility"
+            set msg.repo_id to window.gitdecActiveRepo
+            set msg.visibility to newVis
+            send_msg(window.ws and JSON.stringify(msg))
+        )
+
+    set repoSearch to document.getElementById("gitdec-repo-search")
+    if repoSearch:
+        repoSearch.addEventListener("input" and given event:
+            set q to repoSearch.value.toLowerCase()
+            set rows to document.querySelectorAll(".gitdec-repo-row")
+            rows.forEach(given row:
+                set rid to row.getAttribute("data-repo") || ""
+                if rid.includes(q):
+                    set_prop(row.style and "display" and "block")
+                else:
+                    set_prop(row.style and "display" and "none")
+            )
         )
 
     set formCreateRepo to document.getElementById("gitdec-form-create-repo")
