@@ -53,8 +53,33 @@ enabled = discord_cfg.get('enabled', False)
 token = discord_cfg.get('token', '')
 channel_id_str = discord_cfg.get('channel', '')
 
-# Admin user ID — this user gets sender_role=admin; everyone else is guest
-ADMIN_ID = int(discord_cfg.get('admin_id', '1299810741984956449'))
+# Admins get sender_role=admin; everyone else is guest. Accept BOTH a list of admin
+# user IDs (comma-separated, so multiple owners work) AND a Discord role: anyone
+# holding the admin role is admin regardless of which account they message from.
+def _parse_ids(raw):
+    out = set()
+    for part in str(raw).split(','):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return out
+
+ADMIN_IDS = _parse_ids(discord_cfg.get('admin_id', '1299810741984956449'))
+try:
+    ADMIN_ROLE_ID = int(str(discord_cfg.get('admin_role_id', '1501167171844444190')).strip())
+except (TypeError, ValueError):
+    ADMIN_ROLE_ID = 0
+
+def is_admin_author(author):
+    if author is None:
+        return False
+    if getattr(author, 'id', None) in ADMIN_IDS:
+        return True
+    if ADMIN_ROLE_ID:
+        for r in getattr(author, 'roles', []):
+            if getattr(r, 'id', None) == ADMIN_ROLE_ID:
+                return True
+    return False
 
 if not enabled or not token or not channel_id_str:
     print("[Discord Bridge] Discord connection is not enabled or missing details. Exiting.", flush=True)
@@ -131,7 +156,7 @@ def upload_file_to_daemon(filename, file_bytes):
         }
         data = json.dumps(payload).encode('utf-8')
         req = urllib.request.Request(
-            'http://127.0.0.1:8080/api/upload',
+            'http://127.0.0.1:8088/api/upload',
             data=data,
             headers={'Content-Type': 'application/json'},
             method='POST'
@@ -215,7 +240,7 @@ async def query_daemon_ipc(prompt, author=None):
             tags = f"[SESSION:{active_session_id}] "
         if author is not None:
             username = str(author.display_name).replace('[', '(').replace(']', ')')
-            role = "admin" if author.id == ADMIN_ID else "guest"
+            role = "admin" if is_admin_author(author) else "guest"
             tags += f"[SENDER:{username}] [ROLE:{role}] "
             
         # Search the RAG database using the query
