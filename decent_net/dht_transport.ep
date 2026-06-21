@@ -341,9 +341,12 @@ define dht_handle_transport_message with dht as Int and conn as Map returning In
         set sender_port to 0
         if string_contains(payload and ",") == 1:
             set parts to string_split(payload and ",")
-            set sender_id to ptr_to_str(get_list(parts and 0))
-            set sender_addr to ptr_to_str(get_list(parts and 1))
-            set sender_port to string_to_int(ptr_to_str(get_list(parts and 2)))
+            # Guard every index: a malformed PING like "x," splits to 2 parts, so
+            # reading index 2 unconditionally was an out-of-bounds remote crash.
+            if length_list(parts) >= 3:
+                set sender_id to ptr_to_str(get_list(parts and 0))
+                set sender_addr to ptr_to_str(get_list(parts and 1))
+                set sender_port to string_to_int(ptr_to_str(get_list(parts and 2)))
             free_list(parts)
         set ok to dht_add_peer_with_eviction(dht and sender_id and sender_addr and sender_port)
         set err to transport_send(conn and MSG_TYPE_DHT_PONG and my_id)
@@ -353,16 +356,21 @@ define dht_handle_transport_message with dht as Int and conn as Map returning In
         # Payload = "sender_id,sender_address,sender_port,target_id" or "sender_id,target_id"
         set parts to string_split(payload and ",")
         set parts_len to length_list(parts)
-        set sender_id to ptr_to_str(get_list(parts and 0))
+        set sender_id to ""
         set sender_addr to "unknown"
         set sender_port to 0
         set target_id to ""
+        if parts_len >= 1:
+            set sender_id to ptr_to_str(get_list(parts and 0))
         if parts_len >= 4:
             set sender_addr to ptr_to_str(get_list(parts and 1))
             set sender_port to string_to_int(ptr_to_str(get_list(parts and 2)))
             set target_id to ptr_to_str(get_list(parts and 3))
         else:
-            set target_id to ptr_to_str(get_list(parts and 1))
+            # "sender_id,target_id" form — only read index 1 if it actually exists;
+            # a payload with no comma (1 part) used to read index 1 out of bounds.
+            if parts_len >= 2:
+                set target_id to ptr_to_str(get_list(parts and 1))
         free_list(parts)
         set ok to dht_add_peer_with_eviction(dht and sender_id and sender_addr and sender_port)
         set closest to dht_node_find_closest(dht and target_id and 8)
