@@ -1,13 +1,15 @@
 # ErnosDecent — Kokoro TTS (EP-native).
 # Drives the raw kokoro-v1.0.onnx model via FFI: text -> (libespeak-ng) IPA phonemes
 # -> kokoro vocab tokens -> (libonnxruntime) Run(tokens, bm_fable style, speed) ->
-# 24kHz float audio -> PCM16 WAV. This file is STAGE A: the pure, testable foundation
-# (chunker + vocab + tokenizer). Audio is kept on raw byte buffers, never EP float
-# Lists (which mangle floats). FFI + WAV land in the next stage.
+# 24kHz float audio -> PCM16 WAV. This file implements the full pipeline: chunker +
+# vocab + tokenizer, libespeak-ng phonemize FFI, onnxruntime synthesis FFI, and WAV
+# output. Delivery is wired to the Web UI (tts_request) and Discord (🔊 button). Audio
+# is kept on raw byte buffers, never EP float Lists (which mangle floats).
 # Component: decent_ai/tts.ep
 
 import "string"
 import "collections"
+import "sync"
 
 # ── FFI primitives (resolved at runtime; same as codec.ep / inference.ep) ──
 external define ep_dlopen with lib:
@@ -96,6 +98,16 @@ define tts_f32_to_fixed with u as Int returning Int:
 define tts_ort_fn with api as Int and idx as Int returning Int:
     return tts_peek_ptr_buf(api and idx * 8)
 
+# Release an OrtValue (OrtApi.ReleaseValue, struct index 96 — the Release* block is
+# contiguous and ends at ReleaseTensorTypeAndShapeInfo=99, so ReleaseValue=96). Used
+# by tts_run_tokens to free the per-call input tensors; the audio output value is kept
+# alive until the WAV is written, then released by the caller. No-op on a null value.
+define tts_ort_release_value with api as Int and val as Int returning Int:
+    if val == 0:
+        return 0
+    set ok to ep_dlcall1(tts_ort_fn(api and 96) and val)
+    return 0
+
 # Load bm_fable's style vector for a token sequence of length `token_count`:
 # 256 float32 (1024 bytes) at absolute offset 13060938 + idx*1024 in voices-v1.0.bin
 # (verified: matches numpy bm_fable[idx]). Uses libc fopen/fseek/fread.
@@ -153,13 +165,17 @@ define tts_speak_chunk with text as Str and wav_path as Str returning Int:
     set wr to tts_write_wav_f32(wav_path and map_get_val(res and "ptr") and map_get_val(res and "len") and 24000)
     return 0
 
-# Run the kokoro model on one token sequence; returns {ptr, len} for the f32 audio
-# (the OrtValue is intentionally not released so its buffer stays valid for the WAV
-# writer; the synth process is short-lived per request).
+# Run the kokoro model on one token sequence; returns {ptr, len, val} for the f32
+# audio. The audio OrtValue is returned as "val" (NOT released here) so its buffer
+# (ptr) stays valid for the WAV writer; the caller MUST release it via
+# tts_ort_release_value once the WAV has been written. All other per-call OrtValues
+# (token/style/speed inputs) and scratch buffers are freed before returning — the
+# node is long-running, so leaking them per request grows memory unboundedly.
 define tts_run_tokens with api as Int and session as Int and mem_info as Int and tokens as List returning Map:
     set out to create_map()
     set ok to map_insert(out and "ptr" and 0)
     set ok to map_insert(out and "len" and 0)
+    set ok to map_insert(out and "val" and 0)
     set n to length_list(tokens)
     if n < 3:
         return out
@@ -192,30 +208,63 @@ define tts_run_tokens with api as Int and session as Int and mem_info as Int and
     set speed_vout to alloc_bytes(8)
     set st to ep_dlcall7(tts_ort_fn(api and 49) and mem_info and speed_buf and 4 and speed_shape and 1 and 1 and speed_vout)
     set speed_val to tts_peek_ptr_buf(speed_vout and 0)
+    set nm_tokens to tts_str_to_buf("tokens")
+    set nm_style to tts_str_to_buf("style")
+    set nm_speed to tts_str_to_buf("speed")
+    set nm_audio to tts_str_to_buf("audio")
     set in_names to alloc_bytes(24)
-    set ok to tts_poke_i64(in_names and 0 and tts_str_to_buf("tokens"))
-    set ok to tts_poke_i64(in_names and 8 and tts_str_to_buf("style"))
-    set ok to tts_poke_i64(in_names and 16 and tts_str_to_buf("speed"))
+    set ok to tts_poke_i64(in_names and 0 and nm_tokens)
+    set ok to tts_poke_i64(in_names and 8 and nm_style)
+    set ok to tts_poke_i64(in_names and 16 and nm_speed)
     set in_vals to alloc_bytes(24)
     set ok to tts_poke_i64(in_vals and 0 and tok_val)
     set ok to tts_poke_i64(in_vals and 8 and style_val)
     set ok to tts_poke_i64(in_vals and 16 and speed_val)
     set out_names to alloc_bytes(8)
-    set ok to tts_poke_i64(out_names and 0 and tts_str_to_buf("audio"))
+    set ok to tts_poke_i64(out_names and 0 and nm_audio)
     set out_vals to alloc_bytes(8)
     set st to ep_dlcall8(tts_ort_fn(api and 9) and session and 0 and in_names and in_vals and 3 and out_names and 1 and out_vals)
-    if st != 0:
-        return out
-    set audio_val to tts_peek_ptr_buf(out_vals and 0)
-    set sinfo_out to alloc_bytes(8)
-    set st to ep_dlcall2(tts_ort_fn(api and 65) and audio_val and sinfo_out)
-    set count_out to alloc_bytes(8)
-    set st to ep_dlcall2(tts_ort_fn(api and 64) and tts_peek_ptr_buf(sinfo_out and 0) and count_out)
-    set audio_len to tts_peek_ptr_buf(count_out and 0)
-    set data_out to alloc_bytes(8)
-    set st to ep_dlcall2(tts_ort_fn(api and 51) and audio_val and data_out)
-    set ok to map_insert(out and "ptr" and tts_peek_ptr_buf(data_out and 0))
-    set ok to map_insert(out and "len" and audio_len)
+    # Run is done: inputs were copied/consumed, so the input OrtValues and every
+    # scratch buffer can be released now regardless of success/failure. The audio
+    # OrtValue (extracted below on success) is the only thing kept alive.
+    if st == 0:
+        set audio_val to tts_peek_ptr_buf(out_vals and 0)
+        set sinfo_out to alloc_bytes(8)
+        set st to ep_dlcall2(tts_ort_fn(api and 65) and audio_val and sinfo_out)
+        set sinfo to tts_peek_ptr_buf(sinfo_out and 0)
+        set count_out to alloc_bytes(8)
+        set st to ep_dlcall2(tts_ort_fn(api and 64) and sinfo and count_out)
+        set audio_len to tts_peek_ptr_buf(count_out and 0)
+        set data_out to alloc_bytes(8)
+        set st to ep_dlcall2(tts_ort_fn(api and 51) and audio_val and data_out)
+        set ok to map_insert(out and "ptr" and tts_peek_ptr_buf(data_out and 0))
+        set ok to map_insert(out and "len" and audio_len)
+        set ok to map_insert(out and "val" and audio_val)
+        # ReleaseTensorTypeAndShapeInfo(sinfo) — OrtApi index 99.
+        set ok to ep_dlcall1(tts_ort_fn(api and 99) and sinfo)
+        set ok to free_bytes(sinfo_out)
+        set ok to free_bytes(count_out)
+        set ok to free_bytes(data_out)
+    set ok to tts_ort_release_value(api and tok_val)
+    set ok to tts_ort_release_value(api and style_val)
+    set ok to tts_ort_release_value(api and speed_val)
+    set ok to free_bytes(tok_data)
+    set ok to free_bytes(tok_shape)
+    set ok to free_bytes(tok_vout)
+    set ok to free_bytes(style_buf)
+    set ok to free_bytes(style_shape)
+    set ok to free_bytes(style_vout)
+    set ok to free_bytes(speed_buf)
+    set ok to free_bytes(speed_shape)
+    set ok to free_bytes(speed_vout)
+    set ok to free_bytes(nm_tokens)
+    set ok to free_bytes(nm_style)
+    set ok to free_bytes(nm_speed)
+    set ok to free_bytes(nm_audio)
+    set ok to free_bytes(in_names)
+    set ok to free_bytes(in_vals)
+    set ok to free_bytes(out_names)
+    set ok to free_bytes(out_vals)
     return out
 
 # Open the kokoro ONNX session once; returns {api, session, mem} (api=0 on failure).
@@ -241,9 +290,28 @@ define tts_ort_open returning Map:
     set ok to map_insert(out and "mem" and tts_peek_ptr_buf(mem_out and 0))
     return out
 
+# espeak-ng keeps global, NON-thread-safe state (espeak_Initialize / SetVoice /
+# TextToPhonemes all touch process-wide phoneme tables). The node drives TTS from
+# several threads at once — the Web UI 🔊 handler (a spawned per-client thread) and
+# the IPC "TTS SPEAK" handler used by the Discord bridge. Two overlapping syntheses
+# race espeak's tables and corrupt the heap, which surfaces as a flood of
+# "Invalid instruction NNNN for phoneme '<garbage>'" (espeak walking clobbered phoneme
+# programs) followed by a segfault. Serialize the whole pipeline (espeak + the shared
+# ORT env/session) behind one mutex so only one synthesis runs at a time. Created
+# eagerly at module load, before any worker thread is spawned, so there is no
+# lazy-init race on the mutex itself.
+set TTS_MUTEX to create_mutex()
+
 # Full TTS: chunk `text`, synthesize each chunk, and write one concatenated 24kHz
-# mono PCM16 WAV at wav_path. Returns 0 on success.
+# mono PCM16 WAV at wav_path. Returns 0 on success. Thread-safe entry point: holds
+# TTS_MUTEX across the entire (single-threaded) synthesis in tts_speak_locked.
 define tts_speak with text as Str and wav_path as Str returning Int:
+    lock_mutex(TTS_MUTEX)
+    set rc to tts_speak_locked(text and wav_path)
+    unlock_mutex(TTS_MUTEX)
+    return rc
+
+define tts_speak_locked with text as Str and wav_path as Str returning Int:
     set ses to tts_ort_open()
     if map_get_val(ses and "api") == 0:
         return 3
@@ -444,21 +512,47 @@ define tts_cstr_at with ptr as Int returning Str:
     free_list(bytes)
     return s
 
-# ── Phonemize via libespeak-ng: text -> IPA phonemes (British voice for Fable) ──
-define tts_phonemize with text as Str returning Str:
+# espeak-ng must be initialized ONCE per process. The old tts_phonemize re-ran
+# espeak_Initialize on every call (and the over-eager chunker made that several calls
+# per message), which reloads espeak's phoneme-data tables each time. In the
+# long-running, heap-busy node that reload churn corrupts those tables — espeak then
+# reports "Wrong version of espeak-ng-data ... got 0x0" or a flood of
+# "Invalid instruction NNNN for phoneme '<garbage>'" and finally segfaults. Load the
+# library, initialize, and select the voice exactly once; cache the handle and only
+# run TextToPhonemes per request thereafter. These globals are mutated only while
+# TTS_MUTEX is held — tts_phonemize is reached solely via tts_speak (which holds the
+# lock); test harnesses call it single-threaded — so no additional guard is needed.
+set ESPEAK_LIB to 0
+set ESPEAK_READY to 0
+
+define tts_espeak_ensure returning Int:
+    if ESPEAK_READY == 1:
+        return ESPEAK_LIB
     set lib to ep_dlopen("/opt/homebrew/lib/libespeak-ng.dylib")
     if lib == 0:
-        return ""
+        return 0
     set f_init to ep_dlsym(lib and "espeak_Initialize")
     set path_buf to tts_str_to_buf("/opt/homebrew/share/espeak-ng-data")
     # output=2 (SYNCHRONOUS — no audio device opened), buflength=0, path, options=0
     set sr to ep_dlcall4(f_init and 2 and 0 and path_buf and 0)
+    free_bytes(path_buf)
     # British English voice (for Fable). The language code "en-gb" is NOT accepted by
     # SetVoiceByName (returns NOT_FOUND) — the VoiceName form is required, else no voice
     # loads and TextToPhonemes segfaults.
     set f_voice to ep_dlsym(lib and "espeak_SetVoiceByName")
     set voice_buf to tts_str_to_buf("English (Great Britain)")
     set vr to ep_dlcall1(f_voice and voice_buf)
+    free_bytes(voice_buf)
+    set ESPEAK_LIB to lib
+    set ESPEAK_READY to 1
+    return lib
+
+# ── Phonemize via libespeak-ng: text -> IPA phonemes (British voice for Fable) ──
+# espeak is initialized once (tts_espeak_ensure); this only runs TextToPhonemes.
+define tts_phonemize with text as Str returning Str:
+    set lib to tts_espeak_ensure()
+    if lib == 0:
+        return ""
     set text_buf to tts_str_to_buf(text)
     set textptr to alloc_bytes(8)
     set ok to tts_poke_ptr(textptr and 0 and text_buf)
@@ -482,8 +576,6 @@ define tts_phonemize with text as Str returning Str:
         if nextp == 0:
             set more to 0
         set guard to guard + 1
-    free_bytes(path_buf)
-    free_bytes(voice_buf)
     free_bytes(text_buf)
     free_bytes(textptr)
     return phonemes
@@ -657,40 +749,66 @@ define tts_tokenize with vocab as Map and phonemes as Str returning List:
     set ok to append_list(tokens and 0)
     return tokens
 
-# ── Text chunker: split into <=200-char chunks on sentence, then clause, then word
-#    boundaries (ports the kokoro 510-phoneme-limit splitter). ──
+# ── Text chunker ──
+# A whole message is synthesized as ONE chunk; we only split when it would exceed
+# kokoro's ~510-phoneme budget. Empirically English IPA runs ~1.05–1.07 phonemes per
+# character (stress/length marks, diphthongs), so a 400-char ceiling keeps the token
+# count (~430 with padding) comfortably under 510 while leaving typical replies — and
+# even most multi-sentence ones — un-split. Only genuinely long output (e.g. a reply
+# that would span several chat messages) gets chunked, and then at the last sentence
+# boundary, falling back to a word boundary, so chunks stay whole-sentence.
 define tts_chunk_max returning Int:
-    return 200
+    return 400
 
 define tts_is_sentence_end with c as Int returning Int:
     if c == 46 or else c == 33 or else c == 63:
         return 1
     return 0
 
-define tts_chunk_text with text as Str returning List:
-    set chunks to create_list()
-    set n to string_length(text)
+# Split text into sentences, keeping each terminator (. ! ?) attached to its sentence.
+define tts_split_sentences with s as Str returning List:
+    set out to create_list()
+    set n to string_length(s)
     set cur to ""
     set i to 0
     repeat while i < n:
-        set ch to substring(text and i and 1)
-        set cur to concat(cur and ch)
-        set c to get_character(text and i)
-        # flush on sentence end when at/over a reasonable size, or when over the cap
-        if tts_is_sentence_end(c) == 1 and also string_length(cur) >= 40:
-            set ok to append_list(chunks and string_trim(cur))
+        set cur to concat(cur and substring(s and i and 1))
+        if tts_is_sentence_end(get_character(s and i)) == 1:
+            set ok to append_list(out and string_trim(cur))
             set cur to ""
-        else:
-            if string_length(cur) >= tts_chunk_max():
-                # hard cap: back off to the last space for a cleaner break
-                set sp to string_last_index_of(cur and " ")
-                if sp > 0:
-                    set ok to append_list(chunks and string_trim(substring(cur and 0 and sp)))
-                    set cur to substring(cur and sp + 1 and string_length(cur) - sp - 1)
-                else:
-                    set ok to append_list(chunks and string_trim(cur))
-                    set cur to ""
         set i to i + 1
     if string_length(string_trim(cur)) > 0:
-        set ok to append_list(chunks and string_trim(cur))
+        set ok to append_list(out and string_trim(cur))
+    return out
+
+define tts_chunk_text with text as Str returning List:
+    set chunks to create_list()
+    set t to string_trim(text)
+    set n to string_length(t)
+    # Common case: the whole message fits — never split it.
+    if n <= tts_chunk_max():
+        if n > 0:
+            set ok to append_list(chunks and t)
+        return chunks
+    # Long output: pack WHOLE sentences into chunks up to the cap. We only ever break
+    # on a sentence terminator — never mid-sentence. A single sentence that alone
+    # exceeds the cap is emitted intact (its own chunk) rather than being cut.
+    set sentences to tts_split_sentences(t)
+    set ns to length_list(sentences)
+    set cur to ""
+    set i to 0
+    repeat while i < ns:
+        set s to string_trim(get_list(sentences and i))
+        if string_length(s) > 0:
+            if string_length(cur) == 0:
+                set cur to s
+            else:
+                if (string_length(cur) + 1 + string_length(s)) <= tts_chunk_max():
+                    set cur to concat(cur and concat(" " and s))
+                else:
+                    set ok to append_list(chunks and cur)
+                    set cur to s
+        set i to i + 1
+    if string_length(cur) > 0:
+        set ok to append_list(chunks and cur)
     return chunks

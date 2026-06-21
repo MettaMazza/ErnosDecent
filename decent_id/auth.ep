@@ -8,6 +8,8 @@ import "did"
 import "keys"
 import "string"
 import "crypto"
+import "os"
+import "fs"
 
 # ================================================================
 # Constants
@@ -406,3 +408,34 @@ define verify_device_authorization with authorizer_did as Str and authorizer_pub
     if verify_result == 0:
         return AUTH_ERR_NONE
     return AUTH_ERR_DEVICE_NOT_AUTHORIZED
+
+# ================================================================
+# IPC control-plane token
+# The daemon's loopback IPC port mints session tokens and moves funds, so every
+# command must carry "AUTH <token>" matching the 0600 ipc-token file. These live
+# here (not in node.ep) so the web server, which also authenticates to the IPC
+# port, can share them without depending on a function defined in its importer.
+# ================================================================
+
+define ipc_token_path returning Str:
+    set home to get_home_dir()
+    return concat(home and "/.ernosdecent/ipc-token")
+
+# Read the token fresh on every call: Ernos string module globals do not survive
+# reassignment, so caching it in a global is unreliable.
+define ipc_read_token returning Str:
+    set p to ipc_token_path()
+    if file_exists(p) == 0:
+        return ""
+    return string_trim(read_file(p))
+
+define ipc_get_or_create_token returning Str:
+    set p to ipc_token_path()
+    if file_exists(p) == 1:
+        return string_trim(read_file(p))
+    set tok to keys_random_hex(24)
+    if string_length(tok) == 0:
+        return ""
+    set ok to write_file(p and tok)
+    set ok to keys_chmod(p and 384)
+    return tok
