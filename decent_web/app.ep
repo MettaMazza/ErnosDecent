@@ -291,7 +291,38 @@ define appendMessageRaw with container and sender and text and type and timeStr:
     set escapedText to escapeHTML(text).replace("\n" and "<br>")
     set bubble.innerHTML to f"<span class=\"sender\">{escapeHTML(sender)}</span><p>{escapedText}</p><span class=\"timestamp\">{escapeHTML(timeStr)}</span>"
     container.appendChild(bubble)
+    if container == window.aiContainer and also type == "received":
+        attachTtsButton(bubble and text)
     set container.scrollTop to container.scrollHeight
+
+# ---- TTS: request audio for an AI message and attach a 🔊 button ----
+define requestTts with text and btn:
+    if not text:
+        return 0
+    if text.length == 0:
+        return 0
+    if not window.ws:
+        return 0
+    if not window.isConnected:
+        return 0
+    set_prop(btn and "disabled" and true)
+    set btn.textContent to "⏳"
+    set window.pendingTtsBtn to btn
+    set ttsMsg to Object()
+    set ttsMsg.type to "tts_request"
+    set ttsMsg.text to text
+    send_msg(window.ws and JSON.stringify(ttsMsg))
+    return 0
+
+define attachTtsButton with bubble and text:
+    set btn to document.createElement("button")
+    set btn.className to "btn-tts"
+    set btn.title to "Play audio (Fable voice)"
+    set btn.textContent to "🔊"
+    set btn.onclick to given e:
+        requestTts(text and btn)
+    bubble.appendChild(btn)
+    return 0
 
 define appendMessage with container and sender and text and type:
     set dateStr to Date()
@@ -1637,6 +1668,7 @@ define handleDaemonMessage with msg:
                 set secParts to timeStrSec.split(":")
                 set timeStr to concat(get_list(secParts and 0) and concat(":" and get_list(secParts and 1)))
                 saveAiMessage("AI (Local Model)" and aiText and "received" and timeStr)
+                attachTtsButton(window.currentAiResponseBubble and aiText)
 
         set_prop(window.aiLoader.style and "display" and "none")
         set window.aiInput.disabled to false
@@ -1646,6 +1678,22 @@ define handleDaemonMessage with msg:
         
         set window.currentAiResponseBubble to null
         
+    else if type == "tts_ready":
+        if window.pendingTtsBtn:
+            set_prop(window.pendingTtsBtn and "disabled" and false)
+            set window.pendingTtsBtn.textContent to "🔊"
+        set window.pendingTtsBtn to null
+        set ttsAudio to document.createElement("audio")
+        set ttsAudio.src to msg.url
+        ttsAudio.play()
+
+    else if type == "tts_error":
+        if window.pendingTtsBtn:
+            set_prop(window.pendingTtsBtn and "disabled" and false)
+            set window.pendingTtsBtn.textContent to "🔇"
+        set window.pendingTtsBtn to null
+        console.error(concat("TTS error: " and msg.error))
+
     else if type == "ai_models":
         updateAiModelsUI(msg.models || [])
         

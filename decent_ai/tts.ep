@@ -23,6 +23,7 @@ external define alloc_bytes with n returning Int:
 external define free_bytes with ptr:
 external define poke_byte with ptr and offset and value:
 external define peek_byte with ptr and offset returning Int:
+external define ep_net_send_raw with fd and buf and count:
 
 # ── byte/buffer helpers for FFI marshalling ──
 define tts_peek_ptr_buf with buf as Int and off as Int returning Int:
@@ -349,6 +350,65 @@ define tts_write_wav_multi with path as Str and ptrs as List and lens as List an
         set ci to ci + 1
     set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
     return 0
+
+# Send a complete HTTP response whose body is RAW BYTES (e.g. a WAV file).
+# The normal send_response()/net_send in http.ep are C-string based and truncate
+# at the first NUL — useless for binary. header_str must be the full status line +
+# headers + blank line (NUL-free); body_ptr/body_len point at the raw payload.
+# Caller owns body_ptr and must close client_fd afterwards.
+define tts_http_send_binary with client_fd as Int and header_str as Str and body_ptr as Int and body_len as Int returning Int:
+    set hlen to string_length(header_str)
+    set total to hlen + body_len
+    set buf to alloc_bytes(total)
+    set i to 0
+    repeat while i < hlen:
+        set ok to poke_byte(buf and i and get_character(header_str and i))
+        set i to i + 1
+    set j to 0
+    repeat while j < body_len:
+        set ok to poke_byte(buf and hlen + j and peek_byte(body_ptr and j))
+        set j to j + 1
+    set ok to ep_net_send_raw(client_fd and buf and total)
+    set ok to free_bytes(buf)
+    return 1
+
+# Deterministic filename for a TTS request: djb2 hash of the text.
+# Identical message text reuses the same cached WAV; distinct text gets a
+# distinct file. Shared by the Web UI server and the node's TTS SPEAK verb so
+# both resolve the same path (under decent_web/tts/, inside the web root).
+define tts_filename_for with text as Str returning Str:
+    set h to 5381
+    set i to 0
+    set n to string_length(text)
+    repeat while i < n:
+        set h to ((h * 33) + get_character(text and i)) modulo 1000000007
+        set i to i + 1
+    return concat("tts_" and concat(int_to_string(h) and ".wav"))
+
+# Binary-safe read of a whole file into a fresh byte buffer.
+# Returns Map{ptr, len}; ptr==0 on failure. EP's read_file is C-string based
+# (truncates at the first NUL), so binary assets like WAVs must come through here.
+define tts_read_file_bytes with path as Str returning Map:
+    set out to create_map()
+    set ok to map_insert(out and "ptr" and 0)
+    set ok to map_insert(out and "len" and 0)
+    set libc to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    set fp to ep_dlcall2(ep_dlsym(libc and "fopen") and tts_str_to_buf(path) and tts_str_to_buf("rb"))
+    if fp == 0:
+        return out
+    # fseek(fp, 0, SEEK_END=2); ftell -> size; fseek(fp, 0, SEEK_SET=0)
+    set ok to ep_dlcall3(ep_dlsym(libc and "fseek") and fp and 0 and 2)
+    set size to ep_dlcall1(ep_dlsym(libc and "ftell") and fp)
+    set ok to ep_dlcall3(ep_dlsym(libc and "fseek") and fp and 0 and 0)
+    if size <= 0:
+        set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
+        return out
+    set buf to alloc_bytes(size)
+    set rd to ep_dlcall4(ep_dlsym(libc and "fread") and buf and 1 and size and fp)
+    set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
+    set ok to map_insert(out and "ptr" and buf)
+    set ok to map_insert(out and "len" and rd)
+    return out
 
 # Copy an EP string into a fresh NUL-terminated C buffer; returns its address.
 define tts_str_to_buf with s as Str returning Int:
