@@ -1,0 +1,696 @@
+# ErnosDecent — Kokoro TTS (EP-native).
+# Drives the raw kokoro-v1.0.onnx model via FFI: text -> (libespeak-ng) IPA phonemes
+# -> kokoro vocab tokens -> (libonnxruntime) Run(tokens, bm_fable style, speed) ->
+# 24kHz float audio -> PCM16 WAV. This file is STAGE A: the pure, testable foundation
+# (chunker + vocab + tokenizer). Audio is kept on raw byte buffers, never EP float
+# Lists (which mangle floats). FFI + WAV land in the next stage.
+# Component: decent_ai/tts.ep
+
+import "string"
+import "collections"
+
+# ── FFI primitives (resolved at runtime; same as codec.ep / inference.ep) ──
+external define ep_dlopen with lib:
+external define ep_dlsym with handle and name:
+external define ep_dlcall0 with fn:
+external define ep_dlcall1 with fn and a0:
+external define ep_dlcall2 with fn and a0 and a1:
+external define ep_dlcall3 with fn and a0 and a1 and a2:
+external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
+external define ep_dlcall7 with fn and a0 and a1 and a2 and a3 and a4 and a5 and a6:
+external define ep_dlcall8 with fn and a0 and a1 and a2 and a3 and a4 and a5 and a6 and a7:
+external define alloc_bytes with n returning Int:
+external define free_bytes with ptr:
+external define poke_byte with ptr and offset and value:
+external define peek_byte with ptr and offset returning Int:
+external define ep_net_send_raw with fd and buf and count:
+
+# ── byte/buffer helpers for FFI marshalling ──
+define tts_peek_ptr_buf with buf as Int and off as Int returning Int:
+    set v to 0
+    set i to 7
+    repeat while i >= 0:
+        set v to v * 256 + peek_byte(buf and off + i)
+        set i to i - 1
+    return v
+
+define tts_poke_i64 with buf as Int and off as Int and val as Int returning Int:
+    set p to val
+    set j to 0
+    repeat while j < 8:
+        set ok to poke_byte(buf and off + j and (p modulo 256))
+        set p to p / 256
+        set j to j + 1
+    return 0
+
+define tts_peek_u32 with buf as Int and off as Int returning Int:
+    return peek_byte(buf and off) + peek_byte(buf and off + 1) * 256 + peek_byte(buf and off + 2) * 65536 + peek_byte(buf and off + 3) * 16777216
+
+define tts_poke_u32 with buf as Int and off as Int and val as Int returning Int:
+    set ok to poke_byte(buf and off and (val modulo 256))
+    set ok to poke_byte(buf and off + 1 and ((val / 256) modulo 256))
+    set ok to poke_byte(buf and off + 2 and ((val / 65536) modulo 256))
+    set ok to poke_byte(buf and off + 3 and ((val / 16777216) modulo 256))
+    return 0
+
+define tts_poke_i16 with buf as Int and off as Int and val as Int returning Int:
+    set v to val
+    if v < 0:
+        set v to v + 65536
+    set ok to poke_byte(buf and off and (v modulo 256))
+    set ok to poke_byte(buf and off + 1 and ((v / 256) modulo 256))
+    return 0
+
+# IEEE-754 float32 bits (a u32) -> fixed-point value*1e6 (from inference.ep).
+define tts_f32_to_fixed with u as Int returning Int:
+    if u == 0:
+        return 0
+    set sign_bit to (u / 2147483648) modulo 2
+    set exp_bits to (u / 8388608) modulo 256
+    set mantissa_bits to u modulo 8388608
+    if exp_bits == 0:
+        return 0
+    if exp_bits == 255:
+        return 0
+    set exponent to exp_bits - 127
+    set scale to 1000000
+    set val to 0
+    if exponent >= 0:
+        set temp to 1
+        set i to 0
+        repeat while i < exponent:
+            set temp to temp * 2
+            set i to i + 1
+        set val to scale * temp + (scale * mantissa_bits * temp) / 8388608
+    else:
+        set temp to 1
+        set i to 0
+        repeat while i < (0 - exponent):
+            set temp to temp * 2
+            set i to i + 1
+        set val to scale / temp + (scale * mantissa_bits) / (8388608 * temp)
+    if sign_bit == 1:
+        return 0 - val
+    return val
+
+define tts_ort_fn with api as Int and idx as Int returning Int:
+    return tts_peek_ptr_buf(api and idx * 8)
+
+# Load bm_fable's style vector for a token sequence of length `token_count`:
+# 256 float32 (1024 bytes) at absolute offset 13060938 + idx*1024 in voices-v1.0.bin
+# (verified: matches numpy bm_fable[idx]). Uses libc fopen/fseek/fread.
+define tts_load_style with token_count as Int returning Int:
+    set idx to token_count
+    if idx > 509:
+        set idx to 509
+    set buf to alloc_bytes(1024)
+    set libc to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    set fp to ep_dlcall2(ep_dlsym(libc and "fopen") and tts_str_to_buf("/Users/mettamazza/.ernosagent/models/voices-v1.0.bin") and tts_str_to_buf("rb"))
+    if fp == 0:
+        return buf
+    set ok to ep_dlcall3(ep_dlsym(libc and "fseek") and fp and (13060938 + idx * 1024) and 0)
+    set rd to ep_dlcall4(ep_dlsym(libc and "fread") and buf and 1 and 1024 and fp)
+    set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
+    return buf
+
+# Synthesize `text` (single chunk) to a 24kHz mono PCM16 WAV at wav_path via the
+# raw kokoro ONNX model. Returns 0 on success, or an error code per stage.
+define tts_speak_chunk with text as Str and wav_path as Str returning Int:
+    set vocab to tts_build_vocab()
+    set phon to tts_phonemize(text)
+    set tokens to tts_tokenize(vocab and phon)
+    set n to length_list(tokens)
+    if n < 3:
+        return 1
+
+    set lib to ep_dlopen("/Users/mettamazza/.ernos/kokoro-venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime.1.24.4.dylib")
+    if lib == 0:
+        return 2
+    set api to ep_dlcall1(tts_peek_ptr_buf(ep_dlcall0(ep_dlsym(lib and "OrtGetApiBase")) and 0) and 24)
+
+    # CreateEnv(level=2, "tts", &env)
+    set env_out to alloc_bytes(8)
+    set st to ep_dlcall3(tts_ort_fn(api and 3) and 2 and tts_str_to_buf("tts") and env_out)
+    set env to tts_peek_ptr_buf(env_out and 0)
+    # CreateSessionOptions(&opts)
+    set opt_out to alloc_bytes(8)
+    set st to ep_dlcall1(tts_ort_fn(api and 10) and opt_out)
+    set opts to tts_peek_ptr_buf(opt_out and 0)
+    # CreateSession(env, model, opts, &session)
+    set sess_out to alloc_bytes(8)
+    set st to ep_dlcall4(tts_ort_fn(api and 7) and env and tts_str_to_buf("/Users/mettamazza/.ernosagent/models/kokoro-v1.0.onnx") and opts and sess_out)
+    if st != 0:
+        return 3
+    set session to tts_peek_ptr_buf(sess_out and 0)
+    # CreateCpuMemoryInfo(OrtDeviceAllocator=0, OrtMemTypeDefault=0, &info)
+    set mem_out to alloc_bytes(8)
+    set st to ep_dlcall3(tts_ort_fn(api and 69) and 0 and 0 and mem_out)
+    set mem_info to tts_peek_ptr_buf(mem_out and 0)
+
+    set res to tts_run_tokens(api and session and mem_info and tokens)
+    if map_get_val(res and "len") < 1:
+        return 5
+    set wr to tts_write_wav_f32(wav_path and map_get_val(res and "ptr") and map_get_val(res and "len") and 24000)
+    return 0
+
+# Run the kokoro model on one token sequence; returns {ptr, len} for the f32 audio
+# (the OrtValue is intentionally not released so its buffer stays valid for the WAV
+# writer; the synth process is short-lived per request).
+define tts_run_tokens with api as Int and session as Int and mem_info as Int and tokens as List returning Map:
+    set out to create_map()
+    set ok to map_insert(out and "ptr" and 0)
+    set ok to map_insert(out and "len" and 0)
+    set n to length_list(tokens)
+    if n < 3:
+        return out
+    set tok_data to alloc_bytes(n * 8)
+    set i to 0
+    repeat while i < n:
+        set ok to tts_poke_i64(tok_data and i * 8 and get_list(tokens and i))
+        set i to i + 1
+    set tok_shape to alloc_bytes(16)
+    set ok to tts_poke_i64(tok_shape and 0 and 1)
+    set ok to tts_poke_i64(tok_shape and 8 and n)
+    set tok_vout to alloc_bytes(8)
+    set st to ep_dlcall7(tts_ort_fn(api and 49) and mem_info and tok_data and (n * 8) and tok_shape and 2 and 7 and tok_vout)
+    set tok_val to tts_peek_ptr_buf(tok_vout and 0)
+    set style_buf to tts_load_style(n)
+    set style_shape to alloc_bytes(16)
+    set ok to tts_poke_i64(style_shape and 0 and 1)
+    set ok to tts_poke_i64(style_shape and 8 and 256)
+    set style_vout to alloc_bytes(8)
+    set st to ep_dlcall7(tts_ort_fn(api and 49) and mem_info and style_buf and 1024 and style_shape and 2 and 1 and style_vout)
+    set style_val to tts_peek_ptr_buf(style_vout and 0)
+    # speed f32[1] = 1.15 (IEEE 0x3F933333, LE)
+    set speed_buf to alloc_bytes(4)
+    set ok to poke_byte(speed_buf and 0 and 51)
+    set ok to poke_byte(speed_buf and 1 and 51)
+    set ok to poke_byte(speed_buf and 2 and 147)
+    set ok to poke_byte(speed_buf and 3 and 63)
+    set speed_shape to alloc_bytes(8)
+    set ok to tts_poke_i64(speed_shape and 0 and 1)
+    set speed_vout to alloc_bytes(8)
+    set st to ep_dlcall7(tts_ort_fn(api and 49) and mem_info and speed_buf and 4 and speed_shape and 1 and 1 and speed_vout)
+    set speed_val to tts_peek_ptr_buf(speed_vout and 0)
+    set in_names to alloc_bytes(24)
+    set ok to tts_poke_i64(in_names and 0 and tts_str_to_buf("tokens"))
+    set ok to tts_poke_i64(in_names and 8 and tts_str_to_buf("style"))
+    set ok to tts_poke_i64(in_names and 16 and tts_str_to_buf("speed"))
+    set in_vals to alloc_bytes(24)
+    set ok to tts_poke_i64(in_vals and 0 and tok_val)
+    set ok to tts_poke_i64(in_vals and 8 and style_val)
+    set ok to tts_poke_i64(in_vals and 16 and speed_val)
+    set out_names to alloc_bytes(8)
+    set ok to tts_poke_i64(out_names and 0 and tts_str_to_buf("audio"))
+    set out_vals to alloc_bytes(8)
+    set st to ep_dlcall8(tts_ort_fn(api and 9) and session and 0 and in_names and in_vals and 3 and out_names and 1 and out_vals)
+    if st != 0:
+        return out
+    set audio_val to tts_peek_ptr_buf(out_vals and 0)
+    set sinfo_out to alloc_bytes(8)
+    set st to ep_dlcall2(tts_ort_fn(api and 65) and audio_val and sinfo_out)
+    set count_out to alloc_bytes(8)
+    set st to ep_dlcall2(tts_ort_fn(api and 64) and tts_peek_ptr_buf(sinfo_out and 0) and count_out)
+    set audio_len to tts_peek_ptr_buf(count_out and 0)
+    set data_out to alloc_bytes(8)
+    set st to ep_dlcall2(tts_ort_fn(api and 51) and audio_val and data_out)
+    set ok to map_insert(out and "ptr" and tts_peek_ptr_buf(data_out and 0))
+    set ok to map_insert(out and "len" and audio_len)
+    return out
+
+# Open the kokoro ONNX session once; returns {api, session, mem} (api=0 on failure).
+define tts_ort_open returning Map:
+    set out to create_map()
+    set ok to map_insert(out and "api" and 0)
+    set lib to ep_dlopen("/Users/mettamazza/.ernos/kokoro-venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime.1.24.4.dylib")
+    if lib == 0:
+        return out
+    set api to ep_dlcall1(tts_peek_ptr_buf(ep_dlcall0(ep_dlsym(lib and "OrtGetApiBase")) and 0) and 24)
+    set env_out to alloc_bytes(8)
+    set st to ep_dlcall3(tts_ort_fn(api and 3) and 2 and tts_str_to_buf("tts") and env_out)
+    set opt_out to alloc_bytes(8)
+    set st to ep_dlcall1(tts_ort_fn(api and 10) and opt_out)
+    set sess_out to alloc_bytes(8)
+    set st to ep_dlcall4(tts_ort_fn(api and 7) and tts_peek_ptr_buf(env_out and 0) and tts_str_to_buf("/Users/mettamazza/.ernosagent/models/kokoro-v1.0.onnx") and tts_peek_ptr_buf(opt_out and 0) and sess_out)
+    if st != 0:
+        return out
+    set mem_out to alloc_bytes(8)
+    set st to ep_dlcall3(tts_ort_fn(api and 69) and 0 and 0 and mem_out)
+    set ok to map_insert(out and "api" and api)
+    set ok to map_insert(out and "session" and tts_peek_ptr_buf(sess_out and 0))
+    set ok to map_insert(out and "mem" and tts_peek_ptr_buf(mem_out and 0))
+    return out
+
+# Full TTS: chunk `text`, synthesize each chunk, and write one concatenated 24kHz
+# mono PCM16 WAV at wav_path. Returns 0 on success.
+define tts_speak with text as Str and wav_path as Str returning Int:
+    set ses to tts_ort_open()
+    if map_get_val(ses and "api") == 0:
+        return 3
+    set api to map_get_val(ses and "api")
+    set session to map_get_val(ses and "session")
+    set mem_info to map_get_val(ses and "mem")
+    set vocab to tts_build_vocab()
+    set chunks to tts_chunk_text(text)
+    set nc to length_list(chunks)
+    set ptrs to create_list()
+    set lens to create_list()
+    set ci to 0
+    repeat while ci < nc:
+        set tokens to tts_tokenize(vocab and tts_phonemize(get_list(chunks and ci)))
+        set res to tts_run_tokens(api and session and mem_info and tokens)
+        if map_get_val(res and "len") > 0:
+            set ok to append_list(ptrs and map_get_val(res and "ptr"))
+            set ok to append_list(lens and map_get_val(res and "len"))
+        set ci to ci + 1
+    if length_list(ptrs) == 0:
+        return 5
+    set wr to tts_write_wav_multi(wav_path and ptrs and lens and 24000)
+    return 0
+
+# Write float32 audio samples (at audio_ptr) as a 24kHz mono PCM16 WAV via libc.
+define tts_write_wav_f32 with path as Str and audio_ptr as Int and n_samples as Int and rate as Int returning Int:
+    set libc to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    set fp to ep_dlcall2(ep_dlsym(libc and "fopen") and tts_str_to_buf(path) and tts_str_to_buf("wb"))
+    if fp == 0:
+        return 1
+    set hdr to tts_build_wav_header(n_samples and rate)
+    set wr to ep_dlcall4(ep_dlsym(libc and "fwrite") and hdr and 1 and 44 and fp)
+    set ok to tts_fwrite_pcm(libc and fp and audio_ptr and n_samples)
+    set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
+    return 0
+
+# Build a 44-byte canonical WAV header (mono 16-bit PCM) for n_samples at `rate`.
+define tts_build_wav_header with n_samples as Int and rate as Int returning Int:
+    set data_bytes to n_samples * 2
+    set hdr to alloc_bytes(44)
+    set ok to poke_byte(hdr and 0 and 82)
+    set ok to poke_byte(hdr and 1 and 73)
+    set ok to poke_byte(hdr and 2 and 70)
+    set ok to poke_byte(hdr and 3 and 70)
+    set ok to tts_poke_u32(hdr and 4 and (36 + data_bytes))
+    set ok to poke_byte(hdr and 8 and 87)
+    set ok to poke_byte(hdr and 9 and 65)
+    set ok to poke_byte(hdr and 10 and 86)
+    set ok to poke_byte(hdr and 11 and 69)
+    set ok to poke_byte(hdr and 12 and 102)
+    set ok to poke_byte(hdr and 13 and 109)
+    set ok to poke_byte(hdr and 14 and 116)
+    set ok to poke_byte(hdr and 15 and 32)
+    set ok to tts_poke_u32(hdr and 16 and 16)
+    set ok to poke_byte(hdr and 20 and 1)
+    set ok to poke_byte(hdr and 21 and 0)
+    set ok to poke_byte(hdr and 22 and 1)
+    set ok to poke_byte(hdr and 23 and 0)
+    set ok to tts_poke_u32(hdr and 24 and rate)
+    set ok to tts_poke_u32(hdr and 28 and (rate * 2))
+    set ok to poke_byte(hdr and 32 and 2)
+    set ok to poke_byte(hdr and 33 and 0)
+    set ok to poke_byte(hdr and 34 and 16)
+    set ok to poke_byte(hdr and 35 and 0)
+    set ok to poke_byte(hdr and 36 and 100)
+    set ok to poke_byte(hdr and 37 and 97)
+    set ok to poke_byte(hdr and 38 and 116)
+    set ok to poke_byte(hdr and 39 and 97)
+    set ok to tts_poke_u32(hdr and 40 and data_bytes)
+    return hdr
+
+# Convert n_samples float32 (at aptr) to PCM16 and fwrite them to fp.
+define tts_fwrite_pcm with libc as Int and fp as Int and aptr as Int and n_samples as Int returning Int:
+    set pcm to alloc_bytes(n_samples * 2)
+    set i to 0
+    repeat while i < n_samples:
+        set fixed to tts_f32_to_fixed(tts_peek_u32(aptr and i * 4))
+        set s16 to (fixed * 32767) / 1000000
+        if s16 > 32767:
+            set s16 to 32767
+        if s16 < (0 - 32768):
+            set s16 to (0 - 32768)
+        set ok to tts_poke_i16(pcm and i * 2 and s16)
+        set i to i + 1
+    set wr to ep_dlcall4(ep_dlsym(libc and "fwrite") and pcm and 1 and (n_samples * 2) and fp)
+    set ok to free_bytes(pcm)
+    return 0
+
+# Write multiple audio chunks (parallel ptrs/lens lists) as one concatenated WAV.
+define tts_write_wav_multi with path as Str and ptrs as List and lens as List and rate as Int returning Int:
+    set total to 0
+    set k to 0
+    repeat while k < length_list(lens):
+        set total to total + get_list(lens and k)
+        set k to k + 1
+    set libc to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    set fp to ep_dlcall2(ep_dlsym(libc and "fopen") and tts_str_to_buf(path) and tts_str_to_buf("wb"))
+    if fp == 0:
+        return 1
+    set wr to ep_dlcall4(ep_dlsym(libc and "fwrite") and tts_build_wav_header(total and rate) and 1 and 44 and fp)
+    set ci to 0
+    repeat while ci < length_list(ptrs):
+        set ok to tts_fwrite_pcm(libc and fp and get_list(ptrs and ci) and get_list(lens and ci))
+        set ci to ci + 1
+    set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
+    return 0
+
+# Send a complete HTTP response whose body is RAW BYTES (e.g. a WAV file).
+# The normal send_response()/net_send in http.ep are C-string based and truncate
+# at the first NUL — useless for binary. header_str must be the full status line +
+# headers + blank line (NUL-free); body_ptr/body_len point at the raw payload.
+# Caller owns body_ptr and must close client_fd afterwards.
+define tts_http_send_binary with client_fd as Int and header_str as Str and body_ptr as Int and body_len as Int returning Int:
+    set hlen to string_length(header_str)
+    set total to hlen + body_len
+    set buf to alloc_bytes(total)
+    set i to 0
+    repeat while i < hlen:
+        set ok to poke_byte(buf and i and get_character(header_str and i))
+        set i to i + 1
+    set j to 0
+    repeat while j < body_len:
+        set ok to poke_byte(buf and hlen + j and peek_byte(body_ptr and j))
+        set j to j + 1
+    set ok to ep_net_send_raw(client_fd and buf and total)
+    set ok to free_bytes(buf)
+    return 1
+
+# Deterministic filename for a TTS request: djb2 hash of the text.
+# Identical message text reuses the same cached WAV; distinct text gets a
+# distinct file. Shared by the Web UI server and the node's TTS SPEAK verb so
+# both resolve the same path (under decent_web/tts/, inside the web root).
+define tts_filename_for with text as Str returning Str:
+    set h to 5381
+    set i to 0
+    set n to string_length(text)
+    repeat while i < n:
+        set h to ((h * 33) + get_character(text and i)) modulo 1000000007
+        set i to i + 1
+    return concat("tts_" and concat(int_to_string(h) and ".wav"))
+
+# Binary-safe read of a whole file into a fresh byte buffer.
+# Returns Map{ptr, len}; ptr==0 on failure. EP's read_file is C-string based
+# (truncates at the first NUL), so binary assets like WAVs must come through here.
+define tts_read_file_bytes with path as Str returning Map:
+    set out to create_map()
+    set ok to map_insert(out and "ptr" and 0)
+    set ok to map_insert(out and "len" and 0)
+    set libc to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    set fp to ep_dlcall2(ep_dlsym(libc and "fopen") and tts_str_to_buf(path) and tts_str_to_buf("rb"))
+    if fp == 0:
+        return out
+    # fseek(fp, 0, SEEK_END=2); ftell -> size; fseek(fp, 0, SEEK_SET=0)
+    set ok to ep_dlcall3(ep_dlsym(libc and "fseek") and fp and 0 and 2)
+    set size to ep_dlcall1(ep_dlsym(libc and "ftell") and fp)
+    set ok to ep_dlcall3(ep_dlsym(libc and "fseek") and fp and 0 and 0)
+    if size <= 0:
+        set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
+        return out
+    set buf to alloc_bytes(size)
+    set rd to ep_dlcall4(ep_dlsym(libc and "fread") and buf and 1 and size and fp)
+    set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
+    set ok to map_insert(out and "ptr" and buf)
+    set ok to map_insert(out and "len" and rd)
+    return out
+
+# Copy an EP string into a fresh NUL-terminated C buffer; returns its address.
+define tts_str_to_buf with s as Str returning Int:
+    set n to string_length(s)
+    set buf to alloc_bytes(n + 1)
+    set i to 0
+    repeat while i < n:
+        set ok to poke_byte(buf and i and get_character(s and i))
+        set i to i + 1
+    set ok to poke_byte(buf and n and 0)
+    return buf
+
+# Write a 64-bit little-endian pointer value into buf at off.
+define tts_poke_ptr with buf as Int and off as Int and ptr as Int returning Int:
+    set p to ptr
+    set j to 0
+    repeat while j < 8:
+        set ok to poke_byte(buf and off + j and (p modulo 256))
+        set p to p / 256
+        set j to j + 1
+    return 0
+
+# Read a NUL-terminated C string at ptr into an EP string.
+define tts_cstr_at with ptr as Int returning Str:
+    set bytes to create_list()
+    set i to 0
+    set b to peek_byte(ptr and i)
+    repeat while b != 0 and also i < 200000:
+        set ok to append_list(bytes and b)
+        set i to i + 1
+        set b to peek_byte(ptr and i)
+    set s to string_from_list(bytes)
+    free_list(bytes)
+    return s
+
+# ── Phonemize via libespeak-ng: text -> IPA phonemes (British voice for Fable) ──
+define tts_phonemize with text as Str returning Str:
+    set lib to ep_dlopen("/opt/homebrew/lib/libespeak-ng.dylib")
+    if lib == 0:
+        return ""
+    set f_init to ep_dlsym(lib and "espeak_Initialize")
+    set path_buf to tts_str_to_buf("/opt/homebrew/share/espeak-ng-data")
+    # output=2 (SYNCHRONOUS — no audio device opened), buflength=0, path, options=0
+    set sr to ep_dlcall4(f_init and 2 and 0 and path_buf and 0)
+    # British English voice (for Fable). The language code "en-gb" is NOT accepted by
+    # SetVoiceByName (returns NOT_FOUND) — the VoiceName form is required, else no voice
+    # loads and TextToPhonemes segfaults.
+    set f_voice to ep_dlsym(lib and "espeak_SetVoiceByName")
+    set voice_buf to tts_str_to_buf("English (Great Britain)")
+    set vr to ep_dlcall1(f_voice and voice_buf)
+    set text_buf to tts_str_to_buf(text)
+    set textptr to alloc_bytes(8)
+    set ok to tts_poke_ptr(textptr and 0 and text_buf)
+    set f_ph to ep_dlsym(lib and "espeak_TextToPhonemes")
+    # TextToPhonemes returns ONE clause and advances *textptr; loop until consumed.
+    # textmode=1 (UTF8), phonememode=2 (IPA, no separator).
+    set phonemes to ""
+    set guard to 0
+    set more to 1
+    repeat while more == 1 and also guard < 1000:
+        set ph_ptr to ep_dlcall3(f_ph and textptr and 1 and 2)
+        if ph_ptr != 0:
+            set phonemes to concat(phonemes and tts_cstr_at(ph_ptr))
+            set phonemes to concat(phonemes and " ")
+        # read *textptr (the advanced pointer); 0 => done
+        set nextp to 0
+        set k to 7
+        repeat while k >= 0:
+            set nextp to nextp * 256 + peek_byte(textptr and k)
+            set k to k - 1
+        if nextp == 0:
+            set more to 0
+        set guard to guard + 1
+    free_bytes(path_buf)
+    free_bytes(voice_buf)
+    free_bytes(text_buf)
+    free_bytes(textptr)
+    return phonemes
+
+# ── Kokoro vocab: phoneme codepoint -> token id (from kokoro_onnx config.json) ──
+define tts_vocab_put with v as Map and cp as Int and id as Int returning Int:
+    set ok to map_insert(v and int_to_string(cp) and id)
+    return 0
+
+define tts_build_vocab returning Map:
+    set v to create_map()
+    set ok to tts_vocab_put(v and 59 and 1)
+    set ok to tts_vocab_put(v and 58 and 2)
+    set ok to tts_vocab_put(v and 44 and 3)
+    set ok to tts_vocab_put(v and 46 and 4)
+    set ok to tts_vocab_put(v and 33 and 5)
+    set ok to tts_vocab_put(v and 63 and 6)
+    set ok to tts_vocab_put(v and 8212 and 9)
+    set ok to tts_vocab_put(v and 8230 and 10)
+    set ok to tts_vocab_put(v and 34 and 11)
+    set ok to tts_vocab_put(v and 40 and 12)
+    set ok to tts_vocab_put(v and 41 and 13)
+    set ok to tts_vocab_put(v and 8220 and 14)
+    set ok to tts_vocab_put(v and 8221 and 15)
+    set ok to tts_vocab_put(v and 32 and 16)
+    set ok to tts_vocab_put(v and 771 and 17)
+    set ok to tts_vocab_put(v and 675 and 18)
+    set ok to tts_vocab_put(v and 677 and 19)
+    set ok to tts_vocab_put(v and 678 and 20)
+    set ok to tts_vocab_put(v and 680 and 21)
+    set ok to tts_vocab_put(v and 7517 and 22)
+    set ok to tts_vocab_put(v and 43879 and 23)
+    set ok to tts_vocab_put(v and 65 and 24)
+    set ok to tts_vocab_put(v and 73 and 25)
+    set ok to tts_vocab_put(v and 79 and 31)
+    set ok to tts_vocab_put(v and 81 and 33)
+    set ok to tts_vocab_put(v and 83 and 35)
+    set ok to tts_vocab_put(v and 84 and 36)
+    set ok to tts_vocab_put(v and 87 and 39)
+    set ok to tts_vocab_put(v and 89 and 41)
+    set ok to tts_vocab_put(v and 7498 and 42)
+    set ok to tts_vocab_put(v and 97 and 43)
+    set ok to tts_vocab_put(v and 98 and 44)
+    set ok to tts_vocab_put(v and 99 and 45)
+    set ok to tts_vocab_put(v and 100 and 46)
+    set ok to tts_vocab_put(v and 101 and 47)
+    set ok to tts_vocab_put(v and 102 and 48)
+    set ok to tts_vocab_put(v and 104 and 50)
+    set ok to tts_vocab_put(v and 105 and 51)
+    set ok to tts_vocab_put(v and 106 and 52)
+    set ok to tts_vocab_put(v and 107 and 53)
+    set ok to tts_vocab_put(v and 108 and 54)
+    set ok to tts_vocab_put(v and 109 and 55)
+    set ok to tts_vocab_put(v and 110 and 56)
+    set ok to tts_vocab_put(v and 111 and 57)
+    set ok to tts_vocab_put(v and 112 and 58)
+    set ok to tts_vocab_put(v and 113 and 59)
+    set ok to tts_vocab_put(v and 114 and 60)
+    set ok to tts_vocab_put(v and 115 and 61)
+    set ok to tts_vocab_put(v and 116 and 62)
+    set ok to tts_vocab_put(v and 117 and 63)
+    set ok to tts_vocab_put(v and 118 and 64)
+    set ok to tts_vocab_put(v and 119 and 65)
+    set ok to tts_vocab_put(v and 120 and 66)
+    set ok to tts_vocab_put(v and 121 and 67)
+    set ok to tts_vocab_put(v and 122 and 68)
+    set ok to tts_vocab_put(v and 593 and 69)
+    set ok to tts_vocab_put(v and 592 and 70)
+    set ok to tts_vocab_put(v and 594 and 71)
+    set ok to tts_vocab_put(v and 230 and 72)
+    set ok to tts_vocab_put(v and 946 and 75)
+    set ok to tts_vocab_put(v and 596 and 76)
+    set ok to tts_vocab_put(v and 597 and 77)
+    set ok to tts_vocab_put(v and 231 and 78)
+    set ok to tts_vocab_put(v and 598 and 80)
+    set ok to tts_vocab_put(v and 240 and 81)
+    set ok to tts_vocab_put(v and 676 and 82)
+    set ok to tts_vocab_put(v and 601 and 83)
+    set ok to tts_vocab_put(v and 602 and 85)
+    set ok to tts_vocab_put(v and 603 and 86)
+    set ok to tts_vocab_put(v and 604 and 87)
+    set ok to tts_vocab_put(v and 607 and 90)
+    set ok to tts_vocab_put(v and 609 and 92)
+    set ok to tts_vocab_put(v and 613 and 99)
+    set ok to tts_vocab_put(v and 616 and 101)
+    set ok to tts_vocab_put(v and 618 and 102)
+    set ok to tts_vocab_put(v and 669 and 103)
+    set ok to tts_vocab_put(v and 623 and 110)
+    set ok to tts_vocab_put(v and 624 and 111)
+    set ok to tts_vocab_put(v and 331 and 112)
+    set ok to tts_vocab_put(v and 627 and 113)
+    set ok to tts_vocab_put(v and 626 and 114)
+    set ok to tts_vocab_put(v and 628 and 115)
+    set ok to tts_vocab_put(v and 248 and 116)
+    set ok to tts_vocab_put(v and 632 and 118)
+    set ok to tts_vocab_put(v and 952 and 119)
+    set ok to tts_vocab_put(v and 339 and 120)
+    set ok to tts_vocab_put(v and 633 and 123)
+    set ok to tts_vocab_put(v and 638 and 125)
+    set ok to tts_vocab_put(v and 635 and 126)
+    set ok to tts_vocab_put(v and 641 and 128)
+    set ok to tts_vocab_put(v and 637 and 129)
+    set ok to tts_vocab_put(v and 642 and 130)
+    set ok to tts_vocab_put(v and 643 and 131)
+    set ok to tts_vocab_put(v and 648 and 132)
+    set ok to tts_vocab_put(v and 679 and 133)
+    set ok to tts_vocab_put(v and 650 and 135)
+    set ok to tts_vocab_put(v and 651 and 136)
+    set ok to tts_vocab_put(v and 652 and 138)
+    set ok to tts_vocab_put(v and 611 and 139)
+    set ok to tts_vocab_put(v and 612 and 140)
+    set ok to tts_vocab_put(v and 967 and 142)
+    set ok to tts_vocab_put(v and 654 and 143)
+    set ok to tts_vocab_put(v and 658 and 147)
+    set ok to tts_vocab_put(v and 660 and 148)
+    set ok to tts_vocab_put(v and 712 and 156)
+    set ok to tts_vocab_put(v and 716 and 157)
+    set ok to tts_vocab_put(v and 720 and 158)
+    set ok to tts_vocab_put(v and 688 and 162)
+    set ok to tts_vocab_put(v and 690 and 164)
+    set ok to tts_vocab_put(v and 8595 and 169)
+    set ok to tts_vocab_put(v and 8594 and 171)
+    set ok to tts_vocab_put(v and 8599 and 172)
+    set ok to tts_vocab_put(v and 8600 and 173)
+    set ok to tts_vocab_put(v and 7547 and 177)
+    return v
+
+# ── UTF-8 decode: phoneme string (bytes) -> List of Unicode codepoints ──
+define tts_utf8_codepoints with s as Str returning List:
+    set out to create_list()
+    set n to string_length(s)
+    set i to 0
+    repeat while i < n:
+        set b0 to get_character(s and i)
+        set cp to b0
+        set adv to 1
+        if b0 >= 240:
+            set cp to b0 modulo 8
+            set cp to cp * 64 + (get_character(s and i + 1) modulo 64)
+            set cp to cp * 64 + (get_character(s and i + 2) modulo 64)
+            set cp to cp * 64 + (get_character(s and i + 3) modulo 64)
+            set adv to 4
+        else:
+            if b0 >= 224:
+                set cp to b0 modulo 16
+                set cp to cp * 64 + (get_character(s and i + 1) modulo 64)
+                set cp to cp * 64 + (get_character(s and i + 2) modulo 64)
+                set adv to 3
+            else:
+                if b0 >= 192:
+                    set cp to b0 modulo 32
+                    set cp to cp * 64 + (get_character(s and i + 1) modulo 64)
+                    set adv to 2
+        set ok to append_list(out and cp)
+        set i to i + adv
+    return out
+
+# ── Tokenize IPA phonemes -> kokoro token ids (padded [0] ... [0]) ──
+define tts_tokenize with vocab as Map and phonemes as Str returning List:
+    set tokens to create_list()
+    set ok to append_list(tokens and 0)
+    set cps to tts_utf8_codepoints(phonemes)
+    set n to length_list(cps)
+    set i to 0
+    repeat while i < n:
+        set key to int_to_string(get_list(cps and i))
+        if map_contains(vocab and key) == 1:
+            set ok to append_list(tokens and map_get_val(vocab and key))
+        set i to i + 1
+    free_list(cps)
+    set ok to append_list(tokens and 0)
+    return tokens
+
+# ── Text chunker: split into <=200-char chunks on sentence, then clause, then word
+#    boundaries (ports the kokoro 510-phoneme-limit splitter). ──
+define tts_chunk_max returning Int:
+    return 200
+
+define tts_is_sentence_end with c as Int returning Int:
+    if c == 46 or else c == 33 or else c == 63:
+        return 1
+    return 0
+
+define tts_chunk_text with text as Str returning List:
+    set chunks to create_list()
+    set n to string_length(text)
+    set cur to ""
+    set i to 0
+    repeat while i < n:
+        set ch to substring(text and i and 1)
+        set cur to concat(cur and ch)
+        set c to get_character(text and i)
+        # flush on sentence end when at/over a reasonable size, or when over the cap
+        if tts_is_sentence_end(c) == 1 and also string_length(cur) >= 40:
+            set ok to append_list(chunks and string_trim(cur))
+            set cur to ""
+        else:
+            if string_length(cur) >= tts_chunk_max():
+                # hard cap: back off to the last space for a cleaner break
+                set sp to string_last_index_of(cur and " ")
+                if sp > 0:
+                    set ok to append_list(chunks and string_trim(substring(cur and 0 and sp)))
+                    set cur to substring(cur and sp + 1 and string_length(cur) - sp - 1)
+                else:
+                    set ok to append_list(chunks and string_trim(cur))
+                    set cur to ""
+        set i to i + 1
+    if string_length(string_trim(cur)) > 0:
+        set ok to append_list(chunks and string_trim(cur))
+    return chunks

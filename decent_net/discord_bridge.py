@@ -231,16 +231,21 @@ async def query_daemon_ipc(prompt, author=None):
         print(f"[Discord Bridge] IPC query failed: {e}", flush=True)
         return "error:daemon_offline"
 
-async def send_discord_reply(message, text):
-    """Send a reply, splitting into chunks if it exceeds Discord's 2000-char limit."""
+async def send_discord_reply(message, text, speakable=False):
+    """Send a reply, splitting into chunks if it exceeds Discord's 2000-char limit.
+    When speakable=True, a 🔊 button is attached to the final chunk that plays the
+    full message audio (the whole text, not just that chunk)."""
     try:
         if not text or not text.strip():
             text = "..."
+        view = SpeakView(text) if speakable else None
         if len(text) > 2000:
-            for chunk in [text[i:i+2000] for i in range(0, len(text), 2000)]:
-                await message.reply(chunk)
+            chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+            for idx, chunk in enumerate(chunks):
+                is_last = (idx == len(chunks) - 1)
+                await message.reply(chunk, view=(view if is_last else None))
         else:
-            await message.reply(text)
+            await message.reply(text, view=view)
     except Exception as e:
         print(f"[Discord Bridge] Failed to send reply message: {e}", flush=True)
 
@@ -298,6 +303,36 @@ class ApprovalView(discord.ui.View):
         await interaction.response.edit_message(content=interaction.message.content, view=self)
         self.stop()
 
+class SpeakView(discord.ui.View):
+    """A 🔊 button attached to AI replies. On click, asks the node to synthesise
+    the message audio (Kokoro, voice bm_fable @1.15x via the `TTS SPEAK` IPC verb)
+    and uploads the resulting WAV as a Discord attachment. Anyone in the channel
+    may play it — reading a message aloud is a read-only action."""
+    def __init__(self, text, timeout=None):
+        super().__init__(timeout=timeout)
+        self.text = text
+
+    @discord.ui.button(label="Speak", emoji="🔊", style=discord.ButtonStyle.secondary)
+    async def speak(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        # Collapse newlines so the text rides cleanly in the single-line IPC command.
+        speak_text = (self.text or "").replace("\r", " ").replace("\n", " ").strip()
+        if not speak_text:
+            await interaction.followup.send("Nothing to speak.", ephemeral=True)
+            return
+        resp = await send_daemon_ipc("TTS SPEAK " + speak_text)
+        path = None
+        for part in resp.split(","):
+            if part.startswith("path:"):
+                path = part[len("path:"):].strip()
+        if not path or not os.path.exists(path):
+            await interaction.followup.send(f"🔇 TTS failed: {resp}", ephemeral=True)
+            return
+        try:
+            await interaction.followup.send(file=discord.File(path, filename="ernos_voice.wav"))
+        except Exception as e:
+            await interaction.followup.send(f"🔇 Failed to upload audio: {e}", ephemeral=True)
+
 async def handle_tool_approval(message, resp):
     """Handle a pending tool approval: show a card with interactive buttons and wait for user decision."""
     tool_name, summary = parse_pending_approval(resp)
@@ -340,7 +375,7 @@ async def handle_tool_approval(message, resp):
         await handle_tool_approval(message, ipc_resp)
     elif ipc_resp.startswith("ai:ok,response:"):
         ai_resp = ipc_resp[len("ai:ok,response:"):]
-        await send_discord_reply(message, ai_resp)
+        await send_discord_reply(message, ai_resp, speakable=True)
     elif ipc_resp == "error:daemon_offline":
         await send_discord_reply(message, "❌ Daemon went offline during approval.")
     else:
@@ -513,7 +548,7 @@ async def on_message(message):
                 ai_resp = "..."
                 
             # Send reply on Discord
-            await send_discord_reply(message, ai_resp)
+            await send_discord_reply(message, ai_resp, speakable=True)
 
 if __name__ == "__main__":
     try:

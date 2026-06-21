@@ -17,6 +17,7 @@ import "../decent_id/auth.ep"
 import "../decent_id/keys.ep"
 import "../decent_store/rag"
 import "../storage"
+import "../decent_ai/tts"
 
 set IPC_DAEMON_PORT to 5000
 
@@ -514,6 +515,26 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     else:
                         set chat_resp to "{\"type\":\"chat_msg\",\"sender\":\"system\",\"text\":\"Message sent.\"}"
                     ws_send_text(client_fd and chat_resp)
+                else if msg_type equals "tts_request":
+                    # Synthesise the given text to a WAV (Kokoro, voice bm_fable @1.15x)
+                    # and reply with a URL the browser fetches via GET /tts/<file>.wav.
+                    set tts_text to json_get_string(payload and "text")
+                    if string_length(tts_text) == 0:
+                        ws_send_text(client_fd and "{\"type\":\"tts_error\",\"error\":\"empty text\"}")
+                    else:
+                        set tts_name to tts_filename_for(tts_text)
+                        set tts_path to concat("decent_web/tts/" and tts_name)
+                        set tts_url to concat("/tts/" and tts_name)
+                        set tts_rc to 0
+                        if file_exists(tts_path) == 0:
+                            set tts_rc to tts_speak(tts_text and tts_path)
+                        if tts_rc == 0 and also file_exists(tts_path) == 1:
+                            set tts_msg to "{\"type\":\"tts_ready\",\"url\":\""
+                            set tts_msg to concat(tts_msg and tts_url)
+                            set tts_msg to concat(tts_msg and "\"}")
+                            ws_send_text(client_fd and tts_msg)
+                        else:
+                            ws_send_text(client_fd and "{\"type\":\"tts_error\",\"error\":\"synthesis failed\"}")
                 else if msg_type equals "transfer":
                     set amount to json_get_string(payload and "amount")
                     set to_addr to json_get_string(payload and "to")
@@ -1633,6 +1654,31 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         set body to concat(body and compute)
         set body to concat(body and "}")
         set ok to send_response(client_fd and 200 and "application/json" and body)
+        return 0
+
+    # Serve synthesised TTS audio as raw bytes. The normal static path uses
+    # read_file/send_response (C-string based) which truncate WAV data at the
+    # first NUL, so binary audio must go through a raw-byte send.
+    if starts_with(raw_path and "/tts/") == 1:
+        set tts_safe to sanitize_path(raw_path)
+        set tts_rel to tts_safe
+        if string_length(tts_safe) > 1:
+            if get_character(tts_safe and 0) == 47:
+                set tts_rel to substring(tts_safe and 1 and string_length(tts_safe) - 1)
+        set tts_disk to concat("decent_web/" and tts_rel)
+        if file_exists(tts_disk) == 1:
+            set wav to tts_read_file_bytes(tts_disk)
+            set wav_ptr to map_get_val(wav and "ptr")
+            set wav_len to map_get_val(wav and "len")
+            if wav_ptr != 0 and also wav_len > 0:
+                set hdr to "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: "
+                set hdr to concat(hdr and int_to_string(wav_len))
+                set hdr to concat(hdr and "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+                set ok to tts_http_send_binary(client_fd and hdr and wav_ptr and wav_len)
+                set ok to free_bytes(wav_ptr)
+                set ok to net_close(client_fd)
+                return 0
+        set ok to send_response(client_fd and 404 and "text/plain" and "404 Not Found")
         return 0
 
     # Serve static assets
