@@ -319,13 +319,17 @@ define tts_speak_locked with text as Str and wav_path as Str returning Int:
     set session to map_get_val(ses and "session")
     set mem_info to map_get_val(ses and "mem")
     set vocab to tts_build_vocab()
-    set chunks to tts_chunk_text(text)
+    # Strip non-speakable symbols/emojis/markdown before anything is voiced.
+    set clean to tts_sanitize_text(text)
+    if string_length(clean) == 0:
+        return 5
+    set chunks to tts_chunk_text(clean)
     set nc to length_list(chunks)
     set ptrs to create_list()
     set lens to create_list()
     set ci to 0
     repeat while ci < nc:
-        set tokens to tts_tokenize(vocab and tts_phonemize(get_list(chunks and ci)))
+        set tokens to tts_tokenize(vocab and tts_phonemize_chunk(get_list(chunks and ci)))
         set res to tts_run_tokens(api and session and mem_info and tokens)
         if map_get_val(res and "len") > 0:
             set ok to append_list(ptrs and map_get_val(res and "ptr"))
@@ -579,6 +583,88 @@ define tts_phonemize with text as Str returning Str:
     free_bytes(text_buf)
     free_bytes(textptr)
     return phonemes
+
+# ── Spoken-text sanitizer ──
+# Keep only characters that should be VOICED: letters, digits, whitespace, and the
+# punctuation kokoro is trained on. Everything else — markdown (* _ # ` ~ > etc.),
+# emoji, stars/arrows/math symbols — is dropped so espeak doesn't read it aloud
+# ("asterisk", "star", emoji names, ...). Allowed Unicode punctuation (em-dash,
+# ellipsis, curly quotes) is preserved by copying its original UTF-8 bytes.
+define tts_keep_codepoint with cp as Int returning Int:
+    if cp >= 65 and also cp <= 90:
+        return 1
+    if cp >= 97 and also cp <= 122:
+        return 1
+    if cp >= 48 and also cp <= 57:
+        return 1
+    # . , ! ? ; : ' " ( ) -
+    if cp == 46 or else cp == 44 or else cp == 33 or else cp == 63:
+        return 1
+    if cp == 59 or else cp == 58 or else cp == 39 or else cp == 34:
+        return 1
+    if cp == 40 or else cp == 41 or else cp == 45:
+        return 1
+    # em-dash, ellipsis, curly single/double quotes
+    if cp == 8212 or else cp == 8230:
+        return 1
+    if cp == 8216 or else cp == 8217 or else cp == 8220 or else cp == 8221:
+        return 1
+    return 0
+
+define tts_sanitize_text with s as Str returning Str:
+    set out to ""
+    set n to string_length(s)
+    set i to 0
+    repeat while i < n:
+        set b0 to get_character(s and i)
+        set cp to b0
+        set adv to 1
+        if b0 >= 240:
+            set cp to b0 modulo 8
+            set cp to cp * 64 + (get_character(s and i + 1) modulo 64)
+            set cp to cp * 64 + (get_character(s and i + 2) modulo 64)
+            set cp to cp * 64 + (get_character(s and i + 3) modulo 64)
+            set adv to 4
+        else:
+            if b0 >= 224:
+                set cp to b0 modulo 16
+                set cp to cp * 64 + (get_character(s and i + 1) modulo 64)
+                set cp to cp * 64 + (get_character(s and i + 2) modulo 64)
+                set adv to 3
+            else:
+                if b0 >= 192:
+                    set cp to b0 modulo 32
+                    set cp to cp * 64 + (get_character(s and i + 1) modulo 64)
+                    set adv to 2
+        if cp == 32 or else cp == 9 or else cp == 10 or else cp == 13:
+            set out to concat(out and " ")
+        else:
+            if tts_keep_codepoint(cp) == 1:
+                set out to concat(out and substring(s and i and adv))
+        set i to i + adv
+    return string_trim(out)
+
+# Phonemize a chunk sentence-by-sentence, re-attaching each sentence's terminator
+# (. ! ?). espeak's IPA output (phonememode 2) drops punctuation, so kokoro never
+# sees the sentence-final token it was trained on and the boundary sounds cramped.
+# Re-adding the terminator restores its learned pause/intonation; the trailing spaces
+# (space = a pause token) widen the gap after the period a touch more.
+define tts_phonemize_chunk with chunk as Str returning Str:
+    set sentences to tts_split_sentences(chunk)
+    set ns to length_list(sentences)
+    set out to ""
+    set i to 0
+    repeat while i < ns:
+        set s to string_trim(get_list(sentences and i))
+        set sl to string_length(s)
+        if sl > 0:
+            set out to concat(out and tts_phonemize(s))
+            set last to get_character(s and sl - 1)
+            if tts_is_sentence_end(last) == 1:
+                set out to concat(out and substring(s and sl - 1 and 1))
+            set out to concat(out and "  ")
+        set i to i + 1
+    return out
 
 # ── Kokoro vocab: phoneme codepoint -> token id (from kokoro_onnx config.json) ──
 define tts_vocab_put with v as Map and cp as Int and id as Int returning Int:

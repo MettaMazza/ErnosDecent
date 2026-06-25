@@ -1,0 +1,76 @@
+# Gate for the \uXXXX decoding fix in stdlib/json.ep. Before the fix, json_parse
+# left "&" (&) and ">" (>) as the literal text "u0026"/"u003e",
+# which mangled any decoded shell command and created stray files named after the
+# fragments (echo / u0026u0026 / u003e). These assert real decoding, including
+# multibyte UTF-8 and surrogate pairs.
+
+import "string"
+import "json"
+
+set BS to "\\"
+set Q to "\""
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+# Decode a raw JSON document to its string value.
+define dec with raw:
+    return get_json_value(json_parse(raw))
+
+# Build "\uXXXX" (backslash + u + hex) without relying on EP lexer escape rules.
+define u_esc with hex:
+    return concat(BS and concat("u" and hex))
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # 1. The exact bug: && must decode to "&&", > to ">".
+    set amp to concat(Q and concat(u_esc("0026") and concat(u_esc("0026") and Q)))
+    set total to total + 1
+    set passes to passes + pass_if("\\u0026\\u0026 decodes to &&" and (dec(amp) equals "&&"))
+
+    set gt to concat(Q and concat(u_esc("003e") and Q))
+    set total to total + 1
+    set passes to passes + pass_if("\\u003e decodes to >" and (dec(gt) equals ">"))
+
+    # 2. A realistic mangled command decodes cleanly.
+    #    "ls > out.txt && cat out.txt"
+    set cmd to concat(Q and concat("ls " and concat(u_esc("003e") and concat(" out.txt " and concat(u_esc("0026") and concat(u_esc("0026") and concat(" cat out.txt" and Q)))))))
+    set total to total + 1
+    set passes to passes + pass_if("command decodes redirect+chain" and (dec(cmd) equals "ls > out.txt && cat out.txt"))
+
+    # 3. ASCII escape A -> "A".
+    set a_esc to concat(Q and concat(u_esc("0041") and Q))
+    set total to total + 1
+    set passes to passes + pass_if("\\u0041 decodes to A" and (dec(a_esc) equals "A"))
+
+    # 4. Standard escapes still work (\n -> newline): "a\nb" has length 3.
+    set nl to concat(Q and concat("a" and concat(BS and concat("n" and concat("b" and Q)))))
+    set total to total + 1
+    set passes to passes + pass_if("\\n still decodes (len 3)" and (string_length(dec(nl)) == 3))
+
+    # 5. Multibyte BMP: é (é) -> 2 UTF-8 bytes.
+    set e_acute to concat(Q and concat(u_esc("00e9") and Q))
+    set total to total + 1
+    set passes to passes + pass_if("\\u00e9 -> 2 UTF-8 bytes" and (string_length(dec(e_acute)) == 2))
+
+    # 6. Surrogate pair: 😀 (emoji) -> 4 UTF-8 bytes.
+    set emoji to concat(Q and concat(u_esc("D83D") and concat(u_esc("DE00") and Q)))
+    set total to total + 1
+    set passes to passes + pass_if("surrogate pair -> 4 UTF-8 bytes" and (string_length(dec(emoji)) == 4))
+
+    # 7. Malformed escape does not crash and preserves data.
+    set bad to concat(Q and concat(u_esc("0g") and concat("x" and Q)))
+    set total to total + 1
+    set passes to passes + pass_if("malformed \\u does not crash" and (string_length(dec(bad)) > 0))
+
+    display f"=== {passes}/{total} passed ==="
+    if passes == total:
+        display "ALL PASS"
+    else:
+        display "FAILURES PRESENT"

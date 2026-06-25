@@ -1,0 +1,73 @@
+# Gate for the cwd-garbage-file fix in logging.ep. Proves the path guard rejects
+# every garbage filename actually found in the repo root (each was a clobbered
+# LOG_FILE_PATH that received a run's worth of logs) and that the normal log path
+# still works end to end.
+
+import "string"
+import "fs"
+import "os"
+import "logging"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # 1. The canonical absolute path is accepted.
+    set total to total + 1
+    set passes to passes + pass_if("accepts canonical absolute log path" and (log_path_is_valid("/Users/mettamazza/.ernosdecent/logs/ernosdecent.log") == 1))
+
+    # 2. Every real garbage filename found on disk is rejected.
+    set total to total + 1
+    set passes to passes + pass_if("rejects banner: P2P servers started" and (log_path_is_valid("P2P protocol servers started (P2P:9100") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("rejects banner: DHT listening" and (log_path_is_valid("[P2P] DHT server listening on port 9401") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("rejects agent reply" and (log_path_is_valid("Hello! I am the ErnOS Agent, operating within the Ernos decentralized node. How can I assist you today?") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("rejects web UI banner" and (log_path_is_valid("[*] Sovereign Web UI server starting on port 9480") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("rejects LLM banner" and (log_path_is_valid("[LLM] Trying selected model 'gemma4:26b' on Ollama (11434)...") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("rejects tool-schema header" and (log_path_is_valid("Available Tools:") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("rejects IPC line" and (log_path_is_valid("CMD=SESSION ACTIVE RESP=session:active_id,id:default") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("rejects empty path" and (log_path_is_valid("") == 0))
+
+    # 3. A relative path that even contains the sentinel is still rejected (this is
+    #    exactly what would create a file in the cwd).
+    set total to total + 1
+    set passes to passes + pass_if("rejects relative path with sentinel" and (log_path_is_valid("logs/ernosdecent.log") == 0))
+
+    # 4. The rebuilt expected path is itself absolute, canonical, and valid.
+    set exp to log_expected_path()
+    display f"  log_expected_path() = {exp}"
+    set total to total + 1
+    set passes to passes + pass_if("expected path is valid" and (log_path_is_valid(exp) == 1))
+
+    # 5. End to end: normal logging still writes to the configured absolute path
+    #    and NOT to the cwd.
+    set tmp to "/tmp/ernosdecent_logtest"
+    set ok to run_command(concat("rm -rf " and tmp))
+    set ok to log_init(tmp and 5242880 and 5)
+    set ok to log_info("test" and "integrity check line")
+    set written to concat(tmp and "/ernosdecent.log")
+    set total to total + 1
+    set passes to passes + pass_if("log file created at configured absolute path" and (fs_exists(written) == 1))
+    set body to read_file(written)
+    set total to total + 1
+    set passes to passes + pass_if("log line written to the real file" and (string_contains(body and "integrity check line") == 1))
+    set ok to run_command(concat("rm -rf " and tmp))
+
+    display f"=== {passes}/{total} passed ==="
+    if passes == total:
+        display "ALL PASS"
+    else:
+        display "FAILURES PRESENT"

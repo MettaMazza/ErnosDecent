@@ -33,7 +33,23 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
         set ok to map_insert(result and "verdict" and "ALLOWED")
         set ok to map_insert(result and "reason" and "test-mode: audit skipped")
         return result
-    
+
+    # Deterministic fast-path. A plain-language final reply (NOT a run_command /
+    # codebase_write action audit) that passes the deterministic moderation
+    # classifier is ALLOWED without a second LLM inference — this is the common case
+    # and previously doubled per-reply latency. Anything the classifier flags, and
+    # every dangerous-tool audit, falls through to the full LLM audit below (which
+    # fails closed). Dangerous-tool audits are identified by their payload prefix.
+    set is_action_audit to 0
+    if string_index_of(agent_response and "run_command:") == 0 or else string_index_of(agent_response and "codebase_write:") == 0:
+        set is_action_audit to 1
+    if is_action_audit == 0:
+        set mod to observer_moderate(agent_response)
+        if mod equals "moderation:clean":
+            set ok to map_insert(result and "verdict" and "ALLOWED")
+            set ok to map_insert(result and "reason" and "deterministic fast-path: plain reply, moderation clean")
+            return result
+
     # Get selected model for LLM query
     set selected_model to ""
     if map_contains(ctx and "selected_model") == 1:

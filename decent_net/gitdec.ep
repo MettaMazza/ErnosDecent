@@ -22,6 +22,7 @@ set GITDEC_ERR_UNAUTHORIZED to 802
 set GITDEC_ERR_VERIFICATION_FAILED to 803
 set GITDEC_ERR_INVALID_REF to 804
 set GITDEC_ERR_NOT_FOUND to 805
+set GITDEC_ERR_INVALID_VISIBILITY to 806
 
 # ================================================================
 # Conversion: JSON Nodes to Native Maps/Lists
@@ -76,10 +77,16 @@ define gitdec_serialize_manifest with manifest as Map returning Str:
     set name_val to json_escape_string(map_get_val(manifest and "name"))
     set collaborators to map_get_val(manifest and "authorized_collaborators")
     set refs to map_get_val(manifest and "ref_heads")
-    
+    # Visibility ("public"/"private"); default public for manifests written before the
+    # field existed, so old repos keep behaving exactly as they did.
+    set vis_val to "public"
+    if map_contains(manifest and "visibility") == 1:
+        set vis_val to map_get_val(manifest and "visibility")
+
     set json_str to "{\n"
     set json_str to concat(json_str and f"  \"id\": \"{id_val}\",\n")
     set json_str to concat(json_str and f"  \"name\": \"{name_val}\",\n")
+    set json_str to concat(json_str and f"  \"visibility\": \"{vis_val}\",\n")
     
     # collaborators map
     set json_str to concat(json_str and "  \"authorized_collaborators\": {\n")
@@ -279,6 +286,9 @@ define gitdec_create_repo with repo_id as Str and name as Str and owner_did as S
     set ok to map_insert(manifest and "name" and name)
     set ok to map_insert(manifest and "authorized_collaborators" and collaborators)
     set ok to map_insert(manifest and "ref_heads" and refs)
+    # Visibility: "public" (broadcast to the whole mesh, the default) or "private"
+    # (kept on this node, never announced over Nostr). Toggle with gitdec_set_visibility.
+    set ok to map_insert(manifest and "visibility" and "public")
     
     set ok to gitdec_save_manifest(manifest_path and manifest)
     return manifest
@@ -311,6 +321,40 @@ define gitdec_remove_collaborator with repo_id as Str and owner_did as Str and c
         return GITDEC_ERR_UNAUTHORIZED
         
     set ok to map_delete(collaborators and collab_did)
+    set ok to gitdec_save_manifest(manifest_path and manifest)
+    free_map(manifest)
+    return GITDEC_ERR_NONE
+
+# Is the repo private? (missing field => public, for backward compatibility.)
+define gitdec_repo_is_private with repo_id as Str returning Int:
+    set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+    set manifest to gitdec_load_json(manifest_path)
+    if manifest == 0:
+        return 0
+    set priv to 0
+    if map_contains(manifest and "visibility") == 1:
+        set vis to map_get_val(manifest and "visibility")
+        if vis equals "private":
+            set priv to 1
+    free_map(manifest)
+    return priv
+
+# Owner-only: set a repo's visibility to "public" or "private". Making a repo public
+# does NOT retroactively broadcast it — push or re-announce to share it; making it
+# private stops all future Nostr broadcasts for it (it stays on this node).
+define gitdec_set_visibility with repo_id as Str and owner_did as Str and visibility as Str returning Int:
+    if (visibility equals "public") == 0 and also (visibility equals "private") == 0:
+        return GITDEC_ERR_INVALID_VISIBILITY
+    set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
+    set manifest to gitdec_load_json(manifest_path)
+    if manifest == 0:
+        return GITDEC_ERR_REPO_NOT_FOUND
+    set collaborators to map_get_val(manifest and "authorized_collaborators")
+    set current_role to map_get_val(collaborators and owner_did)
+    if (current_role equals "owner") == 0:
+        free_map(manifest)
+        return GITDEC_ERR_UNAUTHORIZED
+    set ok to map_insert(manifest and "visibility" and visibility)
     set ok to gitdec_save_manifest(manifest_path and manifest)
     free_map(manifest)
     return GITDEC_ERR_NONE
@@ -598,6 +642,11 @@ define gitdec_get_repo_file with repo_id as Str and filename as Str returning St
     return read_file(filepath)
 
 define gitdec_broadcast_nostr with repo_id as Str and kind as Int and content as Str and secret_key_hex as Str and public_key_hex as Str returning Int:
+    # Privacy gate: a private repo is never announced to the mesh. All sharing happens
+    # via these Nostr broadcasts, so skipping them keeps a private repo local-only.
+    if gitdec_repo_is_private(repo_id) == 1:
+        log_info("gitdec" and concat("Repo " and concat(repo_id and " is private - skipping network broadcast.")))
+        return GITDEC_ERR_NONE
     set tags to create_list()
     set r_tag to create_list()
     set ok to append_list(r_tag and "r")
