@@ -45,6 +45,20 @@ set PROTO_PORT_P2P to 9100
 set PROTO_PORT_DHT to 9101
 set PROTO_PORT_RELAY to 9102
 
+# Running count of inbound Noise handshake failures (unauthenticated/incompatible
+# peers or port scanners). Used to throttle logging — these were being emitted as
+# raw stdout spam, one identical line per failed connection.
+set P2P_HS_FAIL_COUNT to 0
+
+# Record a handshake failure and log it throttled: the first occurrence, then a
+# running summary every 100. Routed through log_warn (file logger), which does NOT
+# print to the console, so it no longer spams stdout.
+define p2p_note_handshake_failure returning Int:
+    set P2P_HS_FAIL_COUNT to P2P_HS_FAIL_COUNT + 1
+    if P2P_HS_FAIL_COUNT == 1 or else (P2P_HS_FAIL_COUNT - ((P2P_HS_FAIL_COUNT / 100) * 100)) == 0:
+        set ok to log_warn("p2p" and f"Inbound Noise handshake failures: {P2P_HS_FAIL_COUNT} total (unauthenticated/incompatible peers or scanners).")
+    return 0
+
 # ================================================================
 # DHT Server Thread — handles DHT-only connections (no encryption)
 # ================================================================
@@ -165,7 +179,7 @@ define p2p_handle_connection with conn as Map and static_secret as Int and stati
     set hs_result to noise_net_handshake_respond(conn and static_secret and static_public)
     set hs_err to map_get_val(hs_result and "error")
     if hs_err != NOISE_NET_ERR_NONE:
-        display "[P2P] Handshake failed with remote peer"
+        set ok to p2p_note_handshake_failure()
         return PROTO_ERR_HANDSHAKE_FAILED
 
     set session to map_get_val(hs_result and "session")

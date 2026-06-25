@@ -89,6 +89,33 @@ define log_rotate returning Int:
     return 0
 
 # ================================================================
+# Path integrity (defends against the cwd-garbage-file bug)
+# ================================================================
+# The node logs from ~10 spawned threads (protocol servers, scheduler, raft, web,
+# gitdec). LOG_FILE_PATH is a shared global; under concurrency it can be clobbered
+# by string-buffer aliasing to an unrelated freshly-formatted string (a banner, an
+# agent reply, an IPC line). Every such clobber is a RELATIVE string with no
+# "ernosdecent.log" — so file_append would create a file IN THE CWD named after it
+# and dump the run's logs there. We reject any path that is not our canonical
+# absolute log file, and rebuild it from the home-dir syscall when corrupted.
+
+define log_path_is_valid with p as Str returning Int:
+    if string_length(p) == 0:
+        return 0
+    # Must be an absolute path ('/' == 47). All observed garbage names are relative.
+    if get_character(p and 0) != 47:
+        return 0
+    return string_contains(p and "ernosdecent.log")
+
+define log_expected_path returning Str:
+    # Rebuild from the configured dir when it is still intact, else from the
+    # home-dir syscall (always valid, never aliased through the string arena).
+    set d to concat(LOG_DIR and "")
+    if string_length(d) == 0 or else string_contains(d and "/.ernosdecent") == 0:
+        set d to concat(get_home_dir() and "/.ernosdecent/logs")
+    return concat(d and "/ernosdecent.log")
+
+# ================================================================
 # Core Write
 # ================================================================
 
@@ -139,14 +166,25 @@ define log_write with level as Int and component as Str and message as Str retur
     set line to concat(line and message)
     set line to concat(line and "\n")
 
-    # Check rotation
     set line_len to string_length(line)
-    if LOG_CURRENT_SIZE + line_len > LOG_MAX_FILE_SIZE:
-        set ok to log_rotate()
 
-    # Write to file
-    set ok to file_append(LOG_FILE_PATH and line)
-    set LOG_CURRENT_SIZE to LOG_CURRENT_SIZE + line_len
+    # Harden the path before any file op. If the shared global was clobbered,
+    # self-heal it; then write to a PRIVATE owned copy so a concurrent clobber
+    # between here and file_append cannot redirect the write into the cwd.
+    if log_path_is_valid(LOG_FILE_PATH) == 0:
+        set LOG_FILE_PATH to log_expected_path()
+    set safe_path to concat(LOG_FILE_PATH and "")
+
+    if log_path_is_valid(safe_path) == 1:
+        # Check rotation
+        if LOG_CURRENT_SIZE + line_len > LOG_MAX_FILE_SIZE:
+            set ok to log_rotate()
+        set ok to file_append(safe_path and line)
+        set LOG_CURRENT_SIZE to LOG_CURRENT_SIZE + line_len
+    else:
+        # Path could not be made canonical — never spray logs into a stray file;
+        # fall back to console so the line is not silently lost.
+        display f"[{level_str}] [{component}] {message}"
 
     # Also display errors and fatals to console
     if level >= LOG_LEVEL_ERROR:

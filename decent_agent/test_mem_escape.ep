@@ -1,0 +1,95 @@
+# Gate for the memory_json_escape fix: must escape all control bytes (valid JSON)
+# and run in O(n) (the serialize-hang fix). Builds a string with embedded control
+# bytes and a large blob, asserts correct escaping and near-linear scaling.
+
+import "string"
+import "collections"
+import "./memory"
+
+external define ep_time_now_ms:
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define build with n:
+    set s to "the quick brown fox 0123456789 "
+    repeat while string_length(s) < n:
+        set s to concat(s and s)
+    return s
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # 1. Quote and backslash escape.
+    set q to "\""
+    set out1 to memory_json_escape(concat("a" and concat(q and "b")))
+    set total to total + 1
+    set passes to passes + pass_if("escapes quote" and (string_contains(out1 and "a\\\"b") == 1))
+
+    # 2. Control bytes -> \u00XX. Build a string containing bytes 1, 4, 15.
+    set ctl to create_list()
+    set ok to append_list(ctl and 65)   # A
+    set ok to append_list(ctl and 1)    # SOH -> 
+    set ok to append_list(ctl and 4)    # EOT -> 
+    set ok to append_list(ctl and 15)   # SI  -> 
+    set ok to append_list(ctl and 66)   # B
+    set raw to string_from_list(ctl)
+    set esc to memory_json_escape(raw)
+    set total to total + 1
+    set passes to passes + pass_if("control 0x01 -> \\u0001" and (string_contains(esc and "\\u0001") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("control 0x04 -> \\u0004" and (string_contains(esc and "\\u0004") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("control 0x0f -> \\u000f" and (string_contains(esc and "\\u000f") == 1))
+    set ecodes to string_to_list(esc)
+    set en to length_list(ecodes)
+    set ctrl_count to 0
+    set ci to 0
+    repeat while ci < en:
+        set c to get_list(ecodes and ci)
+        if c < 32:
+            set ctrl_count to ctrl_count + 1
+        set ci to ci + 1
+    set total to total + 1
+    set passes to passes + pass_if("no raw control bytes remain in output" and (ctrl_count == 0))
+
+    # 3. Tab/newline still use short escapes.
+    set tnl to create_list()
+    set ok to append_list(tnl and 97)   # a
+    set ok to append_list(tnl and 9)    # tab
+    set ok to append_list(tnl and 98)   # b
+    set ok to append_list(tnl and 10)   # newline
+    set ok to append_list(tnl and 99)   # c
+    set tn to memory_json_escape(string_from_list(tnl))
+    set total to total + 1
+    set passes to passes + pass_if("tab -> \\t" and (string_contains(tn and "\\t") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("newline -> \\n" and (string_contains(tn and "\\n") == 1))
+
+    # 4. O(n): escaping 256KB must not blow up (was O(n^2) -> minutes). Compare
+    #    160KB vs 320KB; doubling input should ~double time, not ~quadruple.
+    set s1 to build(160000)
+    set s2 to build(320000)
+    set t0 to ep_time_now_ms()
+    set r1 to memory_json_escape(s1)
+    set t1 to ep_time_now_ms()
+    set r2 to memory_json_escape(s2)
+    set t2 to ep_time_now_ms()
+    set d1 to t1 - t0
+    set d2 to t2 - t1
+    display f"  escape 160KB={d1}ms  320KB={d2}ms"
+    set total to total + 1
+    set passes to passes + pass_if("320KB escape finishes < 1500ms (linear)" and (d2 < 1500))
+    set total to total + 1
+    set passes to passes + pass_if("scaling is near-linear (d2 < 4*d1 + 50)" and (d2 < (4 * d1) + 50))
+
+    display f"=== {passes}/{total} passed ==="
+    if passes == total:
+        display "ALL PASS"
+    else:
+        display "FAILURES PRESENT"

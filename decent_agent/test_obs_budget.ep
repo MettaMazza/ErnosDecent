@@ -1,0 +1,79 @@
+# Gate for the context-window fix in react_loop.ep: the per-turn tool-output
+# budget must be DERIVED from the model's own context window (get_model_context_limit,
+# which scales by model + system RAM), never a fixed cap. A desktop listing that
+# blew the prompt to 3.7M chars must be fit to the real window, not crippled to a
+# magic constant.
+
+import "string"
+import "collections"
+import "./react_loop"
+import "./llm"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+# Build a string of at least n characters (doubling).
+define make_big with n as Int returning Str:
+    set s to "ABCDEFGHIJ0123456789"
+    repeat while string_length(s) < n:
+        set s to concat(s and s)
+    return s
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # 1. Budget is exactly the model-derived formula, proving it scales with the
+    #    real context window rather than a hardcoded number.
+    set lim to get_model_context_limit("gemma4")
+    set expected to (((lim * 7) / 2) * 3) / 4 - 1000
+    set got to react_observation_budget("gemma4" and 1000)
+    set total to total + 1
+    set passes to passes + pass_if("budget derived from get_model_context_limit" and (got == expected))
+    display f"  gemma4 ctx limit={lim} tokens -> observation budget={got} chars (prompt=1000)"
+
+    # 2. A larger-window model must yield at least as large a budget as a small
+    #    one at the same prompt length (monotonic in the model's window).
+    set big to react_observation_budget("gemma4" and 0)
+    set small to react_observation_budget("gemma2" and 0)
+    set total to total + 1
+    set passes to passes + pass_if("bigger model window -> budget >= smaller model" and (big >= small))
+    display f"  gemma4 budget={big}  gemma2 budget={small}"
+
+    # 3. Output that fits passes through untouched.
+    set short_out to "Desktop listing: ernos.ep, node.ep, README.md"
+    set total to total + 1
+    set passes to passes + pass_if("small output passes through unchanged" and (react_fit_observation(short_out and 100000) equals short_out))
+
+    # 4. A 4,000,000-char blob (the desktop-listing blowup) is fit to the model's
+    #    window: trimmed, flagged, and — crucially — NOT crippled to a tiny fixed
+    #    cap. With a real model window it must keep far more than 12000 chars.
+    set blob to make_big(4000000)
+    set budget to react_observation_budget("gemma4" and 0)
+    set fitted to react_fit_observation(blob and budget)
+    set flen to string_length(fitted)
+    set total to total + 1
+    set passes to passes + pass_if("blowup blob is trimmed below original" and (flen < 4000000))
+    set total to total + 1
+    set passes to passes + pass_if("trim notice present" and (string_contains(fitted and "OUTPUT TRUNCATED") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("kept length matches the derived room (not a fixed cap)" and (flen == budget))
+    set total to total + 1
+    set passes to passes + pass_if("kept far more than the old 12000 magic cap" and (flen > 100000))
+    display f"  blob={string_length(blob)} budget={budget} fitted={flen}"
+
+    # 5. Floor: even with a near-full window the model still sees some output.
+    set tiny to react_fit_observation(blob and 10)
+    set tlen to string_length(tiny)
+    set total to total + 1
+    set passes to passes + pass_if("min-room floor keeps output non-empty when window is full" and (tlen >= 2048))
+
+    display f"=== {passes}/{total} passed ==="
+    if passes == total:
+        display "ALL PASS"
+    else:
+        display "FAILURES PRESENT"

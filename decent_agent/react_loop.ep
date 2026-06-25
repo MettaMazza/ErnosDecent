@@ -12,6 +12,41 @@ import "memory"
 import "observer"
 import "session"
 
+# Characters of tool output we can fold into the prompt this turn, derived from
+# the model's OWN context window (get_model_context_limit, which already scales by
+# model + system RAM) minus what the prompt already holds. This is NOT a fixed
+# cap: a 200k-token model (gemma4) gets ~hundreds of KB of headroom, an 8k model
+# proportionally less. We convert tokens→chars at ~3.5 chars/token (BPE average
+# for mixed prose + paths/code; deliberately low so we under-estimate the window
+# and never overflow it) and reserve 25% of the window for the model's reply and
+# the loop's remaining turns. Returns the remaining char budget (can be negative
+# when the prompt has already filled the window).
+define react_observation_budget with model_name as Str and prompt_len as Int returning Int:
+    set ctx_tokens to get_model_context_limit(model_name)
+    set window_chars to (ctx_tokens * 7) / 2
+    set usable to (window_chars * 3) / 4
+    return usable - prompt_len
+
+# Fit a tool result into the per-turn budget. If it fits, it passes through whole.
+# If not, keep the head that fits and tell the model it was clipped (with the real
+# total) so it narrows its next query instead of silently losing the tail or
+# blowing up the inference call. A small floor guarantees the model always sees
+# some of the output even when the window is nearly full.
+define react_fit_observation with text as Str and budget as Int returning Str:
+    set room to budget
+    set min_room to 2048
+    if room < min_room:
+        set room to min_room
+    set n to string_length(text)
+    if n <= room:
+        return text
+    set notice to f"\n\n[OUTPUT TRUNCATED to fit the model context window: {n} chars total, {room} kept. Narrow your request — target a specific directory, add a depth/count limit, or filter — and do not recurse into build/cache dirs (target/, node_modules/, .git/, deps/).]"
+    set keep to room - string_length(notice)
+    if keep < 0:
+        set keep to 0
+    set head to substring(text and 0 and keep)
+    return concat(head and notice)
+
 define react_parse_action with raw as Str returning Map:
     set result to create_map()
     set ok to map_insert(result and "found" and 0)
@@ -385,11 +420,16 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set current_prompt to concat(current_prompt and audit_reason)
                     set current_prompt to concat(current_prompt and ". Please correct the response and try again.\n")
             else:
-                # Standard tool observation back to prompt
+                # Standard tool observation back to prompt — fit it to the model's
+                # remaining context window (derived, never a fixed cap).
+                set obs_model to ""
+                if map_contains(ctx and "selected_model") == 1:
+                    set obs_model to map_get_val(ctx and "selected_model")
+                set obs_budget to react_observation_budget(obs_model and string_length(current_prompt))
                 set current_prompt to concat(current_prompt and "\n")
                 set current_prompt to concat(current_prompt and raw_output)
                 set current_prompt to concat(current_prompt and "\nObservation: ")
-                set current_prompt to concat(current_prompt and tool_result)
+                set current_prompt to concat(current_prompt and react_fit_observation(tool_result and obs_budget))
                 set current_prompt to concat(current_prompt and "\n")
                 
                 set denials to 0
@@ -497,11 +537,16 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
         if verdict equals "ALLOWED":
             return tool_result
     
-    # Inject the result as an Observation and re-enter the main loop
+    # Inject the result as an Observation and re-enter the main loop — fit it to
+    # the model's remaining context window (derived, never a fixed cap).
+    set obs_model to ""
+    if map_contains(ctx and "selected_model") == 1:
+        set obs_model to map_get_val(ctx and "selected_model")
+    set obs_budget to react_observation_budget(obs_model and string_length(current_prompt))
     set current_prompt to concat(current_prompt and "\n")
     set current_prompt to concat(current_prompt and raw_output)
     set current_prompt to concat(current_prompt and "\nObservation: ")
-    set current_prompt to concat(current_prompt and tool_result)
+    set current_prompt to concat(current_prompt and react_fit_observation(tool_result and obs_budget))
     set current_prompt to concat(current_prompt and "\n")
     
     if denials >= 2:

@@ -18,6 +18,9 @@ import "./decent_net/relay"
 set HEALTH_OK to "healthy"
 set HEALTH_DEGRADED to "degraded"
 set HEALTH_DOWN to "down"
+# A mesh root / first node legitimately has zero peers. That is a topology state,
+# not a fault, so it gets its own status that does NOT drag overall to "degraded".
+set HEALTH_STANDALONE to "standalone"
 
 # ================================================================
 # Individual Health Checks
@@ -42,8 +45,10 @@ define check_dht_health with dht as Int returning Map:
     if peer_count > 0:
         set ok to map_insert(result and "status" and HEALTH_OK)
     else:
-        set ok to map_insert(result and "status" and HEALTH_DEGRADED)
-        set ok to map_insert(result and "warning" and "no peers discovered")
+        # Zero peers is the legitimate state of a mesh root / first node, not a
+        # fault — report it distinctly so it doesn't pull overall to "degraded".
+        set ok to map_insert(result and "status" and HEALTH_STANDALONE)
+        set ok to map_insert(result and "note" and "no peers yet (root/standalone)")
     return result
 
 define check_raft_health with borrow raft_node as Map returning Map:
@@ -119,8 +124,11 @@ define run_health_check with dht as Int and borrow raft_node as Map and ipc_port
     set ok to map_insert(report and "checks" and checks)
     set ok to map_insert(report and "check_count" and length_list(checks))
 
-    # Determine overall status
+    # Determine overall status. Real faults (down/degraded) take precedence; a
+    # standalone subsystem only surfaces as "standalone" when nothing is actually
+    # wrong, so a healthy root node no longer mislabels itself "degraded".
     set overall to HEALTH_OK
+    set saw_standalone to 0
     set ci to 0
     set total to length_list(checks)
     repeat while ci < total:
@@ -128,11 +136,14 @@ define run_health_check with dht as Int and borrow raft_node as Map and ipc_port
         set status to map_get_val(check and "status")
         if status equals HEALTH_DOWN:
             set overall to HEALTH_DOWN
-        else:
-            if status equals HEALTH_DEGRADED:
-                if overall equals HEALTH_OK:
-                    set overall to HEALTH_DEGRADED
+        else if status equals HEALTH_DEGRADED:
+            if overall equals HEALTH_OK:
+                set overall to HEALTH_DEGRADED
+        else if status equals HEALTH_STANDALONE:
+            set saw_standalone to 1
         set ci to ci + 1
+    if overall equals HEALTH_OK and also saw_standalone == 1:
+        set overall to HEALTH_STANDALONE
 
     set ok to map_insert(report and "overall" and overall)
     set ok to map_insert(report and "timestamp" and ep_time_now_sec())

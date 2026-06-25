@@ -81,7 +81,17 @@ define memory_store with memory_mgr as Map and tier as Int and key as Str and va
         # Timeline
         set timeline to map_get_val(memory_mgr and "timeline")
         set timeline_entry to f"[{key}] {value}"
+        # Bound a single entry: one huge tool result (e.g. a recursive directory
+        # listing) must not bloat memory or slow serialization, which runs on every
+        # reply. 8192 chars keeps the full record useful without unbounded growth.
+        if string_length(timeline_entry) > 8192:
+            set timeline_entry to concat(substring(timeline_entry and 0 and 8192) and "...[truncated]")
         set ok to append_list(timeline and timeline_entry)
+        # Ring buffer: keep only the most recent entries so the timeline can't grow
+        # without limit across a long-running session.
+        set tcount to length_list(timeline)
+        if tcount > 200:
+            set ok to remove_list(timeline and 0)
         set ok to append_list(values_list and timeline_entry)
         return 0
         
@@ -397,36 +407,51 @@ define memory_recall_semantic with memory_mgr as Map and model as Map and query 
         set ok to append_list(results and map_get_val(lessons and best_key))
     return results
 
+define memory_hex_digit with n as Int returning Int:
+    if n < 10:
+        return 48 + n
+    return 87 + n
+
+# O(n) JSON string escape. Reads the whole string once via string_to_list (one
+# pass) and indexes the resulting list in O(1), instead of get_character per index
+# (which is O(n) each -> O(n^2) overall and was the source of the serialize hang).
+# Also escapes ALL control bytes < 0x20 as \u00XX: the old version emitted them raw,
+# producing invalid JSON that failed to reload (config/agent_memory.json corruption).
 define memory_json_escape with s as Str returning Str:
-    set len to string_length(s)
+    set codes to string_to_list(s)
+    set len to length_list(codes)
     set result_list to create_list()
     set i to 0
     repeat while i < len:
-        set ch to get_character(s and i)
+        set ch to get_list(codes and i)
         if ch == 34: # "
             set ok to append_list(result_list and 92)
             set ok to append_list(result_list and 34)
+        else if ch == 92: # \
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 92)
+        else if ch == 10: # \n
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 110)
+        else if ch == 13: # \r
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 114)
+        else if ch == 9: # \t
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 116)
+        else if ch < 32: # other control byte -> \u00XX
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 117)
+            set ok to append_list(result_list and 48)
+            set ok to append_list(result_list and 48)
+            set ok to append_list(result_list and memory_hex_digit(ch / 16))
+            set ok to append_list(result_list and memory_hex_digit(ch - ((ch / 16) * 16)))
         else:
-            if ch == 92: # \
-                set ok to append_list(result_list and 92)
-                set ok to append_list(result_list and 92)
-            else:
-                if ch == 10: # \n
-                    set ok to append_list(result_list and 92)
-                    set ok to append_list(result_list and 110)
-                else:
-                    if ch == 13: # \r
-                        set ok to append_list(result_list and 92)
-                        set ok to append_list(result_list and 114)
-                    else:
-                        if ch == 9: # \t
-                            set ok to append_list(result_list and 92)
-                            set ok to append_list(result_list and 116)
-                        else:
-                            set ok to append_list(result_list and ch)
+            set ok to append_list(result_list and ch)
         set i to i + 1
     set escaped to string_from_list(result_list)
     free_list(result_list)
+    free_list(codes)
     return escaped
 
 define memory_init_synaptic_graph with memory_mgr as Map returning Int:
