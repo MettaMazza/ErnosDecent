@@ -11,6 +11,66 @@ import "tools"
 import "memory"
 import "observer"
 import "session"
+import "sync"
+
+# F4: cooperative cancellation registry. A Stop button / `AI CANCEL` IPC sets a
+# per-session flag on a SEPARATE connection while react_run_loop is blocked on the
+# first; the loop checks (and consumes) it at each turn boundary and halts cleanly.
+# Mutex-guarded because requester and runner are different threads. An empty
+# session id normalises to "default" so both sides agree on a key.
+set RUN_CANCEL_MAP to create_map()
+set RUN_CANCEL_LOCK to create_mutex()
+
+define react_cancel_key with session_id as Str returning Str:
+    if string_length(session_id) == 0:
+        return "default"
+    return session_id
+
+# Request cancellation of the active run for a session (called from the IPC handler).
+define react_request_cancel with session_id as Str returning Int:
+    set key to react_cancel_key(session_id)
+    set ok to lock_mutex(RUN_CANCEL_LOCK)
+    set ok to map_insert(RUN_CANCEL_MAP and key and 1)
+    set ok to unlock_mutex(RUN_CANCEL_LOCK)
+    return 0
+
+# Check and CONSUME a pending cancellation (called by the loop each turn).
+define react_check_cancel with session_id as Str returning Int:
+    set key to react_cancel_key(session_id)
+    set ok to lock_mutex(RUN_CANCEL_LOCK)
+    set hit to map_contains(RUN_CANCEL_MAP and key)
+    if hit == 1:
+        set ok to map_delete(RUN_CANCEL_MAP and key)
+    set ok to unlock_mutex(RUN_CANCEL_LOCK)
+    return hit
+
+# F1: separate a turn's native reasoning from its ReAct content. Reasoning models
+# emit their chain-of-thought as <think>...</think>; that is internal and distinct
+# from the "Thought:/Action:" the ReAct loop parses. We capture it as its own
+# channel and strip it so it can never confuse action parsing or leak to the user.
+# Returns {reasoning, clean}.
+define react_extract_reasoning with text as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "reasoning" and "")
+    set ok to map_insert(result and "clean" and text)
+    set open_pos to string_index_of(text and "<think>")
+    if open_pos < 0:
+        return result
+    set close_pos to string_index_of(text and "</think>")
+    if close_pos < 0:
+        # Unterminated: treat everything after <think> as reasoning, keep the prefix.
+        set before to substring(text and 0 and open_pos)
+        set reasoning to substring(text and open_pos + 7 and string_length(text) - open_pos - 7)
+        set ok to map_insert(result and "reasoning" and string_trim(reasoning))
+        set ok to map_insert(result and "clean" and string_trim(before))
+        return result
+    set reasoning to substring(text and open_pos + 7 and close_pos - open_pos - 7)
+    set before to substring(text and 0 and open_pos)
+    set after_start to close_pos + 8
+    set after to substring(text and after_start and string_length(text) - after_start)
+    set ok to map_insert(result and "reasoning" and string_trim(reasoning))
+    set ok to map_insert(result and "clean" and string_trim(concat(before and after)))
+    return result
 
 # Characters of tool output we can fold into the prompt this turn, derived from
 # the model's OWN context window (get_model_context_limit, which already scales by
@@ -225,6 +285,19 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set use_simulation to 0
             
     repeat while finished == 0 and also loop_idx < 24:
+        # F4: cancellation checkpoint — halt cleanly between turns (before spending
+        # another inference). An in-flight LLM call cannot be interrupted here; that
+        # is phase 2 (abortable socket). 'continue' re-checks the while condition,
+        # which is now false, so the loop exits.
+        set f4_sess to ""
+        if map_contains(ctx and "session_id") == 1:
+            set f4_sess to map_get_val(ctx and "session_id")
+        if react_check_cancel(f4_sess) == 1:
+            display "[ReAct] Run halted by user (cancel)."
+            set ok to map_insert(ctx and "was_cancelled" and 1)
+            set final_answer to "Run halted at your request."
+            set finished to 1
+            continue
         display f"--- ReAct Loop Turn {loop_idx + 1} ---"
         display f"Prompt character length: {string_length(current_prompt)}"
         
@@ -248,10 +321,35 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             
         display f"LLM raw response:\n{raw_output}\n----------------"
         set ok to append_list(values_list and raw_output)
-        
+
+        # F1: capture this turn's native reasoning (<think>...</think>) as its own
+        # channel and strip it from raw_output so it never confuses action parsing or
+        # leaks. Preserve it (timeline + ctx) for transparency and the look-back.
+        set reason_split to react_extract_reasoning(raw_output)
+        set turn_reasoning to map_get_val(reason_split and "reasoning")
+        if string_length(turn_reasoning) > 0:
+            set raw_output to map_get_val(reason_split and "clean")
+            set ok to map_insert(ctx and "last_reasoning" and turn_reasoning)
+            set ok to memory_store(memory_mgr and 3 and "REASONING" and turn_reasoning)
+            display f"[reasoning] {turn_reasoning}"
+        free_map(reason_split)
+
         # Strengthen synapses based on generated thought
         set ok to react_hebbian_trigger(memory_mgr and raw_output)
-        
+
+        # F5: self-accountability look-back. Deterministically review this turn's own
+        # output against ErnOS's values; on unambiguous drift, log it to the timeline
+        # (accountability ledger) and inject a private nudge so the agent corrects
+        # course next turn — without the user having to flag it. Fail-open: clean
+        # output does nothing, the user is always served.
+        set lookback to observer_lookback(raw_output)
+        if map_get_val(lookback and "drift") == 1:
+            set lb_note to map_get_val(lookback and "note")
+            display f"[Observer look-back] self-correction: {lb_note}"
+            set ok to memory_store(memory_mgr and 3 and "SELF-CHECK" and lb_note)
+            set current_prompt to concat(current_prompt and f"\n[SELF-CHECK — INVISIBLE TO USER] Your previous output drifted from your operating values ({lb_note}). Correct course now: speak as ErnOS in the first person, never use pre-trained-assistant disclaimers or claim to be another company's model, and state things plainly. Do not mention this note to the user.\n")
+        free_map(lookback)
+
         set action_map to react_parse_action(raw_output)
         set found_action to map_get_val(action_map and "found")
         
@@ -282,7 +380,40 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 
             set action_allowed to 1
             set action_reason to ""
-            
+
+            # --- F3: Clarification request (pause + ask the user) ---
+            # Mirrors the approval pause/resume rail. Bounded to 3 rounds; once the
+            # budget is spent (or the user said "work with what we have"), further
+            # requests are refused with a nudge to proceed instead of pausing.
+            if tool_name equals "request_clarification":
+                set clarify_rounds to 0
+                if map_contains(ctx and "clarify_rounds") == 1:
+                    set clarify_rounds to map_get_val(ctx and "clarify_rounds")
+                set clarify_done to 0
+                if map_contains(ctx and "clarify_done") == 1:
+                    set clarify_done to map_get_val(ctx and "clarify_done")
+                if clarify_rounds >= 3 or else clarify_done == 1:
+                    set current_prompt to concat(current_prompt and "\n")
+                    set current_prompt to concat(current_prompt and raw_output)
+                    set current_prompt to concat(current_prompt and "\nObservation: You have used your clarification budget. Proceed now with your best understanding; do not ask the user again.\n")
+                    free_list(args_list)
+                    set loop_idx to loop_idx + 1
+                    continue
+                set ok to map_insert(ctx and "clarify_rounds" and clarify_rounds + 1)
+                set pendingc to create_map()
+                set ok to map_insert(pendingc and "questions" and args_str)
+                set ok to map_insert(pendingc and "prompt_state" and current_prompt)
+                set ok to map_insert(pendingc and "raw_output" and raw_output)
+                set ok to map_insert(pendingc and "loop_idx" and loop_idx)
+                set pendc_role to ""
+                if map_contains(ctx and "sender_role") == 1:
+                    set pendc_role to map_get_val(ctx and "sender_role")
+                set ok to map_insert(pendingc and "sender_role" and pendc_role)
+                set ok to map_insert(ctx and "pending_clarification" and pendingc)
+                free_list(args_list)
+                free_list(values_list)
+                return "PENDING_CLARIFICATION"
+
             # --- Tool Approval Gate ---
             set needs_approval to tools_requires_approval(tool_name and args_list)
             if needs_approval == 1:
@@ -364,7 +495,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 if length_list(args_list) >= 1:
                     if get_list(args_list and 0) equals "execute":
                         set is_grid_exec to 1
-            if tool_name equals "run_command" or else tool_name equals "codebase_write" or else is_grid_exec == 1:
+            if tool_name equals "run_command" or else tool_name equals "codebase_write" or else tool_name equals "self_prompt_set" or else is_grid_exec == 1:
                 set audit_payload to ""
                 if tool_name equals "run_command":
                     if length_list(args_list) >= 1:
@@ -372,6 +503,11 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         set audit_payload to concat("run_command: " and cmd_arg)
                 else if is_grid_exec == 1:
                     set audit_payload to "turing_grid_op execute: runs a Turing-grid cell as a shell command"
+                else if tool_name equals "self_prompt_set":
+                    # F6: the agent rewriting its own behavior/skills is a powerful act — audit it.
+                    if length_list(args_list) >= 1:
+                        set sec_arg to get_list(args_list and 0)
+                        set audit_payload to concat("self_prompt_set: agent is rewriting its own prompt section " and sec_arg)
                 else:
                     if length_list(args_list) >= 1:
                         set path_arg to get_list(args_list and 0)
@@ -499,17 +635,21 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
         
         # Run observer security audit for dangerous commands before executing
         set action_allowed to 1
-        if tool_name equals "run_command" or else tool_name equals "codebase_write":
+        if tool_name equals "run_command" or else tool_name equals "codebase_write" or else tool_name equals "self_prompt_set":
             set audit_payload to ""
             if tool_name equals "run_command":
                 if length_list(args_list) >= 1:
                     set cmd_arg to get_list(args_list and 0)
                     set audit_payload to concat("run_command: " and cmd_arg)
+            else if tool_name equals "self_prompt_set":
+                if length_list(args_list) >= 1:
+                    set sec_arg to get_list(args_list and 0)
+                    set audit_payload to concat("self_prompt_set: agent is rewriting its own prompt section " and sec_arg)
             else:
                 if length_list(args_list) >= 1:
                     set path_arg to get_list(args_list and 0)
                     set audit_payload to concat("codebase_write: " and path_arg)
-            
+
             if string_length(audit_payload) > 0:
                 set audit_map to observer_audit(ctx and current_prompt and audit_payload)
                 set verdict to map_get_val(audit_map and "verdict")
@@ -523,7 +663,9 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
             display f"Tool result: {tool_result}"
     else:
         display f"User DENIED tool: {tool_name}. Skipping."
-        set tool_result to f"DENIED by user: Tool '{tool_name}' was not approved for execution."
+        # F2: distinguish a USER decision from a policy gate. The user actively chose
+        # not to run this — acknowledge it, do not retry, and ask what they want instead.
+        set tool_result to f"[USER DECLINED] The user chose not to run '{tool_name}'. This was the user's decision, not a system error or your own limitation. Acknowledge their choice, do NOT retry the same action, and ask what they would like to do instead."
     
     # Store event in Tier 3 Timeline
     set ok to memory_store(memory_mgr and 3 and f"Action: {tool_name}" and f"Result: {tool_result}")
@@ -557,7 +699,49 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
     
     set values_list to create_list()
     set ok to append_list(values_list and current_prompt)
-    
+
+    return react_run_loop(model and memory_mgr and tools_mgr and ctx and current_prompt and loop_idx + 1 and values_list and auto_approve_flag)
+
+
+# F3: resume after the user answers a clarification (or chooses to proceed). Injects
+# the answers as an Observation and re-enters the loop. The "__USE_CURRENT__"
+# sentinel means "work with what we have" — stop asking and finish.
+define react_resume_clarify with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and answers as Str and auto_approve_flag as Int returning Str:
+    set pending to map_get_val(ctx and "pending_clarification")
+    if pending == 0:
+        return "Error: No pending clarification to resume."
+    set current_prompt to map_get_val(pending and "prompt_state")
+    set raw_output to map_get_val(pending and "raw_output")
+    set loop_idx to 0
+    if map_contains(pending and "loop_idx") == 1:
+        set loop_idx to map_get_val(pending and "loop_idx")
+    set saved_role to ""
+    if map_contains(pending and "sender_role") == 1:
+        set saved_role to map_get_val(pending and "sender_role")
+    set ok to map_insert(ctx and "sender_role" and saved_role)
+    set ok to map_delete(ctx and "pending_clarification")
+
+    set obs to ""
+    if answers equals "__USE_CURRENT__":
+        set ok to map_insert(ctx and "clarify_done" and 1)
+        set obs to "The user chose to proceed with the information already available. Do NOT ask for more clarification; complete the task now with your best understanding."
+    else:
+        set obs to concat("The user answered your clarifying question(s): " and answers)
+
+    set ok to memory_store(memory_mgr and 3 and "Clarification" and obs)
+
+    set obs_model to ""
+    if map_contains(ctx and "selected_model") == 1:
+        set obs_model to map_get_val(ctx and "selected_model")
+    set obs_budget to react_observation_budget(obs_model and string_length(current_prompt))
+    set current_prompt to concat(current_prompt and "\n")
+    set current_prompt to concat(current_prompt and raw_output)
+    set current_prompt to concat(current_prompt and "\nObservation: ")
+    set current_prompt to concat(current_prompt and react_fit_observation(obs and obs_budget))
+    set current_prompt to concat(current_prompt and "\n")
+
+    set values_list to create_list()
+    set ok to append_list(values_list and current_prompt)
     return react_run_loop(model and memory_mgr and tools_mgr and ctx and current_prompt and loop_idx + 1 and values_list and auto_approve_flag)
 
 

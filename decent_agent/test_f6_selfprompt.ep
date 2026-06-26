@@ -1,0 +1,75 @@
+# F6 gate: tool-editable [[BEHAVIOR]]/[[SKILLS]] prompt sections, with an immutable
+# core, size cap, approval + role gating.
+
+import "string"
+import "collections"
+import "./tools"
+import "./prompt"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define big with n:
+    set s to "x"
+    repeat while string_length(s) < n:
+        set s to concat(s and s)
+    return s
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # 1. Gating: set requires approval; get is read-only-for-anyone; set is admin-only.
+    set total to total + 1
+    set passes to passes + pass_if("self_prompt_set requires approval" and (tools_requires_approval("self_prompt_set" and create_list()) == 1))
+    set total to total + 1
+    set passes to passes + pass_if("self_prompt_get allowed for guest" and (tools_is_action_allowed("guest" and "self_prompt_get" and create_list()) == 1))
+    set total to total + 1
+    set passes to passes + pass_if("self_prompt_set denied for guest" and (tools_is_action_allowed("guest" and "self_prompt_set" and create_list()) == 0))
+
+    # 2. Round-trip via the executor (admin).
+    set tmgr to create_map()
+    set ctx to create_map()
+    set ok to map_insert(ctx and "sender_role" and "admin")
+    set a1 to create_list()
+    set ok to append_list(a1 and "behavior")
+    set ok to append_list(a1 and "TEST_BEHAVIOR_XYZ")
+    set r1 to tools_execute(tmgr and ctx and "self_prompt_set" and a1)
+    set total to total + 1
+    set passes to passes + pass_if("set behavior persists" and (tools_self_read_section("behavior") equals "TEST_BEHAVIOR_XYZ"))
+
+    # 3. Immutable-core guard: a non-whitelisted section is refused, nothing written.
+    set a2 to create_list()
+    set ok to append_list(a2 and "kernel")
+    set ok to append_list(a2 and "HACKED")
+    set r2 to tools_execute(tmgr and ctx and "self_prompt_set" and a2)
+    set total to total + 1
+    set passes to passes + pass_if("non-whitelisted section refused" and (string_contains(r2 and "immutable") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("behavior unchanged after bad set" and (tools_self_read_section("behavior") equals "TEST_BEHAVIOR_XYZ"))
+
+    # 4. Size cap.
+    set a3 to create_list()
+    set ok to append_list(a3 and "skills")
+    set ok to append_list(a3 and big(5000))
+    set r3 to tools_execute(tmgr and ctx and "self_prompt_set" and a3)
+    set total to total + 1
+    set passes to passes + pass_if("oversize rejected" and (string_contains(r3 and "cap") == 1))
+
+    # 5. The section renders into the assembled prompt with the delimiters.
+    set rendered to prompt_get_self_sections()
+    set total to total + 1
+    set passes to passes + pass_if("renders [[BEHAVIOR]] delimiter" and (string_contains(rendered and "[[BEHAVIOR]]") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("renders the behavior content" and (string_contains(rendered and "TEST_BEHAVIOR_XYZ") == 1))
+
+    display f"=== {passes}/{total} passed ==="
+    if passes == total:
+        display "ALL PASS"
+    else:
+        display "FAILURES PRESENT"
+    return 0

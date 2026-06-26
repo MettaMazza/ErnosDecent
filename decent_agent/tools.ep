@@ -59,6 +59,8 @@ define tools_create:
     set schemas to concat(schemas and "- timeline_tool([action: 'recent'|'add', n_or_text: Int/Str]) -> Str: Your episodic timeline. 'recent' returns the last N entries (default 10); 'add' appends an entry.\n")
     set schemas to concat(schemas and "- lessons_tool([action: 'list'|'get'|'add', key: Str, text: Str]) -> Str: Your distilled lessons. 'list' all, 'get' one by key, 'add' a new lesson (key + text).\n")
     set schemas to concat(schemas and "- reasoning_tool([action: 'note'|'read'|'clear', text: Str]) -> Str: An explicit chain-of-thought scratch buffer. 'note' appends a reasoning step, 'read' replays the chain, 'clear' resets it. Use to think step by step before acting.\n")
+    set schemas to concat(schemas and "- request_clarification([q1: Str, q2: Str, q3: Str]) -> pauses for the user: When the user's intent is genuinely ambiguous and proceeding risks the wrong result, ask UP TO 3 short clarifying questions instead of guessing or dead-ending. Format each question as \"Question text||option1||option2||option3\" (give 2-4 clickable options; the user may also type their own). The user answers and you resume. Use sparingly — at most 3 rounds; if still unclear after that, proceed with your best understanding.\n")
+    set schemas to concat(schemas and "- self_prompt_get([section: 'behavior'|'skills']) -> Str: Read one of your own tool-managed prompt sections. These are directives YOU maintain about how you behave and what modes/skills you have enabled. (Your kernel, value rules, and identity are immutable and not readable/writable here.)\n")
     set schemas to concat(schemas and "- performance_review([]) -> Str: Summarize your learning buffers — counts of golden (kept), preference corrections, rejections, and audits. Use to reflect on how you've been doing.\n")
     set schemas to concat(schemas and "- autonomy_history([]) -> Str: List your scheduled/autonomous jobs and when each last ran. Use to review your autonomous activity.\n")
     set schemas to concat(schemas and "- git_tool([subcommand: Str, args: Str]) -> Str: Run a READ-ONLY git query in the node's repo (status, log, diff, show, branch, remote, rev-parse, tag, describe). For commits/pushes use run_command (approval required).\n")
@@ -68,6 +70,7 @@ define tools_create:
     set schemas to concat(schemas and "WRITE OPERATIONS (requires user approval before execution):\n")
     set schemas to concat(schemas and "- codebase_write([path: Str, content: Str]) -> Str: Overwrite a file. APPROVAL REQUIRED. Use only when explicitly asked to modify code.\n")
     set schemas to concat(schemas and "- run_command([cmd: Str]) -> Str: Execute a shell command. APPROVAL REQUIRED. Use for builds, tests, file operations.\n")
+    set schemas to concat(schemas and "- self_prompt_set([section: 'behavior'|'skills', text: Str]) -> Str: APPROVAL REQUIRED. Rewrite one of your own behavior/skills prompt sections (max 4000 chars) to durably adjust how you operate — e.g. enable a concise mode or note a learned working style. Only 'behavior' and 'skills' are editable; your guardrails cannot be changed.\n")
     set schemas to concat(schemas and "- dht_store([key: Str, val: Str]) -> Str: Store a key-value pair in the DHT. APPROVAL REQUIRED. WARNING: The DHT is a PUBLIC NETWORK STORE. NEVER store private user data, personal info, keys, or sensitive context here. Use operate_synaptic_graph(store) for private data.\n")
     set schemas to concat(schemas and "- name_register([name: Str]) -> Str: Register a name for your DID on the network. APPROVAL REQUIRED.\n")
     set schemas to concat(schemas and "- money_transfer([amount: Int, to_did: Str]) -> Str: Transfer coins to another DID. APPROVAL REQUIRED. Verify amount and recipient.\n")
@@ -92,6 +95,8 @@ define tools_get_schema_string with tools_mgr as Map returning Str:
 
 define tools_requires_approval with tool_name as Str and args_list as List returning Int:
     if tool_name equals "money_transfer":
+        return 1
+    if tool_name equals "self_prompt_set":
         return 1
     if tool_name equals "dht_store":
         return 1
@@ -302,6 +307,12 @@ define tools_is_action_allowed with role as Str and action_name as Str and args_
         return 1
     if action_name equals "moderation_tool":
         return 1
+    if action_name equals "request_clarification":
+        return 1
+    # F6: reading one's own behavior/skills sections is read-only; EDITING them
+    # (self_prompt_set) is omitted here, so it stays admin/owner-only AND approval-gated.
+    if action_name equals "self_prompt_get":
+        return 1
     # Private working-memory tools: reads and non-destructive writes are allowed for
     # any role (they only touch the agent's own local cognition — no network, no
     # filesystem). Destructive ops (clear/forget/del) are admin/owner-only so a
@@ -338,13 +349,51 @@ define tools_memory_dispatch with ctx as Map and domain as Str and args_list as 
     free_list(sub_args)
     return res
 
+# F6: agent-editable prompt sections (config/agent_self_sections.json). ONLY
+# "behavior" and "skills" are valid keys — the kernel/rules/identity are never in
+# this file, so the agent can tune its own behavior without touching its guardrails.
+define tools_self_read_section with section as Str returning Str:
+    set path to "config/agent_self_sections.json"
+    if file_exists(path) == 0:
+        return ""
+    set content to read_file(path)
+    if string_length(content) == 0:
+        return ""
+    set root to json_parse(content)
+    if root == 0:
+        return ""
+    set node to get_json_object_value(root and section)
+    if node == 0:
+        return ""
+    return get_json_value(node)
+
+define tools_self_write_section with section as Str and text as Str returning Int:
+    set behavior to tools_self_read_section("behavior")
+    set skills to tools_self_read_section("skills")
+    if section equals "behavior":
+        set behavior to text
+    else:
+        set skills to text
+    set out to "{\"behavior\":\""
+    set out to concat(out and json_escape_string(behavior))
+    set out to concat(out and "\",\"skills\":\"")
+    set out to concat(out and json_escape_string(skills))
+    set out to concat(out and "\"}")
+    set ok to write_file("config/agent_self_sections.json" and out)
+    return 0
+
 define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str and args_list as List returning Str:
     set sender_role to ""
     if map_contains(ctx and "sender_role") == 1:
         set sender_role to map_get_val(ctx and "sender_role")
         
     if tools_is_action_allowed(sender_role and action_name and args_list) == 0:
-        return f"Error: Access Denied. Tool '{action_name}' is restricted to administrators."
+        set role_shown to sender_role
+        if string_length(role_shown) == 0:
+            set role_shown to "guest"
+        # F2: a role GATE is not a permanent inability — tell the agent exactly why
+        # and instruct it to ask for authorization rather than dead-end with "I can't".
+        return f"[GATE] Tool '{action_name}' requires an elevated role; the current caller role is '{role_shown}'. This is NOT a permanent inability and NOT your own limitation — it is an authorization gate. Tell the user this action needs elevated access/approval and ASK if they want to authorize it. Do not claim you are unable to do it."
 
     if action_name equals "codebase_read":
         if length_list(args_list) < 1:
@@ -432,7 +481,30 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if tools_cmd_is_dangerous(cmd) == 1:
             return "Error: command rejected (chaining/substitution/privilege-escalation patterns are not permitted)."
         return run_command(cmd)
-        
+
+    if action_name equals "self_prompt_get":
+        if length_list(args_list) < 1:
+            return "Error: self_prompt_get requires 1 argument (section: 'behavior' or 'skills')."
+        set sec to ptr_to_str(get_list(args_list and 0))
+        if sec equals "behavior" or else sec equals "skills":
+            return concat(concat("[[" and concat(string_upper(sec) and "]] = ")) and tools_self_read_section(sec))
+        return "Error: unknown section. Editable sections are 'behavior' and 'skills'."
+
+    if action_name equals "self_prompt_set":
+        if length_list(args_list) < 2:
+            return "Error: self_prompt_set requires 2 arguments (section, text)."
+        set sec to ptr_to_str(get_list(args_list and 0))
+        set txt to ptr_to_str(get_list(args_list and 1))
+        # Immutable-core guard: only behavior/skills are writable. The kernel, the
+        # observer's value rules, and identity are never in this file and cannot be
+        # reached here — the agent cannot weaken its own guardrails.
+        if sec equals "behavior" or else sec equals "skills":
+            if string_length(txt) > 4000:
+                return "Error: section text exceeds the 4000-char cap. Keep it concise."
+            set ok to tools_self_write_section(sec and txt)
+            return concat(concat("Updated your [[" and concat(string_upper(sec) and "]] section.")) and " It takes effect on your next turn.")
+        return "Error: only 'behavior' and 'skills' are editable. The kernel, rules, and identity are immutable and cannot be changed."
+
     if action_name equals "dht_store":
         if length_list(args_list) < 2:
             return "Error: dht_store requires 2 arguments (key, val)."
