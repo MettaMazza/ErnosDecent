@@ -1,0 +1,42 @@
+# Root-cause gate for the read_transcripts segfault CLASS: the runtime object
+# accessors must not dereference a non-pointer (a JSON type-tag / small int) — they
+# return safely instead of SIGSEGV-ing the daemon. Reproduces the exact crash recipe.
+
+import "string"
+import "collections"
+import "json"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # The exact buggy pattern: iterate a json node directly so `tag` is the integer
+    # type-tag, then deref it as a node. Pre-fix this segfaulted the whole daemon.
+    set root to json_parse("[{\"role\":\"a\",\"content\":\"b\"}]")
+    set tag to get_list(root and 0)
+    set bad to get_json_object_value(tag and "role")
+    set total to total + 1
+    set passes to passes + pass_if("get_json_object_value on a type-tag returns safely" and (bad == 0))
+    set total to total + 1
+    set passes to passes + pass_if("length_list on a non-pointer returns 0" and (length_list(tag) == 0))
+    set total to total + 1
+    set passes to passes + pass_if("get_list on a non-pointer returns 0" and (get_list(tag and 0) == 0))
+
+    # Valid access still works (guard must not reject real objects).
+    set arr to get_json_value(root)
+    set total to total + 1
+    set passes to passes + pass_if("valid list access still works" and (length_list(arr) == 1))
+
+    display f"=== {passes}/{total} passed (SURVIVED — no segfault) ==="
+    if passes == total:
+        display "ALL PASS"
+    else:
+        display "FAILURES PRESENT"
+    return 0
