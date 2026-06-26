@@ -283,8 +283,17 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         set vocab_node to map_get_val(model and "vocab")
         if length_list(vocab_node) > 0:
             set use_simulation to 0
-            
-    repeat while finished == 0 and also loop_idx < 24:
+
+    # Tool-chaining horizon. The loop chains as many tools as the task needs, one per
+    # turn; this is only a runaway guard (a model that never replies would otherwise
+    # grow the prompt without bound). Default raised to 50 for long-horizon/complex
+    # work and overridable per request via ctx "max_iterations".
+    set max_iters to 50
+    if map_contains(ctx and "max_iterations") == 1:
+        set ov to map_get_val(ctx and "max_iterations")
+        if ov > 0:
+            set max_iters to ov
+    repeat while finished == 0 and also loop_idx < max_iters:
         # F4: cancellation checkpoint — halt cleanly between turns (before spending
         # another inference). An in-flight LLM call cannot be interrupted here; that
         # is phase 2 (abortable socket). 'continue' re-checks the while condition,
@@ -586,7 +595,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
     # instead of spinning — a model that never replies would otherwise run forever with
     # an ever-growing prompt (cost/compute DoS).
     if finished == 0:
-        display "[ReAct] Iteration cap (24) reached — aborting."
+        display f"[ReAct] Iteration cap ({max_iters}) reached — aborting."
         set final_answer to "I could not complete this request within the allowed number of steps."
     free_list(values_list)
     return final_answer
