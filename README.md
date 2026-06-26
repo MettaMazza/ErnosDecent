@@ -58,7 +58,7 @@ Every service on the current internet requires you to trust a third party with y
 | 🏠 **Self-hosted services** — HTTP, email, Git, DNS | GitHub, Gmail, GoDaddy |
 | 💰 **Native financial system** — HD wallets, UTXO ledger, DEX, smart contracts | Ethereum, Coinbase, PayPal |
 | 🤖 **Local AI** — GGUF transformer, embeddings, speech-to-text, **Kokoro text-to-speech** (🔊 local neural voice) | OpenAI, Anthropic, Google Cloud AI |
-| 🧠 **Sovereign agent** — ReAct loop, 9 tools, tiered/Hebbian memory, fail-closed observer gate, model router, platform bridges | Cloud agent platforms |
+| 🧠 **Sovereign agent** — ReAct loop with long-horizon tool chaining, a captured per-turn reasoning channel, tiered/Hebbian memory, a fail-closed **and self-auditing** observer (steelmans, won't straw-man or lie), clarifying-question + stop-mid-run controls, tool-tunable behavior, and grounded psychological/argumentation/architectural frameworks | Cloud agent platforms |
 | 🗂️ **GitDec** — decentralised in-repo issue/PR tracker over Nostr | GitHub Issues/PRs |
 | 📡 **P2P media streaming** — WebRTC, adaptive HLS, codec layer, CDN | YouTube, Twitch, Zoom |
 | 🕵️ **Anonymity layer** — onion routing, mix networks | Tor (external), VPNs |
@@ -162,7 +162,7 @@ ErnosDecent/
 ├── decent_host/       Hosting — HTTP server, static content, SMTP, Git
 ├── decent_money/      Finance — HD wallets, UTXO ledger, tokens, NFTs, DEX, smart contracts
 ├── decent_ai/         AI — GGUF inference, embeddings, speech-to-text, Kokoro text-to-speech
-├── decent_agent/      Cognitive Agent — ReAct loop, 9-tool surface, tiered/Hebbian memory, Turing grid, observer gate, model router, platform bridges
+├── decent_agent/      Cognitive Agent — ReAct loop (long-horizon chaining + reasoning channel), broad tool surface, tiered/Hebbian memory, Turing grid, self-auditing observer, clarification/stop controls, tool-tunable behavior, model router, platform bridges
 ├── decent_media/      Media — WebRTC, adaptive streaming, codecs, P2P CDN
 ├── decent_anon/       Privacy — onion routing, mixnet traffic analysis resistance
 ├── decent_search/     Search — distributed crawler, BM25 & PageRank ranking engine, query merge
