@@ -44,32 +44,60 @@ define react_check_cancel with session_id as Str returning Int:
     set ok to unlock_mutex(RUN_CANCEL_LOCK)
     return hit
 
-# F1: separate a turn's native reasoning from its ReAct content. Reasoning models
-# emit their chain-of-thought as <think>...</think>; that is internal and distinct
-# from the "Thought:/Action:" the ReAct loop parses. We capture it as its own
-# channel and strip it so it can never confuse action parsing or leak to the user.
-# Returns {reasoning, clean}.
+# Remove stray harmony/gemma channel-marker tokens from a string. Longer variants
+# are stripped before their unterminated forms so nothing is left behind.
+define react_strip_markers with s as Str returning Str:
+    set out to s
+    set out to string_replace(out and "<|thought|>" and "")
+    set out to string_replace(out and "<|thought|" and "")
+    set out to string_replace(out and "<|channel|>" and "")
+    set out to string_replace(out and "<channel|>" and "")
+    set out to string_replace(out and "<channel|" and "")
+    set out to string_replace(out and "<|message|>" and "")
+    set out to string_replace(out and "<|message|" and "")
+    set out to string_replace(out and "<|start|>" and "")
+    set out to string_replace(out and "<|end|>" and "")
+    set out to string_replace(out and "<|assistant|>" and "")
+    return out
+
+# F1 (generalized): separate a turn's native reasoning from its ReAct content.
+# Different local models emit reasoning differently: <think>...</think> (deepseek/
+# qwen), or harmony/gemma channel markers like <|thought|> ... <channel|>Action:...
+# (gemma4:26b). We capture the reasoning as its own channel and strip ALL of these
+# markers so they never confuse action parsing or leak to the user. Returns
+# {reasoning, clean}.
 define react_extract_reasoning with text as Str returning Map:
     set result to create_map()
-    set ok to map_insert(result and "reasoning" and "")
-    set ok to map_insert(result and "clean" and text)
-    set open_pos to string_index_of(text and "<think>")
-    if open_pos < 0:
-        return result
-    set close_pos to string_index_of(text and "</think>")
-    if close_pos < 0:
-        # Unterminated: treat everything after <think> as reasoning, keep the prefix.
-        set before to substring(text and 0 and open_pos)
-        set reasoning to substring(text and open_pos + 7 and string_length(text) - open_pos - 7)
-        set ok to map_insert(result and "reasoning" and string_trim(reasoning))
-        set ok to map_insert(result and "clean" and string_trim(before))
-        return result
-    set reasoning to substring(text and open_pos + 7 and close_pos - open_pos - 7)
-    set before to substring(text and 0 and open_pos)
-    set after_start to close_pos + 8
-    set after to substring(text and after_start and string_length(text) - after_start)
+    set reasoning to ""
+    set work to text
+
+    # 1. <think>...</think>
+    set open_pos to string_index_of(work and "<think>")
+    if open_pos >= 0:
+        set close_pos to string_index_of(work and "</think>")
+        if close_pos < 0:
+            set reasoning to concat(reasoning and substring(work and open_pos + 7 and string_length(work) - open_pos - 7))
+            set work to substring(work and 0 and open_pos)
+        else:
+            set reasoning to concat(reasoning and substring(work and open_pos + 7 and close_pos - open_pos - 7))
+            set before to substring(work and 0 and open_pos)
+            set after_start to close_pos + 8
+            set work to concat(before and substring(work and after_start and string_length(work) - after_start))
+
+    # 2. Harmony/gemma: the final channel output follows the LAST <channel|> marker;
+    #    everything before it is reasoning.
+    set ch_pos to string_last_index_of(work and "<channel|>")
+    if ch_pos >= 0:
+        set reasoning to concat(reasoning and concat("\n" and substring(work and 0 and ch_pos)))
+        set after_ch to ch_pos + 10
+        set work to substring(work and after_ch and string_length(work) - after_ch)
+
+    # 3. Strip any remaining stray marker tokens from both channels.
+    set work to react_strip_markers(work)
+    set reasoning to react_strip_markers(reasoning)
+
     set ok to map_insert(result and "reasoning" and string_trim(reasoning))
-    set ok to map_insert(result and "clean" and string_trim(concat(before and after)))
+    set ok to map_insert(result and "clean" and string_trim(work))
     return result
 
 # Characters of tool output we can fold into the prompt this turn, derived from
@@ -766,7 +794,16 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
             set max_runs to 1
         else if profile equals "standard":
             set max_runs to 2
-            
+        else if profile equals "extreme":
+            set max_runs to 16
+        else if profile equals "high":
+            set max_runs to 8
+    # Per-request override for operators who know their hardware.
+    if map_contains(ctx and "max_concurrent_runs") == 1:
+        set mc to map_get_val(ctx and "max_concurrent_runs")
+        if mc > 0:
+            set max_runs to mc
+
     if active_runs >= max_runs:
         return "Error: System is at capacity (concurrency limit reached). Please try again later."
         

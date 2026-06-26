@@ -305,6 +305,14 @@ def parse_pending_approval(resp):
             summary = part[len("summary:"):]
     return tool_name, summary
 
+def extract_ai_ok_response(resp):
+    """Extract the reply text from an 'ai:ok' line, tolerating an optional
+    'reasoning:<b64>' segment before 'response:' (F1 surfaces reasoning to the web;
+    Discord stays clean and just takes the response)."""
+    marker = "response:"
+    idx = resp.find(marker)
+    return resp[idx + len(marker):] if idx >= 0 else resp
+
 class ApprovalView(discord.ui.View):
     def __init__(self, author, timeout=None):
         super().__init__(timeout=timeout)
@@ -417,8 +425,8 @@ async def handle_tool_approval(message, resp):
     if ipc_resp.startswith("ai:pending_approval,"):
         # Chained approval — another gated tool in the same ReAct loop
         await handle_tool_approval(message, ipc_resp)
-    elif ipc_resp.startswith("ai:ok,response:"):
-        ai_resp = ipc_resp[len("ai:ok,response:"):]
+    elif ipc_resp.startswith("ai:ok"):
+        ai_resp = extract_ai_ok_response(ipc_resp)
         await send_discord_reply(message, ai_resp, speakable=True)
     elif ipc_resp == "error:daemon_offline":
         await send_discord_reply(message, "❌ Daemon went offline during approval.")
@@ -503,8 +511,8 @@ async def handle_clarification(message, resp):
         await handle_tool_approval(message, ipc_resp)
     elif ipc_resp.startswith("ai:cancelled,response:"):
         await send_discord_reply(message, "🛑 " + ipc_resp[len("ai:cancelled,response:"):])
-    elif ipc_resp.startswith("ai:ok,response:"):
-        await send_discord_reply(message, ipc_resp[len("ai:ok,response:"):], speakable=True)
+    elif ipc_resp.startswith("ai:ok"):
+        await send_discord_reply(message, extract_ai_ok_response(ipc_resp), speakable=True)
     elif ipc_resp == "error:daemon_offline":
         await send_discord_reply(message, "❌ Daemon went offline during clarification.")
     else:
@@ -671,8 +679,8 @@ async def on_message(message):
                 return
             elif resp.startswith("ai:cancelled,response:"):
                 ai_resp = "🛑 " + resp[len("ai:cancelled,response:"):]
-            elif resp.startswith("ai:ok,response:"):
-                ai_resp = resp[len("ai:ok,response:"):]
+            elif resp.startswith("ai:ok"):
+                ai_resp = extract_ai_ok_response(resp)
             elif resp == "error:daemon_offline":
                 ai_resp = "❌ Error: Cognitive AI Agent daemon is offline or unreachable."
             else:
