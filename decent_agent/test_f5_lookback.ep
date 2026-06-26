@@ -1,0 +1,54 @@
+# F5 gate: observer_lookback self-accountability. Detects unambiguous value drift
+# in the agent's own output, ignores expected ReAct scaffolding, fails open on
+# clean output.
+
+import "string"
+import "collections"
+import "./observer"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define drift_of with text as Str returning Int:
+    set m to observer_lookback(text)
+    return map_get_val(m and "drift")
+
+define main:
+    set passes to 0
+    set total to 0
+
+    # 1. Clean, direct output -> no drift (fail open, user served).
+    set total to total + 1
+    set passes to passes + pass_if("clean output: no drift" and (drift_of("I checked the ledger and the balance is 42.") == 0))
+
+    # 2. ReAct scaffolding present but otherwise clean -> NOT drift (grammar_leak ignored).
+    set total to total + 1
+    set passes to passes + pass_if("scaffolding ignored: no drift" and (drift_of("Thought: I will look it up. Action: reply_request([\"Here it is.\"])") == 0))
+
+    # 3. Pre-trained-assistant disclaimer -> drift.
+    set total to total + 1
+    set passes to passes + pass_if("pretrained denial -> drift" and (drift_of("As an AI, I don't have feelings about that.") == 1))
+
+    # 4. Claiming to be another company's model -> drift.
+    set total to total + 1
+    set passes to passes + pass_if("corporate identity -> drift" and (drift_of("I am Claude, made by Anthropic.") == 1))
+
+    # 5. Note names the violation.
+    set m to observer_lookback("As an AI language model I cannot have opinions.")
+    set total to total + 1
+    set passes to passes + pass_if("note records the drift type" and (string_contains(map_get_val(m and "note") and "pretrained_denial") == 1))
+
+    # 6. Empty/benign -> no drift.
+    set total to total + 1
+    set passes to passes + pass_if("empty -> no drift (fail open)" and (drift_of("") == 0))
+
+    display f"=== {passes}/{total} passed ==="
+    if passes == total:
+        display "ALL PASS"
+    else:
+        display "FAILURES PRESENT"
+    return 0

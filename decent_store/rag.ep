@@ -18,9 +18,43 @@ import "../stdlib/http"
 import "../decent_agent/llm"
 import "json"
 import "sql"
+import "sync"
 
 set RAG_EMBED_MODEL to "nomic-embed-text"
 set RAG_OLLAMA_URL to "http://127.0.0.1:11434/api/embeddings"
+
+# Parsed-embedding cache. rag_search used to re-parse every chunk's embedding TEXT
+# into a vector on EVERY query (~768 dims x N chunks => ~1M short-lived allocations
+# per search). Chunk embeddings are immutable (rag_chunks.id is AUTOINCREMENT and
+# rows are never UPDATEd), so a parsed vector can be cached by id forever. Guarded
+# by a mutex because rag_search runs on per-connection IPC threads (concurrent
+# searches). The lock is held ONLY around the map ops, never across a parse.
+set RAG_VEC_CACHE to create_map()
+set RAG_CACHE_LOCK to create_mutex()
+set RAG_CACHE_MAX to 100000
+
+# Return the parsed embedding vector for a chunk, from cache or by parsing once.
+define rag_get_vec with id_key as Str and emb_str as Str returning List:
+    set ok to lock_mutex(RAG_CACHE_LOCK)
+    set hit to map_contains(RAG_VEC_CACHE and id_key)
+    set cached to 0
+    if hit == 1:
+        set cached to map_get_val(RAG_VEC_CACHE and id_key)
+    set ok to unlock_mutex(RAG_CACHE_LOCK)
+    if hit == 1:
+        return cached
+    # Miss: parse OUTSIDE the lock (allocation-heavy), then store.
+    set vec to rag_parse_embedding(emb_str)
+    set ok to lock_mutex(RAG_CACHE_LOCK)
+    if map_contains(RAG_VEC_CACHE and id_key) == 0:
+        # Safety valve against unbounded growth (e.g. churned/re-indexed corpora):
+        # drop the whole cache wholesale; live vectors still in use stay rooted on
+        # their callers' stacks, and the next queries repopulate.
+        if map_size(RAG_VEC_CACHE) >= RAG_CACHE_MAX:
+            set RAG_VEC_CACHE to create_map()
+        set ok to map_insert(RAG_VEC_CACHE and id_key and vec)
+    set ok to unlock_mutex(RAG_CACHE_LOCK)
+    return vec
 
 # --- float helpers (json.ep truncates decimals; embeddings need real floats) ---
 
@@ -341,7 +375,7 @@ define rag_search with db as Int and query as Str and session_id as Str and k as
     if string_length(qemb_str) == 0:
         return "{\"status\":\"error\",\"message\":\"Failed to embed query.\",\"results\":[]}"
     set qvec to rag_parse_embedding(qemb_str)
-    set sel to "SELECT document_name, chunk_index, content, embedding FROM rag_chunks"
+    set sel to "SELECT id, document_name, chunk_index, content, embedding FROM rag_chunks"
     if string_length(session_id) > 0:
         set sel to concat(sel and concat(" WHERE session_id='" and concat(rag_sql_escape(session_id) and "'")))
     set sel to concat(sel and ";")
@@ -355,11 +389,12 @@ define rag_search with db as Int and query as Str and session_id as Str and k as
     set i to 0
     repeat while i < nr:
         set row to get_list(rows and i)
-        set dname to ptr_to_str(get_list(row and 0))
-        set cidx to ptr_to_str(get_list(row and 1))
-        set content to ptr_to_str(get_list(row and 2))
-        set emb_str to ptr_to_str(get_list(row and 3))
-        set cvec to rag_parse_embedding(emb_str)
+        set id_key to ptr_to_str(get_list(row and 0))
+        set dname to ptr_to_str(get_list(row and 1))
+        set cidx to ptr_to_str(get_list(row and 2))
+        set content to ptr_to_str(get_list(row and 3))
+        set emb_str to ptr_to_str(get_list(row and 4))
+        set cvec to rag_get_vec(id_key and emb_str)
         set score to rag_cosine(qvec and cvec)
         set ok to append_list(docs and dname)
         set ok to append_list(idxs and cidx)

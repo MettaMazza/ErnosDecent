@@ -143,3 +143,29 @@ define observer_get_audit_prompt with assembled_prompt as Str and candidate as S
     set prompt to concat(prompt and "Output strictly as JSON:\n")
     set prompt to concat(prompt and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"explanation\"}\n")
     return prompt
+
+# F5: per-turn self-accountability look-back. Reviews the agent's OWN most recent
+# working output against ErnOS's values using the deterministic classifier — so the
+# agent can self-correct drift WITHOUT the user having to flag it. Returns a Map
+# {drift:0/1, note:<flags>}. Deterministic and FAIL-OPEN: it never blocks or
+# withholds a user-serving reply; it only raises a private nudge on UNAMBIGUOUS
+# value violations (pretrained-assistant disclaimers, claiming to be another
+# company's model, actionable harm). The internal ReAct scaffolding (Thought:/
+# Action:) is expected here, so the grammar_leak signal is deliberately ignored.
+define observer_lookback with agent_output as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "drift" and 0)
+    set ok to map_insert(result and "note" and "")
+    set mod to observer_moderate(agent_output)
+    if string_index_of(mod and "moderation:flagged") == 0:
+        set note to ""
+        if string_contains(mod and "pretrained_denial") == 1:
+            set note to concat(note and "pretrained_denial ")
+        if string_contains(mod and "corporate_identity") == 1:
+            set note to concat(note and "corporate_identity ")
+        if string_contains(mod and "actionable_harm") == 1:
+            set note to concat(note and "actionable_harm ")
+        if string_length(note) > 0:
+            set ok to map_insert(result and "drift" and 1)
+            set ok to map_insert(result and "note" and string_trim(note))
+    return result

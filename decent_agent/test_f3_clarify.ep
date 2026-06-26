@@ -1,0 +1,59 @@
+# F3 gate: clarification resume. react_resume_clarify injects answers and continues;
+# "__USE_CURRENT__" stops further asking; missing pending is handled.
+
+import "string"
+import "collections"
+import "./react_loop"
+import "./memory"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define make_pending returning Map:
+    set pend to create_map()
+    set ok to map_insert(pend and "questions" and "[\"Pick a format||JSON||CSV\"]")
+    set ok to map_insert(pend and "prompt_state" and "USER REQUEST: export the data")
+    set ok to map_insert(pend and "raw_output" and "Thought: ambiguous. Action: request_clarification([\"Pick a format||JSON||CSV\"])")
+    set ok to map_insert(pend and "loop_idx" and 0)
+    set ok to map_insert(pend and "sender_role" and "admin")
+    return pend
+
+define main:
+    set passes to 0
+    set total to 0
+    set mem to memory_create()
+    set tools to create_map()
+    set model to create_map()
+    set ctx to create_map()
+    set ok to map_insert(ctx and "is_test" and 1)
+
+    # 1. Resume with an answer -> returns a result and clears the pending state.
+    set ok to map_insert(ctx and "pending_clarification" and make_pending())
+    set res to react_resume_clarify(model and mem and tools and ctx and "Q1: JSON" and 0)
+    set total to total + 1
+    set passes to passes + pass_if("resume returns a non-empty result" and (string_length(res) > 0))
+    set total to total + 1
+    set passes to passes + pass_if("pending_clarification cleared after resume" and (map_contains(ctx and "pending_clarification") == 0))
+
+    # 2. "Work with what we have" sets clarify_done so the agent stops asking.
+    set ok to map_insert(ctx and "pending_clarification" and make_pending())
+    set res2 to react_resume_clarify(model and mem and tools and ctx and "__USE_CURRENT__" and 0)
+    set total to total + 1
+    set passes to passes + pass_if("use-current sets clarify_done" and (map_get_val(ctx and "clarify_done") == 1))
+
+    # 3. No pending clarification -> graceful error, no crash.
+    set ok to map_delete(ctx and "pending_clarification")
+    set res3 to react_resume_clarify(model and mem and tools and ctx and "anything" and 0)
+    set total to total + 1
+    set passes to passes + pass_if("no pending -> graceful error" and (string_contains(res3 and "No pending clarification") == 1))
+
+    display f"=== {passes}/{total} passed ==="
+    if passes == total:
+        display "ALL PASS"
+    else:
+        display "FAILURES PRESENT"
+    return 0

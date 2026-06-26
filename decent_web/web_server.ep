@@ -35,6 +35,59 @@ define query_daemon_ipc with command as Str returning Str:
     set ok to ep_net_close(fd)
     return resp
 
+# Translate a daemon AI response (ai:ok / ai:pending_approval / ai:clarify / cancelled
+# / error) into the appropriate WS message(s) for the browser. Shared by the prompt,
+# approval, and clarification paths so all of them handle every outcome consistently.
+define ws_dispatch_ai_response with client_fd as Int and ai_resp as Str returning Int:
+    if string_contains(ai_resp and "error:") == 1:
+        ws_send_text(client_fd and "{\"type\":\"ai_token\",\"token\":\"AI subsystem not yet active. \"}")
+        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+        return 0
+    if string_contains(ai_resp and "ai:pending_approval") == 1:
+        set p_tool to extract_ipc_field(ai_resp and "tool")
+        set p_summary to extract_ipc_field(ai_resp and "summary")
+        set am to "{\"type\":\"tool_pending_approval\",\"tool\":\""
+        set am to concat(am and escape_json_string(p_tool))
+        set am to concat(am and "\",\"summary\":\"")
+        set am to concat(am and escape_json_string(p_summary))
+        set am to concat(am and "\"}")
+        ws_send_text(client_fd and am)
+        return 0
+    if string_contains(ai_resp and "ai:clarify") == 1:
+        # F3: questions is the trailing field and itself contains commas/colons, so
+        # take everything after "questions:" and ship it as an escaped string for the
+        # browser to JSON.parse.
+        set qpos to string_index_of(ai_resp and "questions:")
+        set questions to substring(ai_resp and qpos + 10 and string_length(ai_resp) - qpos - 10)
+        set cm to "{\"type\":\"clarify\",\"questions\":\""
+        set cm to concat(cm and escape_json_string(questions))
+        set cm to concat(cm and "\"}")
+        ws_send_text(client_fd and cm)
+        return 0
+    # F1: optional base64 reasoning prefix -> forward as a separate collapsible message.
+    if string_contains(ai_resp and "reasoning:") == 1:
+        set rpos to string_index_of(ai_resp and "reasoning:")
+        set rrest to substring(ai_resp and rpos + 10 and string_length(ai_resp) - rpos - 10)
+        set rend to string_index_of(rrest and ",response:")
+        if rend > 0:
+            set rb64 to substring(rrest and 0 and rend)
+            set rm to "{\"type\":\"reasoning\",\"b64\":\""
+            set rm to concat(rm and escape_json_string(rb64))
+            set rm to concat(rm and "\"}")
+            ws_send_text(client_fd and rm)
+    set resp_pos to string_index_of(ai_resp and "response:")
+    if resp_pos >= 0:
+        set skip to resp_pos + 9
+        set ai_text to substring(ai_resp and skip and string_length(ai_resp) - skip)
+    else:
+        set ai_text to ai_resp
+    set tm to "{\"type\":\"ai_token\",\"token\":\""
+    set tm to concat(tm and escape_json_string(ai_text))
+    set tm to concat(tm and "\"}")
+    ws_send_text(client_fd and tm)
+    ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+    return 0
+
 define extract_ipc_field with ipc_resp as Str and field_name as Str returning Str:
     # Parse "key:value,key2:value2" format and return value for given field
     set parts to string_split(ipc_resp and ",")
@@ -387,33 +440,14 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set ai_cmd to concat(ai_cmd and prompt)
                     set ai_resp to query_daemon_ipc(ai_cmd)
                     display f"[ws] IPC AI -> {ai_resp}"
-                    if string_contains(ai_resp and "error:") == 1:
-                        set err_msg to "{\"type\":\"ai_token\",\"token\":\"AI subsystem not yet active. \"}"
-                        ws_send_text(client_fd and err_msg)
-                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
-                    else if string_contains(ai_resp and "ai:pending_approval") == 1:
-                        # Tool requires user approval — send approval request to frontend
-                        set p_tool to extract_ipc_field(ai_resp and "tool")
-                        set p_summary to extract_ipc_field(ai_resp and "summary")
-                        set approval_msg to "{\"type\":\"tool_pending_approval\",\"tool\":\""
-                        set approval_msg to concat(approval_msg and escape_json_string(p_tool))
-                        set approval_msg to concat(approval_msg and "\",\"summary\":\"")
-                        set approval_msg to concat(approval_msg and escape_json_string(p_summary))
-                        set approval_msg to concat(approval_msg and "\"}")
-                        ws_send_text(client_fd and approval_msg)
-                    else:
-                        set resp_pos to string_index_of(ai_resp and "response:")
-                        if resp_pos >= 0:
-                            set skip to resp_pos + 9
-                            set ai_text to substring(ai_resp and skip and string_length(ai_resp) - skip)
-                        else:
-                            set ai_text to ai_resp
-                        set escaped_ai to escape_json_string(ai_text)
-                        set token_msg to "{\"type\":\"ai_token\",\"token\":\""
-                        set token_msg to concat(token_msg and escaped_ai)
-                        set token_msg to concat(token_msg and "\"}")
-                        ws_send_text(client_fd and token_msg)
-                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                    set ok to ws_dispatch_ai_response(client_fd and ai_resp)
+                else if msg_type equals "clarify_answer":
+                    # F3: the user answered the agent's clarifying question(s) (or chose
+                    # "work with what we have" -> answers == "__USE_CURRENT__"). Resume.
+                    set answers to json_get_string(payload and "answers")
+                    set clarify_resp to query_daemon_ipc(concat("AI CLARIFY " and answers))
+                    display f"[ws] IPC AI CLARIFY -> {clarify_resp}"
+                    set ok to ws_dispatch_ai_response(client_fd and clarify_resp)
                 else if msg_type equals "tool_approve":
                     # User approved a pending tool — relay to daemon
                     set approve_resp to query_daemon_ipc("AI APPROVE")
@@ -1579,6 +1613,14 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
             set gitdec_updates to "0"
         set body to build_status_json(role and did_val and term and peers and dht_size and is_static and elect_enabled and reg_name and gitdec_updates)
         set ok to send_response(client_fd and 200 and "application/json" and body)
+        return 0
+
+    if raw_path equals "/api/cancel":
+        # F4 stop/halt. Served on its own connection (run_web_server spawns a thread
+        # per request), so it is NOT blocked behind the in-flight WS ai_prompt. Sets
+        # the daemon's per-session cancel flag; the running loop halts at its next turn.
+        set cancel_resp to query_daemon_ipc("AI CANCEL")
+        set ok to send_response(client_fd and 200 and "application/json" and "{\"status\":\"ok\",\"cancelled\":true}")
         return 0
 
     if raw_path equals "/api/upload":

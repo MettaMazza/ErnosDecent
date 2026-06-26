@@ -108,6 +108,33 @@ define prompt_sanitize_input with user_prompt as Str returning Str:
     
     return sanitized
 
+# F6: render the agent's self-managed, tool-editable prompt sections. These sit
+# OUTSIDE the immutable core (kernel / rules / identity above) — the agent may
+# adjust its own [[BEHAVIOR]] and [[SKILLS]] via the self_prompt tools, but can
+# never touch its guardrails. Returns "" when the file is absent/empty.
+define prompt_get_self_sections returning Str:
+    set path to "config/agent_self_sections.json"
+    if file_exists(path) == 0:
+        return ""
+    set content to read_file(path)
+    if string_length(content) == 0:
+        return ""
+    set root to json_parse(content)
+    if root == 0:
+        return ""
+    set out to ""
+    set bnode to get_json_object_value(root and "behavior")
+    if bnode != 0:
+        set bval to get_json_value(bnode)
+        if string_length(bval) > 0:
+            set out to concat(out and concat("[[BEHAVIOR]]\n" and concat(bval and "\n[[/BEHAVIOR]]\n")))
+    set snode to get_json_object_value(root and "skills")
+    if snode != 0:
+        set sval to get_json_value(snode)
+        if string_length(sval) > 0:
+            set out to concat(out and concat("[[SKILLS]]\n" and concat(sval and "\n[[/SKILLS]]\n")))
+    return out
+
 define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as Str and tools_schema as Str returning Str:
     set system_prompt to ""
     set is_guest to 0
@@ -128,6 +155,11 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
 
     set system_prompt to concat(system_prompt and prompt_get_kernel())
     set system_prompt to concat(system_prompt and "\n")
+    # F2: denial/gate handling rule — always present so the agent never fabricates a
+    # permanent inability from an authorization gate or a user's decision.
+    set system_prompt to concat(system_prompt and "[DENIAL HANDLING] If an Observation begins with [GATE], the action is blocked by an authorization gate, not by any limitation of yours — explain it needs elevated access/approval and ASK the user if they want to authorize it; never say you are permanently unable. If an Observation begins with [USER DECLINED], the user chose not to run it — acknowledge their choice, do not retry it, and ask what they want instead. Never present a gate or a user's decision as your own incapacity.\n")
+    # F1: per-turn reasoning + free-forming plan scaffold.
+    set system_prompt to concat(system_prompt and "[REASONING] Reason freshly every turn — think the problem through against THIS user and THIS task before you act, rather than reusing one fixed plan. Keep a short running plan and revise it as you learn; it is a scaffold, not a contract. If your model emits a native reasoning/thinking channel, use it; otherwise put your step-by-step reasoning in your Thought. Keep the final reply itself clean and direct — no scaffolding, no thinking tags.\n")
     if string_length(tools_schema) > 0:
         set system_prompt to concat(system_prompt and tools_schema)
         set system_prompt to concat(system_prompt and "\n")
@@ -135,7 +167,9 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
     set system_prompt to concat(system_prompt and "\n")
     set system_prompt to concat(system_prompt and prompt_get_identity())
     set system_prompt to concat(system_prompt and "\n")
-    
+    # F6: agent-managed behavior/skills sections (editable via the self_prompt tools).
+    set system_prompt to concat(system_prompt and prompt_get_self_sections())
+
     set sessions_mgr to map_get_val(ctx and "sessions")
     if sessions_mgr != 0:
         set sess to session_manager_get_active(sessions_mgr)

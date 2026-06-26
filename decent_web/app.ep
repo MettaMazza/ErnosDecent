@@ -451,6 +451,108 @@ define appendApprovalCard with toolName and summary:
         set denyMsg to "{\"type\":\"tool_deny\"}"
         set_prop(window.ws and "send" and denyMsg)
 
+define appendClarifyCard with questionsJson:
+    # F3: render the agent's clarifying questions as clickable option cards. Each
+    # question is "text||opt1||opt2||..."; the user clicks an option (or types one),
+    # then "Send answers" — or "Work with what we have" to let the agent proceed.
+    set questions to JSON.parse(questionsJson)
+    set bubble to document.createElement("div")
+    set bubble.className to "chat-bubble received"
+    set_prop(bubble.style and "border" and "1px solid rgba(59, 130, 246, 0.35)")
+    set_prop(bubble.style and "background" and "rgba(59, 130, 246, 0.06)")
+
+    set window.clarifyHtml to "<span class=\"sender\">ErnOS needs a little more to get this right</span>"
+    set window.clarifyCount to 0
+    questions.forEach(given q and idx:
+        set parts to q.split("||")
+        set qtext to get_list(parts and 0)
+        set block to concat("<div class=\"clarify-q\" style=\"margin:10px 0;\"><p style=\"margin:0 0 6px;\"><strong>" and concat(escapeHTML(qtext) and "</strong></p><div>"))
+        set nparts to get_list(parts and "length")
+        set oi to 1
+        repeat while oi < nparts:
+            set opt to get_list(parts and oi)
+            set block to concat(block and concat("<button type=\"button\" class=\"clarify-opt btn-secondary\" data-qi=\"" and concat(int_to_string(idx) and concat("\" data-val=\"" and concat(escapeHTML(opt) and concat("\">" and concat(escapeHTML(opt) and "</button> ")))))))
+            set oi to oi + 1
+        set block to concat(block and concat("<input type=\"text\" class=\"clarify-text\" data-qi=\"" and concat(int_to_string(idx) and "\" placeholder=\"or type your own\" style=\"margin-top:6px;width:90%;\">")))
+        set block to concat(block and "</div></div>")
+        set window.clarifyHtml to concat(window.clarifyHtml and block)
+        set window.clarifyCount to window.clarifyCount + 1
+    )
+    set window.clarifyHtml to concat(window.clarifyHtml and "<div class=\"clarify-actions\" style=\"margin-top:8px;\"><button type=\"button\" class=\"clarify-send btn-primary\">Send answers</button> <button type=\"button\" class=\"clarify-current btn-secondary\">Work with what we have</button></div>")
+    set_prop(bubble and "innerHTML" and window.clarifyHtml)
+    window.aiContainer.appendChild(bubble)
+    set_prop(window.aiContainer and "scrollTop" and window.aiContainer.scrollHeight)
+
+    # The run is paused waiting on the user — stop the spinner and the Stop button,
+    # keep the input disabled until they answer.
+    set_prop(window.aiLoader.style and "display" and "none")
+    set_prop(window.aiInput and "disabled" and true)
+    set stopB to document.getElementById("btn-stop-ai")
+    if stopB != 0:
+        set_prop(stopB.style and "display" and "none")
+    set nq to window.clarifyCount
+
+    bubble.addEventListener("click" and given e:
+        set tgt to get_list(e and "target")
+        set cls to get_list(tgt and "className")
+        if not cls:
+            return 0
+        set finder to get_list(cls and "indexOf")
+        if finder.call(cls and "clarify-opt") >= 0:
+            set qa to tgt.getAttribute("data-qi")
+            set va to tgt.getAttribute("data-val")
+            set_prop(bubble and concat("data-ans-" and qa) and va)
+            set_prop(tgt.style and "background" and "var(--neon-green, #10b981)")
+            set_prop(tgt.style and "color" and "#0b1220")
+            return 0
+        if finder.call(cls and "clarify-current") >= 0:
+            set acts to bubble.querySelector(".clarify-actions")
+            if acts:
+                set_prop(acts.style and "display" and "none")
+            set mc to Object()
+            set mc.type to "clarify_answer"
+            set mc.answers to "__USE_CURRENT__"
+            send_msg(window.ws and JSON.stringify(mc))
+            set_prop(window.aiLoader.style and "display" and "flex")
+            return 0
+        if finder.call(cls and "clarify-send") >= 0:
+            set ans to ""
+            set k to 0
+            repeat while k < nq:
+                set picked to bubble.getAttribute(concat("data-ans-" and int_to_string(k)))
+                if not picked:
+                    set ti to bubble.querySelector(concat("input.clarify-text[data-qi=\"" and concat(int_to_string(k) and "\"]")))
+                    if ti:
+                        set picked to get_list(ti and "value")
+                if picked:
+                    if string_length(ans) > 0:
+                        set ans to concat(ans and " | ")
+                    set ans to concat(ans and concat("Q" and concat(int_to_string(k + 1) and concat(": " and picked))))
+                set k to k + 1
+            set acts to bubble.querySelector(".clarify-actions")
+            if acts:
+                set_prop(acts.style and "display" and "none")
+            set ms to Object()
+            set ms.type to "clarify_answer"
+            set ms.answers to ans
+            send_msg(window.ws and JSON.stringify(ms))
+            set_prop(window.aiLoader.style and "display" and "flex")
+            return 0
+    )
+
+define appendReasoningBubble with b64:
+    # F1: show the model's captured reasoning for the turn as a collapsed panel above
+    # the answer. base64 (newline/comma-safe over IPC); decoded UTF-8-aware in-browser.
+    set decoded to decodeURIComponent(escape(atob(b64)))
+    set bubble to document.createElement("div")
+    set bubble.className to "chat-bubble received"
+    set_prop(bubble.style and "opacity" and "0.78")
+    set_prop(bubble.style and "fontSize" and "0.85em")
+    set html to concat("<details><summary style=\"cursor:pointer;\">💭 Reasoning</summary><pre style=\"white-space:pre-wrap;margin:6px 0 0;\">" and concat(escapeHTML(decoded) and "</pre></details>"))
+    set_prop(bubble and "innerHTML" and html)
+    window.aiContainer.appendChild(bubble)
+    set_prop(window.aiContainer and "scrollTop" and window.aiContainer.scrollHeight)
+
 define updateHostsTableUI with jsonStr:
     set tbody to document.getElementById("hosts-table-body")
     if not tbody:
@@ -1656,6 +1758,10 @@ define handleDaemonMessage with msg:
         
     else if type == "tool_pending_approval":
         appendApprovalCard(msg.tool and msg.summary)
+    else if type == "clarify":
+        appendClarifyCard(msg.questions)
+    else if type == "reasoning":
+        appendReasoningBubble(msg.b64)
         
     else if type == "ai_complete":
         if window.currentAiResponseBubble:
@@ -1672,10 +1778,15 @@ define handleDaemonMessage with msg:
 
         set_prop(window.aiLoader.style and "display" and "none")
         set window.aiInput.disabled to false
-        
+
         set btnSubmit to document.getElementById("btn-submit-ai")
         set btnSubmit.disabled to false
-        
+
+        # F4: run finished (or was halted) — hide the Stop button.
+        set stopBtn to document.getElementById("btn-stop-ai")
+        if stopBtn != 0:
+            set_prop(stopBtn.style and "display" and "none")
+
         set window.currentAiResponseBubble to null
         
     else if type == "tts_ready":
@@ -3625,7 +3736,15 @@ define main:
         
         set btnSubmit to document.getElementById("btn-submit-ai")
         set btnSubmit.disabled to true
-        
+
+        # F4: reveal the Stop button for the duration of the run (reset it — its own
+        # onclick disables it and changes its label while stopping).
+        set stopBtn to document.getElementById("btn-stop-ai")
+        if stopBtn != 0:
+            set stopBtn.disabled to false
+            set stopBtn.textContent to "Stop"
+            set_prop(stopBtn.style and "display" and "inline-block")
+
         set msg to Object()
         set msg.type to "ai_prompt"
         set msg.prompt to prompt

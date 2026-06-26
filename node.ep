@@ -667,13 +667,28 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             set ok to map_insert(agent_ctx and "sender_role" and sender_role)
                                             set ok to map_insert(agent_ctx and "in_memory_context" and in_memory_context)
                                             set ok to map_insert(agent_ctx and "selected_model" and selected_model)
+                                            # F4: thread the session id so AI CANCEL can target this run.
+                                            set ok to map_insert(agent_ctx and "session_id" and selected_session_id)
+                                            set ok to map_delete(agent_ctx and "was_cancelled")
+                                            # F3: fresh clarification budget for each new request.
+                                            set ok to map_delete(agent_ctx and "clarify_rounds")
+                                            set ok to map_delete(agent_ctx and "clarify_done")
                                             set agent_resp to react_run(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and ai_prompt)
-                                            
+
                                             set ok to map_delete(agent_ctx and "sender_username")
                                             set ok to map_delete(agent_ctx and "sender_role")
                                             set ok to map_delete(agent_ctx and "in_memory_context")
-                                            
-                                            if agent_resp equals "PENDING_APPROVAL":
+
+                                            if map_contains(agent_ctx and "was_cancelled") == 1:
+                                                # F4: run was halted by the user — report distinctly, do not persist.
+                                                set ok to map_delete(agent_ctx and "was_cancelled")
+                                                set resp to f"ai:cancelled,response:{agent_resp}"
+                                            else if agent_resp equals "PENDING_CLARIFICATION":
+                                                # F3: agent is asking the user — hand the questions to the client.
+                                                set pendingc to map_get_val(agent_ctx and "pending_clarification")
+                                                set c_questions to map_get_val(pendingc and "questions")
+                                                set resp to f"ai:clarify,questions:{c_questions}"
+                                            else if agent_resp equals "PENDING_APPROVAL":
                                                 # Tool requires user approval — extract pending action details
                                                 set pending to map_get_val(agent_ctx and "pending_action")
                                                 set p_tool to map_get_val(pending and "tool_name")
@@ -688,7 +703,16 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set ok to session_serialize(active_sess and filepath)
 
                                                 set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                set resp to f"ai:ok,response:{agent_resp}"
+                                                # F1: surface the final turn's reasoning (if any) to the client,
+                                                # base64-encoded so its newlines/commas can't break the IPC line.
+                                                set last_reason to ""
+                                                if map_contains(agent_ctx and "last_reasoning") == 1:
+                                                    set last_reason to map_get_val(agent_ctx and "last_reasoning")
+                                                set ok to map_delete(agent_ctx and "last_reasoning")
+                                                if string_length(last_reason) > 0:
+                                                    set resp to f"ai:ok,reasoning:{base64_encode(last_reason)},response:{agent_resp}"
+                                                else:
+                                                    set resp to f"ai:ok,response:{agent_resp}"
                                         else if cmd_upper equals "BFT STATUS":
                                             set bview to map_get_val(bft_node and "view")
                                             set bseq to map_get_val(bft_node and "seq")
@@ -841,6 +865,48 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                         set resp to f"ai:ok,response:{agent_resp}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
+                                            else:
+                                                set resp to "ai:error,reason:agent_not_initialized"
+                                        else if string_contains(cmd_upper and "AI CANCEL") == 1:
+                                            # F4: stop/halt. Arrives on its own connection while the run is
+                                            # blocked on another; sets the per-session cancel flag the loop
+                                            # consumes at its next turn boundary. Optional [SESSION:id].
+                                            set cancel_sid to ""
+                                            if string_contains(cmd and "[SESSION:") == 1:
+                                                set sp to string_index_of(cmd and "[SESSION:")
+                                                set rest to substring(cmd and sp + 9 and string_length(cmd) - sp - 9)
+                                                set ep to string_index_of(rest and "]")
+                                                if ep > 0:
+                                                    set cancel_sid to substring(rest and 0 and ep)
+                                            set ok to react_request_cancel(cancel_sid)
+                                            set resp to "ai:cancel_ack"
+                                        else if string_contains(cmd_upper and "AI CLARIFY ") == 1:
+                                            # F3: user answered the agent's clarifying question(s) — resume.
+                                            set clarify_answers to substring(cmd and 11 and string_length(cmd) - 11)
+                                            if agent_ctx != 0:
+                                                if map_contains(agent_ctx and "pending_clarification") == 1:
+                                                    set agent_resp to react_resume_clarify(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and clarify_answers and 0)
+                                                    if agent_resp equals "PENDING_CLARIFICATION":
+                                                        set pendingc to map_get_val(agent_ctx and "pending_clarification")
+                                                        set c_questions to map_get_val(pendingc and "questions")
+                                                        set resp to f"ai:clarify,questions:{c_questions}"
+                                                    else if agent_resp equals "PENDING_APPROVAL":
+                                                        set pending to map_get_val(agent_ctx and "pending_action")
+                                                        set p_tool to map_get_val(pending and "tool_name")
+                                                        set p_summary to map_get_val(pending and "summary")
+                                                        set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
+                                                    else:
+                                                        set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                                        set active_sess to session_manager_get_active(sessions_mgr)
+                                                        set ok to session_add_message(active_sess and "assistant" and agent_resp)
+                                                        set dir to map_get_val(sessions_mgr and "sessions_dir")
+                                                        set active_id to map_get_val(sessions_mgr and "active_session_id")
+                                                        set filepath to path_join(dir and concat(active_id and ".json"))
+                                                        set ok to session_serialize(active_sess and filepath)
+                                                        set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                                        set resp to f"ai:ok,response:{agent_resp}"
+                                                else:
+                                                    set resp to "ai:error,reason:no_pending_clarification"
                                             else:
                                                 set resp to "ai:error,reason:agent_not_initialized"
                                         else if cmd_upper equals "AI MODELS":

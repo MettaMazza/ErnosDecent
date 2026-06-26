@@ -135,6 +135,25 @@ async def new_session_cmd(interaction: discord.Interaction, title: str = "Discor
     else:
         await interaction.followup.send(f"❌ Failed to start new session. Daemon response: {resp_set}")
 
+@tree.command(name="stop", description="Halt the currently running ErnOS agent")
+async def stop_cmd(interaction: discord.Interaction):
+    # F4 stop/halt: sent on its own IPC connection (send_daemon_ipc opens a fresh
+    # socket) so it reaches the daemon while an in-flight AI INFER is blocked on
+    # another connection. The running loop halts at its next turn boundary.
+    is_target_channel = interaction.channel.id == channel_id
+    is_thread_in_target_channel = getattr(interaction.channel, 'parent_id', None) == channel_id
+    if not is_target_channel and not is_thread_in_target_channel:
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    sess = active_session_id or ""
+    cancel_cmd = f"AI CANCEL [SESSION:{sess}]" if sess else "AI CANCEL"
+    resp = await send_daemon_ipc(cancel_cmd)
+    if "cancel_ack" in resp:
+        await interaction.followup.send("🛑 Halt requested — the agent will stop at its next step.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"⚠️ Could not reach the agent to halt it. Daemon response: {resp}", ephemeral=True)
+
 # Approval timeout in seconds
 # No timeout — user said "WAIT" (indefinite)
 APPROVAL_TIMEOUT = None
@@ -406,6 +425,91 @@ async def handle_tool_approval(message, resp):
     else:
         await send_discord_reply(message, f"Agent response: {ipc_resp}")
 
+# --- F3: clarification over Discord ---
+def parse_clarify_questions(resp):
+    """Parse 'ai:clarify,questions:<json array of "text||opt1||opt2">' -> [(text, [opts])]."""
+    idx = resp.find("questions:")
+    raw = resp[idx + len("questions:"):] if idx >= 0 else "[]"
+    try:
+        arr = json.loads(raw)
+    except Exception:
+        arr = []
+    out = []
+    for item in arr:
+        bits = str(item).split("||")
+        qtext = bits[0] if bits else ""
+        opts = [b for b in bits[1:] if b]
+        out.append((qtext, opts))
+    return out
+
+class ClarifyView(discord.ui.View):
+    """Buttons for the agent's clarifying options (one click = one answer), plus a
+    'Work with what we have' escape. Only the original asker may answer."""
+    def __init__(self, author, questions, timeout=None):
+        super().__init__(timeout=timeout)
+        self.author = author
+        self.value = None
+        multi = len(questions) > 1
+        count = 0
+        for qi, (qtext, opts) in enumerate(questions):
+            for opt in opts:
+                if count >= 20:  # leave room for the escape button (Discord max 25)
+                    break
+                answer = f"Q{qi+1}: {opt}" if multi else opt
+                btn = discord.ui.Button(label=answer[:80], style=discord.ButtonStyle.secondary)
+                btn.callback = self._make_cb(answer)
+                self.add_item(btn)
+                count += 1
+        esc = discord.ui.Button(label="Work with what we have", style=discord.ButtonStyle.primary)
+        esc.callback = self._make_cb("__USE_CURRENT__")
+        self.add_item(esc)
+
+    def _make_cb(self, answer):
+        async def cb(interaction: discord.Interaction):
+            if interaction.user != self.author:
+                await interaction.response.send_message("❌ Only the original sender can answer this.", ephemeral=True)
+                return
+            self.value = answer
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(content=interaction.message.content, view=self)
+            self.stop()
+        return cb
+
+async def handle_clarification(message, resp):
+    """Show the agent's clarifying questions with clickable options and resume the run."""
+    questions = parse_clarify_questions(resp)
+    lines = ["🤔 **A quick clarification to get this right:**"]
+    for i, (qt, opts) in enumerate(questions):
+        lines.append(f"**{i+1}. {qt}**")
+    card_text = "\n".join(lines) + "\n\nPick an option below — or *Work with what we have* to let me proceed."
+    view = ClarifyView(author=message.author, questions=questions, timeout=APPROVAL_TIMEOUT)
+    clar_msg = await message.reply(card_text, view=view)
+
+    timed_out = await view.wait()
+    if timed_out or view.value is None:
+        for item in view.children:
+            item.disabled = True
+        await clar_msg.edit(content="⏰ No answer — proceeding with what we have.", view=view)
+        ipc_resp = await send_daemon_ipc("AI CLARIFY __USE_CURRENT__")
+    else:
+        answer = view.value
+        await clar_msg.edit(content=f"✅ Got it: `{answer}`", view=view)
+        ipc_resp = await send_daemon_ipc(f"AI CLARIFY {answer}")
+
+    if ipc_resp.startswith("ai:clarify,"):
+        await handle_clarification(message, ipc_resp)
+    elif ipc_resp.startswith("ai:pending_approval,"):
+        await handle_tool_approval(message, ipc_resp)
+    elif ipc_resp.startswith("ai:cancelled,response:"):
+        await send_discord_reply(message, "🛑 " + ipc_resp[len("ai:cancelled,response:"):])
+    elif ipc_resp.startswith("ai:ok,response:"):
+        await send_discord_reply(message, ipc_resp[len("ai:ok,response:"):], speakable=True)
+    elif ipc_resp == "error:daemon_offline":
+        await send_discord_reply(message, "❌ Daemon went offline during clarification.")
+    else:
+        await send_discord_reply(message, f"Agent response: {ipc_resp}")
+
 async def _exec_bridge_command(action, args):
     """Execute one agent->bridge command via discord.py. Returns a result string.
     This is the live half of the node<->bridge RPC; only runs with a real bot token."""
@@ -561,6 +665,12 @@ async def on_message(message):
                 # Tool requires user approval before execution
                 await handle_tool_approval(message, resp)
                 return
+            elif resp.startswith("ai:clarify,"):
+                # F3: agent is asking the user clarifying questions
+                await handle_clarification(message, resp)
+                return
+            elif resp.startswith("ai:cancelled,response:"):
+                ai_resp = "🛑 " + resp[len("ai:cancelled,response:"):]
             elif resp.startswith("ai:ok,response:"):
                 ai_resp = resp[len("ai:ok,response:"):]
             elif resp == "error:daemon_offline":
