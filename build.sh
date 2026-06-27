@@ -175,24 +175,26 @@ if grep -q "ep_crash_log_written" node_compiled.c; then
 else
 python3 -c "
 import sys
+import re
 with open('node_compiled.c', 'r') as f:
     src = f.read()
 
-old_handler = '''static void ep_signal_handler(int sig) {
-    if (ep_try_active) {
-        ep_try_active = 0;
-        longjmp(ep_try_buf, sig);
-    }
-    /* Outside try: print error and exit */
-    const char* name = sig == SIGSEGV ? \"segmentation fault (null pointer or invalid memory access)\"
-                     : sig == SIGFPE  ? \"arithmetic error (division by zero)\"
-                     : sig == SIGABRT ? \"aborted\"
-                     : \"unknown signal\";
-    fprintf(stderr, \"\\\\nRuntime Error: %s (signal %d)\\\\n\", name, sig);
-    _exit(128 + sig);
-}'''
+pattern = r'static\s+void\s+ep_signal_handler\s*\(\s*int\s+sig\s*\)\s*\{'
+match = re.search(pattern, src)
+if match:
+    start_idx = match.start()
+    brace_idx = match.end() - 1
+    brace_count = 1
+    idx = brace_idx + 1
+    while brace_count > 0 and idx < len(src):
+        if src[idx] == '{':
+            brace_count += 1
+        elif src[idx] == '}':
+            brace_count -= 1
+        idx += 1
+    end_idx = idx
 
-new_handler = '''static void ep_signal_handler(int sig) {
+    new_handler = '''static void ep_signal_handler(int sig) {
     if (ep_try_active) {
         ep_try_active = 0;
         longjmp(ep_try_buf, sig);
@@ -216,7 +218,11 @@ new_handler = '''static void ep_signal_handler(int sig) {
             time_t now = time(NULL);
             struct tm* t = localtime(&now);
             char ts[64];
-            strftime(ts, sizeof(ts), \"%Y-%m-%d %H:%M:%S\", t);
+            if (t) {
+                strftime(ts, sizeof(ts), \"%Y-%m-%d %H:%M:%S\", t);
+            } else {
+                snprintf(ts, sizeof(ts), \"%lld\", (long long)now);
+            }
             fprintf(cf, \"\\\\n=== CRASH at %s ===\\\\n\", ts);
             fprintf(cf, \"Signal: %d (%s)\\\\n\", sig, name);
 #if defined(__APPLE__) || defined(__linux__)
@@ -232,17 +238,37 @@ new_handler = '''static void ep_signal_handler(int sig) {
             fclose(cf);
         }
     }
+    /* Write to daemon/general log file if environment variable is set */
+    const char* daemon_log = getenv(\"ERNOS_DAEMON_LOG\");
+    if (!daemon_log || daemon_log[0] == '\\\\0') {
+        daemon_log = getenv(\"ERNOS_LOG_FILE\");
+    }
+    if (daemon_log && daemon_log[0] != '\\\\0') {
+        FILE* f = fopen(daemon_log, \"ab\");
+        if (f) {
+            time_t rawtime;
+            time(&rawtime);
+            struct tm * timeinfo = localtime(&rawtime);
+            char time_buf[80];
+            if (timeinfo) {
+                strftime(time_buf, sizeof(time_buf), \"%Y-%m-%d %H:%M:%S\", timeinfo);
+            } else {
+                snprintf(time_buf, sizeof(time_buf), \"%lld\", (long long)rawtime);
+            }
+            fprintf(f, \"[%s] FATAL: Runtime Error: %s (signal %d)\\\\n\", time_buf, name, sig);
+            fclose(f);
+        }
+    }
     _exit(128 + sig);
 }'''
 
-if old_handler in src:
-    src = src.replace(old_handler, new_handler)
+    src = src[:start_idx] + new_handler + src[end_idx:]
     # Add backtrace include if not present
     if '#include <execinfo.h>' not in src:
         src = src.replace('#include <signal.h>', '#include <signal.h>\\n#if defined(__APPLE__) || defined(__linux__)\\n#include <execinfo.h>\\n#endif')
     with open('node_compiled.c', 'w') as f:
         f.write(src)
-    print('Patched ep_signal_handler with crash log support in node_compiled.c')
+    print('Patched ep_signal_handler dynamically in node_compiled.c')
 else:
     print('WARNING: ep_signal_handler signature not found — crash log patch skipped', file=sys.stderr)
 "
