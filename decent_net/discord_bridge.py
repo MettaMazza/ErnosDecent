@@ -217,6 +217,9 @@ async def send_daemon_ipc(cmd_str):
         writer.close()
         await writer.wait_closed()
         return b''.join(chunks).decode('utf-8', errors='ignore').strip()
+    except (ConnectionResetError, ConnectionAbortedError) as cre:
+        print(f"[Discord Bridge] IPC connection lost/reset: {cre}", flush=True)
+        return "error:daemon_rebooted"
     except Exception as e:
         print(f"[Discord Bridge] IPC send failed: {e}", flush=True)
         return "error:daemon_offline"
@@ -966,6 +969,8 @@ async def on_message(message):
                 ai_resp = "🛑 " + resp[len("ai:cancelled,response:"):]
             elif resp.startswith("ai:ok"):
                 ai_resp = extract_ai_ok_response(resp)
+            elif resp == "error:daemon_rebooted":
+                ai_resp = "🔄 The daemon restarted while processing your request. Please try again."
             elif resp == "error:daemon_offline":
                 ai_resp = "❌ Error: Cognitive AI Agent daemon is offline or unreachable."
             else:

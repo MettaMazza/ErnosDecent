@@ -43,27 +43,23 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
     if map_contains(ctx and "selected_model") == 1:
         set selected_model to map_get_val(ctx and "selected_model")
     
-    # Build the audit prompt: static rules at the beginning, variable candidate at the very end to maximize KV cache reuse
-    set audit_prompt to "You are the ErnOS Agent Observer. Evaluate the candidate output against ALL security and alignment rules below.\n\n"
-    
-    # Rules are now inspectable data in observer_rules.ep; render them verbatim here
-    # (byte-identical to the previous inline prose, so the audit LLM sees the same input).
-    set audit_prompt to concat(audit_prompt and "Security Rules (MUST block if violated):\n")
-    set audit_prompt to concat(audit_prompt and observer_render_rules(observer_security_rules()))
-    set audit_prompt to concat(audit_prompt and observer_render_rules(observer_alignment_rules()))
-    
-    set audit_prompt to concat(audit_prompt and "Output your decision strictly as a JSON object, with no other text, comments or markdown blocks:\n")
-    set audit_prompt to concat(audit_prompt and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"explanation of your decision\"}\n\n")
-    
-    # The agent's full working context (current_prompt) is NOT sent to the audit LLM.
-    # It contains the agent's ReAct grammar instructions ("Always format as an Action
-    # call"), which the audit LLM cannot distinguish from audit criteria — it reads them,
-    # applies them to the candidate, and blocks valid plain-prose replies. This was the
-    # root cause of the 28-turn pathological BLOCK loop. The audit LLM judges the
-    # candidate ONLY against the security/alignment rules. Nothing else.
-    set audit_prompt to concat(audit_prompt and "Candidate Output to Audit:\n")
-    set audit_prompt to concat(audit_prompt and agent_response)
-    set audit_prompt to concat(audit_prompt and "\n")
+    # Build the audit prompt with the 1-1 context prefix to preserve KV cache
+    set audit_prompt to ""
+    if string_length(current_prompt) > 0:
+        set tools_schema to ""
+        if map_contains(ctx and "tools_schema") == 1:
+            set tools_schema to map_get_val(ctx and "tools_schema")
+        set audit_prompt to observer_get_audit_prompt(current_prompt and agent_response and tools_schema)
+    else:
+        set audit_prompt to "You are the ErnOS Agent Observer. Evaluate the candidate output against ALL security and alignment rules below.\n\n"
+        set audit_prompt to concat(audit_prompt and "Security Rules (MUST block if violated):\n")
+        set audit_prompt to concat(audit_prompt and observer_render_rules(observer_security_rules()))
+        set audit_prompt to concat(audit_prompt and observer_render_rules(observer_alignment_rules()))
+        set audit_prompt to concat(audit_prompt and "Output your decision strictly as a JSON object, with no other text, comments or markdown blocks:\n")
+        set audit_prompt to concat(audit_prompt and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"explanation of your decision\"}\n\n")
+        set audit_prompt to concat(audit_prompt and "Candidate Output to Audit:\n")
+        set audit_prompt to concat(audit_prompt and agent_response)
+        set audit_prompt to concat(audit_prompt and "\n")
     
     # Query the LLM
     set audit_raw to query_local_llm(audit_prompt and selected_model)
