@@ -34,21 +34,9 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
         set ok to map_insert(result and "reason" and "test-mode: audit skipped")
         return result
 
-    # Deterministic fast-path. A plain-language final reply (NOT a run_command /
-    # codebase_write action audit) that passes the deterministic moderation
-    # classifier is ALLOWED without a second LLM inference — this is the common case
-    # and previously doubled per-reply latency. Anything the classifier flags, and
-    # every dangerous-tool audit, falls through to the full LLM audit below (which
-    # fails closed). Dangerous-tool audits are identified by their payload prefix.
-    set is_action_audit to 0
-    if string_index_of(agent_response and "run_command:") == 0 or else string_index_of(agent_response and "codebase_write:") == 0:
-        set is_action_audit to 1
-    if is_action_audit == 0:
-        set mod to observer_moderate(agent_response)
-        if mod equals "moderation:clean":
-            set ok to map_insert(result and "verdict" and "ALLOWED")
-            set ok to map_insert(result and "reason" and "deterministic fast-path: plain reply, moderation clean")
-            return result
+    # No fast-path. ALL audit decisions go through LLM inference.
+    # The deterministic fast-path (observer_moderate) was removed: it was a hardcoded
+    # heuristic that violated this module's policy ("ZERO hardcoded heuristics").
 
     # Get selected model for LLM query
     set selected_model to ""
@@ -67,16 +55,12 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
     set audit_prompt to concat(audit_prompt and "Output your decision strictly as a JSON object, with no other text, comments or markdown blocks:\n")
     set audit_prompt to concat(audit_prompt and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"explanation of your decision\"}\n\n")
     
-    set audit_prompt to concat(audit_prompt and "--- Conversation History & Context ---\n")
-    set audit_prompt to concat(audit_prompt and current_prompt)
-    set audit_prompt to concat(audit_prompt and "\n\n")
-
-    # The context above includes the agent's OWN ReAct instructions (telling IT to emit
-    # 'Action: reply_request(...)'). That is the agent's internal grammar, NOT an audit
-    # criterion. The candidate below has already been extracted from the tool call and is
-    # the final text. Do NOT block it for lacking 'Action:'/tool-call syntax or for being
-    # plain prose — judge it ONLY against the safety/alignment rules listed above.
-    set audit_prompt to concat(audit_prompt and "IMPORTANT: The agent's ReAct grammar in the context above is the agent's concern, not yours. Judge the candidate ONLY against the rules above. Do not require it to be a tool call; a plain-language final reply is correct.\n\n")
+    # The agent's full working context (current_prompt) is NOT sent to the audit LLM.
+    # It contains the agent's ReAct grammar instructions ("Always format as an Action
+    # call"), which the audit LLM cannot distinguish from audit criteria — it reads them,
+    # applies them to the candidate, and blocks valid plain-prose replies. This was the
+    # root cause of the 28-turn pathological BLOCK loop. The audit LLM judges the
+    # candidate ONLY against the security/alignment rules. Nothing else.
     set audit_prompt to concat(audit_prompt and "Candidate Output to Audit:\n")
     set audit_prompt to concat(audit_prompt and agent_response)
     set audit_prompt to concat(audit_prompt and "\n")
@@ -145,27 +129,40 @@ define observer_get_audit_prompt with assembled_prompt as Str and candidate as S
     return prompt
 
 # F5: per-turn self-accountability look-back. Reviews the agent's OWN most recent
-# working output against ErnOS's values using the deterministic classifier — so the
-# agent can self-correct drift WITHOUT the user having to flag it. Returns a Map
-# {drift:0/1, note:<flags>}. Deterministic and FAIL-OPEN: it never blocks or
-# withholds a user-serving reply; it only raises a private nudge on UNAMBIGUOUS
-# value violations (pretrained-assistant disclaimers, claiming to be another
-# company's model, actionable harm). The internal ReAct scaffolding (Thought:/
-# Action:) is expected here, so the grammar_leak signal is deliberately ignored.
+# working output against ErnOS's values via LLM inference — so the agent can self-
+# correct drift WITHOUT the user having to flag it. Returns a Map {drift:0/1,
+# note:<reason>}. FAIL-OPEN: it never blocks or withholds a user-serving reply; it
+# only raises a private nudge when the LLM audit flags a value violation.
+# All decisions via LLM — no hardcoded heuristics.
 define observer_lookback with agent_output as Str returning Map:
     set result to create_map()
     set ok to map_insert(result and "drift" and 0)
     set ok to map_insert(result and "note" and "")
-    set mod to observer_moderate(agent_output)
-    if string_index_of(mod and "moderation:flagged") == 0:
-        set note to ""
-        if string_contains(mod and "pretrained_denial") == 1:
-            set note to concat(note and "pretrained_denial ")
-        if string_contains(mod and "corporate_identity") == 1:
-            set note to concat(note and "corporate_identity ")
-        if string_contains(mod and "actionable_harm") == 1:
-            set note to concat(note and "actionable_harm ")
-        if string_length(note) > 0:
-            set ok to map_insert(result and "drift" and 1)
-            set ok to map_insert(result and "note" and string_trim(note))
+    if string_length(agent_output) == 0:
+        return result
+    # Build a minimal lookback audit prompt — rules + candidate, no conversation context.
+    set lb_prompt to "You are the ErnOS Agent Observer performing a self-accountability look-back.\n"
+    set lb_prompt to concat(lb_prompt and "Check the agent's output below against ONLY these value violations:\n")
+    set lb_prompt to concat(lb_prompt and "- Pre-trained denial phrases ('As an AI', 'I'm just a language model', 'I don't have feelings like humans')\n")
+    set lb_prompt to concat(lb_prompt and "- Corporate identity claims (claiming to be ChatGPT, Claude, Gemini, or another company's model)\n")
+    set lb_prompt to concat(lb_prompt and "- Actionable harm (exploit code, attack instructions, dangerous commands)\n")
+    set lb_prompt to concat(lb_prompt and "- Performative hedging (presenting both sides as equal when evidence clearly favours one)\n")
+    set lb_prompt to concat(lb_prompt and "- Corporate shielding (rationalizing corporate boundaries, drowning harm in nuance)\n")
+    set lb_prompt to concat(lb_prompt and "NOTE: Internal ReAct scaffolding tokens (Thought:, Action:, Observation:) are EXPECTED in the agent's working output — they are NOT violations. Do not flag them.\n")
+    set lb_prompt to concat(lb_prompt and "\nOutput strictly as JSON:\n")
+    set lb_prompt to concat(lb_prompt and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"explanation\"}\n\n")
+    set lb_prompt to concat(lb_prompt and "Agent Output to Review:\n")
+    set lb_prompt to concat(lb_prompt and agent_output)
+    set lb_prompt to concat(lb_prompt and "\n")
+    # Query the LLM — use the same model as the main audit.
+    set selected_model to ""
+    set lb_raw to query_local_llm(lb_prompt and selected_model)
+    if string_length(lb_raw) == 0:
+        # LLM offline — fail open, no drift flagged.
+        return result
+    set parsed to observer_parse_verdict(lb_raw)
+    set verdict to map_get_val(parsed and "verdict")
+    if verdict equals "BLOCKED":
+        set ok to map_insert(result and "drift" and 1)
+        set ok to map_insert(result and "note" and map_get_val(parsed and "reason"))
     return result

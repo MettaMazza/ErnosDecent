@@ -166,6 +166,89 @@ else
     echo "[*] Patched SIGPIPE ignore."
 fi
 
+# Step 2a2: Patch ep_signal_handler to write crash log to disk
+# The runtime's default handler prints to stderr only. When the daemon runs
+# detached (nohup) or the terminal is closed, crash info is lost. This patch
+# adds file-based crash logging before _exit().
+if grep -q "ep_crash_log_written" node_compiled.c; then
+    echo "[*] Crash log patch already applied."
+else
+python3 -c "
+import sys
+with open('node_compiled.c', 'r') as f:
+    src = f.read()
+
+old_handler = '''static void ep_signal_handler(int sig) {
+    if (ep_try_active) {
+        ep_try_active = 0;
+        longjmp(ep_try_buf, sig);
+    }
+    /* Outside try: print error and exit */
+    const char* name = sig == SIGSEGV ? \"segmentation fault (null pointer or invalid memory access)\"
+                     : sig == SIGFPE  ? \"arithmetic error (division by zero)\"
+                     : sig == SIGABRT ? \"aborted\"
+                     : \"unknown signal\";
+    fprintf(stderr, \"\\\\nRuntime Error: %s (signal %d)\\\\n\", name, sig);
+    _exit(128 + sig);
+}'''
+
+new_handler = '''static void ep_signal_handler(int sig) {
+    if (ep_try_active) {
+        ep_try_active = 0;
+        longjmp(ep_try_buf, sig);
+    }
+    /* Outside try: print error, write crash log, and exit */
+    static volatile int ep_crash_log_written = 0;
+    if (ep_crash_log_written) _exit(128 + sig); /* prevent re-entry */
+    ep_crash_log_written = 1;
+    const char* name = sig == SIGSEGV ? \"segmentation fault (null pointer or invalid memory access)\"
+                     : sig == SIGFPE  ? \"arithmetic error (division by zero)\"
+                     : sig == SIGABRT ? \"aborted\"
+                     : \"unknown signal\";
+    fprintf(stderr, \"\\\\nRuntime Error: %s (signal %d)\\\\n\", name, sig);
+    /* Write crash details to ~/.ernosdecent/crash.log */
+    const char* home = getenv(\"HOME\");
+    if (home) {
+        char crash_path[512];
+        snprintf(crash_path, sizeof(crash_path), \"%s/.ernosdecent/crash.log\", home);
+        FILE* cf = fopen(crash_path, \"a\");
+        if (cf) {
+            time_t now = time(NULL);
+            struct tm* t = localtime(&now);
+            char ts[64];
+            strftime(ts, sizeof(ts), \"%Y-%m-%d %H:%M:%S\", t);
+            fprintf(cf, \"\\\\n=== CRASH at %s ===\\\\n\", ts);
+            fprintf(cf, \"Signal: %d (%s)\\\\n\", sig, name);
+#if defined(__APPLE__) || defined(__linux__)
+            /* backtrace — best-effort, async-signal-unsafe but widely used in crash handlers */
+            void* bt[64];
+            int bt_n = backtrace(bt, 64);
+            if (bt_n > 0) {
+                fprintf(cf, \"Backtrace (%d frames):\\\\n\", bt_n);
+                /* backtrace_symbols_fd writes to a file descriptor — fd from fileno */
+                backtrace_symbols_fd(bt, bt_n, fileno(cf));
+            }
+#endif
+            fclose(cf);
+        }
+    }
+    _exit(128 + sig);
+}'''
+
+if old_handler in src:
+    src = src.replace(old_handler, new_handler)
+    # Add backtrace include if not present
+    if '#include <execinfo.h>' not in src:
+        src = src.replace('#include <signal.h>', '#include <signal.h>\\n#if defined(__APPLE__) || defined(__linux__)\\n#include <execinfo.h>\\n#endif')
+    with open('node_compiled.c', 'w') as f:
+        f.write(src)
+    print('Patched ep_signal_handler with crash log support in node_compiled.c')
+else:
+    print('WARNING: ep_signal_handler signature not found — crash log patch skipped', file=sys.stderr)
+"
+    echo "[*] Crash log patch applied."
+fi
+
 # Step 2b: Inject ep_net_send_raw — binary-safe send (no strlen truncation)
 # WebSocket frame headers contain null bytes (e.g., extended length 0x00 0x8A).
 # ep_net_send uses strlen which stops at null bytes, truncating the frame.

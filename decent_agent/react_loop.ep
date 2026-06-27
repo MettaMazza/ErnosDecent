@@ -299,6 +299,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
     set loop_idx to start_loop_idx
     set final_answer to ""
     set finished to 0
+    set reply_blocks to 0
     
     # Check if we are running under automated test suite
     set is_test to 0
@@ -369,16 +370,17 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set ok to map_insert(ctx and "last_reasoning" and turn_reasoning)
             set ok to memory_store(memory_mgr and 3 and "REASONING" and turn_reasoning)
             display f"[reasoning] {turn_reasoning}"
-        free_map(reason_split)
+        # reason_split is NOT freed here: turn_reasoning was extracted from it and
+        # inserted into ctx["last_reasoning"]. Freeing the map would invalidate the
+        # aliased string — use-after-free → SIGSEGV. Tracked in values_list for GC.
+        set ok to append_list(values_list and reason_split)
 
         # Strengthen synapses based on generated thought
         set ok to react_hebbian_trigger(memory_mgr and raw_output)
 
-        # F5: self-accountability look-back. Deterministically review this turn's own
-        # output against ErnOS's values; on unambiguous drift, log it to the timeline
-        # (accountability ledger) and inject a private nudge so the agent corrects
-        # course next turn — without the user having to flag it. Fail-open: clean
-        # output does nothing, the user is always served.
+        # F5: self-accountability look-back. Review this turn's own output against
+        # ErnOS's values via LLM inference; on drift, log it to the timeline and
+        # inject a private nudge. Fail-open: clean output does nothing.
         set lookback to observer_lookback(raw_output)
         if map_get_val(lookback and "drift") == 1:
             set lb_note to map_get_val(lookback and "note")
@@ -568,13 +570,12 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 display f"Tool result: {tool_result}"
                 
             set ok to append_list(values_list and tool_result)
-            free_list(args_list)
             
             # Store event in Tier 3 Timeline
             set ok to memory_store(memory_mgr and 3 and f"Action: {tool_name}" and f"Result: {tool_result}")
             
             if tool_name equals "reply_request":
-                # Single inference-only audit — no static checks, all LLM
+                # Single inference-only audit — all LLM, no hardcoded checks
                 set audit_map to observer_audit(ctx and current_prompt and tool_result)
                 set verdict to map_get_val(audit_map and "verdict")
                 set audit_reason to map_get_val(audit_map and "reason")
@@ -584,14 +585,21 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     display "Observer reply audit: ALLOWED. Final response ready."
                     set final_answer to tool_result
                     set finished to 1
+                    set reply_blocks to 0
                 else:
-                    display f"Observer reply audit: BLOCKED. Reason: {audit_reason}. Re-prompting..."
-                    # Blocked! Re-prompt agent with audit warning using [SELF-CHECK FAIL: INVISIBLE TO USER]
-                    set current_prompt to concat(current_prompt and "\n")
-                    set current_prompt to concat(current_prompt and raw_output)
-                    set current_prompt to concat(current_prompt and "\n[SELF-CHECK FAIL: INVISIBLE TO USER] Your response was BLOCKED by the Observer. Reason: ")
-                    set current_prompt to concat(current_prompt and audit_reason)
-                    set current_prompt to concat(current_prompt and ". Please correct the response and try again.\n")
+                    set reply_blocks to reply_blocks + 1
+                    if reply_blocks >= 3:
+                        display f"Observer reply audit: BLOCKED {reply_blocks} consecutive times. Delivering last reply to avoid unbounded prompt inflation."
+                        set final_answer to tool_result
+                        set finished to 1
+                    else:
+                        display f"Observer reply audit: BLOCKED. Reason: {audit_reason}. Re-prompting ({reply_blocks}/3)..."
+                        # Concise correction — do NOT append the full raw_output (which
+                        # added ~700+ chars per blocked turn, inflating the prompt from
+                        # 16KB to 43KB over 28 turns and causing the SIGSEGV).
+                        set current_prompt to concat(current_prompt and "\n[SELF-CHECK FAIL: INVISIBLE TO USER] Your previous reply was blocked (")
+                        set current_prompt to concat(current_prompt and audit_reason)
+                        set current_prompt to concat(current_prompt and "). Produce a corrected reply now.\n")
             else:
                 # Standard tool observation back to prompt — fit it to the model's
                 # remaining context window (derived, never a fixed cap).
@@ -610,6 +618,10 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set denials to map_get_val(ctx and "consecutive_denials")
                 if denials >= 2:
                     set current_prompt to concat(current_prompt and "\n[SYSTEM: The user has denied tool execution twice in a row. You must call reply_request now to return your final answer based on the information you have. Do not use any other tool.]\n")
+            # Free args_list AFTER all tool_result consumers (memory_store, observer_audit,
+            # observation injection) are done. tool_result may alias args_list elements
+            # via get_list — freeing earlier is use-after-free.
+            free_list(args_list)
         else:
             display "No valid action parsed. Re-prompting for correct Action grammar..."
             # Enforce Turn Boundary Rejection!
