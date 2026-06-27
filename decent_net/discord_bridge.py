@@ -275,6 +275,8 @@ async def query_daemon_ipc(prompt, author=None):
         print(f"[Discord Bridge] IPC query failed: {e}", flush=True)
         return "error:daemon_offline"
 
+import re
+
 async def send_discord_reply(message, text, speakable=False):
     """Send a reply, splitting into chunks if it exceeds Discord's 2000-char limit.
     When speakable=True, a 🔊 button is attached to the final chunk that plays the
@@ -282,6 +284,10 @@ async def send_discord_reply(message, text, speakable=False):
     try:
         if not text or not text.strip():
             text = "..."
+        # Guard against invisible/control characters that produce blank Discord messages
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        if not cleaned.strip():
+            text = "(Response contained only invisible characters — this is a bug. Please retry.)"
         view = SpeakView(text) if speakable else None
         if len(text) > 2000:
             chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
@@ -306,10 +312,9 @@ def parse_pending_approval(resp):
     return tool_name, summary
 
 def extract_ai_ok_response(resp):
-    """Extract the reply text from an 'ai:ok' line, tolerating an optional
-    'reasoning:<b64>' segment before 'response:' (F1 surfaces reasoning to the web;
-    Discord stays clean and just takes the response)."""
-    marker = "response:"
+    """Extract the reply text from an 'ai:ok' line. Uses the unique delimiter
+    '|||RESPONSE|||' so base64 reasoning blocks cannot accidentally match."""
+    marker = "|||RESPONSE|||"
     idx = resp.find(marker)
     return resp[idx + len(marker):] if idx >= 0 else resp
 
@@ -570,6 +575,120 @@ async def bridge_poll_loop():
             print(f"[Discord Bridge] poll loop error: {e}", flush=True)
         await asyncio.sleep(1.0)
 
+async def trace_poll_loop(thread, session_id, done_event):
+    """Poll the daemon for trace events and stream them into a Discord thread.
+    Runs until done_event is set (inference complete)."""
+    TYPE_EMOJI = {
+        "thinking": "🧠", "raw_output": "📝", "reasoning": "💭",
+        "lookback": "🔍", "action": "⚙️", "approval": "🔒",
+        "audit": "🛡️", "tool_exec": "🔧", "tool_result": "📋",
+        "reply_audit": "✅", "no_action": "⚠️", "done": "🏁",
+    }
+    await client.wait_until_ready()
+    while not done_event.is_set():
+        try:
+            resp = await send_daemon_ipc(f"TRACE POLL {session_id}")
+            if resp and resp.startswith("["):
+                events = json.loads(resp)
+                for ev in events:
+                    etype = ev.get("type", "info")
+                    content = ev.get("content", "")
+                    emoji = TYPE_EMOJI.get(etype, "ℹ️")
+                    # Truncate to Discord's 2000-char limit
+                    msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
+                    if len(msg) > 2000:
+                        msg = msg[:1997] + "..."
+                    try:
+                        await thread.send(msg)
+                    except Exception as e:
+                        print(f"[Discord Bridge] trace thread send error: {e}", flush=True)
+        except Exception as e:
+            print(f"[Discord Bridge] trace poll error: {e}", flush=True)
+        await asyncio.sleep(0.5)  # Poll every 500ms for near-real-time
+
+async def pending_deletes_cleanup_loop():
+    """On startup, check for any threads whose 2-minute delete timer expired while
+    the bridge was offline (crash resilience). Then continue checking periodically."""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            resp = await send_daemon_ipc("TRACE PENDING_DELETES")
+            if resp and resp.startswith("["):
+                pending = json.loads(resp)
+                for item in pending:
+                    tid = str(item.get("thread_id", ""))
+                    pid = item.get("id", 0)
+                    if tid:
+                        try:
+                            thread_obj = client.get_channel(int(tid))
+                            if thread_obj:
+                                await thread_obj.delete()
+                                print(f"[Discord Bridge] Cleaned up expired trace thread {tid}", flush=True)
+                        except Exception as e:
+                            print(f"[Discord Bridge] Failed to delete thread {tid}: {e}", flush=True)
+                        await send_daemon_ipc(f"TRACE COMPLETE_DELETE {pid}")
+        except Exception as e:
+            print(f"[Discord Bridge] pending deletes cleanup error: {e}", flush=True)
+        await asyncio.sleep(15.0)  # Check every 15 seconds
+
+async def _run_ai_with_traces(message, query_text, author):
+    """Run an AI query with a trace thread for full transparency.
+    Creates a thread, polls traces in parallel, then schedules cleanup."""
+    global active_session_id
+    sess = active_session_id or "default"
+
+    # Create a trace thread attached to the user's message
+    try:
+        thread = await message.create_thread(
+            name=f"🔍 ErnOS Trace — {query_text[:50]}",
+            auto_archive_duration=60  # 1 hour archive (minimum Discord allows)
+        )
+        await thread.send("🔍 **ErnOS Reasoning Trace** — live stream of thinking, tool calls, and audit results.\n*This thread auto-deletes 2 minutes after the response.*")
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to create trace thread: {e}", flush=True)
+        thread = None
+
+    # Start trace poller in background
+    done_event = asyncio.Event()
+    trace_task = None
+    if thread:
+        trace_task = asyncio.create_task(trace_poll_loop(thread, sess, done_event))
+
+    # Run the actual AI query (blocking IPC call)
+    resp = await query_daemon_ipc(query_text, author=author)
+
+    # Signal trace poller to stop, give it one last poll cycle
+    done_event.set()
+    if trace_task:
+        try:
+            await asyncio.wait_for(trace_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            trace_task.cancel()
+
+    # Send final trace marker
+    if thread:
+        try:
+            await thread.send("🏁 **Trace complete** — this thread will auto-delete in 2 minutes.")
+        except Exception:
+            pass
+        # Schedule crash-resilient deletion via SQLite
+        await send_daemon_ipc(f"TRACE SCHEDULE_DELETE {thread.id} 120")
+        # Also schedule local deletion
+        asyncio.create_task(_delete_thread_after(thread, 120))
+
+    return resp
+
+async def _delete_thread_after(thread, delay_secs):
+    """Delete a trace thread after a delay. If we crash, the pending_deletes_cleanup_loop
+    will pick it up from SQLite on next startup."""
+    await asyncio.sleep(delay_secs)
+    try:
+        await thread.delete()
+        # Mark complete in SQLite
+        await send_daemon_ipc(f"TRACE COMPLETE_DELETE {thread.id}")
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to auto-delete trace thread: {e}", flush=True)
+
 @client.event
 async def on_ready():
     global active_session_id
@@ -584,6 +703,12 @@ async def on_ready():
         asyncio.create_task(bridge_poll_loop())
         print("[Discord Bridge] node<->bridge RPC poll loop started.", flush=True)
     
+    # Start the pending-deletes cleanup loop (crash resilience for trace threads)
+    if not getattr(client, "_cleanup_started", False):
+        client._cleanup_started = True
+        asyncio.create_task(pending_deletes_cleanup_loop())
+        print("[Discord Bridge] Pending trace thread cleanup loop started.", flush=True)
+
     # Sync slash commands globally
     try:
         synced = await tree.sync()
@@ -625,7 +750,7 @@ async def on_message(message):
                         None, upload_file_to_daemon, attachment.filename, file_bytes
                     )
                     if success:
-                        await message.reply(f"✅ Indexed `{attachment.filename}` into local RAG storage successfully!")
+                        await message.reply(f"✅ Indexed `{attachment.filename}` into local RAG storage and saved to workspace!")
                     else:
                         await message.reply(f"❌ Failed to index `{attachment.filename}`: {upload_msg}")
                 except Exception as e:
@@ -664,9 +789,9 @@ async def on_message(message):
                 await send_discord_reply(message, f"❌ Failed to start new session. Daemon response: {resp_set}")
             return
 
-        # Indicate typing while waiting for the AI response
+        # Run AI query with trace thread for transparency
         async with message.channel.typing():
-            resp = await query_daemon_ipc(message.content, author=message.author)
+            resp = await _run_ai_with_traces(message, message.content, author=message.author)
             
             # Parse the standard daemon response format
             if resp.startswith("ai:pending_approval,"):
@@ -703,3 +828,4 @@ if __name__ == "__main__":
         sys.exit(1)
     finally:
         update_status("OFFLINE")
+

@@ -158,6 +158,22 @@ Every layer of the contemporary captured internet has an ErnosDecent replacement
 - `decent_web/web_server.ep` — Native HTTP and WebSocket gateway server serving static assets, REST JSON telemetry endpoints, and streaming GGUF transformer completion tokens.
 - **Verification**: Verified via automated HTTP/JSON API requests (1/1 verification suite passing).
 
+### Phase 16: Cognitive Agent Brain (ErnOS Agent) — COMPLETE
+**Deliverables**: ReAct decision-making loop, Hebbian memory systems, secure observer execution audits, and cognitive routing.
+- `decent_agent/react_loop.ep` — Core agentic ReAct loop managing prompt assembly, tool call parsing (with unescaped quote truncation fallback), and turn orchestration.
+- `decent_agent/tools.ep` — Extensible tool executor with 18+ registered tools (filesystem, git, network, and node IPC).
+- `decent_agent/memory.ep` — Tiered memory management utilizing a Hebbian association graph for dynamic beliefs and knowledge consolidation.
+- `decent_agent/observer.ep` — Independent, fail-closed LLM observer audit pipeline checking for harmful output, prompt injections, and dangerous terminal commands.
+- `decent_agent/llm.ep`, `provider_*.ep` — Standardized LLM client abstractions for OpenAI-compatible local APIs and Hugging Face local models.
+
+### Phase 17: Workspace, Changelog, and Discord Transparency — COMPLETE
+**Deliverables**: Per-session workspace rotation, SHA-256 code change logging, and real-time Discord transparency streaming.
+- `decent_agent/workspace.ep` — Session-isolated workspaces under `config/workspaces/active/` with automatic tar-gzip archival of older workspaces (14-day policy) and cross-session retrieval.
+- `decent_agent/changelog.ep` — Automated codebase write logging using SHA-256 file hashing on changes, combined with boot-time git diff auditing.
+- `decent_agent/trace.ep` — SQLite-backed tracing of agent execution events across 12 ReAct stages.
+- `decent_net/discord_bridge.py` — Bidirectional Discord connector that spawns real-time reasoning trace threads per prompt, schedules self-deletions after 2 minutes, and cleans up expired threads crash-resiliently via SQLite.
+- **Verification**: Verified via integration compilation and unit/lint checks (`ernos check` on all 7 affected `.ep` modules and python compiling).
+
 ---
 
 ## Verification Plan

@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] - 2026-06-27
+
+Session `55b2e557` — Per-session workspace management, automatic changelog, Discord transparency
+threads, upload pipeline fix, and response delivery bug fix. All changes compile with zero
+`ernos check` errors. Full AGENT.md compliance audit passed (all 11 Laws verified).
+
+### Added
+
+- **Per-session workspace** (`decent_agent/workspace.ep`, 116 functions) — each chat session gets
+  an isolated `config/workspaces/active/` directory. On `SESSION NEW`, the previous workspace is
+  archived with a timestamp. Workspaces older than 14 days are tar-gzip compressed into
+  `config/workspaces/archive/` for manual deletion. Prior session files remain readable. New tools:
+  `workspace_write`, `workspace_read`, `workspace_list`.
+- **Changelog autodetection** (`decent_agent/changelog.ep`, 115 functions) — every `codebase_write`
+  is wrapped with SHA-256 before/after hashing and logged to monthly JSON files
+  (`config/changelog/changelog_YYYY-MM.json`). On boot, `git diff HEAD~1..HEAD` detects changes
+  made outside the agent. New tool: `changelog` (view recent/by-session/by-path).
+- **Discord transparency threads** (`decent_agent/trace.ep`, 93 functions) — SQLite-backed trace
+  event queue. The ReAct loop emits `trace_emit` at 12 pipeline stages (thinking, raw_output,
+  reasoning, lookback, action, approval, audit, tool_exec, tool_result, reply_audit, no_action,
+  done). Discord bridge creates a thread per query, polls `TRACE POLL` IPC at 500ms intervals,
+  streams emoji-coded events, and auto-deletes threads 2 minutes after response. Crash-resilient:
+  pending deletions tracked in SQLite; `pending_deletes_cleanup_loop` recovers on restart.
+- **RAG retrieve tool** (`decent_agent/tools.ep`) — new `rag_retrieve` tool lets the agent query
+  the RAG database directly with a text search, complementing `codebase_read`.
+- **`react_extract_raw_arg`** (`decent_agent/react_loop.ep`) — fallback string extractor for when
+  `json_parse` truncates LLM output containing unescaped inner quotes.
+
+### Fixed
+
+- **Upload pipeline** — files uploaded via Discord or the web UI were RAG-indexed into SQLite
+  chunks but never saved to disk. The agent's `codebase_read` (filesystem-only) could not find
+  them, causing blind search loops. Fix: `/api/upload` handler now saves the original file to
+  `config/workspaces/active/uploads/`; `codebase_read` falls back to checking that directory.
+- **Empty Discord response** (Root Cause 1) — the IPC response delimiter `response:` could be
+  matched inside base64-encoded reasoning blocks, causing `extract_ai_ok_response` to split at the
+  wrong position and deliver empty/garbage text. Fix: delimiter changed to `|||RESPONSE|||` across
+  all 7 `ai:ok` construction sites in `node.ep`, plus the parsers in `discord_bridge.py` and
+  `web_server.ep`.
+- **Truncated Discord response** (Root Cause 2) — when the LLM emits unescaped double quotes
+  inside a `reply_request` JSON argument (e.g. `reasoning_tool.note("...")`), `json_parse`
+  interprets the inner `"` as the end of the JSON string, truncating the reply. Fix: added a
+  truncation guard that detects when the parsed string is less than 50% of the raw length and falls
+  back to `react_extract_raw_arg` (bracket-aware raw extraction).
+- **Invisible-character blank message** — added a control-character cleaning guard in
+  `send_discord_reply` to prevent blank Discord messages when the response text contains only
+  unprintable characters.
+
+### Changed
+
+- **IPC response format** — `ai:ok,response:` changed to `ai:ok|||RESPONSE|||` and
+  `ai:ok,reasoning:<b64>,response:` changed to `ai:ok,reasoning:<b64>|||RESPONSE|||`. Updated in
+  `node.ep` (7 locations), `discord_bridge.py` (`extract_ai_ok_response`), and `web_server.ep`
+  (`ws_dispatch_ai_response`).
+- **`node.ep`** — imports workspace, changelog, trace modules; calls `workspace_init`,
+  `changelog_init`, `trace_init`, `workspace_archive_old(14)`, `changelog_detect_git_changes` on
+  boot; new IPC verbs: `TRACE POLL`, `TRACE PENDING_DELETES`, `TRACE SCHEDULE_DELETE`,
+  `TRACE COMPLETE_DELETE`.
+- **`react_loop.ep`** — 12 `trace_emit` calls across the ReAct pipeline; JSON truncation guard
+  with `react_extract_raw_arg` fallback.
+- **`tools.ep`** — imports workspace, changelog, rag; `codebase_write` wrapped with changelog
+  hashing; `codebase_read` workspace-uploads fallback; new tools: `workspace_write`,
+  `workspace_read`, `workspace_list`, `changelog`, `rag_retrieve`.
+- **`discord_bridge.py`** — `trace_poll_loop`, `pending_deletes_cleanup_loop`,
+  `_run_ai_with_traces`, `_delete_thread_after`; invisible-character guard; updated delimiter.
+- **`web_server.ep`** — upload handler saves files to workspace; updated IPC delimiter parsing.
+
+---
+
 ## [Unreleased] - 2026-06-21
 
 Verified on the `agent-parity` branch. The stack now spans **17 subsystems**, ~103 source

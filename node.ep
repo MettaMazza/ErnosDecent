@@ -92,6 +92,9 @@ import "./decent_agent/turing_grid"
 import "./decent_agent/react_loop"
 import "./decent_agent/session"
 import "./decent_agent/scheduler"
+import "./decent_agent/workspace"
+import "./decent_agent/changelog"
+import "./decent_agent/trace"
 
 # AI / speech
 import "./decent_ai/speech"
@@ -496,6 +499,29 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                     set dr_data to substring(dr_args and dr_bar + 1 and string_length(dr_args) - dr_bar - 1)
                                     set dr_ok to bridge_submit_result(storage_get_db() and dr_id and dr_data)
                                     set resp to concat("bridge:result_recorded,id:" and int_to_string(dr_id))
+                            else if string_contains(cmd_upper and "TRACE POLL ") == 1:
+                                # Trace event polling for Discord transparency threads
+                                set trace_sess to string_trim(substring(cmd and 11 and string_length(cmd) - 11))
+                                set resp to trace_poll(storage_get_db() and trace_sess)
+                            else if cmd_upper equals "TRACE PENDING_DELETES":
+                                # Return threads whose 2-min delete timer has expired
+                                set resp to trace_get_pending_deletes(storage_get_db())
+                            else if string_contains(cmd_upper and "TRACE SCHEDULE_DELETE ") == 1:
+                                # Schedule a thread for deletion: TRACE SCHEDULE_DELETE <thread_id> <delay_secs>
+                                set tsd_args to string_trim(substring(cmd and 22 and string_length(cmd) - 22))
+                                set tsd_space to string_index_of(tsd_args and " ")
+                                if tsd_space < 0:
+                                    set resp to "trace:error,reason:invalid_format"
+                                else:
+                                    set tsd_thread to substring(tsd_args and 0 and tsd_space)
+                                    set tsd_delay to string_to_int(substring(tsd_args and tsd_space + 1 and string_length(tsd_args) - tsd_space - 1))
+                                    set ok to trace_schedule_delete(storage_get_db() and tsd_thread and tsd_delay)
+                                    set resp to f"trace:delete_scheduled,thread_id:{tsd_thread}"
+                            else if string_contains(cmd_upper and "TRACE COMPLETE_DELETE ") == 1:
+                                # Mark a pending deletion as complete: TRACE COMPLETE_DELETE <id>
+                                set tcd_id to string_to_int(string_trim(substring(cmd and 22 and string_length(cmd) - 22)))
+                                set ok to trace_complete_delete(storage_get_db() and tcd_id)
+                                set resp to f"trace:delete_completed,id:{tcd_id}"
                             else:
                                 if cmd_upper equals "NET STATUS":
                                     set dht_sz to dht_node_peer_count(dht_node)
@@ -710,9 +736,9 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                     set last_reason to map_get_val(agent_ctx and "last_reasoning")
                                                 set ok to map_delete(agent_ctx and "last_reasoning")
                                                 if string_length(last_reason) > 0:
-                                                    set resp to f"ai:ok,reasoning:{base64_encode(last_reason)},response:{agent_resp}"
+                                                    set resp to f"ai:ok,reasoning:{base64_encode(last_reason)}|||RESPONSE|||{agent_resp}"
                                                 else:
-                                                    set resp to f"ai:ok,response:{agent_resp}"
+                                                    set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
                                         else if cmd_upper equals "BFT STATUS":
                                             set bview to map_get_val(bft_node and "view")
                                             set bseq to map_get_val(bft_node and "seq")
@@ -815,7 +841,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                         set filepath to path_join(dir and concat(active_id and ".json"))
                                                         set ok to session_serialize(active_sess and filepath)
                                                         set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                        set resp to f"ai:ok,response:{agent_resp}"
+                                                        set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
@@ -839,7 +865,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                         set filepath to path_join(dir and concat(active_id and ".json"))
                                                         set ok to session_serialize(active_sess and filepath)
                                                         set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                        set resp to f"ai:ok,response:{agent_resp}"
+                                                        set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
@@ -862,7 +888,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                         set filepath to path_join(dir and concat(active_id and ".json"))
                                                         set ok to session_serialize(active_sess and filepath)
                                                         set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                        set resp to f"ai:ok,response:{agent_resp}"
+                                                        set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
@@ -904,7 +930,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                         set filepath to path_join(dir and concat(active_id and ".json"))
                                                         set ok to session_serialize(active_sess and filepath)
                                                         set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                        set resp to f"ai:ok,response:{agent_resp}"
+                                                        set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_clarification"
                                             else:
@@ -1004,6 +1030,8 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                     set sys_val to get_json_value(sys_node)
                                                 set sessions_mgr to map_get_val(agent_ctx and "sessions")
                                                 set sess to session_manager_new_session(sessions_mgr and id_val and title_val and model_val and sys_val)
+                                                # Rotate workspace for the new session
+                                                set ok to workspace_init(id_val)
                                                 set resp to f"session:ok,id:{id_val}"
                                             else:
                                                 set resp to "session:error,reason:invalid_json"
@@ -1079,7 +1107,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                         else if cmd_upper equals "AI AUTONOMY":
                                             set agent_resp to react_run(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and "Maintain state and execute background optimizations")
                                             set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                            set resp to f"ai:ok,response:{agent_resp}"
+                                            set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
                                         else:
                                             if string_contains(cmd_upper and "MONEY TRANSFER ") == 1:
                                                 # Parse: MONEY TRANSFER <amount> <recipient>
@@ -2214,6 +2242,24 @@ define main:
     set agent_sessions to session_manager_create("config/sessions")
     set ok to session_manager_load_all(agent_sessions)
     set ok to map_insert(agent_ctx and "sessions" and agent_sessions)
+
+    # Trace event table (for Discord transparency threads)
+    set ok to trace_init(storage_get_db())
+    log_info("node" and "Trace event table initialised.")
+
+    # Changelog subsystem (monthly file rotation)
+    set ok to changelog_init()
+    set ok to changelog_detect_git_changes("startup")
+    log_info("node" and "Changelog initialised; git changes scanned.")
+
+    # Per-session workspace — initialise for the active session, archive old ones
+    set ws_active_id to map_get_val(agent_sessions and "active_session_id")
+    if string_length(ws_active_id) > 0:
+        set ok to workspace_init(ws_active_id)
+    set ws_archived to workspace_archive_old(14)
+    if ws_archived > 0:
+        log_info("node" and f"Archived {ws_archived} workspace(s) older than 14 days.")
+        display f"[+] Archived {ws_archived} old workspace(s)."
 
     # Start the task scheduler background loop
     spawn scheduler_tick_loop(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx))

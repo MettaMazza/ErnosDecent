@@ -1,0 +1,404 @@
+# ErnosPlain Changelog Autodetection System
+# Component: decent_agent/changelog.ep
+# Tracks file changes with hashing, timestamps, and git integration
+
+import "fs"
+import "os"
+import "json"
+import "collections"
+import "string"
+
+# Cryptographic SHA256 helper (built-in in ErnosPlain)
+external define ep_sha256 with data as Str returning Str
+
+# ---- JSON escaping helper (matches session.ep pattern) ----
+define changelog_json_escape with s as Str returning Str:
+    set len to string_length(s)
+    set result_list to create_list()
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(s and i)
+        if ch == 34: # "
+            set ok to append_list(result_list and 92)
+            set ok to append_list(result_list and 34)
+        else:
+            if ch == 92: # \
+                set ok to append_list(result_list and 92)
+                set ok to append_list(result_list and 92)
+            else:
+                if ch == 10: # \n
+                    set ok to append_list(result_list and 92)
+                    set ok to append_list(result_list and 110)
+                else:
+                    if ch == 13: # \r
+                        set ok to append_list(result_list and 92)
+                        set ok to append_list(result_list and 114)
+                    else:
+                        if ch == 9: # \t
+                            set ok to append_list(result_list and 92)
+                            set ok to append_list(result_list and 116)
+                        else:
+                            set ok to append_list(result_list and ch)
+        set i to i + 1
+    set escaped to string_from_list(result_list)
+    free_list(result_list)
+    return escaped
+
+# ---- Trim trailing newline from command output ----
+define changelog_trim_newline with s as Str returning Str:
+    set slen to string_length(s)
+    if slen == 0:
+        return s
+    set last_char to get_character(s and slen - 1)
+    if last_char == 10: # newline
+        return substring(s and 0 and slen - 1)
+    if last_char == 13: # carriage return
+        return substring(s and 0 and slen - 1)
+    return s
+
+# ================================================================
+# changelog_init — Create the changelog directory if it doesn't exist
+# ================================================================
+define changelog_init returning Int:
+    if file_exists("config/changelog") == 0:
+        set ok to create_directory("config/changelog")
+    return 0
+
+# ================================================================
+# changelog_get_current_file — Get path to current month's changelog
+# Creates the file with "[]" if it doesn't exist yet
+# ================================================================
+define changelog_get_current_file returning Str:
+    set ym_raw to run_command("date +%Y-%m")
+    set ym to changelog_trim_newline(ym_raw)
+    set filename to concat("changelog_" and concat(ym and ".json"))
+    set filepath to path_join("config/changelog" and filename)
+    if file_exists(filepath) == 0:
+        set ok to write_file(filepath and "[]")
+    return filepath
+
+# ================================================================
+# changelog_hash_file — Hash a file's contents with SHA256
+# Returns empty string if the file does not exist
+# ================================================================
+define changelog_hash_file with path as Str returning Str:
+    if file_exists(path) == 0:
+        return ""
+    set content to read_file(path)
+    set hash_val to ep_sha256(content)
+    return hash_val
+
+# ================================================================
+# changelog_log_change — Append a change entry to the changelog
+# Manually builds JSON and appends to the monthly changelog array
+# ================================================================
+define changelog_log_change with session_id as Str and tool as Str and path as Str and action as Str and hash_before as Str and hash_after as Str and size_before as Int and size_after as Int and summary as Str returning Int:
+    set changelog_path to changelog_get_current_file()
+    set file_content to read_file(changelog_path)
+
+    # Get current UTC timestamp
+    set ts_raw to run_command("date -u +%Y-%m-%dT%H:%M:%SZ")
+    set ts to changelog_trim_newline(ts_raw)
+
+    # Build the JSON entry manually
+    set entry to "{"
+    set entry to concat(entry and f"\"timestamp\":\"{changelog_json_escape(ts)}\"")
+    set entry to concat(entry and f",\"session_id\":\"{changelog_json_escape(session_id)}\"")
+    set entry to concat(entry and f",\"tool\":\"{changelog_json_escape(tool)}\"")
+    set entry to concat(entry and f",\"path\":\"{changelog_json_escape(path)}\"")
+    set entry to concat(entry and f",\"action\":\"{changelog_json_escape(action)}\"")
+    set entry to concat(entry and f",\"hash_before\":\"{changelog_json_escape(hash_before)}\"")
+    set entry to concat(entry and f",\"hash_after\":\"{changelog_json_escape(hash_after)}\"")
+    set entry to concat(entry and f",\"size_before\":{size_before}")
+    set entry to concat(entry and f",\"size_after\":{size_after}")
+    set entry to concat(entry and f",\"summary\":\"{changelog_json_escape(summary)}\"")
+    set entry to concat(entry and "}")
+
+    # Append to existing JSON array
+    set content_len to string_length(file_content)
+    if content_len <= 2:
+        # Empty array "[]" or empty string — start fresh
+        set new_content to concat("[" and concat(entry and "]"))
+    else:
+        # Strip trailing "]" and append ",entry]"
+        set trimmed to substring(file_content and 0 and content_len - 1)
+        set new_content to concat(trimmed and concat("," and concat(entry and "]")))
+
+    set ok to write_file(changelog_path and new_content)
+    return 0
+
+# ================================================================
+# changelog_detect_git_changes — Detect recent git commit changes
+# Runs git diff, hashes each changed file, logs to changelog
+# ================================================================
+define changelog_detect_git_changes with session_id as Str returning Int:
+    set diff_output to run_command("git diff --name-only HEAD~1..HEAD 2>/dev/null")
+    set diff_len to string_length(diff_output)
+    if diff_len == 0:
+        return 0
+
+    set count to 0
+    set start to 0
+    set pos to 0
+
+    repeat while pos < diff_len:
+        set nl_pos to string_index_of(substring(diff_output and pos and diff_len - pos) and "\n")
+        if nl_pos < 0:
+            # Last line (no trailing newline)
+            set file_path to substring(diff_output and start and diff_len - start)
+            if string_length(file_path) > 0:
+                set file_hash to changelog_hash_file(file_path)
+                set file_len to string_length(file_path)
+                set ok to changelog_log_change(session_id and "git" and file_path and "commit" and "" and file_hash and 0 and file_len and "Detected via git diff")
+                set count to count + 1
+            set pos to diff_len
+        else:
+            set line_len to nl_pos
+            set file_path to substring(diff_output and start and line_len)
+            if string_length(file_path) > 0:
+                set file_hash to changelog_hash_file(file_path)
+                set file_len to string_length(file_path)
+                set ok to changelog_log_change(session_id and "git" and file_path and "commit" and "" and file_hash and 0 and file_len and "Detected via git diff")
+                set count to count + 1
+            set start to start + line_len + 1
+            set pos to start
+
+    return count
+
+# ================================================================
+# changelog_get_recent — Get last N changelog entries as readable text
+# ================================================================
+define changelog_get_recent with count as Int returning Str:
+    set changelog_path to changelog_get_current_file()
+    set file_content to read_file(changelog_path)
+    set root to json_parse(file_content)
+    if root == 0:
+        return ""
+
+    set entries to get_json_value(root)
+    set total to length_list(entries)
+    if total == 0:
+        return ""
+
+    # Determine start index (last `count` entries)
+    set start_idx to 0
+    if total > count:
+        set start_idx to total - count
+
+    set result to ""
+    set i to start_idx
+    repeat while i < total:
+        set entry_node to get_list(entries and i)
+
+        set ts_node to get_json_object_value(entry_node and "timestamp")
+        set tool_node to get_json_object_value(entry_node and "tool")
+        set path_node to get_json_object_value(entry_node and "path")
+        set action_node to get_json_object_value(entry_node and "action")
+        set hb_node to get_json_object_value(entry_node and "hash_before")
+        set ha_node to get_json_object_value(entry_node and "hash_after")
+        set sb_node to get_json_object_value(entry_node and "size_before")
+        set sa_node to get_json_object_value(entry_node and "size_after")
+        set sum_node to get_json_object_value(entry_node and "summary")
+
+        set ts_val to ""
+        set tool_val to ""
+        set path_val to ""
+        set action_val to ""
+        set hb_val to ""
+        set ha_val to ""
+        set sb_val to 0
+        set sa_val to 0
+        set sum_val to ""
+
+        if ts_node != 0:
+            set ts_val to get_json_value(ts_node)
+        if tool_node != 0:
+            set tool_val to get_json_value(tool_node)
+        if path_node != 0:
+            set path_val to get_json_value(path_node)
+        if action_node != 0:
+            set action_val to get_json_value(action_node)
+        if hb_node != 0:
+            set hb_val to get_json_value(hb_node)
+        if ha_node != 0:
+            set ha_val to get_json_value(ha_node)
+        if sb_node != 0:
+            set sb_val to get_json_value(sb_node)
+        if sa_node != 0:
+            set sa_val to get_json_value(sa_node)
+        if sum_node != 0:
+            set sum_val to get_json_value(sum_node)
+
+        # Format: [timestamp] tool: path (action)
+        set line1 to f"[{ts_val}] {tool_val}: {path_val} ({action_val})"
+        # Format:   before: hash... -> after: hash... (sizeB -> sizeB)
+        set line2 to f"  before: {hb_val} -> after: {ha_val} ({sb_val}B -> {sa_val}B)"
+        # Format:   summary
+        set line3 to f"  {sum_val}"
+
+        if string_length(result) > 0:
+            set result to concat(result and concat("\n" and line1))
+        else:
+            set result to line1
+        set result to concat(result and concat("\n" and line2))
+        set result to concat(result and concat("\n" and line3))
+
+        set i to i + 1
+
+    return result
+
+# ================================================================
+# changelog_get_by_session — Get entries filtered by session_id
+# ================================================================
+define changelog_get_by_session with session_id as Str returning Str:
+    set changelog_path to changelog_get_current_file()
+    set file_content to read_file(changelog_path)
+    set root to json_parse(file_content)
+    if root == 0:
+        return ""
+
+    set entries to get_json_value(root)
+    set total to length_list(entries)
+    if total == 0:
+        return ""
+
+    set result to ""
+    set i to 0
+    repeat while i < total:
+        set entry_node to get_list(entries and i)
+
+        set sid_node to get_json_object_value(entry_node and "session_id")
+        set sid_val to ""
+        if sid_node != 0:
+            set sid_val to get_json_value(sid_node)
+
+        if sid_val equals session_id:
+            set ts_node to get_json_object_value(entry_node and "timestamp")
+            set tool_node to get_json_object_value(entry_node and "tool")
+            set path_node to get_json_object_value(entry_node and "path")
+            set action_node to get_json_object_value(entry_node and "action")
+            set hb_node to get_json_object_value(entry_node and "hash_before")
+            set ha_node to get_json_object_value(entry_node and "hash_after")
+            set sb_node to get_json_object_value(entry_node and "size_before")
+            set sa_node to get_json_object_value(entry_node and "size_after")
+            set sum_node to get_json_object_value(entry_node and "summary")
+
+            set ts_val to ""
+            set tool_val to ""
+            set path_val to ""
+            set action_val to ""
+            set hb_val to ""
+            set ha_val to ""
+            set sb_val to 0
+            set sa_val to 0
+            set sum_val to ""
+
+            if ts_node != 0:
+                set ts_val to get_json_value(ts_node)
+            if tool_node != 0:
+                set tool_val to get_json_value(tool_node)
+            if path_node != 0:
+                set path_val to get_json_value(path_node)
+            if action_node != 0:
+                set action_val to get_json_value(action_node)
+            if hb_node != 0:
+                set hb_val to get_json_value(hb_node)
+            if ha_node != 0:
+                set ha_val to get_json_value(ha_node)
+            if sb_node != 0:
+                set sb_val to get_json_value(sb_node)
+            if sa_node != 0:
+                set sa_val to get_json_value(sa_node)
+            if sum_node != 0:
+                set sum_val to get_json_value(sum_node)
+
+            set line1 to f"[{ts_val}] {tool_val}: {path_val} ({action_val})"
+            set line2 to f"  before: {hb_val} -> after: {ha_val} ({sb_val}B -> {sa_val}B)"
+            set line3 to f"  {sum_val}"
+
+            if string_length(result) > 0:
+                set result to concat(result and concat("\n" and line1))
+            else:
+                set result to line1
+            set result to concat(result and concat("\n" and line2))
+            set result to concat(result and concat("\n" and line3))
+
+        set i to i + 1
+
+    return result
+
+# ================================================================
+# changelog_get_by_path — Get entries filtered by file path
+# ================================================================
+define changelog_get_by_path with target_path as Str returning Str:
+    set changelog_path to changelog_get_current_file()
+    set file_content to read_file(changelog_path)
+    set root to json_parse(file_content)
+    if root == 0:
+        return ""
+
+    set entries to get_json_value(root)
+    set total to length_list(entries)
+    if total == 0:
+        return ""
+
+    set result to ""
+    set i to 0
+    repeat while i < total:
+        set entry_node to get_list(entries and i)
+
+        set p_node to get_json_object_value(entry_node and "path")
+        set p_val to ""
+        if p_node != 0:
+            set p_val to get_json_value(p_node)
+
+        if p_val equals target_path:
+            set ts_node to get_json_object_value(entry_node and "timestamp")
+            set tool_node to get_json_object_value(entry_node and "tool")
+            set action_node to get_json_object_value(entry_node and "action")
+            set hb_node to get_json_object_value(entry_node and "hash_before")
+            set ha_node to get_json_object_value(entry_node and "hash_after")
+            set sb_node to get_json_object_value(entry_node and "size_before")
+            set sa_node to get_json_object_value(entry_node and "size_after")
+            set sum_node to get_json_object_value(entry_node and "summary")
+
+            set ts_val to ""
+            set tool_val to ""
+            set action_val to ""
+            set hb_val to ""
+            set ha_val to ""
+            set sb_val to 0
+            set sa_val to 0
+            set sum_val to ""
+
+            if ts_node != 0:
+                set ts_val to get_json_value(ts_node)
+            if tool_node != 0:
+                set tool_val to get_json_value(tool_node)
+            if action_node != 0:
+                set action_val to get_json_value(action_node)
+            if hb_node != 0:
+                set hb_val to get_json_value(hb_node)
+            if ha_node != 0:
+                set ha_val to get_json_value(ha_node)
+            if sb_node != 0:
+                set sb_val to get_json_value(sb_node)
+            if sa_node != 0:
+                set sa_val to get_json_value(sa_node)
+            if sum_node != 0:
+                set sum_val to get_json_value(sum_node)
+
+            set line1 to f"[{ts_val}] {tool_val}: {target_path} ({action_val})"
+            set line2 to f"  before: {hb_val} -> after: {ha_val} ({sb_val}B -> {sa_val}B)"
+            set line3 to f"  {sum_val}"
+
+            if string_length(result) > 0:
+                set result to concat(result and concat("\n" and line1))
+            else:
+                set result to line1
+            set result to concat(result and concat("\n" and line2))
+            set result to concat(result and concat("\n" and line3))
+
+        set i to i + 1
+
+    return result

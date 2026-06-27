@@ -28,6 +28,9 @@ import "../decent_store/content"
 import "../decent_store/knowledge"
 import "../decent_net/bridge_rpc"
 import "../decent_net/gitdec"
+import "./workspace"
+import "./changelog"
+import "../decent_store/rag"
 
 define append_string_to_char_list with char_list as List and s as Str returning Int:
     set len to string_length(s)
@@ -66,7 +69,12 @@ define tools_create:
     set schemas to concat(schemas and "- git_tool([subcommand: Str, args: Str]) -> Str: Run a READ-ONLY git query in the node's repo (status, log, diff, show, branch, remote, rev-parse, tag, describe). For commits/pushes use run_command (approval required).\n")
     set schemas to concat(schemas and "- kg_tool([action: 'add_entity'|'add_relation'|'query'|'find', a: Str, b: Str, c: Str]) -> Str: Your persistent knowledge graph. add_entity(name,type,attrs); add_relation(src,rel,dst); query(name) returns facts/edges; find(text) searches names. Survives restart.\n")
     set schemas to concat(schemas and "- procedure_tool([action: 'store'|'get'|'list'|'pin'|'unpin'|'archive', name: Str, steps: Str]) -> Str: Your procedural memory of named multi-step procedures. store(name,steps); get(name); list; pin/unpin/archive(name). Survives restart.\n")
-    set schemas to concat(schemas and "- consolidate_tool([mode: ''|'force']) -> Str: Summarize recent episodic timeline entries into durable lessons (consolidation). Runs the LLM; records a consolidation and a lesson. Use during quiet/autonomous time.\n\n")
+    set schemas to concat(schemas and "- consolidate_tool([mode: ''|'force']) -> Str: Summarize recent episodic timeline entries into durable lessons (consolidation). Runs the LLM; records a consolidation and a lesson. Use during quiet/autonomous time.\n")
+    set schemas to concat(schemas and "- workspace_write([filename: Str, content: Str]) -> Str: Write a file to your session workspace (scratch space).\n")
+    set schemas to concat(schemas and "- workspace_read([filename: Str]) -> Str: Read a file from your session workspace. Use workspace_read([session_id, filename]) to read from a prior session.\n")
+    set schemas to concat(schemas and "- workspace_list([]) -> Str: List files in your current session workspace.\n")
+    set schemas to concat(schemas and "- changelog([]) -> Str: View recent codebase changes. Use changelog([count]) for last N, changelog(['session', id]) for a session, changelog(['path', filepath]) for a file.\n")
+    set schemas to concat(schemas and "- rag_retrieve([query: Str]) -> Str: Search your RAG knowledge base (uploaded documents). Returns matching text segments from indexed documents. Use this when the user references an uploaded file.\n\n")
     set schemas to concat(schemas and "WRITE OPERATIONS (requires user approval before execution):\n")
     set schemas to concat(schemas and "- codebase_write([path: Str, content: Str]) -> Str: Overwrite a file. APPROVAL REQUIRED. Use only when explicitly asked to modify code.\n")
     set schemas to concat(schemas and "- run_command([cmd: Str]) -> Str: Execute a shell command. APPROVAL REQUIRED. Use for builds, tests, file operations.\n")
@@ -400,7 +408,11 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: codebase_read requires 1 argument (path)."
         set path to get_list(args_list and 0)
         if file_exists(path) == 0:
-            return f"Error: File '{path}' does not exist."
+            # Fallback: check workspace uploads directory
+            set ws_path to path_join("config/workspaces/active/uploads" and path)
+            if file_exists(ws_path) == 1:
+                return read_file(ws_path)
+            return f"Error: File '{path}' does not exist. If this is an uploaded document, try rag_retrieve([\"query about the document\"]) to search the RAG database."
         return read_file(path)
             
     if action_name equals "read_transcripts":
@@ -475,7 +487,21 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: codebase_write requires 2 arguments (path, content)."
         set path to get_list(args_list and 0)
         set content to get_list(args_list and 1)
+        # Changelog: capture before-state
+        set cl_hash_before to changelog_hash_file(path)
+        set cl_size_before to 0
+        if file_exists(path) == 1:
+            set cl_existing to read_file(path)
+            set cl_size_before to string_length(cl_existing)
+        # Write the file
         set ok to write_file(path and content)
+        # Changelog: capture after-state and log
+        set cl_hash_after to changelog_hash_file(path)
+        set cl_size_after to string_length(content)
+        set cl_sess to ""
+        if map_contains(ctx and "session_id") == 1:
+            set cl_sess to map_get_val(ctx and "session_id")
+        set ok to changelog_log_change(cl_sess and "codebase_write" and path and "write" and cl_hash_before and cl_hash_after and cl_size_before and cl_size_after and f"File '{path}' written.")
         return f"File '{path}' written successfully."
         
     if action_name equals "run_command":
@@ -973,5 +999,48 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if length_list(args_list) < 1:
             return "Error: reply_request requires 1 argument (response)."
         return get_list(args_list and 0)
-        
+
+    if action_name equals "workspace_write":
+        if length_list(args_list) < 2:
+            return "Error: workspace_write requires 2 arguments (filename, content)."
+        set ws_filename to get_list(args_list and 0)
+        set ws_content to get_list(args_list and 1)
+        return workspace_write_file(ws_filename and ws_content)
+
+    if action_name equals "workspace_read":
+        if length_list(args_list) < 1:
+            return "Error: workspace_read requires at least 1 argument (filename)."
+        if length_list(args_list) >= 2:
+            set ws_sess_id to get_list(args_list and 0)
+            set ws_filename to get_list(args_list and 1)
+            return workspace_read_prior(ws_sess_id and ws_filename)
+        set ws_filename to get_list(args_list and 0)
+        return workspace_read_file(ws_filename)
+
+    if action_name equals "workspace_list":
+        return workspace_list_active()
+
+    if action_name equals "changelog":
+        if length_list(args_list) >= 2:
+            set cl_filter_type to get_list(args_list and 0)
+            set cl_filter_val to get_list(args_list and 1)
+            if cl_filter_type equals "session":
+                return changelog_get_by_session(cl_filter_val)
+            if cl_filter_type equals "path":
+                return changelog_get_by_path(cl_filter_val)
+        if length_list(args_list) >= 1:
+            set cl_count to string_to_int(get_list(args_list and 0))
+            if cl_count > 0:
+                return changelog_get_recent(cl_count)
+        return changelog_get_recent(20)
+
+    if action_name equals "rag_retrieve":
+        if length_list(args_list) < 1:
+            return "Error: rag_retrieve requires 1 argument (query)."
+        set rr_query to get_list(args_list and 0)
+        set rr_sess to ""
+        if map_contains(ctx and "session_id") == 1:
+            set rr_sess to map_get_val(ctx and "session_id")
+        return rag_search(storage_get_db() and rr_query and rr_sess and 10)
+
     return f"Error: Unknown tool '{action_name}'."

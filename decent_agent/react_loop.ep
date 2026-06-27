@@ -12,6 +12,7 @@ import "memory"
 import "observer"
 import "session"
 import "sync"
+import "trace"
 
 # F4: cooperative cancellation registry. A Stop button / `AI CANCEL` IPC sets a
 # per-session flag on a SEPARATE connection while react_run_loop is blocked on the
@@ -134,6 +135,42 @@ define react_fit_observation with text as Str and budget as Int returning Str:
         set keep to 0
     set head to substring(text and 0 and keep)
     return concat(head and notice)
+
+# Extract the raw string content from a JSON-like args_str (e.g. '["some text"]')
+# by stripping the outer [" and "] wrappers. Used as a fallback when json_parse
+# is confused by unescaped inner quotes from the LLM.
+define react_extract_raw_arg with args_str as Str returning Str:
+    set slen to string_length(args_str)
+    if slen < 4:
+        return args_str
+    # Find the opening quote after '[' (skip whitespace)
+    set start to 0
+    set found_start to 0
+    repeat while start < slen and found_start == 0:
+        set ch to get_character(args_str and start)
+        if ch == 34: # '"'
+            set found_start to 1
+        else:
+            set start to start + 1
+    if found_start == 0:
+        return args_str
+    # Find the closing quote before ']' (scan from end)
+    set end_pos to slen - 1
+    set found_end to 0
+    repeat while end_pos > start and found_end == 0:
+        set ch to get_character(args_str and end_pos)
+        if ch == 34: # '"'
+            set found_end to 1
+        else:
+            set end_pos to end_pos - 1
+    if found_end == 0:
+        return args_str
+    # Extract content between the outermost quotes
+    set content_start to start + 1
+    set content_len to end_pos - content_start
+    if content_len <= 0:
+        return args_str
+    return substring(args_str and content_start and content_len)
 
 define react_parse_action with raw as Str returning Map:
     set result to create_map()
@@ -338,12 +375,17 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             continue
         display f"--- ReAct Loop Turn {loop_idx + 1} ---"
         display f"Prompt character length: {string_length(current_prompt)}"
+        set trace_db to storage_get_db()
+        set trace_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set trace_sid to map_get_val(ctx and "session_id")
         
         set raw_output to ""
         if is_test == 0:
             set selected_model to ""
             if map_contains(ctx and "selected_model") == 1:
                 set selected_model to map_get_val(ctx and "selected_model")
+            set ok to trace_emit(trace_db and trace_sid and "thinking" and f"Querying {selected_model}...")
             set raw_output to query_local_llm(current_prompt and selected_model)
             
         if string_length(raw_output) == 0:
@@ -358,6 +400,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set finished to 1
             
         display f"LLM raw response:\n{raw_output}\n----------------"
+        set ok to trace_emit(trace_db and trace_sid and "raw_output" and substring(raw_output and 0 and 1800))
         set ok to append_list(values_list and raw_output)
 
         # F1: capture this turn's native reasoning (<think>...</think>) as its own
@@ -370,6 +413,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set ok to map_insert(ctx and "last_reasoning" and turn_reasoning)
             set ok to memory_store(memory_mgr and 3 and "REASONING" and turn_reasoning)
             display f"[reasoning] {turn_reasoning}"
+            set ok to trace_emit(trace_db and trace_sid and "reasoning" and substring(turn_reasoning and 0 and 1800))
         # reason_split is NOT freed here: turn_reasoning was extracted from it and
         # inserted into ctx["last_reasoning"]. Freeing the map would invalidate the
         # aliased string — use-after-free → SIGSEGV. Tracked in values_list for GC.
@@ -385,6 +429,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         if map_get_val(lookback and "drift") == 1:
             set lb_note to map_get_val(lookback and "note")
             display f"[Observer look-back] self-correction: {lb_note}"
+            set ok to trace_emit(trace_db and trace_sid and "lookback" and lb_note)
             set ok to memory_store(memory_mgr and 3 and "SELF-CHECK" and lb_note)
             set current_prompt to concat(current_prompt and f"\n[SELF-CHECK — INVISIBLE TO USER] Your previous output drifted from your operating values ({lb_note}). Correct course now: speak as ErnOS in the first person, never use pre-trained-assistant disclaimers or claim to be another company's model, and state things plainly. Do not mention this note to the user.\n")
         free_map(lookback)
@@ -396,6 +441,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set tool_name to map_get_val(action_map and "tool_name")
             set args_str to map_get_val(action_map and "args_str")
             display f"Parsed action: '{tool_name}' with args: '{args_str}'"
+            set ok to trace_emit(trace_db and trace_sid and "action" and f"{tool_name}({args_str})")
             set ok to append_list(values_list and action_map)
             
             # Parse arguments as JSON array or fallback to raw string
@@ -412,6 +458,15 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         set val to get_json_value(json_item)
                         set ok to append_list(args_list and val)
                         set item_i to item_i + 1
+                    # Truncation guard: if JSON parsed a single string that is
+                    # drastically shorter than the raw args, the LLM likely
+                    # emitted unescaped inner quotes. Fall back to raw extraction.
+                    if items_len == 1:
+                        set parsed_len to string_length(get_list(args_list and 0))
+                        set raw_len to string_length(args_str)
+                        if parsed_len < raw_len / 2:
+                            display f"[react] JSON truncation detected ({parsed_len} vs {raw_len} chars). Using raw extraction."
+                            set ok to set_list(args_list and 0 and react_extract_raw_arg(args_str))
                 else:
                     set ok to append_list(args_list and get_json_value(json_node))
             else:
@@ -488,6 +543,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         set approval_summary to concat(approval_summary and ")")
                         
                         display f"Tool '{tool_name}' requires user approval. Pausing for confirmation."
+                        set ok to trace_emit(trace_db and trace_sid and "approval" and f"Waiting for approval: {tool_name}({args_str})")
                         
                         # Store pending action state in context for the IPC layer to pick up
                         set pending to create_map()
@@ -563,11 +619,15 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set tool_result to ""
             if action_allowed == 0:
                 display f"Observer action audit: BLOCKED. Reason: {action_reason}"
+                set ok to trace_emit(trace_db and trace_sid and "audit" and f"Observer: BLOCKED — {action_reason}")
                 set tool_result to concat("BLOCKED by Observer: " and action_reason)
             else:
+                set ok to trace_emit(trace_db and trace_sid and "audit" and "Observer: ALLOWED")
                 display f"Executing tool: {tool_name}..."
+                set ok to trace_emit(trace_db and trace_sid and "tool_exec" and f"Executing: {tool_name}")
                 set tool_result to tools_execute(tools_mgr and ctx and tool_name and args_list)
                 display f"Tool result: {tool_result}"
+                set ok to trace_emit(trace_db and trace_sid and "tool_result" and substring(tool_result and 0 and 1800))
                 
             set ok to append_list(values_list and tool_result)
             
@@ -583,6 +643,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 
                 if verdict equals "ALLOWED":
                     display "Observer reply audit: ALLOWED. Final response ready."
+                    set ok to trace_emit(trace_db and trace_sid and "reply_audit" and "Reply audit: ALLOWED")
                     set final_answer to tool_result
                     set finished to 1
                     set reply_blocks to 0
@@ -594,6 +655,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         set finished to 1
                     else:
                         display f"Observer reply audit: BLOCKED. Reason: {audit_reason}. Re-prompting ({reply_blocks}/3)..."
+                        set ok to trace_emit(trace_db and trace_sid and "reply_audit" and f"Reply audit: BLOCKED — {audit_reason} ({reply_blocks}/3)")
                         # Concise correction — do NOT append the full raw_output (which
                         # added ~700+ chars per blocked turn, inflating the prompt from
                         # 16KB to 43KB over 28 turns and causing the SIGSEGV).
@@ -624,6 +686,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             free_list(args_list)
         else:
             display "No valid action parsed. Re-prompting for correct Action grammar..."
+            set ok to trace_emit(trace_db and trace_sid and "no_action" and "No valid action parsed, re-prompting")
             # Enforce Turn Boundary Rejection!
             set current_prompt to concat(current_prompt and "\n")
             set current_prompt to concat(current_prompt and raw_output)
@@ -636,6 +699,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
     # an ever-growing prompt (cost/compute DoS).
     if finished == 0:
         display f"[ReAct] Iteration cap ({max_iters}) reached — aborting."
+        set ok to trace_emit(trace_db and trace_sid and "done" and f"Iteration cap ({max_iters}) reached")
         set final_answer to "I could not complete this request within the allowed number of steps."
     free_list(values_list)
     return final_answer
@@ -847,5 +911,12 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set active_runs to map_get_val(ctx and "active_runs")
     if active_runs > 0:
         set ok to map_insert(ctx and "active_runs" and active_runs - 1)
-        
+
+    # Emit final trace event and schedule cleanup
+    set trace_db to storage_get_db()
+    set trace_sid to ""
+    if map_contains(ctx and "session_id") == 1:
+        set trace_sid to map_get_val(ctx and "session_id")
+    set ok to trace_emit(trace_db and trace_sid and "done" and "Final answer ready")
+
     return res
