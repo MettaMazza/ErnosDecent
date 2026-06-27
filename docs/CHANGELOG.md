@@ -34,6 +34,8 @@ threads, upload pipeline fix, and response delivery bug fix. All changes compile
   the RAG database directly with a text search, complementing `codebase_read`.
 - **`react_extract_raw_arg`** (`decent_agent/react_loop.ep`) — fallback string extractor for when
   `json_parse` truncates LLM output containing unescaped inner quotes.
+- **Discord AI stop button** (`decent_net/discord_bridge.py`) — added a `StopView` component containing a `Stop AI` 🛑 button, attached to the trace thread's introductory message. Users/admins can click it to halt a running AI task.
+- **Concurrent IPC server** (`node.ep`) — updated `ipc_server_loop` to handle clients concurrently using `spawn handle_ipc_client` and `cast_borrow_to_map` wrappers. This enables real-time trace streaming via `TRACE POLL` and instant cancellation via `AI CANCEL` while an inference query is running.
 
 ### Fixed
 

@@ -7,7 +7,7 @@ function set_prop(target, key, value) {
 }
 
 function send_msg(ws, payload) {
-    let sendFn, readyState;
+    let readyState, sendFn;
     if (!ws) {
         return 0;
     }
@@ -45,7 +45,7 @@ function string_length(str) {
 }
 
 function escapeHTML(str) {
-    let reLt, reQuot, reClass, reGt, reApos, res, reAmp;
+    let reQuot, reApos, reLt, res, reAmp, reGt, reClass;
     if (!str) {
         return "";
     }
@@ -87,7 +87,7 @@ function setControlsEnabled(enabled) {
 }
 
 function handleDisconnect() {
-    let walletVal, headerDid, nodePeers, chunkCount, indicator, nodeRole, dhtSize, statusText, nodeTerm, didFull;
+    let indicator, didFull, walletVal, chunkCount, nodeTerm, nodeRole, headerDid, dhtSize, nodePeers, statusText;
     window.isConnected = false;
     indicator = document.getElementById("connection-indicator");
     indicator.classList.remove("online");
@@ -114,7 +114,7 @@ function handleDisconnect() {
 }
 
 function connectDaemon() {
-    let hostname, port, wsClass, ws, wsUrl;
+    let ws, hostname, wsClass, port, wsUrl;
     port = (window.location.port || "8080");
     hostname = (window.location.hostname || "127.0.0.1");
     if ((hostname === "localhost")) {
@@ -214,7 +214,7 @@ function connectDaemon() {
 }
 
 function saveChatMessage(chanName, sender, text, type, timeStr) {
-    let channelList, historyObj, msg, historyStr, hasChannel;
+    let channelList, hasChannel, historyObj, msg, historyStr;
     historyStr = window.localStorage.getItem("ernode_chat_history");
     historyObj = Object();
     if (historyStr) {
@@ -235,7 +235,7 @@ function saveChatMessage(chanName, sender, text, type, timeStr) {
 }
 
 function saveAiMessage(sender, text, type, timeStr) {
-    let historyList, historyStr, msg;
+    let historyList, msg, historyStr;
     historyStr = window.localStorage.getItem("ernode_ai_history");
     historyList = [];
     if (historyStr) {
@@ -251,7 +251,7 @@ function saveAiMessage(sender, text, type, timeStr) {
 }
 
 function renderChatHistory(chanName) {
-    let historyObj, historyStr, hasChannel, channelList;
+    let historyObj, hasChannel, channelList, historyStr;
     window.chatContainer.innerHTML = "";
     historyStr = window.localStorage.getItem("ernode_chat_history");
     if (!historyStr) {
@@ -272,7 +272,7 @@ function renderChatHistory(chanName) {
 }
 
 function renderAiHistory() {
-    let historyStr, historyList;
+    let historyList, historyStr;
     window.aiContainer.innerHTML = "";
     historyStr = window.localStorage.getItem("ernode_ai_history");
     if (!historyStr) {
@@ -287,7 +287,7 @@ function renderAiHistory() {
 }
 
 function appendMessageRaw(container, sender, text, type, timeStr) {
-    let bubble, escapedText;
+    let escapedText, bubble;
     bubble = document.createElement("div");
     bubble.className = ("chat-bubble " + String(type));
     escapedText = escapeHTML(text).replace("\n", "<br>");
@@ -337,7 +337,7 @@ function attachTtsButton(bubble, text) {
 }
 
 function appendMessage(container, sender, text, type) {
-    let secParts, timeStr, dateStr, timeParts, timeStrSec;
+    let dateStr, timeStr, timeStrSec, secParts, timeParts;
     dateStr = Date();
     timeParts = dateStr.split(" ");
     timeStrSec = timeParts[4];
@@ -352,7 +352,7 @@ function appendMessage(container, sender, text, type) {
 }
 
 function appendAiToken(token) {
-    let bubble, textNode;
+    let textNode, bubble;
     if (!window.currentAiResponseBubble) {
         bubble = document.createElement("div");
         bubble.className = "chat-bubble received ai-bot";
@@ -366,7 +366,7 @@ function appendAiToken(token) {
 }
 
 function appendApprovalCard(toolName, summary) {
-    let denyBtn, bubble, approveAllBtn, contentHtml, approveBtn, escapedTool, escapedSummary, actionsHtml, btnSubmit;
+    let denyBtn, actionsHtml, approveAllBtn, btnSubmit, escapedTool, approveBtn, bubble, escapedSummary, contentHtml;
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
     set_prop(bubble.style, "border", "1px solid rgba(245, 158, 11, 0.3)");
@@ -453,7 +453,7 @@ function appendApprovalCard(toolName, summary) {
 }
 
 function appendClarifyCard(questionsJson) {
-    let questions, nq, stopB, bubble;
+    let stopB, nq, bubble, questions;
     questions = JSON.parse(questionsJson);
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -549,7 +549,7 @@ function appendClarifyCard(questionsJson) {
 }
 
 function appendReasoningBubble(b64) {
-    let html, bubble, decoded;
+    let bubble, html, decoded;
     decoded = decodeURIComponent(escape(atob(b64)));
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -562,7 +562,7 @@ function appendReasoningBubble(b64) {
 }
 
 function updateHostsTableUI(jsonStr) {
-    let primary, electedHostEl, list, tbody, i;
+    let tbody, i, list, primary, electedHostEl;
     tbody = document.getElementById("hosts-table-body");
     if (!tbody) {
         return 0;
@@ -606,7 +606,7 @@ function updateHostsTableUI(jsonStr) {
 }
 
 function handleDhtResult(msg) {
-    let dhtLog, entry;
+    let entry, dhtLog;
     if ((msg.key === "network:host_nodes")) {
         if (msg.found) {
             updateHostsTableUI(msg.value);
@@ -636,7 +636,7 @@ function handleDhtResult(msg) {
 }
 
 function handleNameResult(msg) {
-    let entry, nameLog, headerDid;
+    let nameLog, entry, headerDid;
     nameLog = document.getElementById("name-log");
     if (!nameLog) {
         return 0;
@@ -669,7 +669,7 @@ function handleNameResult(msg) {
 }
 
 function selectAiModel(modelName, skipSave) {
-    let btns, msg, modelText, aiModelSelect;
+    let modelText, msg, btns, aiModelSelect;
     window.selectedAiModel = modelName;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
@@ -697,7 +697,7 @@ function selectAiModel(modelName, skipSave) {
 }
 
 function updateAiModelsUI(models) {
-    let activeClass, currentSelected, aiModelSelect, isIncluded;
+    let currentSelected, aiModelSelect, activeClass, isIncluded;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
         currentSelected = window.selectedAiModel;
@@ -769,7 +769,7 @@ function deleteSession(id) {
 }
 
 function updatePlatformsUI() {
-    let waToggle, waPhoneId, waStatus, whatsappConfig, tgStatus, discChannel, discToken, waToken, telegramConfig, discToggle, statusText, discStatus, tgToggle, discordConfig, tgToken;
+    let waStatus, tgStatus, tgToken, statusText, telegramConfig, waPhoneId, discStatus, tgToggle, discChannel, waToggle, whatsappConfig, discordConfig, discToken, waToken, discToggle;
     if (!window.platforms) {
         return 0;
     }
@@ -869,7 +869,7 @@ function updatePlatformsUI() {
 }
 
 function updatePromptsUI() {
-    let kernelArea, personaArea, observerArea;
+    let observerArea, kernelArea, personaArea;
     if (!window.prompts) {
         return 0;
     }
@@ -908,7 +908,7 @@ function showPromptsStatus(text, isSuccess) {
 }
 
 function renderPluginsUI() {
-    let deleteBtns, body, toggleBtns;
+    let body, toggleBtns, deleteBtns;
     body = document.getElementById("plugins-list-body");
     if (!body) {
         return 0;
@@ -1008,7 +1008,7 @@ function savePluginsSettings() {
 }
 
 function savePromptsConfig() {
-    let payload, observerArea, kernelArea, personaArea;
+    let payload, personaArea, kernelArea, observerArea;
     if ((!window.ws || !window.isConnected)) {
         showPromptsStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1031,7 +1031,7 @@ function savePromptsConfig() {
 }
 
 function updateSystemConfigUI() {
-    let nodeName, relayPort, isStaticHost, maxMsg, banThresh, rateLimit, dhtTtl, banDur, p2pPort, raftPort, heartbeat, seedAddr, logLevel, dataDir, enableHostElect, listenAddr, ipcPort, maxContent, seedPort, maxConn, webPort, dhtPort, electTimeout;
+    let isStaticHost, maxMsg, seedPort, raftPort, maxConn, dhtTtl, nodeName, logLevel, relayPort, ipcPort, rateLimit, banDur, heartbeat, maxContent, enableHostElect, dhtPort, p2pPort, dataDir, seedAddr, banThresh, listenAddr, electTimeout, webPort;
     if (!window.systemConfig) {
         return 0;
     }
@@ -1152,7 +1152,7 @@ function showSystemConfigStatus(text, statusType) {
 }
 
 function saveSystemConfig() {
-    let valElect, val, isStaticHost, payload, enableHostElect, valStatic;
+    let valStatic, val, isStaticHost, payload, enableHostElect, valElect;
     if ((!window.ws || !window.isConnected)) {
         showSystemConfigStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1220,7 +1220,7 @@ function saveSystemConfig() {
 }
 
 function savePlatformConfig(platformId) {
-    let phoneVal, enabledVal, discConfig, whatsappConfig, payload, telegramConfig, chanVal, tokenVal;
+    let tokenVal, enabledVal, phoneVal, discConfig, telegramConfig, chanVal, whatsappConfig, payload;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1283,7 +1283,7 @@ function savePlatformConfig(platformId) {
 }
 
 function handlePlatformToggle(platformId) {
-    let payload, enabledVal, telegramConfig, whatsappConfig, discConfig;
+    let enabledVal, discConfig, whatsappConfig, telegramConfig, payload;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1330,7 +1330,7 @@ function handlePlatformToggle(platformId) {
 }
 
 function registerPlugin() {
-    let desc, newPlugin, endpoint, name;
+    let name, desc, endpoint, newPlugin;
     if (!window.plugins) {
         window.plugins = [];
     }
@@ -1440,7 +1440,7 @@ function updateSessionsUI(sessions) {
 }
 
 function initMemoryCanvas() {
-    let container, height, oldCanvas, emptyState, width, canvas;
+    let emptyState, canvas, height, container, oldCanvas, width;
     container = document.getElementById("memory-graph-viz");
     if (!container) {
         return 0;
@@ -1468,7 +1468,7 @@ function initMemoryCanvas() {
 }
 
 function updateMemoryGraphData(edges) {
-    let width, height, currentIds, incomingNodes;
+    let incomingNodes, height, currentIds, width;
     if (!window.canvasElement) {
         initMemoryCanvas();
     }
@@ -1505,7 +1505,7 @@ function updateMemoryGraphData(edges) {
 }
 
 function animateGraph() {
-    let j, n2, force, nodeIds, dy, n1, dist, width, height, dx, i, fx, fy;
+    let force, fx, height, j, dist, width, fy, nodeIds, n1, n2, i, dy, dx;
     if (!window.isConnected) {
         window.animationFrameId = requestAnimationFrame((dummy) => {
     animateGraph();
@@ -1613,7 +1613,7 @@ function animateGraph() {
 }
 
 function renderTuringGrid(data) {
-    let container, turingCellsCount, isHead, r, turingHeadPos, c, value, headX, headZ, html, cellClass, headY, cellKey;
+    let r, isHead, headX, html, container, c, headY, cellClass, headZ, turingHeadPos, turingCellsCount, cellKey, value;
     container = document.getElementById("turing-grid-viz");
     if (!container) {
         return 0;
@@ -1694,7 +1694,7 @@ function updateMemoryTables(data) {
 }
 
 function handleDaemonMessage(msg) {
-    let sess, type, rvRepos, timeStr, uiHostElect, bwDown, timeStrSec, secParts, summaryNotice, chunkCount, nameInput, computeSlots, dateStr, nodeTerm, textNode, encKeyEl, nodePeers, storageBody, activeCircuits, walletVal, natMode, nodeRole, dhtSize, ttsAudio, aiText, noSelected, bwUp, sigKeyEl, idNameEl, btnSubmit, refresh, rvFile, sess_id, roleUpper, headerDid, timeParts, stopBtn, didFull, uiStaticHost, auToggle, gdBadge, msgSessions, detailsPanel;
+    let storageBody, nodeRole, timeStr, msgSessions, timeStrSec, auToggle, refresh, aiText, uiHostElect, dateStr, ttsAudio, encKeyEl, dhtSize, walletVal, rvFile, nodePeers, textNode, sess_id, detailsPanel, gdBadge, computeSlots, bwDown, secParts, chunkCount, stopBtn, sess, rvRepos, summaryNotice, btnSubmit, roleUpper, timeParts, uiStaticHost, natMode, sigKeyEl, headerDid, idNameEl, activeCircuits, didFull, bwUp, nameInput, type, nodeTerm, noSelected;
     type = msg.type;
     if ((type === "status")) {
         roleUpper = msg.role.toUpperCase();
@@ -1995,7 +1995,7 @@ function handleDaemonMessage(msg) {
 }
 
 function handleOnionResult(msg) {
-    let results, resultsBox, html;
+    let html, resultsBox, results;
     resultsBox = document.getElementById("onion-results-box");
     if (!resultsBox) {
         return 0;
@@ -2030,7 +2030,7 @@ function getActiveTab() {
 }
 
 function createBrowserTab(url, activate) {
-    let tab, id;
+    let id, tab;
     id = ("tab_" + Math.random().toString(36).substring(2, 9));
     tab = Object();
     tab.id = id;
@@ -2097,7 +2097,7 @@ function renderBrowserTabs() {
 }
 
 function switchBrowserTab(tabId) {
-    let tab, contentArea, addressInput, loader;
+    let contentArea, tab, loader, addressInput;
     window.activeTabId = tabId;
     renderBrowserTabs();
     tab = null;
@@ -2138,7 +2138,7 @@ function switchBrowserTab(tabId) {
 }
 
 function closeBrowserTab(tabId) {
-    let modal, tObj, idx, i;
+    let modal, i, idx, tObj;
     idx = (0 - 1);
     i = 0;
     window.browserTabs.forEach((t) => {
@@ -2170,7 +2170,7 @@ function closeBrowserTab(tabId) {
 }
 
 function navigateTab(tab, url) {
-    let targetUrl, hasDot, loader, addressInput, hasProtocol, contentArea, progressBar, viewMsg, isSearch;
+    let hasProtocol, viewMsg, contentArea, progressBar, targetUrl, hasDot, addressInput, loader, isSearch;
     targetUrl = url.trim();
     if ((targetUrl === "")) {
         return 0;
@@ -2278,7 +2278,7 @@ function updateStarButton(tab) {
 }
 
 function toggleBookmarkActiveTab() {
-    let newBookmark, i, existingIdx, activeTab;
+    let newBookmark, activeTab, existingIdx, i;
     activeTab = getActiveTab();
     if ((!activeTab || (activeTab.url === "ernos://newtab"))) {
         return 0;
@@ -2305,7 +2305,7 @@ function toggleBookmarkActiveTab() {
 }
 
 function renderBookmarksBar() {
-    let bar, homeItem;
+    let homeItem, bar;
     bar = document.getElementById("browser-bookmarks-bar");
     if (!bar) {
         return 0;
@@ -2336,7 +2336,7 @@ function renderBookmarksBar() {
 }
 
 function resolveRelativeUrl(baseUrl, relativeUrl) {
-    let protoIdx, lastSlash, firstSlash, domain, afterProto, baseFolder;
+    let firstSlash, lastSlash, afterProto, baseFolder, protoIdx, domain;
     if (((string_index_of(relativeUrl, "://") >= 0) || (string_index_of(relativeUrl, "data:") === 0))) {
         return relativeUrl;
     }
@@ -2365,7 +2365,7 @@ function resolveRelativeUrl(baseUrl, relativeUrl) {
 }
 
 function interceptViewportClicks() {
-    let links, contentArea;
+    let contentArea, links;
     contentArea = document.getElementById("reader-modal-content");
     if (!contentArea) {
         return 0;
@@ -2386,7 +2386,7 @@ function interceptViewportClicks() {
 }
 
 function renderNewTabPage(tab) {
-    let scDdg, newTabHtml, scWiki, contentArea, form, scTor, scGithub;
+    let scGithub, scWiki, scDdg, newTabHtml, contentArea, form, scTor;
     contentArea = document.getElementById("reader-modal-content");
     if ((tab.id !== window.activeTabId)) {
         return 0;
@@ -2428,7 +2428,7 @@ function renderNewTabPage(tab) {
 }
 
 function handleOnionViewResult(msg) {
-    let targetTab, contentArea, htmlLower, tabId, tEnd, title, tStart, urlParts, loader, activeTab, progressBar;
+    let tabId, tEnd, htmlLower, progressBar, loader, contentArea, targetTab, title, tStart, activeTab, urlParts;
     tabId = msg.tabId;
     targetTab = null;
     window.browserTabs.forEach((t) => {
@@ -2543,7 +2543,7 @@ function updateGitDecRepos(reposStr) {
 }
 
 function selectGitDecRepo(repoId) {
-    let msg1, viewerName, detailsPanel, msg2, noSelected, activeIdEl, viewerContent, msgFileList, msg3;
+    let viewerName, viewerContent, detailsPanel, msg1, activeIdEl, msg3, msgFileList, msg2, noSelected;
     window.gitdecActiveRepo = repoId;
     noSelected = document.getElementById("gitdec-no-repo-selected");
     detailsPanel = document.getElementById("gitdec-repo-details");
@@ -2582,7 +2582,7 @@ function selectGitDecRepo(repoId) {
 }
 
 function handleGitDecFile(repoId, filename, content) {
-    let titleEl, auQuery, removeBtns, keys, isOwner, data, visToggle, guideViewer, visVal, issueListEl, opt, activeFileSpan, manifest, branchSelect, fileViewer, commitListEl, visBadge, sRepoName, listEl, b_keys, localRole, branches, sRepoId, prListEl;
+    let branchSelect, localRole, commitListEl, visVal, visToggle, guideViewer, listEl, manifest, auQuery, fileViewer, opt, b_keys, prListEl, keys, titleEl, sRepoName, visBadge, sRepoId, data, issueListEl, branches, isOwner, removeBtns, activeFileSpan;
     if (((repoId === "ErnosDecent") && ((((((((((((filename === "docs/gitdec_user_guide.md") || (filename === "docs/system_guide_synthesis.md")) || (filename === "docs/ERNOS_REFERENCE.md")) || (filename === "README.md")) || (filename === "docs/settings_guide.md")) || (filename === "docs/identity_registry_guide.md")) || (filename === "docs/network_dht_guide.md")) || (filename === "docs/resource_pooling_guide.md")) || (filename === "docs/turing_hebbian_guide.md")) || (filename === "docs/messaging_social_guide.md")) || (filename === "docs/storage_crdt_guide.md")) || (filename === "docs/ledger_dex_guide.md")))) {
         guideViewer = document.getElementById("guide-text-content");
         if (guideViewer) {
@@ -2781,7 +2781,7 @@ function handleGitDecFile(repoId, filename, content) {
 }
 
 function renderGitDecFiles(repoId, filesStr) {
-    let fileListEl, files, count;
+    let files, count, fileListEl;
     if ((repoId !== window.gitdecActiveRepo)) {
         return 0;
     }
@@ -2838,7 +2838,7 @@ function renderGitDecFiles(repoId, filesStr) {
 }
 
 function showGitDecIssueDetail(issue) {
-    let commentsContainer, bodyRow, titleEl, detailCard;
+    let bodyRow, detailCard, commentsContainer, titleEl;
     window.gitdecActiveIssue = issue;
     detailCard = document.getElementById("gitdec-issue-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -2864,7 +2864,7 @@ function showGitDecIssueDetail(issue) {
 }
 
 function showGitDecPrDetail(pr) {
-    let descRow, titleEl, branchEl, detailCard, reviewsContainer;
+    let detailCard, reviewsContainer, descRow, titleEl, branchEl;
     window.gitdecActivePr = pr;
     detailCard = document.getElementById("gitdec-pr-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -2898,7 +2898,7 @@ function showGitDecPrDetail(pr) {
 }
 
 function initGuide() {
-    let navList, file, msg, activeBtn, btns;
+    let navList, btns, activeBtn, file, msg;
     navList = document.getElementById("guide-nav-list");
     if (!navList) {
         return 0;
@@ -2935,7 +2935,7 @@ function initGuide() {
 }
 
 function initGitDec() {
-    let commitsPanel, btnCloseIssue, formCreatePr, btnCloseImportRepo, modalNewPr, modalNewRepo, btnCloseCloneRepo, formImportRepo, settingsBtn, formCreateRepo, btnCloseNewPr, issuesBtn, btnNewRepo, btnNewIssue, modalCloneRepo, btnCloneRepo, btnDeleteRepo, autoUpdateToggle, filesBtn, formCloneRepo, modalImportRepo, formSettingsAddCollab, formCreateIssue, btnImportRepo, prsPanel, settingsPanel, formReviewPr, btnToggleVis, formCommentIssue, btnCloseNewRepo, repoSearch, filesPanel, prsBtn, modalNewIssue, btnNewPr, btnCloseNewIssue, btnMergeMain, commitsBtn, issuesPanel;
+    let modalNewIssue, btnDeleteRepo, settingsBtn, repoSearch, btnCloseNewRepo, commitsPanel, filesBtn, prsPanel, filesPanel, modalNewPr, commitsBtn, btnCloseCloneRepo, btnNewIssue, prsBtn, settingsPanel, btnNewPr, issuesPanel, btnImportRepo, modalImportRepo, btnCloseIssue, btnCloseNewPr, btnCloseNewIssue, formCreatePr, formCreateIssue, formReviewPr, btnCloseImportRepo, formCommentIssue, formSettingsAddCollab, issuesBtn, formCloneRepo, btnNewRepo, modalCloneRepo, formCreateRepo, btnMergeMain, btnToggleVis, autoUpdateToggle, btnCloneRepo, modalNewRepo, formImportRepo;
     commitsBtn = document.getElementById("gitdec-tab-commits");
     filesBtn = document.getElementById("gitdec-tab-files");
     issuesBtn = document.getElementById("gitdec-tab-issues");
@@ -3336,7 +3336,7 @@ function initGitDec() {
 }
 
 function main() {
-    let onionSearchHtml, subTabs, savedTab, nameInput, btnCloseBrowser, addressInput, navItems, ddgBookmark, btnSaveDiscord, btnDecayMemory, transferForm, btnAddPlugin, aiForm, toggleTelegram, menuReloadOption, btnSwapTokens, channelBtns, guideSections, networkGrid, torBookmark, chatForm, turingForm, tabPanels, btnStar, readerModal, readerModalHtml, btnBack, pageTitle, guideBtns, nameForm, btnForward, menuNewTab, onionCard, dhtCardWide, btnRefreshHosts, targetBtn, btnTriggerAutonomy, menuBookmarkOption, aiModelSelect, btnSaveSystemConfig, clickFn, wikiBookmark, btnNewSession, onionForm, btnReload, btnSaveWhatsapp, dhtForm, btnAddTab, menuExitOption, menuNewIncognito, toggleWhatsapp, savedLastName, btnSaveTelegram, btnSavePrompts, btnMenu, btnHome, toggleDiscord;
+    let btnSaveTelegram, nameInput, btnHome, btnSwapTokens, btnAddTab, torBookmark, tabPanels, toggleTelegram, menuExitOption, btnSaveDiscord, btnAddPlugin, chatForm, btnSaveSystemConfig, dhtForm, menuReloadOption, guideBtns, savedTab, readerModalHtml, menuNewTab, aiForm, subTabs, networkGrid, btnMenu, onionCard, transferForm, aiModelSelect, btnDecayMemory, btnForward, wikiBookmark, btnStar, btnSaveWhatsapp, navItems, btnReload, channelBtns, dhtCardWide, menuBookmarkOption, onionSearchHtml, btnTriggerAutonomy, menuNewIncognito, onionForm, ddgBookmark, toggleDiscord, btnRefreshHosts, savedLastName, targetBtn, btnCloseBrowser, btnBack, turingForm, clickFn, readerModal, btnNewSession, pageTitle, addressInput, toggleWhatsapp, btnSavePrompts, nameForm, guideSections;
     window.ws = null;
     window.isConnected = false;
     window.uptimeSeconds = 0;

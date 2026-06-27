@@ -360,6 +360,35 @@ class ApprovalView(discord.ui.View):
         await interaction.response.edit_message(content=interaction.message.content, view=self)
         self.stop()
 
+class StopView(discord.ui.View):
+    """A Stop button that allows the original user (or admins) to cancel a running
+    AI inference process mid-task by sending an 'AI CANCEL' IPC command."""
+    def __init__(self, author, session_id, timeout=None):
+        super().__init__(timeout=timeout)
+        self.author = author
+        self.session_id = session_id
+
+    @discord.ui.button(label="Stop AI", emoji="🛑", style=discord.ButtonStyle.danger)
+    async def stop_ai(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Allow original sender OR admins to halt the run
+        if interaction.user != self.author and not is_admin_author(interaction.user):
+            await interaction.response.send_message("❌ Only the original sender or an administrator can stop this task.", ephemeral=True)
+            return
+        
+        await interaction.response.defer()
+        # Disable the stop button
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+        
+        # Send cancel command to daemon
+        sess = self.session_id or "default"
+        resp = await send_daemon_ipc(f"AI CANCEL [SESSION:{sess}]")
+        print(f"[Discord Bridge] Stop button clicked for session {sess}, daemon ack: {resp}", flush=True)
+
 class SpeakView(discord.ui.View):
     """A 🔊 button attached to AI replies. On click, asks the node to synthesise
     the message audio (Kokoro, voice bm_fable @1.15x via the `TTS SPEAK` IPC verb)
@@ -638,12 +667,16 @@ async def _run_ai_with_traces(message, query_text, author):
     sess = active_session_id or "default"
 
     # Create a trace thread attached to the user's message
+    initial_msg = None
     try:
         thread = await message.create_thread(
             name=f"🔍 ErnOS Trace — {query_text[:50]}",
             auto_archive_duration=60  # 1 hour archive (minimum Discord allows)
         )
-        await thread.send("🔍 **ErnOS Reasoning Trace** — live stream of thinking, tool calls, and audit results.\n*This thread auto-deletes 2 minutes after the response.*")
+        initial_msg = await thread.send(
+            "🔍 **ErnOS Reasoning Trace** — live stream of thinking, tool calls, and audit results.\n*This thread auto-deletes 2 minutes after the response.*",
+            view=StopView(author=message.author, session_id=sess)
+        )
     except Exception as e:
         print(f"[Discord Bridge] Failed to create trace thread: {e}", flush=True)
         thread = None
@@ -664,6 +697,16 @@ async def _run_ai_with_traces(message, query_text, author):
             await asyncio.wait_for(trace_task, timeout=2.0)
         except asyncio.TimeoutError:
             trace_task.cancel()
+
+    # Disable the stop button
+    if thread and initial_msg:
+        try:
+            disabled_view = StopView(author=message.author, session_id=sess)
+            for item in disabled_view.children:
+                item.disabled = True
+            await initial_msg.edit(view=disabled_view)
+        except Exception as e:
+            print(f"[Discord Bridge] Failed to disable stop button: {e}", flush=True)
 
     # Send final trace marker
     if thread:
