@@ -13,6 +13,8 @@ import "observer"
 import "session"
 import "sync"
 import "trace"
+import "../storage"
+import "sql"
 
 # F4: cooperative cancellation registry. A Stop button / `AI CANCEL` IPC sets a
 # per-session flag on a SEPARATE connection while react_run_loop is blocked on the
@@ -33,6 +35,12 @@ define react_request_cancel with session_id as Str returning Int:
     set ok to lock_mutex(RUN_CANCEL_LOCK)
     set ok to map_insert(RUN_CANCEL_MAP and key and 1)
     set ok to unlock_mutex(RUN_CANCEL_LOCK)
+    
+    # Also write to SQLite DB
+    set db to storage_get_db()
+    if db != 0:
+        set es to string_replace(key and "'" and "''")
+        set ok to sql_execute(db and f"INSERT OR REPLACE INTO trace_cancellations (session_id) VALUES ('{es}');")
     return 0
 
 # Check and CONSUME a pending cancellation (called by the loop each turn).
@@ -43,7 +51,22 @@ define react_check_cancel with session_id as Str returning Int:
     if hit == 1:
         set ok to map_delete(RUN_CANCEL_MAP and key)
     set ok to unlock_mutex(RUN_CANCEL_LOCK)
-    return hit
+    if hit == 1:
+        return 1
+        
+    # Check SQLite DB
+    set db to storage_get_db()
+    if db != 0:
+        set es to string_replace(key and "'" and "''")
+        set rows to sql_query(db and f"SELECT COUNT(*) FROM trace_cancellations WHERE session_id='{es}';")
+        if length_list(rows) > 0:
+            set first_row to get_list(rows and 0)
+            set count_str to get_list(first_row and 0)
+            if string_to_int(count_str) > 0:
+                # Consume it: delete from trace_cancellations
+                set ok to sql_execute(db and f"DELETE FROM trace_cancellations WHERE session_id='{es}';")
+                return 1
+    return 0
 
 # Remove stray harmony/gemma channel-marker tokens from a string. Longer variants
 # are stripped before their unterminated forms so nothing is left behind.

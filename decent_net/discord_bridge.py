@@ -5,7 +5,8 @@ import json
 import socket
 import discord
 import asyncio
-import signal
+import sqlite3
+import time
 
 import urllib.request
 import base64
@@ -360,9 +361,94 @@ class ApprovalView(discord.ui.View):
         await interaction.response.edit_message(content=interaction.message.content, view=self)
         self.stop()
 
+def get_db_path():
+    return os.path.expanduser("~/.ernosdecent/node.db")
+
+def db_request_cancel(session_id):
+    try:
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO trace_cancellations (session_id) VALUES (?)", (session_id,))
+        conn.commit()
+        conn.close()
+        return "ok"
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to write cancel to DB: {e}", flush=True)
+        return f"error:{e}"
+
+def db_poll_traces(session_id):
+    events = []
+    try:
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND session_id=? ORDER BY id LIMIT 50",
+            (session_id,)
+        )
+        rows = cursor.fetchall()
+        for r in rows:
+            events.append({
+                "id": r[0],
+                "type": r[1],
+                "content": r[2],
+                "ts": r[3]
+            })
+            cursor.execute("UPDATE trace_events SET sent=1 WHERE id=?", (r[0],))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to query trace_events: {e}", flush=True)
+    return events
+
+def db_get_pending_deletes():
+    pending = []
+    try:
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        now = int(time.time())
+        cursor.execute(
+            "SELECT id, thread_id FROM trace_pending_deletes WHERE delete_after <= ? ORDER BY id LIMIT 50",
+            (now,)
+        )
+        rows = cursor.fetchall()
+        for r in rows:
+            pending.append({
+                "id": r[0],
+                "thread_id": r[1]
+            })
+        conn.close()
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to get pending deletes: {e}", flush=True)
+    return pending
+
+def db_complete_delete(pid):
+    try:
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM trace_pending_deletes WHERE id=?", (pid,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to complete delete: {e}", flush=True)
+
+def db_schedule_delete(thread_id, delay_secs):
+    try:
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        now = int(time.time())
+        delete_after = now + delay_secs
+        cursor.execute(
+            "INSERT INTO trace_pending_deletes (thread_id, delete_after, created_at) VALUES (?, ?, ?)",
+            (str(thread_id), delete_after, now)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to schedule delete: {e}", flush=True)
+
 class StopView(discord.ui.View):
     """A Stop button that allows the original user (or admins) to cancel a running
-    AI inference process mid-task by sending an 'AI CANCEL' IPC command."""
+    AI inference process mid-task by writing directly to SQLite cancellations table."""
     def __init__(self, author, session_id, timeout=None):
         super().__init__(timeout=timeout)
         self.author = author
@@ -374,7 +460,7 @@ class StopView(discord.ui.View):
         if interaction.user != self.author and not is_admin_author(interaction.user):
             await interaction.response.send_message("❌ Only the original sender or an administrator can stop this task.", ephemeral=True)
             return
-        
+
         await interaction.response.defer()
         # Disable the stop button
         for item in self.children:
@@ -383,11 +469,11 @@ class StopView(discord.ui.View):
             await interaction.message.edit(view=self)
         except Exception:
             pass
-        
-        # Send cancel command to daemon
+
+        # Write cancel flag directly to SQLite
         sess = self.session_id or "default"
-        resp = await send_daemon_ipc(f"AI CANCEL [SESSION:{sess}]")
-        print(f"[Discord Bridge] Stop button clicked for session {sess}, daemon ack: {resp}", flush=True)
+        resp = db_request_cancel(sess)
+        print(f"[Discord Bridge] Stop button clicked for session {sess}, SQLite write ack: {resp}", flush=True)
 
 class SpeakView(discord.ui.View):
     """A 🔊 button attached to AI replies. On click, asks the node to synthesise
@@ -605,7 +691,7 @@ async def bridge_poll_loop():
         await asyncio.sleep(1.0)
 
 async def trace_poll_loop(thread, session_id, done_event):
-    """Poll the daemon for trace events and stream them into a Discord thread.
+    """Poll SQLite directly for trace events and stream them into a Discord thread.
     Runs until done_event is set (inference complete)."""
     TYPE_EMOJI = {
         "thinking": "🧠", "raw_output": "📝", "reasoning": "💭",
@@ -616,21 +702,19 @@ async def trace_poll_loop(thread, session_id, done_event):
     await client.wait_until_ready()
     while not done_event.is_set():
         try:
-            resp = await send_daemon_ipc(f"TRACE POLL {session_id}")
-            if resp and resp.startswith("["):
-                events = json.loads(resp)
-                for ev in events:
-                    etype = ev.get("type", "info")
-                    content = ev.get("content", "")
-                    emoji = TYPE_EMOJI.get(etype, "ℹ️")
-                    # Truncate to Discord's 2000-char limit
-                    msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
-                    if len(msg) > 2000:
-                        msg = msg[:1997] + "..."
-                    try:
-                        await thread.send(msg)
-                    except Exception as e:
-                        print(f"[Discord Bridge] trace thread send error: {e}", flush=True)
+            events = db_poll_traces(session_id)
+            for ev in events:
+                etype = ev.get("type", "info")
+                content = ev.get("content", "")
+                emoji = TYPE_EMOJI.get(etype, "ℹ️")
+                # Truncate to Discord's 2000-char limit
+                msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
+                if len(msg) > 2000:
+                    msg = msg[:1997] + "..."
+                try:
+                    await thread.send(msg)
+                except Exception as e:
+                    print(f"[Discord Bridge] trace thread send error: {e}", flush=True)
         except Exception as e:
             print(f"[Discord Bridge] trace poll error: {e}", flush=True)
         await asyncio.sleep(0.5)  # Poll every 500ms for near-real-time
@@ -641,21 +725,19 @@ async def pending_deletes_cleanup_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         try:
-            resp = await send_daemon_ipc("TRACE PENDING_DELETES")
-            if resp and resp.startswith("["):
-                pending = json.loads(resp)
-                for item in pending:
-                    tid = str(item.get("thread_id", ""))
-                    pid = item.get("id", 0)
-                    if tid:
-                        try:
-                            thread_obj = client.get_channel(int(tid))
-                            if thread_obj:
-                                await thread_obj.delete()
-                                print(f"[Discord Bridge] Cleaned up expired trace thread {tid}", flush=True)
-                        except Exception as e:
-                            print(f"[Discord Bridge] Failed to delete thread {tid}: {e}", flush=True)
-                        await send_daemon_ipc(f"TRACE COMPLETE_DELETE {pid}")
+            pending = db_get_pending_deletes()
+            for item in pending:
+                tid = str(item.get("thread_id", ""))
+                pid = item.get("id", 0)
+                if tid:
+                    try:
+                        thread_obj = client.get_channel(int(tid))
+                        if thread_obj:
+                            await thread_obj.delete()
+                            print(f"[Discord Bridge] Cleaned up expired trace thread {tid}", flush=True)
+                    except Exception as e:
+                        print(f"[Discord Bridge] Failed to delete thread {tid}: {e}", flush=True)
+                    db_complete_delete(pid)
         except Exception as e:
             print(f"[Discord Bridge] pending deletes cleanup error: {e}", flush=True)
         await asyncio.sleep(15.0)  # Check every 15 seconds
@@ -715,7 +797,7 @@ async def _run_ai_with_traces(message, query_text, author):
         except Exception:
             pass
         # Schedule crash-resilient deletion via SQLite
-        await send_daemon_ipc(f"TRACE SCHEDULE_DELETE {thread.id} 120")
+        db_schedule_delete(thread.id, 120)
         # Also schedule local deletion
         asyncio.create_task(_delete_thread_after(thread, 120))
 
@@ -728,7 +810,7 @@ async def _delete_thread_after(thread, delay_secs):
     try:
         await thread.delete()
         # Mark complete in SQLite
-        await send_daemon_ipc(f"TRACE COMPLETE_DELETE {thread.id}")
+        db_complete_delete(thread.id)
     except Exception as e:
         print(f"[Discord Bridge] Failed to auto-delete trace thread: {e}", flush=True)
 
