@@ -278,10 +278,11 @@ async def query_daemon_ipc(prompt, author=None):
 
 import re
 
-async def send_discord_reply(message, text, speakable=False):
+async def send_discord_reply(message, text, speakable=False, edit_msg=None):
     """Send a reply, splitting into chunks if it exceeds Discord's 2000-char limit.
     When speakable=True, a 🔊 button is attached to the final chunk that plays the
-    full message audio (the whole text, not just that chunk)."""
+    full message audio (the whole text, not just that chunk).
+    If edit_msg is provided, it edits that message first instead of creating a new one."""
     try:
         if not text or not text.strip():
             text = "..."
@@ -292,13 +293,29 @@ async def send_discord_reply(message, text, speakable=False):
         view = SpeakView(text) if speakable else None
         if len(text) > 2000:
             chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
-            for idx, chunk in enumerate(chunks):
-                is_last = (idx == len(chunks) - 1)
-                await message.reply(chunk, view=(view if is_last else None))
+            if edit_msg:
+                try:
+                    await edit_msg.edit(content=chunks[0], view=None)
+                except Exception:
+                    await message.reply(chunks[0])
+                for idx in range(1, len(chunks)):
+                    is_last = (idx == len(chunks) - 1)
+                    await message.reply(chunks[idx], view=(view if is_last else None))
+            else:
+                for idx, chunk in enumerate(chunks):
+                    is_last = (idx == len(chunks) - 1)
+                    await message.reply(chunk, view=(view if is_last else None))
         else:
-            await message.reply(text, view=view)
+            if edit_msg:
+                try:
+                    await edit_msg.edit(content=text, view=view)
+                except Exception:
+                    await message.reply(text, view=view)
+            else:
+                await message.reply(text, view=view)
     except Exception as e:
         print(f"[Discord Bridge] Failed to send reply message: {e}", flush=True)
+
 
 def parse_pending_approval(resp):
     """Parse 'ai:pending_approval,tool:<name>,summary:<args>' into (tool, summary)."""
@@ -505,7 +522,7 @@ class SpeakView(discord.ui.View):
         except Exception as e:
             await interaction.followup.send(f"🔇 Failed to upload audio: {e}", ephemeral=True)
 
-async def handle_tool_approval(message, resp):
+async def handle_tool_approval(message, resp, edit_msg=None):
     """Handle a pending tool approval: show a card with interactive buttons and wait for user decision."""
     tool_name, summary = parse_pending_approval(resp)
     
@@ -544,14 +561,17 @@ async def handle_tool_approval(message, resp):
     # Process the result from the daemon after approval/denial
     if ipc_resp.startswith("ai:pending_approval,"):
         # Chained approval — another gated tool in the same ReAct loop
-        await handle_tool_approval(message, ipc_resp)
+        await handle_tool_approval(message, ipc_resp, edit_msg=edit_msg)
+    elif ipc_resp.startswith("ai:cancelled,response:"):
+        await send_discord_reply(message, "🛑 " + ipc_resp[len("ai:cancelled,response:"):], edit_msg=edit_msg)
     elif ipc_resp.startswith("ai:ok"):
         ai_resp = extract_ai_ok_response(ipc_resp)
-        await send_discord_reply(message, ai_resp, speakable=True)
+        await send_discord_reply(message, ai_resp, speakable=True, edit_msg=edit_msg)
     elif ipc_resp == "error:daemon_offline":
-        await send_discord_reply(message, "❌ Daemon went offline during approval.")
+        await send_discord_reply(message, "❌ Daemon went offline during approval.", edit_msg=edit_msg)
     else:
-        await send_discord_reply(message, f"Agent response: {ipc_resp}")
+        await send_discord_reply(message, f"Agent response: {ipc_resp}", edit_msg=edit_msg)
+
 
 # --- F3: clarification over Discord ---
 def parse_clarify_questions(resp):
@@ -604,7 +624,7 @@ class ClarifyView(discord.ui.View):
             self.stop()
         return cb
 
-async def handle_clarification(message, resp):
+async def handle_clarification(message, resp, edit_msg=None):
     """Show the agent's clarifying questions with clickable options and resume the run."""
     questions = parse_clarify_questions(resp)
     lines = ["🤔 **A quick clarification to get this right:**"]
@@ -626,17 +646,18 @@ async def handle_clarification(message, resp):
         ipc_resp = await send_daemon_ipc(f"AI CLARIFY {answer}")
 
     if ipc_resp.startswith("ai:clarify,"):
-        await handle_clarification(message, ipc_resp)
+        await handle_clarification(message, ipc_resp, edit_msg=edit_msg)
     elif ipc_resp.startswith("ai:pending_approval,"):
-        await handle_tool_approval(message, ipc_resp)
+        await handle_tool_approval(message, ipc_resp, edit_msg=edit_msg)
     elif ipc_resp.startswith("ai:cancelled,response:"):
-        await send_discord_reply(message, "🛑 " + ipc_resp[len("ai:cancelled,response:"):])
+        await send_discord_reply(message, "🛑 " + ipc_resp[len("ai:cancelled,response:"):], edit_msg=edit_msg)
     elif ipc_resp.startswith("ai:ok"):
-        await send_discord_reply(message, extract_ai_ok_response(ipc_resp), speakable=True)
+        await send_discord_reply(message, extract_ai_ok_response(ipc_resp), speakable=True, edit_msg=edit_msg)
     elif ipc_resp == "error:daemon_offline":
-        await send_discord_reply(message, "❌ Daemon went offline during clarification.")
+        await send_discord_reply(message, "❌ Daemon went offline during clarification.", edit_msg=edit_msg)
     else:
-        await send_discord_reply(message, f"Agent response: {ipc_resp}")
+        await send_discord_reply(message, f"Agent response: {ipc_resp}", edit_msg=edit_msg)
+
 
 async def _exec_bridge_command(action, args):
     """Execute one agent->bridge command via discord.py. Returns a result string.
@@ -742,7 +763,7 @@ async def pending_deletes_cleanup_loop():
             print(f"[Discord Bridge] pending deletes cleanup error: {e}", flush=True)
         await asyncio.sleep(15.0)  # Check every 15 seconds
 
-async def _run_ai_with_traces(message, query_text, author):
+async def _run_ai_with_traces(message, query_text, author, reply_msg=None):
     """Run an AI query with a trace thread for full transparency.
     Creates a thread, polls traces in parallel, then schedules cleanup."""
     global active_session_id
@@ -780,7 +801,7 @@ async def _run_ai_with_traces(message, query_text, author):
         except asyncio.TimeoutError:
             trace_task.cancel()
 
-    # Disable the stop button
+    # Disable the stop button on trace thread
     if thread and initial_msg:
         try:
             disabled_view = StopView(author=message.author, session_id=sess)
@@ -788,7 +809,17 @@ async def _run_ai_with_traces(message, query_text, author):
                 item.disabled = True
             await initial_msg.edit(view=disabled_view)
         except Exception as e:
-            print(f"[Discord Bridge] Failed to disable stop button: {e}", flush=True)
+            print(f"[Discord Bridge] Failed to disable trace thread stop button: {e}", flush=True)
+
+    # Disable the stop button on the main reply_msg
+    if reply_msg:
+        try:
+            disabled_view = StopView(author=message.author, session_id=sess)
+            for item in disabled_view.children:
+                item.disabled = True
+            await reply_msg.edit(view=disabled_view)
+        except Exception as e:
+            print(f"[Discord Bridge] Failed to disable main reply stop button: {e}", flush=True)
 
     # Send final trace marker
     if thread:
@@ -800,6 +831,7 @@ async def _run_ai_with_traces(message, query_text, author):
         db_schedule_delete(thread.id, 120)
         # Also schedule local deletion
         asyncio.create_task(_delete_thread_after(thread, 120))
+
 
     return resp
 
@@ -916,16 +948,24 @@ async def on_message(message):
 
         # Run AI query with trace thread for transparency
         async with message.channel.typing():
-            resp = await _run_ai_with_traces(message, message.content, author=message.author)
+            # Send immediate reply message with StopView in the main channel
+            sess = active_session_id or "default"
+            reply_msg = None
+            try:
+                reply_msg = await message.reply("🧠 Thinking...", view=StopView(author=message.author, session_id=sess))
+            except Exception as e:
+                print(f"[Discord Bridge] Failed to send initial thinking reply: {e}", flush=True)
+
+            resp = await _run_ai_with_traces(message, message.content, author=message.author, reply_msg=reply_msg)
             
             # Parse the standard daemon response format
             if resp.startswith("ai:pending_approval,"):
                 # Tool requires user approval before execution
-                await handle_tool_approval(message, resp)
+                await handle_tool_approval(message, resp, edit_msg=reply_msg)
                 return
             elif resp.startswith("ai:clarify,"):
                 # F3: agent is asking the user clarifying questions
-                await handle_clarification(message, resp)
+                await handle_clarification(message, resp, edit_msg=reply_msg)
                 return
             elif resp.startswith("ai:cancelled,response:"):
                 ai_resp = "🛑 " + resp[len("ai:cancelled,response:"):]
@@ -940,8 +980,9 @@ async def on_message(message):
             if not ai_resp or not ai_resp.strip():
                 ai_resp = "..."
                 
-            # Send reply on Discord
-            await send_discord_reply(message, ai_resp, speakable=True)
+            # Send reply on Discord (editing the initial placeholder message)
+            await send_discord_reply(message, ai_resp, speakable=True, edit_msg=reply_msg)
+
 
 if __name__ == "__main__":
     try:
