@@ -802,25 +802,19 @@ async def _run_ai_with_traces(message, query_text, author, reply_msg=None):
         except asyncio.TimeoutError:
             trace_task.cancel()
 
-    # Disable the stop button on trace thread
+    # Remove the stop button on trace thread
     if thread and initial_msg:
         try:
-            disabled_view = StopView(author=message.author, session_id=sess)
-            for item in disabled_view.children:
-                item.disabled = True
-            await initial_msg.edit(view=disabled_view)
+            await initial_msg.edit(view=None)
         except Exception as e:
-            print(f"[Discord Bridge] Failed to disable trace thread stop button: {e}", flush=True)
+            print(f"[Discord Bridge] Failed to remove trace thread stop button: {e}", flush=True)
 
-    # Disable the stop button on the main reply_msg
+    # Remove the stop button on the main reply_msg
     if reply_msg:
         try:
-            disabled_view = StopView(author=message.author, session_id=sess)
-            for item in disabled_view.children:
-                item.disabled = True
-            await reply_msg.edit(view=disabled_view)
+            await reply_msg.edit(view=None)
         except Exception as e:
-            print(f"[Discord Bridge] Failed to disable main reply stop button: {e}", flush=True)
+            print(f"[Discord Bridge] Failed to remove main reply stop button: {e}", flush=True)
 
     # Send final trace marker
     if thread:

@@ -141,12 +141,57 @@ define workspace_write_file with filename as Str and content as Str returning St
     set ok to write_file(full_path and content)
     return full_path
 
+# ---- Recursive helper to list all workspace files ----
+define workspace_list_recursive with dir_path as Str and relative_prefix as Str returning Str:
+    set entries to list_directory(dir_path)
+    set len to length_list(entries)
+    set result to ""
+    set i to 0
+    repeat while i < len:
+        set entry to get_list(entries and i)
+        set first_char to get_character(entry and 0)
+        # Skip hidden files/directories starting with '.' (char 46)
+        if first_char != 46:
+            set full_entry_path to path_join(dir_path and entry)
+            set rel_entry_path to entry
+            if string_length(relative_prefix) > 0:
+                set rel_entry_path to path_join(relative_prefix and entry)
+            
+            if is_directory(full_entry_path) == 1:
+                set sub_list to workspace_list_recursive(full_entry_path and rel_entry_path)
+                if string_length(sub_list) > 0:
+                    if string_length(result) > 0:
+                        set result to concat(result and concat("\n" and sub_list))
+                    else:
+                        set result to sub_list
+            else:
+                if string_length(result) > 0:
+                    set result to concat(result and concat("\n" and rel_entry_path))
+                else:
+                    set result to rel_entry_path
+        set i to i + 1
+    free_list(entries)
+    return result
+
+# ================================================================
+# workspace_write_file — Write a file into the active workspace
+# ================================================================
+define workspace_write_file with filename as Str and content as Str returning Str:
+    set full_path to path_join("config/workspaces/active" and filename)
+    set ok to write_file(full_path and content)
+    return full_path
+
 # ================================================================
 # workspace_read_file — Read a file from the active workspace
 # ================================================================
 define workspace_read_file with filename as Str returning Str:
     set full_path to path_join("config/workspaces/active" and filename)
     if file_exists(full_path) == 0:
+        # Check fallback inside uploads/ folder
+        set fallback_path to path_join("config/workspaces/active/uploads" and filename)
+        if file_exists(fallback_path) == 1:
+            set content to read_file(fallback_path)
+            return content
         display f"[workspace] Error: file not found: {full_path}"
         return ""
     set content to read_file(full_path)
@@ -162,6 +207,11 @@ define workspace_read_prior with session_id as Str and filename as Str returning
         return ""
     set full_path to path_join(session_path and filename)
     if file_exists(full_path) == 0:
+        # Check fallback inside uploads/ folder
+        set fallback_path to path_join(path_join(session_path and "uploads") and filename)
+        if file_exists(fallback_path) == 1:
+            set content to read_file(fallback_path)
+            return content
         display f"[workspace] Error: file not found in prior session: {full_path}"
         return ""
     set content to read_file(full_path)
@@ -175,19 +225,7 @@ define workspace_list_active returning Str:
     set active_path to "config/workspaces/active"
     if file_exists(active_path) == 0:
         return ""
-    set entries to list_directory(active_path)
-    set len to length_list(entries)
-    set result to ""
-    set i to 0
-    repeat while i < len:
-        set entry to get_list(entries and i)
-        if string_length(result) > 0:
-            set result to concat(result and concat("\n" and entry))
-        else:
-            set result to entry
-        set i to i + 1
-    free_list(entries)
-    return result
+    return workspace_list_recursive(active_path and "")
 
 # ================================================================
 # workspace_archive_old — Archive old session workspaces past max age
