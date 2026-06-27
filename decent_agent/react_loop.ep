@@ -68,6 +68,46 @@ define react_check_cancel with session_id as Str returning Int:
                 return 1
     return 0
 
+# Drain all pending whispers for a session (called before each LLM call).
+# Returns concatenated whisper text or empty string. Consumes all whispers.
+define react_drain_whispers with session_id as Str returning Str:
+    set db to storage_get_db()
+    if db == 0:
+        return ""
+    set key to session_id
+    if string_length(key) == 0:
+        set key to "default"
+    set es to string_replace(key and "'" and "''")
+    set rows to sql_query(db and f"SELECT id, content FROM trace_whispers WHERE session_id='{es}' ORDER BY id;")
+    set count to length_list(rows)
+    if count == 0:
+        return ""
+    set out to ""
+    set idx to 0
+    repeat while idx < count:
+        set row to get_list(rows and idx)
+        set w_id to get_list(row and 0)
+        set w_content to get_list(row and 1)
+        set out to concat(out and f"- {w_content}\n")
+        set ok to sql_execute(db and f"DELETE FROM trace_whispers WHERE id={w_id};")
+        set idx to idx + 1
+    return out
+
+# Write a mid-turn message from the agent to the user via trace_events.
+# The Discord bridge picks up events with type 'mid_message' and posts them
+# in the main channel, NOT in the trace thread. Does NOT end the react loop.
+define react_write_mid_message with session_id as Str and content as Str returning Int:
+    set db to storage_get_db()
+    if db == 0:
+        return 1
+    set key to session_id
+    if string_length(key) == 0:
+        set key to "default"
+    set es to string_replace(key and "'" and "''")
+    set ec to string_replace(content and "'" and "''")
+    set ok to sql_execute(db and f"INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('{es}', 'mid_message', '{ec}', strftime('%s','now'), 0);")
+    return ok
+
 # Remove stray harmony/gemma channel-marker tokens from a string. Longer variants
 # are stripped before their unterminated forms so nothing is left behind.
 define react_strip_markers with s as Str returning Str:
@@ -360,6 +400,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
     set final_answer to ""
     set finished to 0
     set reply_blocks to 0
+    set override_output to ""
     
     # Check if we are running under automated test suite
     set is_test to 0
@@ -403,24 +444,37 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         if map_contains(ctx and "session_id") == 1:
             set trace_sid to map_get_val(ctx and "session_id")
         
+        set query_prompt to current_prompt
+        # Whisper checkpoint — drain any mid-turn user guidance before the LLM call.
+        set whispers to react_drain_whispers(trace_sid)
+        if string_length(whispers) > 0:
+            display f"[ReAct] Received mid-turn whisper(s) from user."
+            set ok to trace_emit(trace_db and trace_sid and "whisper_received" and whispers)
+            set query_prompt to concat(query_prompt and f"\n[MID-TURN USER GUIDANCE — the user has sent additional direction while you are processing. This is NOT a new request — it is live guidance for your CURRENT task. Read it carefully and adjust your approach. You may acknowledge it with mid_message but do NOT end your turn with reply_request unless the user explicitly tells you to stop.]\n{whispers}[/MID-TURN USER GUIDANCE]\n")
+        
         set raw_output to ""
-        if is_test == 0:
-            set selected_model to ""
-            if map_contains(ctx and "selected_model") == 1:
-                set selected_model to map_get_val(ctx and "selected_model")
-            set ok to trace_emit(trace_db and trace_sid and "thinking" and f"Querying {selected_model}...")
-            set raw_output to query_local_llm(current_prompt and selected_model)
-            
-        if string_length(raw_output) == 0:
-            if is_test == 1:
-                set raw_output to react_simulate_inference(current_prompt and loop_idx)
-            else if use_simulation == 0:
-                set raw_output to inference_run(model and current_prompt and 0 and 200)
-            else:
-                # No LLM available — tell user instead of faking it with hardcoded heuristics
-                display "[ReAct] No LLM response and no local model loaded. Returning error."
-                set final_answer to "Error: No LLM model responded. Please check that your selected model is running in Ollama or LM Studio."
-                set finished to 1
+        if string_length(override_output) > 0:
+            set raw_output to override_output
+            set override_output to ""
+            display f"[ReAct] Skipping LLM call, using overridden raw_output."
+        else:
+            if is_test == 0:
+                set selected_model to ""
+                if map_contains(ctx and "selected_model") == 1:
+                    set selected_model to map_get_val(ctx and "selected_model")
+                set ok to trace_emit(trace_db and trace_sid and "thinking" and f"Querying {selected_model}...")
+                set raw_output to query_local_llm(query_prompt and selected_model)
+                
+            if string_length(raw_output) == 0:
+                if is_test == 1:
+                    set raw_output to react_simulate_inference(query_prompt and loop_idx)
+                else if use_simulation == 0:
+                    set raw_output to inference_run(model and query_prompt and 0 and 200)
+                else:
+                    # No LLM available — tell user instead of faking it with hardcoded heuristics
+                    display "[ReAct] No LLM response and no local model loaded. Returning error."
+                    set final_answer to "Error: No LLM model responded. Please check that your selected model is running in Ollama or LM Studio."
+                    set finished to 1
             
         display f"LLM raw response:\n{raw_output}\n----------------"
         set ok to trace_emit(trace_db and trace_sid and "raw_output" and substring(raw_output and 0 and 1800))
@@ -531,6 +585,57 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 free_list(values_list)
                 return "PENDING_CLARIFICATION"
 
+            # --- Mid-message response (does NOT end the turn) ---
+            # Allows the agent to send a visible message to the user while continuing
+            # its current task. Used to acknowledge whispers, give progress updates,
+            # or respond to mid-turn guidance without stopping work.
+            if tool_name equals "mid_message":
+                set mid_content to react_extract_raw_arg(args_str)
+                set mid_sess to ""
+                if map_contains(ctx and "session_id") == 1:
+                    set mid_sess to map_get_val(ctx and "session_id")
+                set ok to react_write_mid_message(mid_sess and mid_content)
+                display f"[ReAct] Mid-message sent to user: {substring(mid_content and 0 and 100)}"
+                # Note: react_write_mid_message already writes to trace_events.
+                # Do NOT also call trace_emit here — that creates a duplicate row.
+                # Check if the same LLM output contains a SECOND Action: after mid_message.
+                # Without this, actions like request_clarification bundled with mid_message
+                # are silently dropped (the parser only catches the first Action:).
+                set raw_lower to string_lower(raw_output)
+                set first_action_pos to string_index_of(raw_lower and "action:")
+                set after_action to ""
+                if first_action_pos >= 0:
+                    set search_start to first_action_pos + 7
+                    if search_start < string_length(raw_output):
+                        set remainder to substring(raw_lower and search_start and string_length(raw_lower) - search_start)
+                        set second_offset to string_index_of(remainder and "action:")
+                        if second_offset >= 0:
+                            set abs_pos to search_start + second_offset
+                            set after_action to substring(raw_output and abs_pos and string_length(raw_output) - abs_pos)
+                if string_length(after_action) > 0:
+                    set second_action to react_parse_action(after_action)
+                    set second_found to map_get_val(second_action and "found")
+                    if second_found == 1:
+                        set second_name to map_get_val(second_action and "tool_name")
+                        set second_args to map_get_val(second_action and "args_str")
+                        display f"[ReAct] Found second action after mid_message: {second_name}"
+                        # Inject the second action as if the LLM just emitted it on the next turn.
+                        set override_output to f"Thought: (continued from mid_message)\nAction: {second_name}({second_args})"
+                        set current_prompt to concat(current_prompt and "\nObservation: Mid-message delivered to the user.\n")
+                        set current_prompt to concat(current_prompt and override_output)
+                        free_map(second_action)
+                        free_list(args_list)
+                        # Do NOT increment loop_idx — re-parse on the same iteration budget.
+                        continue
+                    free_map(second_action)
+                # No second action — continue the loop with a fresh LLM call.
+                set current_prompt to concat(current_prompt and "\n")
+                set current_prompt to concat(current_prompt and raw_output)
+                set current_prompt to concat(current_prompt and "\nObservation: Mid-message delivered to the user. Continue your current task.\n")
+                free_list(args_list)
+                set loop_idx to loop_idx + 1
+                continue
+
             # --- Tool Approval Gate ---
             set needs_approval to tools_requires_approval(tool_name and args_list)
             if needs_approval == 1:
@@ -635,8 +740,17 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set audit_map to observer_audit(ctx and current_prompt and audit_payload)
                     set verdict to map_get_val(audit_map and "verdict")
                     if verdict equals "BLOCKED":
-                        set action_allowed to 0
-                        set action_reason to map_get_val(audit_map and "reason")
+                        # If the human already approved this action (via the approval gate
+                        # or auto_approve), the observer's BLOCKED verdict is advisory only.
+                        # The human is the authority — the observer cannot overrule explicit
+                        # human approval. The concern is still logged for transparency.
+                        if needs_approval == 1:
+                            set block_reason to map_get_val(audit_map and "reason")
+                            display f"Observer audit: BLOCKED (overridden by human approval). Reason: {block_reason}"
+                            set ok to trace_emit(trace_db and trace_sid and "audit" and f"Observer: BLOCKED (human-approved, advisory only) — {block_reason}")
+                        else:
+                            set action_allowed to 0
+                            set action_reason to map_get_val(audit_map and "reason")
                     free_map(audit_map)
                     
             set tool_result to ""
@@ -664,7 +778,14 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set audit_reason to map_get_val(audit_map and "reason")
                 free_map(audit_map)
                 
-                if verdict equals "ALLOWED":
+                # Fail-open for reply_request when the observer had a parse failure.
+                # reply_request is user-visible text, not a dangerous system action.
+                # A parse failure should surface the response rather than silently
+                # discard it and re-prompt. Dangerous tools retain fail-closed.
+                set is_parse_fail to 0
+                if string_contains(audit_reason and "Audit unavailable") == 1:
+                    set is_parse_fail to 1
+                if verdict equals "ALLOWED" or else is_parse_fail == 1:
                     display "Observer reply audit: ALLOWED. Final response ready."
                     set ok to trace_emit(trace_db and trace_sid and "reply_audit" and "Reply audit: ALLOWED")
                     set final_answer to tool_result
@@ -694,8 +815,13 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set obs_budget to react_observation_budget(obs_model and string_length(current_prompt))
                 set current_prompt to concat(current_prompt and "\n")
                 set current_prompt to concat(current_prompt and raw_output)
+                # Guard: empty tool results cause the LLM to continuation-complete the
+                # Observation line instead of starting a new Thought/Action block.
+                set obs_text to tool_result
+                if string_length(string_trim(tool_result)) == 0:
+                    set obs_text to "[empty result — the tool returned no output]"
                 set current_prompt to concat(current_prompt and "\nObservation: ")
-                set current_prompt to concat(current_prompt and react_fit_observation(tool_result and obs_budget))
+                set current_prompt to concat(current_prompt and react_fit_observation(obs_text and obs_budget))
                 set current_prompt to concat(current_prompt and "\n")
                 
                 set denials to 0
@@ -710,10 +836,12 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         else:
             display "No valid action parsed. Re-prompting for correct Action grammar..."
             set ok to trace_emit(trace_db and trace_sid and "no_action" and "No valid action parsed, re-prompting")
-            # Enforce Turn Boundary Rejection!
+            # Enforce Turn Boundary Rejection — tell the model EXACTLY what it did wrong
+            # and what it must do. Common cause: the LLM continuation-completed an empty
+            # Observation instead of starting a new Thought/Action block.
             set current_prompt to concat(current_prompt and "\n")
             set current_prompt to concat(current_prompt and raw_output)
-            set current_prompt to concat(current_prompt and "\n[SELF-CHECK FAIL: INVISIBLE TO USER] You did NOT call the reply_request tool or any other tool. To reply to the user, you must use the grammar: Action: reply_request([\"your response\"])\n")
+            set current_prompt to concat(current_prompt and "\n[FORMAT VIOLATION — YOUR OUTPUT ABOVE WAS INVALID]\nYour last output did NOT contain a valid Action call. What went wrong:\n1. You may have output raw data or continued from a previous Observation — stop. The Observation is COMPLETE. Move on.\n2. You may have written prose without calling any tool.\n\nYou MUST now output EXACTLY this format:\nThought: <your reasoning about what to do next>\nAction: <tool_name>([\"<arg1>\"])\n\nTo reply to the user: Action: reply_request([\"your response\"])\nTo call a tool: Action: <tool_name>([\"arg\"])\n\nDo NOT continue or amend the previous Observation. It is finished. Output your next Thought and Action now.\n")
             
         set loop_idx to loop_idx + 1
 
@@ -738,6 +866,10 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
     set args_list to map_get_val(pending and "args_list")
     set current_prompt to map_get_val(pending and "prompt_state")
     set raw_output to map_get_val(pending and "raw_output")
+    set trace_db to storage_get_db()
+    set trace_sid to ""
+    if map_contains(ctx and "session_id") == 1:
+        set trace_sid to map_get_val(ctx and "session_id")
     
     set loop_idx to 0
     if map_contains(pending and "loop_idx") == 1:
@@ -790,8 +922,12 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
                 set audit_map to observer_audit(ctx and current_prompt and audit_payload)
                 set verdict to map_get_val(audit_map and "verdict")
                 if verdict equals "BLOCKED":
-                    set action_allowed to 0
-                    set tool_result to concat("BLOCKED by Observer: " and map_get_val(audit_map and "reason"))
+                    # Since this is react_resume_approved, the action has been explicitly
+                    # approved by the human user. The observer's BLOCKED verdict is advisory
+                    # only and does not prevent execution.
+                    set block_reason to map_get_val(audit_map and "reason")
+                    display f"Observer audit: BLOCKED (overridden by human approval). Reason: {block_reason}"
+                    set ok to trace_emit(trace_db and trace_sid and "audit" and f"Observer: BLOCKED (human-approved, advisory only) — {block_reason}")
                 free_map(audit_map)
         
         if action_allowed == 1:
@@ -909,6 +1045,15 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set ok to map_insert(ctx and "active_runs" and active_runs + 1)
 
     set ok to map_insert(ctx and "auto_approve" and 0)
+    # Drain any stale whispers left over from a previous query. Without this,
+    # whispers written during query A but not consumed before it finished would
+    # bleed into query B's first LLM call.
+    set stale_sid to ""
+    if map_contains(ctx and "session_id") == 1:
+        set stale_sid to map_get_val(ctx and "session_id")
+    set stale_whispers to react_drain_whispers(stale_sid)
+    if string_length(stale_whispers) > 0:
+        display f"[ReAct] Discarded {string_length(stale_whispers)} chars of stale whispers from previous query."
     set sanitized_user_prompt to prompt_sanitize_input(user_prompt)
     # Trigger Hebbian learning on prompt concepts
     set ok to react_hebbian_trigger(memory_mgr and sanitized_user_prompt)

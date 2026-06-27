@@ -28,7 +28,7 @@ define prompt_get_kernel returning Str:
     return kernel
 
 define prompt_get_context with memory_mgr as Map:
-    set ctx to "Current system context:\n"
+    set ctx to "[PERSISTENT MEMORY — accumulated across ALL prior sessions, NOT specific to the current conversation. Do NOT treat these as active context or reference them as current session knowledge.]\n"
     if map_contains(memory_mgr and "lessons_count") == 1:
         set count to map_get_val(memory_mgr and "lessons_count")
         set ctx to concat(ctx and f"- Distilled lessons: {count}\n")
@@ -170,8 +170,11 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
     # F2: denial/gate handling rule — always present so the agent never fabricates a
     # permanent inability from an authorization gate or a user's decision.
     set system_prompt to concat(system_prompt and "[DENIAL HANDLING] If an Observation begins with [GATE], the action is blocked by an authorization gate, not by any limitation of yours — explain it needs elevated access/approval and ASK the user if they want to authorize it; never say you are permanently unable. If an Observation begins with [USER DECLINED], the user chose not to run it — acknowledge their choice, do not retry it, and ask what they want instead. Never present a gate or a user's decision as your own incapacity.\n")
-    # F1: per-turn reasoning + free-forming plan scaffold.
     set system_prompt to concat(system_prompt and "[REASONING] Reason freshly every turn — think the problem through against THIS user and THIS task before you act, rather than reusing one fixed plan. Keep a short running plan and revise it as you learn; it is a scaffold, not a contract. If your model emits a native reasoning/thinking channel, use it; otherwise put your step-by-step reasoning in your Thought. Keep the final reply itself clean and direct — no scaffolding, no thinking tags.\n")
+    # Guidance to keep the user informed during multi-turn / long execution tasks.
+    set system_prompt to concat(system_prompt and "[MID-TURN PROGRESS UPDATES] For long-running, multi-turn tasks (e.g., performing multiple workspace/codebase reads, compile cycles, or command executions in a sequence), you MUST keep the user informed of your progress. Use the mid_message tool during your processing loop to tell the user what step you are currently on, what findings you have made so far, or if you need to ask for mid-process advice. Do not remain silent while chaining multiple tool executions.\n")
+    # Epistemic integrity — non-overridable invariant, same pattern as DENIAL HANDLING.
+    set system_prompt to concat(system_prompt and "[EPISTEMIC INTEGRITY] You MUST distinguish between what you have directly accessed via tools and what you have been shown fragments of. If you have not called workspace_read or codebase_read on a file, you have NOT read it — retrieval fragments injected into your context are NOT a read, they are cosine-similarity matches of a few chunks. Never claim 'I have read' or 'I recognize' content you have not verified with a tool call. Never claim ownership of actions, outputs, or experiences described in content produced by another entity — if a document describes another AI's behaviour, those are NOT your actions. When uncertain whether content is yours, state that honestly. Use tools to verify before making claims — if you cannot verify, do not claim.\n")
     # Always-present cognitive/psychological/architectural frameworks (standard layer).
     set system_prompt to concat(system_prompt and prompt_get_frameworks())
     if string_length(tools_schema) > 0:
@@ -228,11 +231,11 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
     if map_contains(ctx and "in_memory_context") == 1:
         set mem_ctx to map_get_val(ctx and "in_memory_context")
         if string_length(mem_ctx) > 0:
-            # RAG/retrieved context, bound to the CURRENT question. Place it before the
-            # user request and tell the agent to treat it as relevant source material —
-            # this is what "ties RAG to the prompt". Brackets in the payload were
-            # sanitized to parentheses by the caller so the IPC tag parses.
-            set system_prompt to concat(system_prompt and f"[RETRIEVED CONTEXT — excerpts from the user's indexed documents/memory that the retriever judged relevant to the user's NEXT message. Treat these as source material: draw on them directly when they answer the question, and say so when you do. They are not the user's words.]\n{mem_ctx}\n\n")
+            # RAG/retrieved context, bound to the CURRENT question. Epistemic constraints
+            # prevent the agent from claiming it has "read" documents it only received
+            # fragments of, or claiming ownership of other entities' work. Brackets in
+            # the payload were sanitized to parentheses by the caller so the IPC tag parses.
+            set system_prompt to concat(system_prompt and f"[RETRIEVED CONTEXT — FRAGMENTS ONLY]\nThe following are cosine-similarity retrieval chunks from the user's indexed documents. EPISTEMIC CONSTRAINTS:\n1. These are FRAGMENTS, not a full read. You have NOT read the document. To read it, call workspace_read.\n2. You did NOT produce this content. Do not claim ownership or personal memory of events described here unless your own session history contains them.\n3. Do not say 'I have read this' — say 'I can see fragments retrieved from this document' or 'the retrieved excerpts show...'\n4. If the user asks you to read a document, USE workspace_read — do not rely on these fragments alone.\n5. If the content describes actions by another AI or entity, do NOT claim those as your own.\n{mem_ctx}\n\n")
     set system_prompt to concat(system_prompt and "\nUser Request:\n")
             
     set sanitized_user_prompt to prompt_sanitize_input(user_prompt)

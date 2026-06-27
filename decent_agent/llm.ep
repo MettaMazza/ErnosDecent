@@ -206,6 +206,89 @@ define get_model_context_limit with model_name as Str returning Int:
             set limit to model_max
     return limit
 
+# ── Split-message chat completion for observer audits ─────────────────────────
+# Sends system_content as a "system" role message (reference context) and
+# user_content as a "user" role message (the current audit instruction).
+# For Ollama, also requests JSON-only output via "format": "json" in options.
+# Response parsing is identical to try_chat_completion.
+define try_chat_completion_split with url as Str and model_name as Str and system_content as Str and user_content as Str returning Str:
+    set headers to "Content-Type: application/json"
+    set escaped_system to json_escape_string(system_content)
+    set escaped_user to json_escape_string(user_content)
+
+    set body to "{\"model\": \""
+    set body to concat(body and model_name)
+    set body to concat(body and "\", \"messages\": [{\"role\": \"system\", \"content\": \"")
+    set body to concat(body and escaped_system)
+    set body to concat(body and "\"}, {\"role\": \"user\", \"content\": \"")
+    set body to concat(body and escaped_user)
+    if string_contains(url and "11434") == 1:
+        set num_ctx to get_model_context_limit(model_name)
+        set num_ctx_str to int_to_string(num_ctx)
+        # /v1/chat/completions is the OpenAI-compatible endpoint — it requires
+        # "response_format": {"type": "json_object"}, NOT the Ollama-native "format": "json".
+        set body to concat(body and "\"}], \"response_format\": {\"type\": \"json_object\"}, \"options\": {\"num_ctx\": ")
+        set body to concat(body and num_ctx_str)
+        set body to concat(body and "}}")
+    else:
+        set body to concat(body and "\"}]}")
+
+    display f"[LLM DEBUG] POST (split) {url} model={model_name} body_len={string_length(body)}"
+    set response to http_post(url and headers and body)
+    display f"[LLM DEBUG] Raw response length: {string_length(response)}"
+
+    if string_length(response) == 0:
+        display "[LLM DEBUG] FAIL: http_post returned empty string"
+        return ""
+
+    if string_length(response) < 200:
+        display f"[LLM DEBUG] Short response: {response}"
+
+    if response equals "Error: connection failed":
+        display "[LLM DEBUG] FAIL: connection failed"
+        return ""
+
+    set response to http_dechunk(response)
+    display f"[LLM DEBUG] After dechunk length: {string_length(response)}"
+
+    if string_contains(response and "\"error\":") == 1:
+        display f"[LLM DEBUG] FAIL: response contains error JSON key"
+        return ""
+
+    set root_node to json_parse(response)
+    if root_node == 0:
+        display "[LLM DEBUG] FAIL: json_parse returned 0"
+        return ""
+
+    set choices_node to get_json_object_value(root_node and "choices")
+    if choices_node == 0:
+        display "[LLM DEBUG] FAIL: no 'choices' in JSON"
+        return ""
+
+    set choices_list to get_json_value(choices_node)
+    if length_list(choices_list) == 0:
+        display "[LLM DEBUG] FAIL: choices list empty"
+        return ""
+
+    set first_choice to get_list(choices_list and 0)
+    if first_choice == 0:
+        display "[LLM DEBUG] FAIL: first choice is null"
+        return ""
+
+    set message_node to get_json_object_value(first_choice and "message")
+    if message_node == 0:
+        display "[LLM DEBUG] FAIL: no 'message' in choice"
+        return ""
+
+    set content_node to get_json_object_value(message_node and "content")
+    if content_node == 0:
+        display "[LLM DEBUG] FAIL: no 'content' in message"
+        return ""
+
+    set content_str to get_json_value(content_node)
+    display f"[LLM DEBUG] SUCCESS: got content length={string_length(content_str)}"
+    return content_str
+
 define try_chat_completion with url as Str and model_name as Str and prompt as Str returning Str:
     set headers to "Content-Type: application/json"
     set escaped_prompt to json_escape_string(prompt)
@@ -435,7 +518,26 @@ define query_via_router with prompt as Str and selected_model as Str returning S
         set i to i + 1
     return ""
 
-define query_local_llm with prompt as Str and selected_model as Str returning Str:
+# ── Repetition-loop detector ─────────────────────────────────────────────────
+# Scans the tail of a generated string for consecutive repeating sequences.
+# Returns 1 if a unit of length 8–200 chars repeats 3+ times at the tail.
+define detect_repetition_loop with s as Str returning Int:
+    set len to string_length(s)
+    if len < 30:
+        return 0
+    set L to 8
+    repeat while L <= 200:
+        if len >= 3 * L:
+            set sub1 to substring(s and len - L and L)
+            set sub2 to substring(s and len - 2 * L and L)
+            if sub1 equals sub2:
+                set sub3 to substring(s and len - 3 * L and L)
+                if sub2 equals sub3:
+                    return 1
+        set L to L + 1
+    return 0
+
+define query_local_llm_raw with prompt as Str and selected_model as Str returning Str:
     if string_length(selected_model) > 0:
         # Structured router path first (model_registry). On any miss, fall through to
         # the original cascade below — fully preserved, including the gemma4:26b default.
@@ -489,6 +591,69 @@ define query_local_llm with prompt as Str and selected_model as Str returning St
             return res
     if is_port_open("127.0.0.1" and 1234) == 1:
         set res to try_chat_completion("http://127.0.0.1:1234/v1/chat/completions" and "gemma4:26b" and prompt)
+        if string_length(res) > 0:
+            return res
+
+    return ""
+
+# ── Public entry point with loop-detection retry ─────────────────────────────
+# Wraps query_local_llm_raw. If the LLM gets stuck in a repetition loop,
+# appends a loop-avoidance directive and retries up to 3 times.
+define query_local_llm with prompt as Str and selected_model as Str returning Str:
+    set current_prompt to prompt
+    set retries to 0
+    repeat while retries < 3:
+        set raw_output to query_local_llm_raw(current_prompt and selected_model)
+        if string_length(raw_output) == 0:
+            return raw_output
+        if detect_repetition_loop(string_trim(raw_output)) == 1:
+            display f"[WARNING] LLM repetition loop detected on attempt {retries + 1}/3. Retrying with loop-avoidance directive..."
+            set current_prompt to concat(prompt and "\n\n[SYSTEM DIRECTION: Your previous output contained a repetition loop — the same phrase was repeated many times in sequence. Produce a FRESH response. Vary your phrasing. Do NOT repeat sentences or paragraphs.]")
+            set retries to retries + 1
+        else:
+            return raw_output
+    display "[ERROR] LLM stuck in repetition loop after 3 retries. Returning error."
+    return "Error: LLM output contained a repetition loop and could not recover after 3 retries."
+
+# ── Split-message JSON entry point for observer audits ────────────────────────
+# Like query_local_llm_raw but sends system_content as "system" role and
+# user_content as "user" role, and requests JSON format from Ollama.
+# Uses the same cascade (router → LM Studio → Ollama → llama.cpp).
+# No repetition-loop retry — audit responses are short and structured.
+define query_local_llm_json with system_content as Str and user_content as Str and selected_model as Str returning Str:
+    # For the split call, we bypass the router (it only takes a single prompt)
+    # and go straight to the endpoint cascade with try_chat_completion_split.
+
+    if string_length(selected_model) > 0:
+        # 1. Try selected_model on LM Studio (1234)
+        if is_port_open("127.0.0.1" and 1234) == 1:
+            set res to try_chat_completion_split("http://127.0.0.1:1234/v1/chat/completions" and selected_model and system_content and user_content)
+            if string_length(res) > 0:
+                return res
+
+        # 2. Try selected_model on Ollama (11434)
+        if is_port_open("127.0.0.1" and 11434) == 1:
+            set res to try_chat_completion_split("http://127.0.0.1:11434/v1/chat/completions" and selected_model and system_content and user_content)
+            if string_length(res) > 0:
+                return res
+
+        # 3. Try selected_model on llama.cpp (8080/8081)
+        if is_port_open("127.0.0.1" and 8080) == 1:
+            set res to try_chat_completion_split("http://127.0.0.1:8080/v1/chat/completions" and selected_model and system_content and user_content)
+            if string_length(res) > 0:
+                return res
+        if is_port_open("127.0.0.1" and 8081) == 1:
+            set res to try_chat_completion_split("http://127.0.0.1:8081/v1/chat/completions" and selected_model and system_content and user_content)
+            if string_length(res) > 0:
+                return res
+
+    # Default cascade with gemma4:26b
+    if is_port_open("127.0.0.1" and 11434) == 1:
+        set res to try_chat_completion_split("http://127.0.0.1:11434/v1/chat/completions" and "gemma4:26b" and system_content and user_content)
+        if string_length(res) > 0:
+            return res
+    if is_port_open("127.0.0.1" and 1234) == 1:
+        set res to try_chat_completion_split("http://127.0.0.1:1234/v1/chat/completions" and "gemma4:26b" and system_content and user_content)
         if string_length(res) > 0:
             return res
 

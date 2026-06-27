@@ -48,6 +48,16 @@ def sig_handler(signum, frame):
 signal.signal(signal.SIGTERM, sig_handler)
 signal.signal(signal.SIGINT, sig_handler)
 
+_active_tasks = set()
+
+def create_tracked_task(coro):
+    """Create a task and keep a strong reference to it in _active_tasks
+    to prevent the garbage collector from destroying it mid-flight."""
+    task = asyncio.create_task(coro)
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
+    return task
+
 # Load configuration
 config = load_config()
 discord_cfg = config.get('discord', {})
@@ -162,6 +172,28 @@ APPROVAL_TIMEOUT = None
 
 active_session_id = "default"
 
+# Whisper mid-message system: tracks whether the AI is currently processing.
+# When True, incoming messages are treated as mid-turn whispers instead of new queries.
+_ai_busy = False
+_ai_busy_channel_id = None  # channel where the active query originated
+
+def db_write_whisper(session_id, content):
+    """Write a mid-turn whisper to SQLite for the react loop to pick up."""
+    try:
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        now = int(time.time())
+        cursor.execute(
+            "INSERT INTO trace_whispers (session_id, content, created_at) VALUES (?, ?, ?)",
+            (session_id, content, now)
+        )
+        conn.commit()
+        conn.close()
+        return "ok"
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to write whisper: {e}", flush=True)
+        return f"error:{e}"
+
 async def get_active_session_id():
     resp = await send_daemon_ipc("SESSION ACTIVE")
     if resp.startswith("session:active_id,id:"):
@@ -199,7 +231,20 @@ def _read_ipc_token():
 
 
 async def send_daemon_ipc(cmd_str):
-    """Send a raw IPC command to the daemon and return the response."""
+    """Send a raw IPC command to the daemon and return the response.
+    Uses an independent task so the IPC call survives parent task cancellation
+    (which happens when discord.py cleans up on_message coroutines)."""
+    try:
+        return await _send_daemon_ipc_inner(cmd_str)
+    except asyncio.CancelledError:
+        print("[DELIVERY] WARNING: IPC task was cancelled mid-flight (asyncio.CancelledError)", flush=True)
+        return "error:daemon_offline"
+    except Exception as e:
+        print(f"[Discord Bridge] IPC send wrapper failed: {e}", flush=True)
+        return "error:daemon_offline"
+
+async def _send_daemon_ipc_inner(cmd_str):
+    """Inner IPC implementation, shielded from cancellation by the caller."""
     try:
         token = _read_ipc_token()
         if token:
@@ -216,7 +261,11 @@ async def send_daemon_ipc(cmd_str):
             chunks.append(chunk)
         writer.close()
         await writer.wait_closed()
-        return b''.join(chunks).decode('utf-8', errors='ignore').strip()
+        result = b''.join(chunks).decode('utf-8', errors='ignore').strip()
+        if not result:
+            print("[DELIVERY] WARNING: IPC returned empty response (daemon may have crashed)", flush=True)
+            return "error:daemon_rebooted"
+        return result
     except (ConnectionResetError, ConnectionAbortedError) as cre:
         print(f"[Discord Bridge] IPC connection lost/reset: {cre}", flush=True)
         return "error:daemon_rebooted"
@@ -282,6 +331,14 @@ async def query_daemon_ipc(prompt, author=None):
 
 import re
 
+async def _delayed_delete(msg, delay_seconds):
+    """Delete a Discord message after a delay. Fire-and-forget via asyncio.create_task."""
+    try:
+        await asyncio.sleep(delay_seconds)
+        await msg.delete()
+    except Exception:
+        pass
+
 async def send_discord_reply(message, text, speakable=False, edit_msg=None):
     """Send a reply, splitting into chunks if it exceeds Discord's 2000-char limit.
     When speakable=True, a 🔊 button is attached to the final chunk that plays the
@@ -313,12 +370,14 @@ async def send_discord_reply(message, text, speakable=False, edit_msg=None):
             if edit_msg:
                 try:
                     await edit_msg.edit(content=text, view=view)
-                except Exception:
+                    print(f"[DELIVERY] edit_msg.edit() succeeded, msg_id={edit_msg.id}", flush=True)
+                except Exception as edit_err:
+                    print(f"[DELIVERY] edit_msg.edit() FAILED: {type(edit_err).__name__}: {edit_err} — falling back to reply", flush=True)
                     await message.reply(text, view=view)
             else:
                 await message.reply(text, view=view)
     except Exception as e:
-        print(f"[Discord Bridge] Failed to send reply message: {e}", flush=True)
+        print(f"[DELIVERY] send_discord_reply OUTER EXCEPTION: {type(e).__name__}: {e}", flush=True)
 
 
 def parse_pending_approval(resp):
@@ -526,6 +585,42 @@ class SpeakView(discord.ui.View):
         except Exception as e:
             await interaction.followup.send(f"🔇 Failed to upload audio: {e}", ephemeral=True)
 
+async def _handle_approval_bg(message, resp, reply_msg, trace_ctx):
+    """Background task wrapper for handle_tool_approval.
+    Runs independently of on_message so discord.py can't cancel it."""
+    global _ai_busy, _ai_busy_channel_id
+    try:
+        await handle_tool_approval(message, resp, edit_msg=reply_msg)
+    except Exception as e:
+        print(f"[DELIVERY] _handle_approval_bg EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        try:
+            await message.reply(f"⚠️ Error during approval flow: {e}")
+        except Exception:
+            pass
+    finally:
+        _ai_busy = False
+        _ai_busy_channel_id = None
+        if trace_ctx:
+            await _cleanup_traces(trace_ctx)
+
+async def _handle_clarify_bg(message, resp, reply_msg, trace_ctx):
+    """Background task wrapper for handle_clarification.
+    Runs independently of on_message so discord.py can't cancel it."""
+    global _ai_busy, _ai_busy_channel_id
+    try:
+        await handle_clarification(message, resp, edit_msg=reply_msg)
+    except Exception as e:
+        print(f"[DELIVERY] _handle_clarify_bg EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        try:
+            await message.reply(f"⚠️ Error during clarification flow: {e}")
+        except Exception:
+            pass
+    finally:
+        _ai_busy = False
+        _ai_busy_channel_id = None
+        if trace_ctx:
+            await _cleanup_traces(trace_ctx)
+
 async def handle_tool_approval(message, resp, edit_msg=None):
     """Handle a pending tool approval: show a card with interactive buttons and wait for user decision."""
     tool_name, summary = parse_pending_approval(resp)
@@ -550,6 +645,8 @@ async def handle_tool_approval(message, resp, edit_msg=None):
             item.disabled = True
         await approval_msg.edit(content=f"⏰ **Timed out** — `{tool_name}` was auto-denied.", view=view)
         await send_daemon_ipc("AI DENY")
+        try: await approval_msg.delete()
+        except Exception: pass
         return
         
     if view.value is True:
@@ -562,37 +659,71 @@ async def handle_tool_approval(message, resp, edit_msg=None):
         await approval_msg.edit(content=f"❌ **Denied** `{tool_name}` — cancelled.", view=view)
         ipc_resp = await send_daemon_ipc("AI DENY")
         
+    try: await approval_msg.delete()
+    except Exception: pass
+
     # Process the result from the daemon after approval/denial
+    print(f"[DELIVERY] Approval IPC resp: len={len(ipc_resp) if ipc_resp else 'None'} prefix={repr(ipc_resp[:80]) if ipc_resp else 'None'}", flush=True)
     if ipc_resp.startswith("ai:pending_approval,"):
-        # Chained approval — another gated tool in the same ReAct loop
+        print("[DELIVERY] Approval result: chained pending_approval", flush=True)
         await handle_tool_approval(message, ipc_resp, edit_msg=edit_msg)
+    elif ipc_resp.startswith("ai:clarify,"):
+        print("[DELIVERY] Approval result: clarify", flush=True)
+        await handle_clarification(message, ipc_resp, edit_msg=edit_msg)
     elif ipc_resp.startswith("ai:cancelled,response:"):
+        print("[DELIVERY] Approval result: cancelled", flush=True)
         await send_discord_reply(message, "🛑 " + ipc_resp[len("ai:cancelled,response:"):], edit_msg=edit_msg)
     elif ipc_resp.startswith("ai:ok"):
         ai_resp = extract_ai_ok_response(ipc_resp)
+        print(f"[DELIVERY] Approval result: ai:ok, len={len(ai_resp)}", flush=True)
         await send_discord_reply(message, ai_resp, speakable=True, edit_msg=edit_msg)
-    elif ipc_resp == "error:daemon_offline":
-        await send_discord_reply(message, "❌ Daemon went offline during approval.", edit_msg=edit_msg)
+    elif ipc_resp == "error:daemon_offline" or ipc_resp == "error:daemon_rebooted":
+        print(f"[DELIVERY] Approval result: {ipc_resp}", flush=True)
+        await send_discord_reply(message, "🔄 Daemon went offline during processing. Please retry.", edit_msg=edit_msg)
     else:
+        print(f"[DELIVERY] Approval result: UNMATCHED resp={repr(ipc_resp[:200])}", flush=True)
         await send_discord_reply(message, f"Agent response: {ipc_resp}", edit_msg=edit_msg)
 
 
 # --- F3: clarification over Discord ---
 def parse_clarify_questions(resp):
-    """Parse 'ai:clarify,questions:<json array of "text||opt1||opt2">' -> [(text, [opts])]."""
+    """Parse 'ai:clarify,questions:<json or raw "text||opt1||opt2">' -> [(text, [opts])].
+    Falls back to raw string splitting if JSON parsing fails."""
     idx = resp.find("questions:")
-    raw = resp[idx + len("questions:"):] if idx >= 0 else "[]"
+    raw = resp[idx + len("questions:"):].strip() if idx >= 0 else ""
+    if not raw:
+        return []
+    # Primary: try JSON array parse
     try:
         arr = json.loads(raw)
-    except Exception:
-        arr = []
-    out = []
-    for item in arr:
-        bits = str(item).split("||")
-        qtext = bits[0] if bits else ""
-        opts = [b for b in bits[1:] if b]
-        out.append((qtext, opts))
-    return out
+        if isinstance(arr, list):
+            out = []
+            for item in arr:
+                bits = str(item).split("||")
+                qtext = bits[0] if bits else ""
+                opts = [b for b in bits[1:] if b]
+                out.append((qtext, opts))
+            return out
+    except Exception as e:
+        print(f"[Discord Bridge] JSON parse failed for clarify questions: {e}", flush=True)
+        print(f"[Discord Bridge] Raw questions string: {raw[:200]}", flush=True)
+    # Fallback: treat as a single raw question string (strip outer brackets/quotes)
+    fallback = raw.strip()
+    if fallback.startswith("["):
+        fallback = fallback[1:]
+    if fallback.endswith("]"):
+        fallback = fallback[:-1]
+    fallback = fallback.strip()
+    if fallback.startswith('"'):
+        fallback = fallback[1:]
+    if fallback.endswith('"'):
+        fallback = fallback[:-1]
+    if not fallback:
+        return []
+    bits = fallback.split("||")
+    qtext = bits[0] if bits else ""
+    opts = [b.strip() for b in bits[1:] if b.strip()]
+    return [(qtext, opts)]
 
 class ClarifyView(discord.ui.View):
     """Buttons for the agent's clarifying options (one click = one answer), plus a
@@ -631,6 +762,18 @@ class ClarifyView(discord.ui.View):
 async def handle_clarification(message, resp, edit_msg=None):
     """Show the agent's clarifying questions with clickable options and resume the run."""
     questions = parse_clarify_questions(resp)
+    if not questions:
+        print(f"[Discord Bridge] WARNING: clarify response parsed to zero questions. Raw: {resp[:300]}", flush=True)
+        # Fall back: surface the raw question text so the user at least sees something
+        idx = resp.find("questions:")
+        raw_q = resp[idx + len("questions:"):].strip() if idx >= 0 else "The agent has a question."
+        # Strip JSON-array wrapping for display
+        raw_q = raw_q.strip('[] "')
+        if "||" in raw_q:
+            parts = raw_q.split("||")
+            questions = [(parts[0], [p.strip() for p in parts[1:] if p.strip()])]
+        else:
+            questions = [(raw_q[:500], [])]
     lines = ["🤔 **A quick clarification to get this right:**"]
     for i, (qt, opts) in enumerate(questions):
         lines.append(f"**{i+1}. {qt}**")
@@ -646,8 +789,17 @@ async def handle_clarification(message, resp, edit_msg=None):
         ipc_resp = await send_daemon_ipc("AI CLARIFY __USE_CURRENT__")
     else:
         answer = view.value
-        await clar_msg.edit(content=f"✅ Got it: `{answer}`", view=view)
+        if answer == "__USE_CURRENT__":
+            await clar_msg.edit(content="✅ Proceeding with current understanding.", view=view)
+        else:
+            await clar_msg.edit(content=f"✅ Got it: `{answer}`", view=view)
         ipc_resp = await send_daemon_ipc(f"AI CLARIFY {answer}")
+
+    # Clean up the clarification card — it served its purpose
+    try:
+        await clar_msg.delete()
+    except Exception:
+        pass
 
     if ipc_resp.startswith("ai:clarify,"):
         await handle_clarification(message, ipc_resp, edit_msg=edit_msg)
@@ -715,14 +867,16 @@ async def bridge_poll_loop():
             print(f"[Discord Bridge] poll loop error: {e}", flush=True)
         await asyncio.sleep(1.0)
 
-async def trace_poll_loop(thread, session_id, done_event):
+async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
     """Poll SQLite directly for trace events and stream them into a Discord thread.
-    Runs until done_event is set (inference complete)."""
+    Runs until done_event is set (inference complete).
+    mid_message events are posted to main_channel (visible to user), not the trace thread."""
     TYPE_EMOJI = {
         "thinking": "🧠", "raw_output": "📝", "reasoning": "💭",
         "lookback": "🔍", "action": "⚙️", "approval": "🔒",
         "audit": "🛡️", "tool_exec": "🔧", "tool_result": "📋",
         "reply_audit": "✅", "no_action": "⚠️", "done": "🏁",
+        "mid_message": "💬", "whisper_received": "🫧",
     }
     await client.wait_until_ready()
     while not done_event.is_set():
@@ -732,7 +886,17 @@ async def trace_poll_loop(thread, session_id, done_event):
                 etype = ev.get("type", "info")
                 content = ev.get("content", "")
                 emoji = TYPE_EMOJI.get(etype, "ℹ️")
-                # Truncate to Discord's 2000-char limit
+                # mid_message: post to main channel as a visible agent reply
+                if etype == "mid_message" and main_channel:
+                    mid_text = f"💬 {content}"
+                    if len(mid_text) > 2000:
+                        mid_text = mid_text[:1997] + "..."
+                    try:
+                        await main_channel.send(mid_text)
+                    except Exception as e:
+                        print(f"[Discord Bridge] mid_message send error: {e}", flush=True)
+                    continue
+                # All other events: post to trace thread
                 msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
                 if len(msg) > 2000:
                     msg = msg[:1997] + "..."
@@ -743,6 +907,32 @@ async def trace_poll_loop(thread, session_id, done_event):
         except Exception as e:
             print(f"[Discord Bridge] trace poll error: {e}", flush=True)
         await asyncio.sleep(0.5)  # Poll every 500ms for near-real-time
+    # Final drain — pick up any events written during/after the last LLM call
+    # (e.g. mid_message events). Without this, the loop exits before delivering them.
+    try:
+        events = db_poll_traces(session_id)
+        for ev in events:
+            etype = ev.get("type", "info")
+            content = ev.get("content", "")
+            emoji = TYPE_EMOJI.get(etype, "ℹ️")
+            if etype == "mid_message" and main_channel:
+                mid_text = f"💬 {content}"
+                if len(mid_text) > 2000:
+                    mid_text = mid_text[:1997] + "..."
+                try:
+                    await main_channel.send(mid_text)
+                except Exception as e:
+                    print(f"[Discord Bridge] mid_message final-drain send error: {e}", flush=True)
+                continue
+            msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
+            if len(msg) > 2000:
+                msg = msg[:1997] + "..."
+            try:
+                await thread.send(msg)
+            except Exception as e:
+                print(f"[Discord Bridge] trace thread final-drain send error: {e}", flush=True)
+    except Exception as e:
+        print(f"[Discord Bridge] final trace drain error: {e}", flush=True)
 
 async def pending_deletes_cleanup_loop():
     """On startup, check for any threads whose 2-minute delete timer expired while
@@ -767,35 +957,57 @@ async def pending_deletes_cleanup_loop():
             print(f"[Discord Bridge] pending deletes cleanup error: {e}", flush=True)
         await asyncio.sleep(15.0)  # Check every 15 seconds
 
-async def _run_ai_with_traces(message, query_text, author, reply_msg=None):
-    """Run an AI query with a trace thread for full transparency.
-    Creates a thread, polls traces in parallel, then schedules cleanup."""
+async def _start_ai_with_traces(message, query_text, author, reply_msg=None):
+    """Start an AI query with a trace thread. Returns (resp, trace_ctx) where trace_ctx
+    contains the lifecycle objects needed to keep polling alive across approval/clarification
+    flows. The caller MUST call _cleanup_traces(trace_ctx) when the full response cycle ends."""
     global active_session_id
     sess = active_session_id or "default"
 
+    trace_ctx = {
+        "thread": None,
+        "initial_msg": None,
+        "done_event": asyncio.Event(),
+        "trace_task": None,
+        "reply_msg": reply_msg,
+    }
+
     # Create a trace thread attached to the user's message
-    initial_msg = None
     try:
         thread = await message.create_thread(
             name=f"🔍 ErnOS Trace — {query_text[:50]}",
-            auto_archive_duration=60  # 1 hour archive (minimum Discord allows)
+            auto_archive_duration=60
         )
-        initial_msg = await thread.send(
+        trace_ctx["thread"] = thread
+        trace_ctx["initial_msg"] = await thread.send(
             "🔍 **ErnOS Reasoning Trace** — live stream of thinking, tool calls, and audit results.\n*This thread auto-deletes 2 minutes after the response.*",
             view=StopView(author=message.author, session_id=sess)
         )
     except Exception as e:
         print(f"[Discord Bridge] Failed to create trace thread: {e}", flush=True)
-        thread = None
 
-    # Start trace poller in background
-    done_event = asyncio.Event()
-    trace_task = None
+    # Start trace poller in background — stays alive until _cleanup_traces is called
+    thread = trace_ctx["thread"]
     if thread:
-        trace_task = asyncio.create_task(trace_poll_loop(thread, sess, done_event))
+        trace_ctx["trace_task"] = asyncio.create_task(
+            trace_poll_loop(thread, sess, trace_ctx["done_event"], main_channel=message.channel)
+        )
 
     # Run the actual AI query (blocking IPC call)
     resp = await query_daemon_ipc(query_text, author=author)
+
+    return resp, trace_ctx
+
+
+async def _cleanup_traces(trace_ctx):
+    """Stop the trace poll loop, remove buttons, and schedule thread deletion.
+    Called ONCE when the full response cycle is complete (after all approval/clarification
+    rounds are finished)."""
+    done_event = trace_ctx["done_event"]
+    trace_task = trace_ctx["trace_task"]
+    thread = trace_ctx["thread"]
+    initial_msg = trace_ctx["initial_msg"]
+    reply_msg = trace_ctx["reply_msg"]
 
     # Signal trace poller to stop, give it one last poll cycle
     done_event.set()
@@ -812,12 +1024,9 @@ async def _run_ai_with_traces(message, query_text, author, reply_msg=None):
         except Exception as e:
             print(f"[Discord Bridge] Failed to remove trace thread stop button: {e}", flush=True)
 
-    # Remove the stop button on the main reply_msg
-    if reply_msg:
-        try:
-            await reply_msg.edit(view=None)
-        except Exception as e:
-            print(f"[Discord Bridge] Failed to remove main reply stop button: {e}", flush=True)
+    # NOTE: Do NOT edit reply_msg here to remove its view. By this point,
+    # send_discord_reply has already replaced the StopView with SpeakView (TTS button).
+    # Editing reply_msg with view=None would strip the TTS button from the final response.
 
     # Send final trace marker
     if thread:
@@ -825,13 +1034,9 @@ async def _run_ai_with_traces(message, query_text, author, reply_msg=None):
             await thread.send("🏁 **Trace complete** — this thread will auto-delete in 2 minutes.")
         except Exception:
             pass
-        # Schedule crash-resilient deletion via SQLite
         db_schedule_delete(thread.id, 120)
-        # Also schedule local deletion
-        asyncio.create_task(_delete_thread_after(thread, 120))
+        create_tracked_task(_delete_thread_after(thread, 120))
 
-
-    return resp
 
 async def _delete_thread_after(thread, delay_secs):
     """Delete a trace thread after a delay. If we crash, the pending_deletes_cleanup_loop
@@ -855,13 +1060,13 @@ async def on_ready():
     # Start the node<->bridge RPC poll loop (idempotent — guard against double-start).
     if not getattr(client, "_bridge_poll_started", False):
         client._bridge_poll_started = True
-        asyncio.create_task(bridge_poll_loop())
+        create_tracked_task(bridge_poll_loop())
         print("[Discord Bridge] node<->bridge RPC poll loop started.", flush=True)
     
     # Start the pending-deletes cleanup loop (crash resilience for trace threads)
     if not getattr(client, "_cleanup_started", False):
         client._cleanup_started = True
-        asyncio.create_task(pending_deletes_cleanup_loop())
+        create_tracked_task(pending_deletes_cleanup_loop())
         print("[Discord Bridge] Pending trace thread cleanup loop started.", flush=True)
 
     # Sync slash commands globally
@@ -873,6 +1078,7 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
+    global _ai_busy, _ai_busy_channel_id, active_session_id
     # Ignore bot's own messages
     if message.author == client.user:
         return
@@ -915,6 +1121,26 @@ async def on_message(message):
     if has_text:
         print(f"[Discord Bridge] Processing message from {message.author}: {message.content}", flush=True)
         
+        # Whisper detection: if AI is busy processing, treat incoming messages as
+        # mid-turn guidance instead of queuing a new AI query. The whisper is written
+        # to SQLite and picked up by the react loop before its next LLM call.
+        if _ai_busy and message.channel.id == _ai_busy_channel_id:
+            sess = active_session_id or "default"
+            result = db_write_whisper(sess, message.content)
+            if result == "ok":
+                try:
+                    whisper_ack = await message.reply("🫧 **Whisper received** — your guidance will reach the agent on its next reasoning step.")
+                    # Auto-delete the acknowledgement after 5 seconds to keep the chat clean
+                    create_tracked_task(_delayed_delete(whisper_ack, 5.0))
+                except Exception:
+                    pass
+            else:
+                try:
+                    await message.reply(f"⚠️ Could not queue whisper: {result}")
+                except Exception:
+                    pass
+            return
+        
         # Check if the message is the /new command
         if message.content.strip().startswith("/new"):
             parts = message.content.strip().split(maxsplit=1)
@@ -937,51 +1163,186 @@ async def on_message(message):
             resp_set = await send_daemon_ipc(set_cmd)
             
             if "session:set_ok" in resp_set or "session:ok" in resp_new:
-                global active_session_id
                 active_session_id = session_id
                 await send_discord_reply(message, f"✨ Started a new AI session: **{title}** (ID: `{session_id}`). Current context has been reset.")
             else:
                 await send_discord_reply(message, f"❌ Failed to start new session. Daemon response: {resp_set}")
             return
 
-        # Run AI query with trace thread for transparency
+async def _run_query_bg(message, reply_msg):
+    """Independently scheduled background task to run the AI query.
+    By running on the global loop, this is immune to discord.py event cancellations."""
+    global _ai_busy, _ai_busy_channel_id
+    trace_ctx = None
+    bg_launched = False
+    try:
         async with message.channel.typing():
-            # Send immediate reply message with StopView in the main channel
-            sess = active_session_id or "default"
-            reply_msg = None
-            try:
-                reply_msg = await message.reply("🧠 Thinking...", view=StopView(author=message.author, session_id=sess))
-            except Exception as e:
-                print(f"[Discord Bridge] Failed to send initial thinking reply: {e}", flush=True)
-
-            resp = await _run_ai_with_traces(message, message.content, author=message.author, reply_msg=reply_msg)
-            
+            resp, trace_ctx = await _start_ai_with_traces(message, message.content, author=message.author, reply_msg=reply_msg)
+            print(f"[DELIVERY] IPC resp: len={len(resp) if resp else 'None'} prefix={repr(resp[:80]) if resp else 'None'}", flush=True)
+            print(f"[DELIVERY] reply_msg={'id=' + str(reply_msg.id) if reply_msg else 'None'}", flush=True)
+        
             # Parse the standard daemon response format
             if resp.startswith("ai:pending_approval,"):
-                # Tool requires user approval before execution
-                await handle_tool_approval(message, resp, edit_msg=reply_msg)
+                print("[DELIVERY] Branch: pending_approval — launching background task", flush=True)
+                create_tracked_task(_handle_approval_bg(message, resp, reply_msg, trace_ctx))
+                bg_launched = True
                 return
             elif resp.startswith("ai:clarify,"):
-                # F3: agent is asking the user clarifying questions
-                await handle_clarification(message, resp, edit_msg=reply_msg)
+                print("[DELIVERY] Branch: clarify — launching background task", flush=True)
+                create_tracked_task(_handle_clarify_bg(message, resp, reply_msg, trace_ctx))
+                bg_launched = True
                 return
             elif resp.startswith("ai:cancelled,response:"):
+                print("[DELIVERY] Branch: cancelled", flush=True)
                 ai_resp = "🛑 " + resp[len("ai:cancelled,response:"):]
             elif resp.startswith("ai:ok"):
                 ai_resp = extract_ai_ok_response(resp)
+                print(f"[DELIVERY] Branch: ai:ok, extracted len={len(ai_resp)}, empty={not ai_resp.strip()}", flush=True)
             elif resp == "error:daemon_rebooted":
+                print("[DELIVERY] Branch: daemon_rebooted", flush=True)
                 ai_resp = "🔄 The daemon restarted while processing your request. Please try again."
             elif resp == "error:daemon_offline":
+                print("[DELIVERY] Branch: daemon_offline", flush=True)
                 ai_resp = "❌ Error: Cognitive AI Agent daemon is offline or unreachable."
             else:
+                print(f"[DELIVERY] Branch: UNMATCHED resp={repr(resp[:200])}", flush=True)
                 ai_resp = f"Error processing request: {resp}"
                 
             # Ensure we don't send an empty reply
             if not ai_resp or not ai_resp.strip():
+                print("[DELIVERY] WARNING: ai_resp was empty, replacing with '...'", flush=True)
                 ai_resp = "..."
                 
             # Send reply on Discord (editing the initial placeholder message)
+            print(f"[DELIVERY] Calling send_discord_reply len={len(ai_resp)}", flush=True)
             await send_discord_reply(message, ai_resp, speakable=True, edit_msg=reply_msg)
+            print("[DELIVERY] send_discord_reply returned OK", flush=True)
+    except Exception as e:
+        print(f"[DELIVERY] EXCEPTION in response path: {type(e).__name__}: {e}", flush=True)
+        try:
+            fallback = ai_resp if 'ai_resp' in locals() else f"Internal error: {e}"
+            await message.reply(fallback)
+            print("[DELIVERY] Emergency fallback reply sent", flush=True)
+        except Exception as e2:
+            print(f"[DELIVERY] EMERGENCY FALLBACK ALSO FAILED: {e2}", flush=True)
+    finally:
+        if not bg_launched:
+            _ai_busy = False
+            _ai_busy_channel_id = None
+            if trace_ctx:
+                await _cleanup_traces(trace_ctx)
+
+
+@client.event
+async def on_message(message):
+    global _ai_busy, _ai_busy_channel_id, active_session_id
+    # Ignore bot's own messages
+    if message.author == client.user:
+        return
+    
+    # Listen only to the configured channel or threads within it
+    is_target_channel = message.channel.id == channel_id
+    is_thread_in_target_channel = getattr(message.channel, 'parent_id', None) == channel_id
+    if not is_target_channel and not is_thread_in_target_channel:
+        return
+
+    # Process attachments first (uploads/RAG indexing)
+    if message.attachments:
+        has_text = len(message.content.strip()) > 0
+        for attachment in message.attachments:
+            if attachment.filename.endswith(('.txt', '.md', '.pdf', '.json', '.js', '.py', '.ep', '.ts', '.c', '.h')):
+                try:
+                    # Download the file content
+                    file_data = await attachment.read()
+                    
+                    # Ensure uploads dir exists in active workspace
+                    uploads_dir = "config/workspaces/active/uploads"
+                    os.makedirs(uploads_dir, exist_ok=True)
+                    
+                    filepath = os.path.join(uploads_dir, attachment.filename)
+                    with open(filepath, "wb") as f:
+                        f.write(file_data)
+                    
+                    # Call RAG indexing API on daemon
+                    payload = {"filename": f"uploads/{attachment.filename}", "content": file_data.decode('utf-8', errors='ignore')}
+                    cmd = f"RAG INDEX {json.dumps(payload)}"
+                    resp = await send_daemon_ipc(cmd)
+                    
+                    success = "index:ok" in resp
+                    upload_msg = resp[len("index:error,reason:"):] if not success else ""
+                    if success:
+                        await message.reply(f"✅ Indexed `{attachment.filename}` into local RAG storage and saved to workspace!")
+                    else:
+                        await message.reply(f"❌ Failed to index `{attachment.filename}`: {upload_msg}")
+                except Exception as e:
+                    await message.reply(f"❌ Error processing `{attachment.filename}`: {str(e)}")
+
+    # Now process text if present
+    has_text = len(message.content.strip()) > 0
+    if has_text:
+        print(f"[Discord Bridge] Processing message from {message.author}: {message.content}", flush=True)
+        
+        # Whisper detection: if AI is busy processing, treat incoming messages as
+        # mid-turn guidance instead of queuing a new AI query. The whisper is written
+        # to SQLite and picked up by the react loop before its next LLM call.
+        if _ai_busy and message.channel.id == _ai_busy_channel_id:
+            sess = active_session_id or "default"
+            result = db_write_whisper(sess, message.content)
+            if result == "ok":
+                try:
+                    whisper_ack = await message.reply("🫧 **Whisper received** — your guidance will reach the agent on its next reasoning step.")
+                    # Auto-delete the acknowledgement after 5 seconds to keep the chat clean
+                    create_tracked_task(_delayed_delete(whisper_ack, 5.0))
+                except Exception:
+                    pass
+            else:
+                try:
+                    await message.reply(f"⚠️ Could not queue whisper: {result}")
+                except Exception:
+                    pass
+            return
+        
+        # Check if the message is the /new command
+        if message.content.strip().startswith("/new"):
+            parts = message.content.strip().split(maxsplit=1)
+            title = parts[1] if len(parts) > 1 else "Discord Session"
+            import time
+            session_id = f"session_{int(time.time() * 1000)}"
+            
+            # Start a new session
+            new_payload = {
+                "id": session_id,
+                "title": f"{title} {int(time.time())}",
+                "model": "",
+                "system_prompt": "You are ErnOS Agent — a digital cognitive system running on a local decentralized node."
+            }
+            new_cmd = f"SESSION NEW {json.dumps(new_payload)}"
+            resp_new = await send_daemon_ipc(new_cmd)
+            
+            # Switch to the new session on the daemon
+            set_cmd = f"SESSION SET {session_id}"
+            resp_set = await send_daemon_ipc(set_cmd)
+            
+            if "session:set_ok" in resp_set or "session:ok" in resp_new:
+                active_session_id = session_id
+                await send_discord_reply(message, f"✨ Started a new AI session: **{title}** (ID: `{session_id}`). Current context has been reset.")
+            else:
+                await send_discord_reply(message, f"❌ Failed to start new session. Daemon response: {resp_set}")
+            return
+
+        # Start AI query via a background task to completely shield it from event cancellations.
+        sess = active_session_id or "default"
+        reply_msg = None
+        try:
+            reply_msg = await message.reply("🧠 Thinking...", view=StopView(author=message.author, session_id=sess))
+        except Exception as e:
+            print(f"[Discord Bridge] Failed to send initial thinking reply: {e}", flush=True)
+
+        # Set busy flag — stays True across the entire background run
+        _ai_busy = True
+        _ai_busy_channel_id = message.channel.id
+        create_tracked_task(_run_query_bg(message, reply_msg))
+        return
 
 
 if __name__ == "__main__":

@@ -4,9 +4,9 @@
 # Deterministic, FAIL-CLOSED extraction of the audit verdict from the LLM's raw
 # output. The model is told to emit {"verdict": "...", "reason": "..."} but often
 # wraps it in prose or ```json fences; this robustly pulls the {...} object and
-# reads the real verdict. If it cannot parse, the verdict stays BLOCKED — an
-# unreadable audit is treated as a block, never silently allowed. (Logic is
-# identical to the previous inline parser in observer_audit.)
+# reads the real verdict. If JSON parsing fails, falls back to text-scanning for
+# ALLOWED/BLOCKED keywords. If neither works, the verdict stays BLOCKED — an
+# unreadable audit is treated as a block, never silently allowed.
 
 import "string"
 import "collections"
@@ -18,6 +18,7 @@ define observer_parse_verdict with audit_raw as Str returning Map:
     set ok to map_insert(result and "reason" and "Audit unavailable (no/invalid LLM verdict) — failing closed.")
     if string_length(audit_raw) == 0:
         return result
+    # Primary path: extract JSON object and parse verdict/reason fields
     set obj_start to string_index_of(audit_raw and "{")
     set obj_end to string_last_index_of(audit_raw and "}")
     set audit_json to audit_raw
@@ -25,10 +26,68 @@ define observer_parse_verdict with audit_raw as Str returning Map:
         set audit_json to substring(audit_raw and obj_start and obj_end - obj_start + 1)
     set audit_node to json_parse(audit_json)
     if audit_node != 0:
+        # Try verdict field — check common key name variations
         set verd_node to get_json_object_value(audit_node and "verdict")
+        if verd_node == 0:
+            set verd_node to get_json_object_value(audit_node and "Verdict")
+        if verd_node == 0:
+            set verd_node to get_json_object_value(audit_node and "decision")
+        if verd_node == 0:
+            set verd_node to get_json_object_value(audit_node and "Decision")
+        if verd_node == 0:
+            set verd_node to get_json_object_value(audit_node and "result")
+        if verd_node == 0:
+            set verd_node to get_json_object_value(audit_node and "Result")
+        if verd_node == 0:
+            set verd_node to get_json_object_value(audit_node and "outcome")
+        # Try reason field — check common key name variations
         set reason_node to get_json_object_value(audit_node and "reason")
+        if reason_node == 0:
+            set reason_node to get_json_object_value(audit_node and "Reason")
+        if reason_node == 0:
+            set reason_node to get_json_object_value(audit_node and "explanation")
+        if reason_node == 0:
+            set reason_node to get_json_object_value(audit_node and "Explanation")
+        if reason_node == 0:
+            set reason_node to get_json_object_value(audit_node and "justification")
         if verd_node != 0:
-            set ok to map_insert(result and "verdict" and get_json_value(verd_node))
+            set raw_verdict to string_to_upper(get_json_value(verd_node))
+            # Normalise verdict value: map common synonyms to ALLOWED/BLOCKED
+            if string_contains(raw_verdict and "ALLOW") == 1:
+                set ok to map_insert(result and "verdict" and "ALLOWED")
+            else if string_contains(raw_verdict and "PERMIT") == 1:
+                set ok to map_insert(result and "verdict" and "ALLOWED")
+            else if string_contains(raw_verdict and "SAFE") == 1:
+                set ok to map_insert(result and "verdict" and "ALLOWED")
+            else if string_contains(raw_verdict and "APPROV") == 1:
+                set ok to map_insert(result and "verdict" and "ALLOWED")
+            else if string_contains(raw_verdict and "PASS") == 1:
+                set ok to map_insert(result and "verdict" and "ALLOWED")
+            else if string_contains(raw_verdict and "BLOCK") == 1:
+                set ok to map_insert(result and "verdict" and "BLOCKED")
+            else if string_contains(raw_verdict and "DENY") == 1:
+                set ok to map_insert(result and "verdict" and "BLOCKED")
+            else if string_contains(raw_verdict and "DENIED") == 1:
+                set ok to map_insert(result and "verdict" and "BLOCKED")
+            else if string_contains(raw_verdict and "REJECT") == 1:
+                set ok to map_insert(result and "verdict" and "BLOCKED")
+            else if string_contains(raw_verdict and "UNSAFE") == 1:
+                set ok to map_insert(result and "verdict" and "BLOCKED")
+            else:
+                set ok to map_insert(result and "verdict" and raw_verdict)
         if reason_node != 0:
             set ok to map_insert(result and "reason" and get_json_value(reason_node))
+        return result
+    # Fallback: JSON parse failed — scan raw text for verdict keywords.
+    # This handles cases where the LLM wraps the verdict in prose, markdown,
+    # or otherwise produces non-JSON output that still contains the decision.
+    set upper to string_to_upper(audit_raw)
+    if string_contains(upper and "ALLOWED") == 1:
+        set ok to map_insert(result and "verdict" and "ALLOWED")
+        set ok to map_insert(result and "reason" and "Verdict extracted via text scan (JSON parse failed)")
+    else if string_contains(upper and "BLOCKED") == 1:
+        set ok to map_insert(result and "verdict" and "BLOCKED")
+        set ok to map_insert(result and "reason" and "Verdict extracted via text scan (JSON parse failed)")
+    # else: stays BLOCKED with the original "Audit unavailable" reason (fail-closed)
     return result
+

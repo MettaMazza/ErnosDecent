@@ -41,6 +41,14 @@ define append_string_to_char_list with char_list as List and s as Str returning 
         set i to i + 1
     return 0
 
+define tools_safe_int with val as Int returning Int:
+    # If the value is a small number, it is already an Int (line number)
+    if val < 1000000:
+        return val
+    # Otherwise, it is a string pointer. Cast to Str and convert.
+    set sval to ptr_to_str(val)
+    return string_to_int(sval)
+
 define tools_create:
     set tools_mgr to create_map()
     set schemas to "Available Tools:\n\n"
@@ -118,6 +126,10 @@ define tools_create:
     set schemas to concat(schemas and "  Description: Pause execution to ask the user up to 3 clarifying questions. Format: \"Question text||opt1||opt2\".\n")
     set schemas to concat(schemas and "  Example: Action: request_clarification([\"Should I build now?||Yes||No\"])\n\n")
     
+    set schemas to concat(schemas and "- mid_message([message: Str]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Send a visible message to the user WITHOUT ending your current turn. Use this to acknowledge mid-turn whispers, give progress updates, or respond to user guidance received while processing. Unlike reply_request, this does NOT stop the ReAct loop — you continue working after sending it.\n")
+    set schemas to concat(schemas and "  Example: Action: mid_message([\"Got your guidance, adjusting approach now.\"])\n\n")
+    
     set schemas to concat(schemas and "- self_prompt_get([section: 'behavior'|'skills']) -> Str\n")
     set schemas to concat(schemas and "  Description: Read your own tool-managed prompt behavior/skills sections.\n")
     set schemas to concat(schemas and "  Example: Action: self_prompt_get([\"behavior\"])\n\n")
@@ -153,6 +165,13 @@ define tools_create:
     set schemas to concat(schemas and "- workspace_read([filename: Str]) -> Str\n")
     set schemas to concat(schemas and "  Description: Read a file from your active session workspace (with fallback to prior sessions/uploads).\n")
     set schemas to concat(schemas and "  Example: Action: workspace_read([\"uploads/file.md\"])\n\n")
+    set schemas to concat(schemas and "- workspace_read_range([filename: Str, start_line: Int, end_line: Int]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Read a specific line range (1-indexed, inclusive) from a file in your workspace.\n")
+    set schemas to concat(schemas and "  Example: Action: workspace_read_range([\"uploads/file.md\", 1, 500])\n\n")
+
+    set schemas to concat(schemas and "- file_info([filename: Str]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Get metadata (byte size and line count) for a workspace file.\n")
+    set schemas to concat(schemas and "  Example: Action: file_info([\"uploads/file.md\"])\n\n")
     
     set schemas to concat(schemas and "- workspace_list([]) -> Str\n")
     set schemas to concat(schemas and "  Description: List files in your active session workspace recursively.\n")
@@ -446,6 +465,8 @@ define tools_is_action_allowed with role as Str and action_name as Str and args_
     if action_name equals "moderation_tool":
         return 1
     if action_name equals "request_clarification":
+        return 1
+    if action_name equals "mid_message":
         return 1
     # F6: reading one's own behavior/skills sections is read-only; EDITING them
     # (self_prompt_set) is omitted here, so it stays admin/owner-only AND approval-gated.
@@ -1152,6 +1173,20 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return workspace_read_prior(ws_sess_id and ws_filename)
         set ws_filename to get_list(args_list and 0)
         return workspace_read_file(ws_filename)
+
+    if action_name equals "workspace_read_range":
+        if length_list(args_list) < 3:
+            return "Error: workspace_read_range requires 3 arguments: filename (Str), start_line (Int), and end_line (Int). Example: Action: workspace_read_range([\"uploads/file.md\", 1, 500])"
+        set ws_filename to get_list(args_list and 0)
+        set ws_start_line to tools_safe_int(get_list(args_list and 1))
+        set ws_end_line to tools_safe_int(get_list(args_list and 2))
+        return workspace_read_range(ws_filename and ws_start_line and ws_end_line)
+
+    if action_name equals "file_info":
+        if length_list(args_list) < 1:
+            return "Error: file_info requires 1 argument (filename). Example: Action: file_info([\"uploads/file.md\"])"
+        set ws_filename to get_list(args_list and 0)
+        return workspace_file_info(ws_filename)
 
     if action_name equals "workspace_list":
         return workspace_list_active()
