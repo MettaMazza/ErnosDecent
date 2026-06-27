@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import signal
 import socket
 import discord
 import asyncio
