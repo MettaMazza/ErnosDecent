@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] - 2026-06-29
+
+Session `55b2e557` — File reading blindness fixes, agent orchestration and swarm system.
+
+### Added
+
+- **Agent Orchestrator** (`decent_agent/orchestrator.ep`, 375 lines) — enables spawning sub-agents
+  as threads with ReAct loops. Thread-safe via mutexes and channels. Functions: `orchestrator_create`,
+  `orchestrator_spawn`, `orchestrator_wait`, `orchestrator_check`, `orchestrator_cancel`,
+  `orchestrator_list`, `orchestrator_swarm`. Swarm supports fan-out with 3 merge strategies:
+  `concat`, `best` (longest), `vote` (majority). Admin-only via fail-closed RBAC gate.
+- **Delegate tools** (`decent_agent/tools.ep`) — 6 new agent-facing tools: `delegate_task`,
+  `delegate_wait`, `delegate_check`, `delegate_cancel`, `delegate_list`, `delegate_swarm`.
+  All admin/owner-gated. Orchestrator state stored in `agent_ctx["orchestrator"]`.
+
+### Fixed
+
+- **Workspace listing blindness** — `workspace_list` now shows `filename (N lines, M bytes)` for
+  files and `dirname/ (dir, K items)` for directories. Depth-limited to 3 levels with truncation
+  at 8000 chars.
+- **File read metadata blindness** — `workspace_read` prepends `[File: name | Lines: N | Size: M bytes]`
+  header. Files over 500 lines append a `workspace_read_range` continuation hint.
+- **Range read blindness** — `workspace_read_range` prepends `[Lines X-Y of N total | File: name]`
+  header and appends continuation hint when more lines exist.
+- **auto_read raw file fallback** — `manage_reading_progress("auto_read", ...)` now falls back to
+  raw workspace file pagination via `workspace_read_range` when no RAG chunks are indexed.
+- **Duplicate function** — removed duplicate `workspace_write_file` definition.
+
+---
+
 ## [Unreleased] - 2026-06-27
 
 Session `55b2e557` — Per-session workspace management, automatic changelog, Discord transparency

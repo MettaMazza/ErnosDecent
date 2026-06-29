@@ -19,7 +19,7 @@ define workspace_json_escape with s as Str returning Str:
             set ok to append_list(result_list and 92)
             set ok to append_list(result_list and 34)
         else:
-            if ch == 92: # \
+            if ch == 92: # \\
                 set ok to append_list(result_list and 92)
                 set ok to append_list(result_list and 92)
             else:
@@ -52,6 +52,20 @@ define workspace_trim_newline with s as Str returning Str:
     if last_char == 13: # carriage return
         return substring(s and 0 and slen - 1)
     return s
+
+# ---- Count newlines in a string (returns line count) ----
+define workspace_count_lines with content as Str returning Int:
+    set len to string_length(content)
+    if len == 0:
+        return 0
+    set lines to 1
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(content and i)
+        if ch == 10:
+            set lines to lines + 1
+        set i to i + 1
+    return lines
 
 # ================================================================
 # workspace_init — Initialize per-session workspace directory
@@ -141,8 +155,10 @@ define workspace_write_file with filename as Str and content as Str returning St
     set ok to write_file(full_path and content)
     return full_path
 
-# ---- Recursive helper to list all workspace files ----
-define workspace_list_recursive with dir_path as Str and relative_prefix as Str returning Str:
+# ---- Recursive helper to list all workspace files with metadata ----
+# Returns formatted entries: "filename  (N lines, M bytes)" for files,
+# "dirname/  (dir, K items)" for directories. Respects max_depth.
+define workspace_list_recursive with dir_path as Str and relative_prefix as Str and depth as Int and max_depth as Int returning Str:
     set entries to list_directory(dir_path)
     set len to length_list(entries)
     set result to ""
@@ -156,33 +172,48 @@ define workspace_list_recursive with dir_path as Str and relative_prefix as Str 
             set rel_entry_path to entry
             if string_length(relative_prefix) > 0:
                 set rel_entry_path to path_join(relative_prefix and entry)
-            
+
             if is_directory(full_entry_path) == 1:
-                set sub_list to workspace_list_recursive(full_entry_path and rel_entry_path)
-                if string_length(sub_list) > 0:
-                    if string_length(result) > 0:
-                        set result to concat(result and concat("\n" and sub_list))
-                    else:
-                        set result to sub_list
-            else:
+                # Count items in this directory
+                set sub_entries to list_directory(full_entry_path)
+                set sub_count to length_list(sub_entries)
+                free_list(sub_entries)
+
+                set dir_label to concat(rel_entry_path and concat("/  (dir, " and concat(int_to_string(sub_count) and " items)")))
                 if string_length(result) > 0:
-                    set result to concat(result and concat("\n" and rel_entry_path))
+                    set result to concat(result and concat("\n" and dir_label))
                 else:
-                    set result to rel_entry_path
+                    set result to dir_label
+
+                # Recurse if within depth limit
+                if depth < max_depth:
+                    set sub_list to workspace_list_recursive(full_entry_path and rel_entry_path and depth + 1 and max_depth)
+                    if string_length(sub_list) > 0:
+                        set result to concat(result and concat("\n" and sub_list))
+            else:
+                # File: read it to get size and line count
+                set file_content to read_file(full_entry_path)
+                set file_size to string_length(file_content)
+                set file_lines to workspace_count_lines(file_content)
+                set file_label to concat(rel_entry_path and concat("  (" and concat(int_to_string(file_lines) and concat(" lines, " and concat(int_to_string(file_size) and " bytes)")))))
+                if string_length(result) > 0:
+                    set result to concat(result and concat("\n" and file_label))
+                else:
+                    set result to file_label
+
+        # Check if output is getting too large (8000 char cap)
+        if string_length(result) > 8000:
+            set result to concat(result and "\n[Listing truncated — use workspace_list([\"subdir\"]) to explore deeper]")
+            free_list(entries)
+            return result
+
         set i to i + 1
     free_list(entries)
     return result
 
 # ================================================================
-# workspace_write_file — Write a file into the active workspace
-# ================================================================
-define workspace_write_file with filename as Str and content as Str returning Str:
-    set full_path to path_join("config/workspaces/active" and filename)
-    set ok to write_file(full_path and content)
-    return full_path
-
-# ================================================================
 # workspace_read_file — Read a file from the active workspace
+# Prepends metadata header and appends continuation hint for large files
 # ================================================================
 define workspace_read_file with filename as Str returning Str:
     set full_path to path_join("config/workspaces/active" and filename)
@@ -191,11 +222,25 @@ define workspace_read_file with filename as Str returning Str:
         set fallback_path to path_join("config/workspaces/active/uploads" and filename)
         if file_exists(fallback_path) == 1:
             set content to read_file(fallback_path)
-            return content
+            set total_lines to workspace_count_lines(content)
+            set total_size to string_length(content)
+            set header to concat("[File: " and concat(filename and concat(" | Lines: " and concat(int_to_string(total_lines) and concat(" | Size: " and concat(int_to_string(total_size) and " bytes]\n"))))))
+            set output to concat(header and content)
+            if total_lines > 500:
+                set hint to concat("\n[File has " and concat(int_to_string(total_lines) and concat(" lines total — use workspace_read_range([\"" and concat(filename and "\", 501, 1000]) to continue]"))))
+                set output to concat(output and hint)
+            return output
         display f"[workspace] Error: file not found: {full_path}"
         return ""
     set content to read_file(full_path)
-    return content
+    set total_lines to workspace_count_lines(content)
+    set total_size to string_length(content)
+    set header to concat("[File: " and concat(filename and concat(" | Lines: " and concat(int_to_string(total_lines) and concat(" | Size: " and concat(int_to_string(total_size) and " bytes]\n"))))))
+    set output to concat(header and content)
+    if total_lines > 500:
+        set hint to concat("\n[File has " and concat(int_to_string(total_lines) and concat(" lines total — use workspace_read_range([\"" and concat(filename and "\", 501, 1000]) to continue]"))))
+        set output to concat(output and hint)
+    return output
 
 # ================================================================
 # workspace_file_info — Get size and line count of a workspace file
@@ -234,6 +279,9 @@ define workspace_file_info with filename as Str returning Str:
 
 # ================================================================
 # workspace_read_range — Read a specific line range from a workspace file
+# Prepends range header with total line count and appends continuation hint
+# Note: get_character is O(n) per call due to internal strlen. For files under
+# 100KB this is tolerable. A C-level patch replaces this with pointer indexing.
 # ================================================================
 define workspace_read_range with filename as Str and start_line as Int and end_line as Int returning Str:
     set full_path to path_join("config/workspaces/active" and filename)
@@ -248,7 +296,9 @@ define workspace_read_range with filename as Str and start_line as Int and end_l
     set len to string_length(content)
     if len == 0:
         return ""
-        
+
+    # Count total lines and find start/end positions in a single pass
+    set total_lines to 1
     set current_line to 1
     set start_pos to -1
     set end_pos to -1
@@ -260,6 +310,7 @@ define workspace_read_range with filename as Str and start_line as Int and end_l
     repeat while i < len:
         set ch to get_character(content and i)
         if ch == 10: # \n
+            set total_lines to total_lines + 1
             set current_line to current_line + 1
             if current_line == start_line:
                 set start_pos to i + 1
@@ -272,13 +323,30 @@ define workspace_read_range with filename as Str and start_line as Int and end_l
         set end_pos to len
         
     if start_pos == -1 or else start_pos >= len:
-        return ""
+        return f"[Lines {start_line}-{end_line} of {total_lines} total | File: {filename}]\n(Requested range is beyond end of file)"
         
     set slice_len to end_pos - start_pos
     if slice_len <= 0:
-        return ""
-        
-    return substring(content and start_pos and slice_len)
+        return f"[Lines {start_line}-{end_line} of {total_lines} total | File: {filename}]\n(Empty range)"
+
+    # Determine actual last line shown (may be less than end_line if file is shorter)
+    set actual_end to end_line
+    if actual_end > total_lines:
+        set actual_end to total_lines
+
+    set header to f"[Lines {start_line}-{actual_end} of {total_lines} total | File: {filename}]\n"
+    set file_slice to substring(content and start_pos and slice_len)
+    set output to concat(header and file_slice)
+
+    # Append continuation hint if there are more lines
+    if actual_end < total_lines:
+        set next_start to actual_end + 1
+        set next_end to next_start + 499
+        if next_end > total_lines:
+            set next_end to total_lines
+        set hint to f"\n[Use workspace_read_range([\"{filename}\", {next_start}, {next_end}]) to continue]"
+        set output to concat(output and hint)
+    return output
 
 # ================================================================
 # workspace_read_prior — Read a file from a prior session workspace
@@ -302,13 +370,13 @@ define workspace_read_prior with session_id as Str and filename as Str returning
 
 # ================================================================
 # workspace_list_active — List files in the active workspace
-# Returns newline-separated list of filenames
+# Returns formatted list with file metadata, depth-limited to 3 levels
 # ================================================================
 define workspace_list_active returning Str:
     set active_path to "config/workspaces/active"
     if file_exists(active_path) == 0:
         return ""
-    return workspace_list_recursive(active_path and "")
+    return workspace_list_recursive(active_path and "" and 0 and 3)
 
 # ================================================================
 # workspace_archive_old — Archive old session workspaces past max age

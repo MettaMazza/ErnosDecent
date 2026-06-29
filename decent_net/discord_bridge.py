@@ -1110,98 +1110,9 @@ async def on_ready():
     except Exception as e:
         print(f"[Discord Bridge] Failed to sync command tree: {e}", flush=True)
 
-@client.event
-async def on_message(message):
-    global _ai_busy, _ai_busy_channel_id, active_session_id
-    # Ignore bot's own messages
-    if message.author == client.user:
-        return
-    
-    # Listen only to the configured channel or threads within it
-    is_target_channel = message.channel.id == channel_id
-    is_thread_in_target_channel = getattr(message.channel, 'parent_id', None) == channel_id
-    if not is_target_channel and not is_thread_in_target_channel:
-        return
-    
-    has_text = message.content and message.content.strip()
-    has_attachments = len(message.attachments) > 0
-    if not has_text and not has_attachments:
-        return
-        
-    # Process all attachments first
-    if has_attachments:
-        for attachment in message.attachments:
-            ext = os.path.splitext(attachment.filename)[1].lower()
-            supported_extensions = ['.pdf', '.txt', '.md', '.markdown']
-            if ext not in supported_extensions:
-                await message.reply(f"⚠️ Unsupported attachment format: `{attachment.filename}`. Supported types: `pdf, txt, md, markdown`.")
-                continue
-            
-            async with message.channel.typing():
-                try:
-                    file_bytes = await attachment.read()
-                    loop = asyncio.get_running_loop()
-                    success, upload_msg = await loop.run_in_executor(
-                        None, upload_file_to_daemon, attachment.filename, file_bytes
-                    )
-                    if success:
-                        await message.reply(f"✅ Indexed `{attachment.filename}` into local RAG storage and saved to workspace!")
-                    else:
-                        await message.reply(f"❌ Failed to index `{attachment.filename}`: {upload_msg}")
-                except Exception as e:
-                    await message.reply(f"❌ Error processing `{attachment.filename}`: {str(e)}")
-
-    # Now process text if present
-    if has_text:
-        print(f"[Discord Bridge] Processing message from {message.author}: {message.content}", flush=True)
-        
-        # Whisper detection: if AI is busy processing, treat incoming messages as
-        # mid-turn guidance instead of queuing a new AI query. The whisper is written
-        # to SQLite and picked up by the react loop before its next LLM call.
-        if _ai_busy and message.channel.id == _ai_busy_channel_id:
-            sess = active_session_id or "default"
-            result = db_write_whisper(sess, message.content)
-            if result == "ok":
-                try:
-                    whisper_ack = await message.reply("🫧 **Whisper received** — your guidance will reach the agent on its next reasoning step.")
-                    # Auto-delete the acknowledgement after 5 seconds to keep the chat clean
-                    create_tracked_task(_delayed_delete(whisper_ack, 5.0))
-                except Exception:
-                    pass
-            else:
-                try:
-                    await message.reply(f"⚠️ Could not queue whisper: {result}")
-                except Exception:
-                    pass
-            return
-        
-        # Check if the message is the /new command
-        if message.content.strip().startswith("/new"):
-            parts = message.content.strip().split(maxsplit=1)
-            title = parts[1] if len(parts) > 1 else "Discord Session"
-            import time
-            session_id = f"session_{int(time.time() * 1000)}"
-            
-            # Start a new session
-            new_payload = {
-                "id": session_id,
-                "title": f"{title} {int(time.time())}",
-                "model": "",
-                "system_prompt": "You are ErnOS Agent — a digital cognitive system running on a local decentralized node."
-            }
-            new_cmd = f"SESSION NEW {json.dumps(new_payload)}"
-            resp_new = await send_daemon_ipc(new_cmd)
-            
-            # Switch to the new session on the daemon
-            set_cmd = f"SESSION SET {session_id}"
-            resp_set = await send_daemon_ipc(set_cmd)
-            
-            if "session:set_ok" in resp_set or "session:ok" in resp_new:
-                active_session_id = session_id
-                await send_discord_reply(message, f"✨ Started a new AI session: **{title}** (ID: `{session_id}`). Current context has been reset.")
-            else:
-                await send_discord_reply(message, f"❌ Failed to start new session. Daemon response: {resp_set}")
-            return
+# (First on_message handler removed — Python replaces event handlers, so only the
+# second registration below is active. The dead handler was identical except for a
+# broken IPC-based file upload path that sent JSON to a pipe-delimited endpoint.)
 
 async def _run_query_bg(message, reply_msg):
     """Independently scheduled background task to run the AI query.
@@ -1280,30 +1191,22 @@ async def on_message(message):
     if not is_target_channel and not is_thread_in_target_channel:
         return
 
-    # Process attachments first (uploads/RAG indexing)
+    # Process attachments first (uploads/RAG indexing via HTTP /api/upload)
     if message.attachments:
-        has_text = len(message.content.strip()) > 0
         for attachment in message.attachments:
-            if attachment.filename.endswith(('.txt', '.md', '.pdf', '.json', '.js', '.py', '.ep', '.ts', '.c', '.h')):
+            ext = os.path.splitext(attachment.filename)[1].lower()
+            supported_extensions = ['.pdf', '.txt', '.md', '.markdown', '.json', '.js', '.py', '.ep', '.ts', '.c', '.h']
+            if ext not in supported_extensions:
+                await message.reply(f"⚠️ Unsupported attachment format: `{attachment.filename}`. Supported types: {', '.join(supported_extensions)}")
+                continue
+
+            async with message.channel.typing():
                 try:
-                    # Download the file content
-                    file_data = await attachment.read()
-                    
-                    # Ensure uploads dir exists in active workspace
-                    uploads_dir = "config/workspaces/active/uploads"
-                    os.makedirs(uploads_dir, exist_ok=True)
-                    
-                    filepath = os.path.join(uploads_dir, attachment.filename)
-                    with open(filepath, "wb") as f:
-                        f.write(file_data)
-                    
-                    # Call RAG indexing API on daemon
-                    payload = {"filename": f"uploads/{attachment.filename}", "content": file_data.decode('utf-8', errors='ignore')}
-                    cmd = f"RAG INDEX {json.dumps(payload)}"
-                    resp = await send_daemon_ipc(cmd)
-                    
-                    success = "index:ok" in resp
-                    upload_msg = resp[len("index:error,reason:"):] if not success else ""
+                    file_bytes = await attachment.read()
+                    loop = asyncio.get_running_loop()
+                    success, upload_msg = await loop.run_in_executor(
+                        None, upload_file_to_daemon, attachment.filename, file_bytes
+                    )
                     if success:
                         await message.reply(f"✅ Indexed `{attachment.filename}` into local RAG storage and saved to workspace!")
                     else:

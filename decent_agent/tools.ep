@@ -31,6 +31,7 @@ import "../decent_net/gitdec"
 import "./workspace"
 import "./changelog"
 import "../decent_store/rag"
+import "./orchestrator"
 
 external define tools_set_active_session with sid as Str returning Int
 
@@ -106,8 +107,8 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: operate_scheduler([\"list\"])\n\n")
         
         set schemas to concat(schemas and "- manage_reading_progress([action: 'get_bookmark'|'get_notes'|'auto_read', doc_name: Str, count_or_empty: Int/Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Read document chunks or view bookmarks/notes. 'auto_read' reads the next count chunks.\n")
-        set schemas to concat(schemas and "  Example: Action: manage_reading_progress([\"get_bookmark\", \"ErnosDecent-Book.md\"])\n\n")
+        set schemas to concat(schemas and "  Description: Read document chunks or view bookmarks/notes. 'auto_read' reads the next count chunks (from RAG index or raw workspace file as fallback).\n")
+        set schemas to concat(schemas and "  Example: Action: manage_reading_progress([\"auto_read\", \"uploads/file.md\", 5])\n\n")
         
     set schemas to concat(schemas and "- web_search([query: Str]) -> Str\n")
     set schemas to concat(schemas and "  Description: Search the live web for facts, news, or validation.\n")
@@ -183,11 +184,11 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: workspace_write([\"notes.txt\", \"these are my notes\"])\n\n")
         
         set schemas to concat(schemas and "- workspace_read([filename: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Read a file from your active session workspace (with fallback to prior sessions/uploads).\n")
+        set schemas to concat(schemas and "  Description: Read a file from workspace. Returns metadata header [File: name | Lines: N | Size: M bytes] followed by content. Large files show a continuation hint with workspace_read_range.\n")
         set schemas to concat(schemas and "  Example: Action: workspace_read([\"uploads/file.md\"])\n\n")
         
         set schemas to concat(schemas and "- workspace_read_range([filename: Str, start_line: Int, end_line: Int]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Read a specific line range (1-indexed, inclusive) from a file in your workspace.\n")
+        set schemas to concat(schemas and "  Description: Read a line range (1-indexed, inclusive). Returns [Lines X-Y of N total] header and continuation hint if more lines exist.\n")
         set schemas to concat(schemas and "  Example: Action: workspace_read_range([\"uploads/file.md\", 1, 500])\n\n")
 
         set schemas to concat(schemas and "- file_info([filename: Str]) -> Str\n")
@@ -195,7 +196,7 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: file_info([\"uploads/file.md\"])\n\n")
         
         set schemas to concat(schemas and "- workspace_list([]) -> Str\n")
-        set schemas to concat(schemas and "  Description: List files in your active session workspace recursively.\n")
+        set schemas to concat(schemas and "  Description: List files in workspace with metadata (line count, byte size per file, item count per directory). Depth-limited to 3 levels.\n")
         set schemas to concat(schemas and "  Example: Action: workspace_list([])\n\n")
         
         set schemas to concat(schemas and "- changelog([count_or_filter: Int/Str, val_or_empty: Str]) -> Str\n")
@@ -259,6 +260,31 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "- submit_issue([repo_id: Str, title: Str, body: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: File a new issue tracking ticket in a repository. Gather all template facts before calling.\n")
         set schemas to concat(schemas and "  Example: Action: submit_issue([\"ErnosDecent\", \"Build warning in main.ep\", \"## Expected\\n...\\n## Actual\\n...\"])\n\n")
+        
+        set schemas to concat(schemas and "ORCHESTRATION (agent delegation):\n")
+        set schemas to concat(schemas and "- delegate_task([instruction: Str, role: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Spawn a local sub-agent thread to work on a task. Returns a task_id for tracking.\n")
+        set schemas to concat(schemas and "  Example: Action: delegate_task([\"Research the security implications of this change\", \"Security Analyst\"])\n\n")
+        
+        set schemas to concat(schemas and "- delegate_wait([task_id: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Block until a delegated sub-agent task completes and return its result.\n")
+        set schemas to concat(schemas and "  Example: Action: delegate_wait([\"agent_1\"])\n\n")
+        
+        set schemas to concat(schemas and "- delegate_check([task_id: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Non-blocking status check on a delegated task. Returns 'running', 'completed:<response>', or 'not_found'.\n")
+        set schemas to concat(schemas and "  Example: Action: delegate_check([\"agent_1\"])\n\n")
+        
+        set schemas to concat(schemas and "- delegate_cancel([task_id: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Cancel a running sub-agent task.\n")
+        set schemas to concat(schemas and "  Example: Action: delegate_cancel([\"agent_1\"])\n\n")
+        
+        set schemas to concat(schemas and "- delegate_list([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: List all delegated sub-agent tasks and their statuses.\n")
+        set schemas to concat(schemas and "  Example: Action: delegate_list([])\n\n")
+        
+        set schemas to concat(schemas and "- delegate_swarm([instruction: Str, sub_tasks: Str, join_strategy: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Fan-out: spawn multiple sub-agents (one per sub-task, separated by '|'), wait for all, merge results. join_strategy: 'concat', 'best', or 'vote'.\n")
+        set schemas to concat(schemas and "  Example: Action: delegate_swarm([\"Review this code\", \"Check security|Check performance|Check correctness\", \"concat\"])\n\n")
         
     set schemas to concat(schemas and "TERMINAL:\n")
     set schemas to concat(schemas and "- reply_request([response: Str]) -> Str\n")
@@ -964,6 +990,19 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set rows_chunks to sql_query(DB and sql_chunks)
             set chunks_len to length_list(rows_chunks)
             if chunks_len == 0:
+                # Fallback: try reading raw workspace file if no RAG chunks exist
+                set raw_content to workspace_read_file(doc_name)
+                if string_length(raw_content) > 0:
+                    set lines_per_page to 500
+                    if count > 0:
+                        set lines_per_page to count * 100
+                    set bk_line to start_chunk * lines_per_page + 1
+                    set bk_end to bk_line + lines_per_page - 1
+                    set range_result to workspace_read_range(doc_name and bk_line and bk_end)
+                    set next_bk to start_chunk + 1
+                    set sql_upd_raw to concat("INSERT INTO reading_progress (document_name, current_chunk, notes, updated_at) VALUES ('" and concat(escaped_doc and concat("', " and concat(int_to_string(next_bk) and concat(", '', 0) ON CONFLICT(document_name) DO UPDATE SET current_chunk=" and concat(int_to_string(next_bk) and ";"))))))
+                    set ok to sql_execute(DB and sql_upd_raw)
+                    return concat(f"Auto-reading '{doc_name}' (raw file, page {start_chunk}):\n\n" and concat(range_result and f"\nProgress saved: next page is {next_bk}."))
                 return f"No chunks found for '{doc_name}' at or after chunk {start_chunk}."
                 
             set out to f"Auto-reading '{doc_name}' from chunk {start_chunk}:\n\n"
@@ -1261,5 +1300,66 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if map_contains(ctx and "session_id") == 1:
             set rr_sess to map_get_val(ctx and "session_id")
         return rag_search(storage_get_db() and rr_query and rr_sess and 10)
+
+    # ---- Orchestration tools ----
+    if action_name equals "delegate_task":
+        if length_list(args_list) < 2:
+            return "Error: delegate_task requires 2 arguments: instruction (Str) and role (Str)."
+        set dt_instruction to get_list(args_list and 0)
+        set dt_role to get_list(args_list and 1)
+        set dt_orch to map_get_val(ctx and "orchestrator")
+        if dt_orch == 0:
+            return "Error: Orchestrator not initialized."
+        set dt_model to map_get_val(ctx and "model")
+        set dt_memory to map_get_val(ctx and "memory_mgr")
+        set dt_tools to map_get_val(ctx and "tools_mgr")
+        return orchestrator_spawn(dt_orch and dt_instruction and dt_role and dt_model and dt_memory and dt_tools and cast_map_to_int(ctx))
+
+    if action_name equals "delegate_wait":
+        if length_list(args_list) < 1:
+            return "Error: delegate_wait requires 1 argument: task_id (Str)."
+        set dw_task_id to get_list(args_list and 0)
+        set dw_orch to map_get_val(ctx and "orchestrator")
+        if dw_orch == 0:
+            return "Error: Orchestrator not initialized."
+        return orchestrator_wait(dw_orch and dw_task_id)
+
+    if action_name equals "delegate_check":
+        if length_list(args_list) < 1:
+            return "Error: delegate_check requires 1 argument: task_id (Str)."
+        set dc_task_id to get_list(args_list and 0)
+        set dc_orch to map_get_val(ctx and "orchestrator")
+        if dc_orch == 0:
+            return "Error: Orchestrator not initialized."
+        return orchestrator_check(dc_orch and dc_task_id)
+
+    if action_name equals "delegate_cancel":
+        if length_list(args_list) < 1:
+            return "Error: delegate_cancel requires 1 argument: task_id (Str)."
+        set dcn_task_id to get_list(args_list and 0)
+        set dcn_orch to map_get_val(ctx and "orchestrator")
+        if dcn_orch == 0:
+            return "Error: Orchestrator not initialized."
+        return orchestrator_cancel(dcn_orch and dcn_task_id)
+
+    if action_name equals "delegate_list":
+        set dl_orch to map_get_val(ctx and "orchestrator")
+        if dl_orch == 0:
+            return "Error: Orchestrator not initialized."
+        return orchestrator_list(dl_orch)
+
+    if action_name equals "delegate_swarm":
+        if length_list(args_list) < 3:
+            return "Error: delegate_swarm requires 3 arguments: instruction (Str), sub_tasks (Str, pipe-separated), join_strategy (Str: 'concat'|'best'|'vote')."
+        set ds_instruction to get_list(args_list and 0)
+        set ds_sub_tasks to get_list(args_list and 1)
+        set ds_strategy to get_list(args_list and 2)
+        set ds_orch to map_get_val(ctx and "orchestrator")
+        if ds_orch == 0:
+            return "Error: Orchestrator not initialized."
+        set ds_model to map_get_val(ctx and "model")
+        set ds_memory to map_get_val(ctx and "memory_mgr")
+        set ds_tools to map_get_val(ctx and "tools_mgr")
+        return orchestrator_swarm(ds_orch and ds_instruction and ds_sub_tasks and ds_strategy and ds_model and ds_memory and ds_tools and cast_map_to_int(ctx))
 
     return f"Error: Unknown tool '{action_name}'."

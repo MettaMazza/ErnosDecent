@@ -1,0 +1,372 @@
+# ─────────────────────────────────────────────────────
+# orchestrator.ep — Agent Orchestration Module
+# ErnosDecent Agent Framework
+# ─────────────────────────────────────────────────────
+# Enables spawning sub-agents as threads, waiting for
+# results, cancelling tasks, and running agent swarms.
+# ─────────────────────────────────────────────────────
+
+import "collections"
+import "string"
+
+external define cast_borrow_to_map with b returning Map
+external define cast_map_to_int with m returning Int
+
+# ─────────────────────────────────────────────────────
+# orchestrator_create
+# Creates and returns a new orchestrator state map
+# containing: "tasks" map, "results" map, "counter"
+# (integer), and "mutex" for thread safety.
+# ─────────────────────────────────────────────────────
+define orchestrator_create returning Int:
+    set orch to create_map()
+    set tasks to create_map()
+    set results to create_map()
+    set mtx to create_mutex()
+    set ok to map_insert(orch and "tasks" and tasks)
+    set ok to map_insert(orch and "results" and results)
+    set ok to map_insert(orch and "counter" and 0)
+    set ok to map_insert(orch and "mutex" and mtx)
+    return orch
+
+
+# ─────────────────────────────────────────────────────
+# orchestrator_generate_id
+# Thread-safe unique task ID generation. Locks mutex,
+# increments internal counter, unlocks, and returns
+# a string of the form "agent_N".
+# ─────────────────────────────────────────────────────
+define orchestrator_generate_id with orch as Int returning Str:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set counter to map_get_val(orch and "counter")
+    set counter to counter + 1
+    set ok to map_insert(orch and "counter" and counter)
+    set ok to unlock_mutex(mtx)
+    set id_str to concat("agent_" and int_to_string(counter))
+    return id_str
+
+
+# ─────────────────────────────────────────────────────
+# orchestrator_spawn_worker
+# Runs inside a spawned thread. Builds a role-prefixed
+# prompt, calls react_run to execute the ReAct loop,
+# then sends the result through the provided channel.
+# ─────────────────────────────────────────────────────
+define orchestrator_spawn_worker with task_id as Str and instruction as Str and role as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int and result_ch as Int returning Int:
+    set role_prefix to concat("[Role: " and role)
+    set prompt to concat(role_prefix and concat("] " and instruction))
+    set result to react_run(cast_borrow_to_map(model) and cast_borrow_to_map(memory_mgr) and cast_borrow_to_map(tools_mgr) and cast_borrow_to_map(ctx) and prompt)
+    send result to result_ch
+    return 0
+
+
+# ─────────────────────────────────────────────────────
+# orchestrator_spawn
+# Public API to spawn a new sub-agent. Generates a
+# unique task ID, creates a channel and task metadata
+# map, stores it under the orchestrator's "tasks" map,
+# spawns the worker thread, and returns the task_id.
+# ─────────────────────────────────────────────────────
+define orchestrator_spawn with orch as Int and instruction as Str and role as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int returning Str:
+    set task_id to orchestrator_generate_id(orch)
+    set ch to create_channel()
+    # Build task metadata map
+    set task_map to create_map()
+    set ok to map_insert(task_map and "channel" and ch)
+    set ok to map_insert(task_map and "role" and role)
+    set ok to map_insert(task_map and "status" and "running")
+    set ok to map_insert(task_map and "result" and "")
+    set ok to map_insert(task_map and "task_id" and task_id)
+    # Store task under orchestrator with mutex protection
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set ok to map_insert(tasks and task_id and task_map)
+    set ok to unlock_mutex(mtx)
+    # Spawn the worker thread
+    spawn orchestrator_spawn_worker(task_id and instruction and role and model and memory_mgr and tools_mgr and ctx and ch)
+    return task_id
+
+
+# ─────────────────────────────────────────────────────
+# orchestrator_wait
+# Blocks until the specified task completes by
+# receiving from its channel. Once the result arrives,
+# updates the task status to "completed", stores the
+# result, and returns it.
+# Returns "error:task_not_found" if task_id is invalid.
+# ─────────────────────────────────────────────────────
+define orchestrator_wait with orch as Int and task_id as Str returning Str:
+    set mtx to map_get_val(orch and "mutex")
+    # Check existence
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set has_task to map_contains(tasks and task_id)
+    set ok to unlock_mutex(mtx)
+    if has_task == 0:
+        return "error:task_not_found"
+    # Retrieve channel (safe — only this task_id's data)
+    set ok to lock_mutex(mtx)
+    set task_map to map_get_val(tasks and task_id)
+    set ch to map_get_val(task_map and "channel")
+    set ok to unlock_mutex(mtx)
+    # Block until result arrives
+    set result to receive from ch
+    # Update status and store result
+    set ok to lock_mutex(mtx)
+    set ok to map_insert(task_map and "status" and "completed")
+    set ok to map_insert(task_map and "result" and result)
+    set results_map to map_get_val(orch and "results")
+    set ok to map_insert(results_map and task_id and result)
+    set ok to unlock_mutex(mtx)
+    return result
+
+
+# ─────────────────────────────────────────────────────
+# orchestrator_check
+# Non-blocking status check for a task. Returns:
+#   "running"              — task still in progress
+#   "completed:<response>" — task finished
+#   "cancelled"            — task was cancelled
+#   "not_found"            — no such task_id
+# ─────────────────────────────────────────────────────
+define orchestrator_check with orch as Int and task_id as Str returning Str:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set has_task to map_contains(tasks and task_id)
+    if has_task == 0:
+        set ok to unlock_mutex(mtx)
+        return "not_found"
+    set task_map to map_get_val(tasks and task_id)
+    set status to ptr_to_str(map_get_val(task_map and "status"))
+    if status equals "completed":
+        set result to ptr_to_str(map_get_val(task_map and "result"))
+        set ok to unlock_mutex(mtx)
+        set response to concat("completed:" and result)
+        return response
+    if status equals "cancelled":
+        set ok to unlock_mutex(mtx)
+        return "cancelled"
+    # Status is still "running"
+    set ok to unlock_mutex(mtx)
+    return "running"
+
+
+# ─────────────────────────────────────────────────────
+# orchestrator_cancel
+# Requests cancellation of a running task. Calls
+# react_request_cancel with the task_id, updates
+# the task status to "cancelled".
+# Returns "cancelled" or "not_found".
+# ─────────────────────────────────────────────────────
+define orchestrator_cancel with orch as Int and task_id as Str returning Str:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set has_task to map_contains(tasks and task_id)
+    if has_task == 0:
+        set ok to unlock_mutex(mtx)
+        return "not_found"
+    set task_map to map_get_val(tasks and task_id)
+    set ok to map_insert(task_map and "status" and "cancelled")
+    set ok to unlock_mutex(mtx)
+    # Cancel the ReAct loop outside the lock to avoid
+    # holding the mutex during an external call
+    set ok to react_request_cancel(task_id)
+    return "cancelled"
+
+
+# ─────────────────────────────────────────────────────
+# orchestrator_list
+# Lists all tracked tasks with their role and current
+# status, formatted as a simple table string:
+#   task_id | role | status
+# Returns "No active tasks." if the task map is empty.
+# ─────────────────────────────────────────────────────
+define orchestrator_list with orch as Int returning Str:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set keys to map_keys(tasks)
+    set count to length_list(keys)
+    set ok to unlock_mutex(mtx)
+    if count == 0:
+        free_list(keys)
+        return "No active tasks."
+    # Build header
+    set output to "task_id          | role             | status\n"
+    set output to concat(output and "-----------------+------------------+-----------\n")
+    # Build rows
+    set i to 0
+    repeat while i < count:
+        set key to get_list(keys and i)
+        set ok to lock_mutex(mtx)
+        set task_map to map_get_val(tasks and key)
+        set role to ptr_to_str(map_get_val(task_map and "role"))
+        set status to ptr_to_str(map_get_val(task_map and "status"))
+        set ok to unlock_mutex(mtx)
+        set row to concat(ptr_to_str(key) and " | ")
+        set row to concat(row and concat(role and " | "))
+        set row to concat(row and concat(status and "\n"))
+        set output to concat(output and row)
+        set i to i + 1
+    free_list(keys)
+    return output
+
+
+# ─────────────────────────────────────────────────────
+# _orch_split_by_pipe (internal helper)
+# Splits a string by the "|" delimiter into a list of
+# trimmed substrings. Returns a list handle (caller
+# must free_list when done).
+# ─────────────────────────────────────────────────────
+define _orch_split_by_pipe with input as Str returning Int:
+    set parts to create_list()
+    set remaining to input
+    set pos to string_index_of(remaining and "|")
+    repeat while pos != -1:
+        set part to substring(remaining and 0 and pos)
+        set part to string_trim(part)
+        set ok to append_list(parts and str_to_ptr(part))
+        set rest_start to pos + 1
+        set rest_len to string_length(remaining) - rest_start
+        if rest_len > 0:
+            set remaining to substring(remaining and rest_start and rest_len)
+        else:
+            set remaining to ""
+        set pos to string_index_of(remaining and "|")
+    # Append the final segment after the last "|"
+    set remaining to string_trim(remaining)
+    if string_length(remaining) > 0:
+        set ok to append_list(parts and str_to_ptr(remaining))
+    return parts
+
+
+# ─────────────────────────────────────────────────────
+# _orch_merge_concat (internal helper)
+# Merges a list of result strings by concatenating
+# them with "---" separators between each.
+# ─────────────────────────────────────────────────────
+define _orch_merge_concat with results as Int returning Str:
+    set count to length_list(results)
+    if count == 0:
+        return ""
+    set output to ptr_to_str(get_list(results and 0))
+    set i to 1
+    repeat while i < count:
+        set item to ptr_to_str(get_list(results and i))
+        set output to concat(output and concat("\n---\n" and item))
+        set i to i + 1
+    return output
+
+
+# ─────────────────────────────────────────────────────
+# _orch_merge_best (internal helper)
+# Selects the "best" result by choosing the response
+# with the greatest string length.
+# ─────────────────────────────────────────────────────
+define _orch_merge_best with results as Int returning Str:
+    set count to length_list(results)
+    if count == 0:
+        return ""
+    set best to ptr_to_str(get_list(results and 0))
+    set best_len to string_length(best)
+    set i to 1
+    repeat while i < count:
+        set item to ptr_to_str(get_list(results and i))
+        set item_len to string_length(item)
+        if item_len > best_len:
+            set best to item
+            set best_len to item_len
+        set i to i + 1
+    return best
+
+
+# ─────────────────────────────────────────────────────
+# _orch_merge_vote (internal helper)
+# Simple majority-vote merge. Counts how many times
+# each identical response appears and returns the most
+# frequent one. Falls back to the first result if all
+# responses are unique.
+# ─────────────────────────────────────────────────────
+define _orch_merge_vote with results as Int returning Str:
+    set count to length_list(results)
+    if count == 0:
+        return ""
+    # Count occurrences of each unique response
+    set counts_map to create_map()
+    set best to ptr_to_str(get_list(results and 0))
+    set best_count to 0
+    set i to 0
+    repeat while i < count:
+        set item to ptr_to_str(get_list(results and i))
+        set has_key to map_contains(counts_map and item)
+        if has_key == 1:
+            set cur_count to map_get_val(counts_map and item)
+            set cur_count to cur_count + 1
+            set ok to map_insert(counts_map and item and cur_count)
+        else:
+            set ok to map_insert(counts_map and item and 1)
+            set cur_count to 1
+        if cur_count > best_count:
+            set best to item
+            set best_count to cur_count
+        set i to i + 1
+    return best
+
+
+# ─────────────────────────────────────────────────────
+# orchestrator_swarm
+# High-level swarm execution. Splits sub_tasks_str by
+# the "|" delimiter, spawns one sub-agent per task
+# (all running concurrently), waits for all to finish,
+# then merges the results using join_strategy:
+#   "concat" — concatenate all results
+#   "best"   — select the longest result
+#   "vote"   — majority vote on identical results
+# Falls back to "concat" for unknown strategies.
+# ─────────────────────────────────────────────────────
+define orchestrator_swarm with orch as Int and instruction as Str and sub_tasks_str as Str and join_strategy as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int returning Str:
+    # Split the sub-tasks string by "|"
+    set parts to _orch_split_by_pipe(sub_tasks_str)
+    set num_tasks to length_list(parts)
+    if num_tasks == 0:
+        free_list(parts)
+        return "error:no_sub_tasks"
+    # Phase 1: Spawn one agent per sub-task
+    set task_ids to create_list()
+    set i to 0
+    repeat while i < num_tasks:
+        set sub_task to ptr_to_str(get_list(parts and i))
+        set full_instruction to concat(instruction and concat(": " and sub_task))
+        set role to concat("swarm_worker_" and int_to_string(i))
+        set tid to orchestrator_spawn(orch and full_instruction and role and model and memory_mgr and tools_mgr and ctx)
+        set ok to append_list(task_ids and str_to_ptr(tid))
+        set i to i + 1
+    free_list(parts)
+    # Phase 2: Wait for all results
+    set results to create_list()
+    set i to 0
+    repeat while i < num_tasks:
+        set tid to ptr_to_str(get_list(task_ids and i))
+        set result to orchestrator_wait(orch and tid)
+        set ok to append_list(results and str_to_ptr(result))
+        set i to i + 1
+    free_list(task_ids)
+    # Phase 3: Merge results by strategy
+    set merged to ""
+    if join_strategy equals "concat":
+        set merged to _orch_merge_concat(results)
+    else:
+        if join_strategy equals "best":
+            set merged to _orch_merge_best(results)
+        else:
+            if join_strategy equals "vote":
+                set merged to _orch_merge_vote(results)
+            else:
+                # Unknown strategy — fall back to concat
+                set merged to _orch_merge_concat(results)
+    free_list(results)
+    return merged
