@@ -74,10 +74,71 @@ else:
     if first > 0:
         content = content[:first] + inject + content[first:]
     else:
-        content = inject + content
+        content = content + inject
+
+# 1. Inject GC blocking helpers
+content = content.replace(
+    '#define EP_GC_UPDATE_TOP() { volatile int _dummy; ep_thread_local_top = (void*)&_dummy; }',
+    '''#define EP_GC_UPDATE_TOP() { volatile int _dummy; ep_thread_local_top = (void*)&_dummy; }
+
+static void ep_gc_enter_blocking(void) {
+    EP_GC_UPDATE_TOP();
+    if (ep_thread_slot >= 0) {
+        pthread_mutex_lock(&ep_gc_mutex);
+        ep_thread_active[ep_thread_slot] = 0;
+        pthread_mutex_unlock(&ep_gc_mutex);
+    }
+}
+
+static void ep_gc_exit_blocking(void) {
+    if (ep_thread_slot >= 0) {
+        pthread_mutex_lock(&ep_gc_mutex);
+        while (ep_gc_stop_requested) {
+            pthread_cond_wait(&ep_gc_resume_cond, &ep_gc_mutex);
+        }
+        ep_thread_active[ep_thread_slot] = 1;
+        pthread_mutex_unlock(&ep_gc_mutex);
+    }
+}
+'''
+)
+
+# 2. Wrap blocking calls in test_agent_compiled.c
+def wrap_second_occ(content, sig, impl_sig, call_wrapper_body):
+    first = content.find(sig)
+    second = content.find(sig, first + 1)
+    target = second if second > 0 else first
+    if target > 0:
+        wrapper = f'{impl_sig};\\n{sig} {{\\n{call_wrapper_body}\\n}}\\n'
+        content = content[:target] + wrapper + impl_sig + content[target + len(sig):]
+    return content
+
+content = wrap_second_occ(content, 'long long ep_sleep_ms(long long ms)', 'long long ep_sleep_ms_impl(long long ms)', '    ep_gc_enter_blocking();\\n    long long res = ep_sleep_ms_impl(ms);\\n    ep_gc_exit_blocking();\\n    return res;')
+content = wrap_second_occ(content, 'long long ep_net_accept(long long server_fd)', 'long long ep_net_accept_impl(long long server_fd)', '    ep_gc_enter_blocking();\\n    long long res = ep_net_accept_impl(server_fd);\\n    ep_gc_exit_blocking();\\n    return res;')
+content = wrap_second_occ(content, 'char* ep_net_recv(long long fd, long long max_len)', 'char* ep_net_recv_impl(long long fd, long long max_len)', '    ep_gc_enter_blocking();\\n    char* res = ep_net_recv_impl(fd, max_len);\\n    ep_gc_exit_blocking();\\n    return res;')
+content = wrap_second_occ(content, 'long long ep_http_request(long long method_val, long long url_val, long long headers_val, long long body_val)', 'long long ep_http_request_impl(long long method_val, long long url_val, long long headers_val, long long body_val)', '    ep_gc_enter_blocking();\\n    long long res = ep_http_request_impl(method_val, url_val, headers_val, body_val);\\n    ep_gc_exit_blocking();\\n    return res;')
+
+# 3. Inject SQLite thread-safety patch to test_agent_compiled.c
+content = content.replace(
+    'long long sql_execute(long long db, long long sql) {',
+    'static pthread_mutex_t ep_sqlite_global_mutex = PTHREAD_MUTEX_INITIALIZER;\\nlong long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'
+)
+content = content.replace(
+    'long long sql_query(long long db, long long sql) {',
+    'long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'
+)
+content = content.replace(
+    'long long sql_execute_params(long long db, long long sql, long long params) {',
+    'long long sql_execute_params_impl(long long db, long long sql, long long params);\\nlong long sql_execute_params(long long db, long long sql, long long params) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_execute_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_params_impl(long long db, long long sql, long long params) {'
+)
+content = content.replace(
+    'long long sql_query_params(long long db, long long sql, long long params) {',
+    'long long sql_query_params_impl(long long db, long long sql, long long params);\\nlong long sql_query_params(long long db, long long sql, long long params) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_query_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_params_impl(long long db, long long sql, long long params) {'
+)
+
 with open('decent_agent/test_agent_compiled.c', 'w') as f:
     f.write(content)
-print('Patched conflicting mutex declarations and injected cast_borrow_to_map/cast_map_to_int/ep_net_send_raw in test_agent_compiled.c')
+print('Patched conflicting mutex declarations, test blocking barriers, and SQLite thread-safety in test_agent_compiled.c')
 "
 
     
@@ -363,16 +424,43 @@ else:
     echo "[*] Injected cast_borrow_to_map/cast_map_to_int."
 fi
 
-# Step 2d: Patch conflicting mutex declarations & disable stdout/stderr buffering
+# Step 2d: Patch conflicting mutex declarations & disable stdout/stderr buffering, and inject GC blocking helpers
 python3 -c "
 with open('node_compiled.c', 'r') as f:
     content = f.read()
 content = content.replace('long long ep_mutex_lock(long long);', '')
 content = content.replace('long long ep_mutex_unlock(long long);', '')
 content = content.replace('int main(int argc, char** argv) {', 'int main(int argc, char** argv) {\\n    setvbuf(stdout, NULL, _IONBF, 0);\\n    setvbuf(stderr, NULL, _IONBF, 0);')
+
+content = content.replace(
+    '#define EP_GC_UPDATE_TOP() { volatile int _dummy; ep_thread_local_top = (void*)&_dummy; }',
+    '''#define EP_GC_UPDATE_TOP() { volatile int _dummy; ep_thread_local_top = (void*)&_dummy; }
+
+static void ep_gc_enter_blocking(void) {
+    EP_GC_UPDATE_TOP();
+    if (ep_thread_slot >= 0) {
+        pthread_mutex_lock(&ep_gc_mutex);
+        ep_thread_active[ep_thread_slot] = 0;
+        pthread_mutex_unlock(&ep_gc_mutex);
+    }
+}
+
+static void ep_gc_exit_blocking(void) {
+    if (ep_thread_slot >= 0) {
+        pthread_mutex_lock(&ep_gc_mutex);
+        while (ep_gc_stop_requested) {
+            pthread_cond_wait(&ep_gc_resume_cond, &ep_gc_mutex);
+        }
+        ep_thread_active[ep_thread_slot] = 1;
+        pthread_mutex_unlock(&ep_gc_mutex);
+    }
+}
+'''
+)
+
 with open('node_compiled.c', 'w') as f:
     f.write(content)
-print('Patched conflicting mutex declarations and disabled buffering in node_compiled.c')
+print('Patched conflicting mutex declarations, buffering, and GC blocking helpers in node_compiled.c')
 "
 
 # Step 2e: Patch ep_net_recv_bytes to return NULL (0) on short reads
@@ -395,11 +483,13 @@ if second > 0:
     if (count <= 0) return 0;
     char* buf = (char*)malloc(count + 1);
     ssize_t total = 0;
+    ep_gc_enter_blocking();
     while (total < count) {
         ssize_t n = recv((int)fd, buf + total, count - total, 0);
         if (n <= 0) break;
         total += n;
     }
+    ep_gc_exit_blocking();
     if (total < count) {
         free(buf);
         return 0;
@@ -679,6 +769,54 @@ long long tools_set_active_session(long long sid_ptr) {
                 print('ERROR: HTTP client patch failed to locate recv loop target.')
     else:
         print('ERROR: HTTP client patch failed to locate ep_http_request.')
+"
+
+# Step 2i: Patch SQLite functions and wrap blocking calls to be thread-safe
+python3 -c "
+with open('node_compiled.c', 'r') as f:
+    content = f.read()
+
+# 1. Inject SQLite global mutex and wrap SQL functions
+inject = '''static pthread_mutex_t ep_sqlite_global_mutex = PTHREAD_MUTEX_INITIALIZER;\\n'''
+
+content = content.replace(
+    'long long sql_execute(long long db, long long sql) {',
+    inject + '''long long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'''
+)
+
+content = content.replace(
+    'long long sql_query(long long db, long long sql) {',
+    '''long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'''
+)
+
+content = content.replace(
+    'long long sql_execute_params(long long db, long long sql, long long params) {',
+    '''long long sql_execute_params_impl(long long db, long long sql, long long params);\\nlong long sql_execute_params(long long db, long long sql, long long params) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_execute_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_params_impl(long long db, long long sql, long long params) {'''
+)
+
+content = content.replace(
+    'long long sql_query_params(long long db, long long sql, long long params) {',
+    '''long long sql_query_params_impl(long long db, long long sql, long long params);\\nlong long sql_query_params(long long db, long long sql, long long params) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_query_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_params_impl(long long db, long long sql, long long params) {'''
+)
+
+# 2. Wrap blocking calls in node_compiled.c
+def wrap_second_occ(content, sig, impl_sig, call_wrapper_body):
+    first = content.find(sig)
+    second = content.find(sig, first + 1)
+    target = second if second > 0 else first
+    if target > 0:
+        wrapper = f'{impl_sig};\\n{sig} {{\\n{call_wrapper_body}\\n}}\\n'
+        content = content[:target] + wrapper + impl_sig + content[target + len(sig):]
+    return content
+
+content = wrap_second_occ(content, 'long long ep_sleep_ms(long long ms)', 'long long ep_sleep_ms_impl(long long ms)', '    ep_gc_enter_blocking();\\n    long long res = ep_sleep_ms_impl(ms);\\n    ep_gc_exit_blocking();\\n    return res;')
+content = wrap_second_occ(content, 'long long ep_net_accept(long long server_fd)', 'long long ep_net_accept_impl(long long server_fd)', '    ep_gc_enter_blocking();\\n    long long res = ep_net_accept_impl(server_fd);\\n    ep_gc_exit_blocking();\\n    return res;')
+content = wrap_second_occ(content, 'char* ep_net_recv(long long fd, long long max_len)', 'char* ep_net_recv_impl(long long fd, long long max_len)', '    ep_gc_enter_blocking();\\n    char* res = ep_net_recv_impl(fd, max_len);\\n    ep_gc_exit_blocking();\\n    return res;')
+content = wrap_second_occ(content, 'long long ep_http_request(long long method_val, long long url_val, long long headers_val, long long body_val)', 'long long ep_http_request_impl(long long method_val, long long url_val, long long headers_val, long long body_val)', '    ep_gc_enter_blocking();\\n    long long res = ep_http_request_impl(method_val, url_val, headers_val, body_val);\\n    ep_gc_exit_blocking();\\n    return res;')
+
+with open('node_compiled.c', 'w') as f:
+    f.write(content)
+print('[+] Applied SQLite thread-safety and GC blocking barrier patches to node_compiled.c')
 "
 
 # Step 3: Set platform-specific library paths and compile
