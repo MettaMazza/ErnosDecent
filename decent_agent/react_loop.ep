@@ -431,6 +431,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         set f4_sess to ""
         if map_contains(ctx and "session_id") == 1:
             set f4_sess to map_get_val(ctx and "session_id")
+        set ok to tools_set_active_session(f4_sess)
         if react_check_cancel(f4_sess) == 1:
             display "[ReAct] Run halted by user (cancel)."
             set ok to map_insert(ctx and "was_cancelled" and 1)
@@ -583,6 +584,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set ok to map_insert(ctx and "pending_clarification" and pendingc)
                 free_list(args_list)
                 free_list(values_list)
+                set ok to tools_set_active_session("")
                 return "PENDING_CLARIFICATION"
 
             # --- Mid-message response (does NOT end the turn) ---
@@ -704,6 +706,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         
                         free_list(args_list)
                         free_list(values_list)
+                        set ok to tools_set_active_session("")
                         return "PENDING_APPROVAL"
                 else:
                     # Approval was granted — clear the flag and proceed
@@ -853,6 +856,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         set ok to trace_emit(trace_db and trace_sid and "done" and f"Iteration cap ({max_iters}) reached")
         set final_answer to "I could not complete this request within the allowed number of steps."
     free_list(values_list)
+    set ok to tools_set_active_session("")
     return final_answer
 
 
@@ -1070,12 +1074,17 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set values_list to create_list()
     set ok to append_list(values_list and history)
     
-    set tools_schema to map_get_val(tools_mgr and "schemas")
+    set sender_role to ""
+    if map_contains(ctx and "sender_role") == 1:
+        set sender_role to map_get_val(ctx and "sender_role")
+    
+    set local_tools_mgr to tools_create(sender_role)
+    set tools_schema to map_get_val(local_tools_mgr and "schemas")
     set ok to map_insert(ctx and "tools_schema" and tools_schema)
     set assembled_prompt to prompt_assemble(memory_mgr and ctx and sanitized_user_prompt and tools_schema)
     set ok to append_list(values_list and assembled_prompt)
     
-    set res to react_run_loop(model and memory_mgr and tools_mgr and ctx and assembled_prompt and 0 and values_list and 0)
+    set res to react_run_loop(model and memory_mgr and local_tools_mgr and ctx and assembled_prompt and 0 and values_list and 0)
     
     set ok to map_delete(ctx and "tools_schema")
     set active_runs to map_get_val(ctx and "active_runs")

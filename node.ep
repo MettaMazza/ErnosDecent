@@ -354,7 +354,7 @@ define handle_onion_search with index as Map and query as Str and dht as Int and
 # ipc_read_token / ipc_get_or_create_token) live in decent_id/auth.ep — shared so the
 # web server, which also authenticates to the IPC port, doesn't depend on a function
 # defined here (it imports decent_id/auth too).
-define handle_ipc_client with client_fd as Int and borrow raft_node as Map and borrow identity as Map and dht_node as Int and relay_node as Int and msg_store as Int and ledger as Map and name_reg as Int and seed_addr as Str and seed_port as Int and borrow agent_memory as Map and borrow agent_tools as Map and borrow agent_ctx as Map and borrow agent_model as Map and static_secret as Int and static_public as Int and bft_node as Map:
+define handle_ipc_client with client_fd as Int and borrow raft_node as Map and borrow identity as Map and dht_node as Int and relay_node as Int and msg_store as Int and borrow ledger as Map and name_reg as Int and seed_addr as Str and seed_port as Int and borrow agent_memory as Map and borrow agent_tools as Map and borrow agent_ctx as Map and borrow agent_model as Map and static_secret as Int and static_public as Int and borrow bft_node as Map:
 
     set req to ep_net_recv(client_fd and 65536)
     set cmd to string_trim(req)
@@ -434,7 +434,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                 else:
                     if cmd_upper equals "WALLET BALANCE":
                         set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
-                        set balance to ledger_get_balance(ledger and sign_pub)
+                        set balance to ledger_get_balance(cast_borrow_to_map(ledger) and sign_pub)
                         set resp to concat("wallet_balance:" and int_to_string(balance))
                     else:
                         if cmd_upper equals "POOL STATUS":
@@ -762,10 +762,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             # finality; multi-validator finalizes when 2f+1 peers commit
                                             # via the BFT Noise handler).
                                             set bdata to string_trim(substring(cmd and 12 and string_length(cmd) - 12))
-                                            set bvcount to length_list(map_get_val(bft_node and "validators"))
+                                            set bvcount to length_list(map_get_val(cast_borrow_to_map(bft_node) and "validators"))
                                             if bvcount <= 1:
                                                 # single self-validator (f=0): immediate local finality
-                                                set cval to bft_run_local(bft_node and bdata)
+                                                set cval to bft_run_local(cast_borrow_to_map(bft_node) and bdata)
                                                 if string_length(cval) > 0:
                                                     set resp to concat("bft:committed,value:" and cval)
                                                 else:
@@ -775,12 +775,12 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 # PRE-PREPARE to peer validators, then apply it locally to emit our
                                                 # own (also-gossiped) PREPARE. Finality arrives asynchronously as
                                                 # peers' signed PREPARE/COMMIT votes return through the BFT handler.
-                                                set pp to bft_propose(bft_node and bdata)
+                                                set pp to bft_propose(cast_borrow_to_map(bft_node) and bdata)
                                                 if map_contains(pp and "phase") == 0:
                                                     set resp to "bft:error,reason:not_leader_for_current_view"
                                                 else:
                                                     set bsent to broadcast_bft_to_peers(bft_serialize_msg(pp) and dht_node and static_secret and static_public)
-                                                    set lr to bft_handle(bft_node and pp)
+                                                    set lr to bft_handle(cast_borrow_to_map(bft_node) and pp)
                                                     set lts to map_get_val(lr and "to_send")
                                                     if map_contains(lts and "phase") == 1:
                                                         set ok to broadcast_bft_to_peers(bft_serialize_msg(lts) and dht_node and static_secret and static_public)
@@ -1140,7 +1140,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                     set recipient to substring(xfer_args and space_pos + 1 and string_length(xfer_args) - space_pos - 1)
                                                     set amount to string_to_int(amt_str)
                                                     set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
-                                                    set sender_bal to ledger_get_balance(ledger and sign_pub)
+                                                    set sender_bal to ledger_get_balance(cast_borrow_to_map(ledger) and sign_pub)
                                                     if amount > sender_bal:
                                                         set resp to f"transfer:error,reason:insufficient_balance,balance:{sender_bal},requested:{amount}"
                                                     else:
@@ -1221,13 +1221,13 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                 # Sign the block hash for validator proof
                                                                 set block_sig_result to sign_message(block_hash and sign_sec)
                                                                 set block_sig_hex to ptr_to_str(map_get_val(block_sig_result and "signature"))
-                                                                set block_err to ledger_add_block(ledger and tx_list and sign_pub and block_sig_hex and state_root)
+                                                                set block_err to ledger_add_block(cast_borrow_to_map(ledger) and tx_list and sign_pub and block_sig_hex and state_root)
                                                                 if block_err == 0:
                                                                     # F2: gossip the freshly-produced block to peers over the
                                                                     # authenticated Noise channel (non-blocking; the receiver
                                                                     # applies it via ledger_receive_block with fork-choice).
                                                                     spawn broadcast_block_to_peers(cast_map_to_int(ledger) and dht_node and static_secret and static_public)
-                                                                    set new_bal to ledger_get_balance(ledger and sign_pub)
+                                                                    set new_bal to ledger_get_balance(cast_borrow_to_map(ledger) and sign_pub)
                                                                     set resp to f"transfer:ok,tx_id:{tx_hash},amount:{amount},to:{recipient},new_balance:{new_bal}"
                                                                 else:
                                                                     set resp to f"transfer:error,reason:block_rejected,code:{block_err}"
@@ -1813,7 +1813,7 @@ define ipc_server_loop with listen_fd as Int and borrow raft_node as Map and bor
     repeat while 1 == 1:
         set client_fd to ep_net_accept(listen_fd)
         if client_fd >= 0:
-            handle_ipc_client(client_fd and raft_node and identity and dht_node and relay_node and msg_store and ledger and name_reg and seed_addr and seed_port and agent_memory and agent_tools and agent_ctx and agent_model and static_secret and static_public and bft_node)
+            handle_ipc_client(client_fd and raft_node and identity and dht_node and relay_node and msg_store and borrow ledger and name_reg and seed_addr and seed_port and agent_memory and agent_tools and agent_ctx and agent_model and static_secret and static_public and borrow bft_node)
     return 0
 
 # ================================================================
@@ -2185,7 +2185,7 @@ define main:
     set agent_memory to memory_deserialize("config/agent_memory.json")
     log_info("node" and "Hebbian cognitive memory rehydrated.")
     display "[+] Hebbian cognitive memory rehydrated."
-    set agent_tools to tools_create()
+    set agent_tools to tools_create("admin")
     set agent_turing_grid to grid_create()
     set agent_model to create_map() # Empty map triggers simulation/fallback reasoning mode
     

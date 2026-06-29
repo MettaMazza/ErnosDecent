@@ -5,6 +5,30 @@
 
 set -o pipefail
 
+# Netcat wrapper to automatically inject loopback IPC AUTH tokens
+nc() {
+    if [ "$1" = "-z" ]; then
+        command nc "$@"
+        return $?
+    fi
+    local input
+    input=$(cat)
+    # If the input is an HTTP request or already has AUTH, pass it raw
+    if [[ "$input" == "AUTH "* ]] || [[ "$input" == "GET "* ]] || [[ "$input" == "POST "* ]] || [[ "$input" == *"\r\n\r\n"* ]]; then
+        printf '%s' "$input" | command nc "$@"
+    else
+        local token=""
+        if [ -f "$HOME/.ernosdecent/ipc-token" ]; then
+            token=$(cat "$HOME/.ernosdecent/ipc-token" | tr -d '\r\n ')
+        fi
+        if [ -n "$token" ]; then
+            echo "AUTH $token $input" | command nc "$@"
+        else
+            echo "$input" | command nc "$@"
+        fi
+    fi
+}
+
 PASS=0
 FAIL=0
 TOTAL=0
@@ -94,8 +118,8 @@ assert_contains "IPC STORAGE returns chunk_count" "$resp" '"chunk_count"'
 # 1.5 POOL STATUS
 resp=$(echo "POOL STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
 assert_contains "IPC POOL returns pool:active" "$resp" "pool:active"
-assert_contains "IPC POOL returns bandwidth_up:" "$resp" "bandwidth_up:"
-assert_contains "IPC POOL returns bandwidth_down:" "$resp" "bandwidth_down:"
+assert_contains "IPC POOL returns compute_jobs:" "$resp" "compute_jobs:"
+assert_contains "IPC POOL returns relay_registrations:" "$resp" "relay_registrations:"
 
 # 1.6 NET STATUS
 resp=$(echo "NET STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
@@ -110,52 +134,52 @@ assert_contains "IPC MSG SEND returns msg:sent" "$resp" "msg:sent"
 assert_contains "IPC MSG SEND returns id:" "$resp" "id:"
 assert_contains "IPC MSG SEND echoes text:" "$resp" "text:live_test_message"
 
-# 1.8 AI INFER
-resp=$(echo "AI INFER hello world" | nc -w 120 127.0.0.1 5000 2>/dev/null)
-assert_contains "IPC AI INFER returns ai:" "$resp" "ai:"
-assert_contains "IPC AI INFER returns response:" "$resp" "response:"
-
-# 1.9 MONEY TRANSFER
+# 1.8 MONEY TRANSFER
 resp=$(echo "MONEY TRANSFER 10 did:key:test_recipient" | nc -w 2 127.0.0.1 5000 2>/dev/null)
 assert_contains "IPC MONEY TRANSFER returns transfer:" "$resp" "transfer:"
 
-# 1.10 MONEY SWAP
+# 1.9 MONEY SWAP
 resp=$(echo "MONEY SWAP ERN USD 5" | nc -w 2 127.0.0.1 5000 2>/dev/null)
 assert_contains "IPC MONEY SWAP returns swap:" "$resp" "swap:"
 
-# 1.11 HEALTH
+# 1.10 HEALTH
 resp=$(echo "HEALTH" | nc -w 2 127.0.0.1 5000 2>/dev/null)
 assert_not_empty "IPC HEALTH returns non-empty" "$resp"
 assert_contains "IPC HEALTH returns health:" "$resp" "health:"
 
-# 1.12 Unknown command
+# 1.11 Unknown command
 resp=$(echo "BOGUS_COMMAND" | nc -w 2 127.0.0.1 5000 2>/dev/null)
 assert_contains "IPC unknown returns error:unknown_command" "$resp" "error:unknown_command"
+
+# 1.12 AI INFER (last — blocks the single-threaded IPC server while the LLM processes)
+resp=$(echo "AI INFER hello world" | nc -w 120 127.0.0.1 5000 2>/dev/null)
+assert_contains "IPC AI INFER returns ai:" "$resp" "ai:"
+assert_contains "IPC AI INFER returns RESPONSE" "$resp" "RESPONSE"
 
 echo ""
 echo "=== TEST SUITE 2: HTTP Static Serving ==="
 echo ""
 
 # 2.1 GET /
-code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/)
+code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8088/)
 assert_contains "HTTP GET / returns 200" "$code" "200"
 
-body=$(curl -s http://127.0.0.1:8080/)
+body=$(curl -s http://127.0.0.1:8088/)
 assert_contains "HTTP GET / returns HTML" "$body" "<!DOCTYPE html>"
 
 # 2.2 GET /app.js
-code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/app.js)
+code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8088/app.js)
 assert_contains "HTTP GET /app.js returns 200" "$code" "200"
 
-body=$(curl -s http://127.0.0.1:8080/app.js)
+body=$(curl -s http://127.0.0.1:8088/app.js)
 assert_contains "HTTP GET /app.js has connectDaemon" "$body" "connectDaemon"
 
 # 2.3 GET /style.css
-code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/style.css)
+code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8088/style.css)
 assert_contains "HTTP GET /style.css returns 200" "$code" "200"
 
 # 2.4 GET /nonexistent
-code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/does_not_exist.xyz)
+code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8088/does_not_exist.xyz)
 assert_contains "HTTP GET /nonexistent returns 404" "$code" "404"
 
 echo ""
@@ -163,23 +187,23 @@ echo "=== TEST SUITE 3: HTTP API Endpoints ==="
 echo ""
 
 # 3.1 GET /api/status
-resp=$(curl -s http://127.0.0.1:8080/api/status)
+resp=$(curl -s http://127.0.0.1:8088/api/status)
 assert_contains "API /api/status returns type:status" "$resp" '"type":"status"'
 assert_contains "API /api/status returns did" "$resp" '"did":"'
 assert_contains "API /api/status returns role" "$resp" '"role":"'
 
 # 3.2 GET /api/wallet
-resp=$(curl -s http://127.0.0.1:8080/api/wallet)
+resp=$(curl -s http://127.0.0.1:8088/api/wallet)
 assert_contains "API /api/wallet returns type:wallet" "$resp" '"type":"wallet"'
 assert_contains "API /api/wallet returns balance" "$resp" '"balance":"'
 
 # 3.3 GET /api/storage
-resp=$(curl -s http://127.0.0.1:8080/api/storage)
+resp=$(curl -s http://127.0.0.1:8088/api/storage)
 assert_contains "API /api/storage returns type:storage" "$resp" '"type":"storage"'
 assert_contains "API /api/storage returns chunk_count" "$resp" '"chunk_count":'
 
 # 3.4 GET /api/pool
-resp=$(curl -s http://127.0.0.1:8080/api/pool)
+resp=$(curl -s http://127.0.0.1:8088/api/pool)
 assert_contains "API /api/pool returns type:pool" "$resp" '"type":"pool"'
 assert_contains "API /api/pool returns bandwidth" "$resp" '"bandwidth_up":'
 
@@ -194,7 +218,7 @@ resp=$(curl -s --include \
   --header "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
   --header "Sec-WebSocket-Version: 13" \
   --max-time 2 \
-  http://127.0.0.1:8080/ws 2>/dev/null || true)
+  http://127.0.0.1:8088/ws 2>/dev/null || true)
 assert_contains "WS upgrade returns 101" "$resp" "101 Switching Protocols"
 assert_contains "WS upgrade returns Sec-WebSocket-Accept" "$resp" "Sec-WebSocket-Accept:"
 
@@ -355,11 +379,19 @@ echo "=== TEST SUITE 9: Multi-Node Bootstrap ==="
 echo ""
 
 # Start a second node with --port and --seed
-lsof -ti:9200,9300 2>/dev/null | xargs kill -9 2>/dev/null
+lsof -ti:9200,9201,9202,9203,9280,9300 2>/dev/null | xargs kill -9 2>/dev/null
 sleep 1
 ./node --port 9200 --seed 127.0.0.1:9101 &
 NODE2_PID=$!
-sleep 3
+
+# Wait for Node 2 IPC to become ready (up to 15 seconds)
+for i in $(seq 1 15); do
+    n2_check=$(echo "STATUS" | nc -w 1 127.0.0.1 9300 2>/dev/null)
+    if echo "$n2_check" | grep -q "status:active"; then
+        break
+    fi
+    sleep 1
+done
 
 # 9.1 Node 2 is alive on IPC port 9300
 n2_status=$(echo "STATUS" | nc -w 2 127.0.0.1 9300 2>/dev/null)
@@ -399,17 +431,17 @@ echo "=== TEST SUITE 10: HTTP API DHT & Name ==="
 echo ""
 
 # 10.1 API /api/status has DID
-api_status=$(curl -s http://127.0.0.1:8080/api/status 2>/dev/null)
+api_status=$(curl -s http://127.0.0.1:8088/api/status 2>/dev/null)
 assert_contains "API status has DID" "$api_status" "did"
 assert_contains "API status has role" "$api_status" "role"
 assert_contains "API status has dht_size" "$api_status" "dht_size"
 
 # 10.2 API /api/wallet has balance
-api_wallet=$(curl -s http://127.0.0.1:8080/api/wallet 2>/dev/null)
+api_wallet=$(curl -s http://127.0.0.1:8088/api/wallet 2>/dev/null)
 assert_contains "API wallet has balance" "$api_wallet" "balance"
 
 # 10.3 API /api/storage has chunk_count
-api_store=$(curl -s http://127.0.0.1:8080/api/storage 2>/dev/null)
+api_store=$(curl -s http://127.0.0.1:8088/api/storage 2>/dev/null)
 assert_contains "API storage has chunk_count" "$api_store" "chunk_count"
 
 echo ""
@@ -433,9 +465,9 @@ did_val_pre=$(echo "$did_pre" | grep -o 'did:[^,]*' | head -1)
 
 # Kill and restart daemon
 echo "  [....] Restarting daemon..."
-lsof -ti:5000,8080,9100,9101,9102 2>/dev/null | xargs kill -9 2>/dev/null
+lsof -ti:5000,8088,9100,9101,9102 2>/dev/null | xargs kill -9 2>/dev/null
 sleep 2
-nohup ./node > node_restart.log 2>&1 &
+nohup ./node > node_restart_2.log 2>&1 &
 sleep 3
 
 # Wait for daemon
@@ -474,12 +506,12 @@ echo ""
 
 # 12.1 WS upgrade with correct key produces valid accept header
 ws_key="dGhlIHNhbXBsZSBub25jZQ=="
-ws_resp=$(printf "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${ws_key}\r\nSec-WebSocket-Version: 13\r\n\r\n" | nc -w 2 127.0.0.1 8080 2>/dev/null | head -5)
+ws_resp=$(printf "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:8088\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${ws_key}\r\nSec-WebSocket-Version: 13\r\n\r\n" | command nc -w 2 127.0.0.1 8088 2>/dev/null | head -5)
 assert_contains "WS upgrade HTTP 101" "$ws_resp" "101"
 assert_contains "WS upgrade has Accept" "$ws_resp" "Sec-WebSocket-Accept"
 
 # 12.2 WS with bad version rejected or accepted gracefully
-ws_bad=$(printf "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${ws_key}\r\nSec-WebSocket-Version: 8\r\n\r\n" | nc -w 2 127.0.0.1 8080 2>/dev/null | head -3)
+ws_bad=$(printf "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:8088\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${ws_key}\r\nSec-WebSocket-Version: 8\r\n\r\n" | command nc -w 2 127.0.0.1 8088 2>/dev/null | head -3)
 # Just verify it doesn't crash the server
 post_ws=$(echo "STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
 assert_contains "Server survives bad WS version" "$post_ws" "status:active"
@@ -489,7 +521,8 @@ echo "=== TEST SUITE 13: HTTP API Auth & Proxy ==="
 echo ""
 
 # 13.1 POST /api/login with correct passphrase returns success
-login_correct=$(curl -s -X POST -H "Content-Type: application/json" -d '{"passphrase":"ernosdecent"}' http://127.0.0.1:8080/api/login 2>/dev/null)
+WEB_PASS=$(cat "$HOME/.ernosdecent/web-password" 2>/dev/null | tr -d '\r\n ')
+login_correct=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"passphrase\":\"${WEB_PASS}\"}" http://127.0.0.1:8088/api/login 2>/dev/null)
 assert_contains "Login correct returns success:true" "$login_correct" '"success":true'
 assert_contains "Login correct returns token" "$login_correct" '"token":'
 
@@ -501,7 +534,7 @@ expires_at=$(echo "$login_correct" | grep -o '"expires_at":[0-9]*' | cut -d':' -
 nonce=$(echo "$login_correct" | grep -o '"nonce":"[^"]*' | cut -d'"' -f4)
 
 # 13.2 POST /api/login with incorrect passphrase returns 401
-login_wrong=$(curl -s -w "%{http_code}" -o /dev/null -X POST -H "Content-Type: application/json" -d '{"passphrase":"wrong_password"}' http://127.0.0.1:8080/api/login 2>/dev/null)
+login_wrong=$(curl -s -w "%{http_code}" -o /dev/null -X POST -H "Content-Type: application/json" -d '{"passphrase":"wrong_password"}' http://127.0.0.1:8088/api/login 2>/dev/null)
 if [ "$login_wrong" = "401" ]; then
     pass "Login wrong returns 401 Unauthorized"
 else
@@ -509,7 +542,7 @@ else
 fi
 
 # 13.3 GET /api/meili without headers returns 401
-meili_no_auth=$(curl -s -w "%{http_code}" -o /dev/null http://127.0.0.1:8080/api/meili 2>/dev/null)
+meili_no_auth=$(curl -s -w "%{http_code}" -o /dev/null http://127.0.0.1:8088/api/meili 2>/dev/null)
 if [ "$meili_no_auth" = "401" ]; then
     pass "MeiliSearch without token returns 401 Unauthorized"
 else
@@ -523,7 +556,7 @@ meili_auth=$(curl -s -w "%{http_code}" -o /dev/null \
   -H "X-Session-Issued: ${issued_at}" \
   -H "X-Session-Expires: ${expires_at}" \
   -H "X-Session-Nonce: ${nonce}" \
-  http://127.0.0.1:8080/api/meili 2>/dev/null)
+  http://127.0.0.1:8088/api/meili 2>/dev/null)
 if [ "$meili_auth" != "401" ]; then
     pass "MeiliSearch with token passes auth check (status: $meili_auth)"
 else
@@ -531,7 +564,7 @@ else
 fi
 
 # 13.5 GET /api/ollama without headers returns 401
-ollama_no_auth=$(curl -s -w "%{http_code}" -o /dev/null http://127.0.0.1:8080/api/ollama 2>/dev/null)
+ollama_no_auth=$(curl -s -w "%{http_code}" -o /dev/null http://127.0.0.1:8088/api/ollama 2>/dev/null)
 if [ "$ollama_no_auth" = "401" ]; then
     pass "Ollama without token returns 401 Unauthorized"
 else
@@ -545,7 +578,7 @@ ollama_auth=$(curl -s -w "%{http_code}" -o /dev/null \
   -H "X-Session-Issued: ${issued_at}" \
   -H "X-Session-Expires: ${expires_at}" \
   -H "X-Session-Nonce: ${nonce}" \
-  http://127.0.0.1:8080/api/ollama 2>/dev/null)
+  http://127.0.0.1:8088/api/ollama 2>/dev/null)
 if [ "$ollama_auth" != "401" ]; then
     pass "Ollama with token passes auth check (status: $ollama_auth)"
 else

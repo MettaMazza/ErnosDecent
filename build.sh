@@ -51,6 +51,19 @@ long long ep_net_send_raw(long long fd, long long buf, long long count) {
     }
     return total;
 }
+
+char ep_active_session_id[256] = \"\";
+
+long long tools_set_active_session(long long sid_ptr) {
+    const char* sid = (const char*)sid_ptr;
+    if (sid) {
+        strncpy(ep_active_session_id, sid, sizeof(ep_active_session_id) - 1);
+        ep_active_session_id[sizeof(ep_active_session_id) - 1] = '\\0';
+    } else {
+        ep_active_session_id[0] = '\\0';
+    }
+    return 0;
+}
 '''
 pat = 'long long ep_net_send(long long fd, const char* data) {'
 first = content.find(pat)
@@ -541,10 +554,135 @@ long long ep_net_listen_loopback(long long port) {
         print('[*] Bound IPC + Web UI to loopback (127.0.0.1); P2P/DHT/relay remain public.')
 "
 
+# Step 2h: Inject tools_set_active_session and refactor ep_http_request in node_compiled.c
+python3 -c "
+with open('node_compiled.c', 'r') as f:
+    content = f.read()
 
+if 'ep_active_session_id' in content:
+    print('[*] tools_set_active_session already present.')
+else:
+    inject_decl = '''
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+long long react_check_cancel(long long);
+long long react_request_cancel(long long);
+long long ptr_to_str(long long);
+
+char ep_active_session_id[256] = \"\";
+
+long long tools_set_active_session(long long sid_ptr) {
+    const char* sid = (const char*)sid_ptr;
+    if (sid) {
+        strncpy(ep_active_session_id, sid, sizeof(ep_active_session_id) - 1);
+        ep_active_session_id[sizeof(ep_active_session_id) - 1] = '\\\\0';
+    } else {
+        ep_active_session_id[0] = '\\\\0';
+    }
+    return 0;
+}
+
+'''
+    pat_http = 'long long ep_http_request(long long method_val, long long url_val, long long headers_val, long long body_val) {'
+    first_http = content.find(pat_http)
+    second_http = content.find(pat_http, first_http + 1)
+    target_http = second_http if second_http > 0 else first_http
+    if target_http > 0:
+        content = content[:target_http] + inject_decl + content[target_http:]
+        
+        # Replace the recv loop in the second ep_http_request
+        old_recv_loop = '''    char recv_buf[4096];
+    ssize_t n;
+    while ((n = recv(sockfd, recv_buf, sizeof(recv_buf), 0)) > 0) {
+        if (resp_len + n >= resp_cap) {
+            resp_cap *= 2;
+            char* new_resp = realloc(resp, resp_cap);
+            if (!new_resp) {
+                free(resp);
+                close(sockfd);
+                return (long long)strdup(\"Error: memory allocation failed\");
+            }
+            resp = new_resp;
+        }
+        memcpy(resp + resp_len, recv_buf, n);
+        resp_len += n;
+    }
+    resp[resp_len] = '\\\\0';
+    close(sockfd);'''
+
+        new_recv_loop = '''    // Set socket to non-blocking mode
+    fcntl(sockfd, F_SETFL, O_NONBLOCK);
+
+    char recv_buf[4096];
+    ssize_t n;
+    int aborted = 0;
+    while (1) {
+        if (ep_active_session_id[0] != '\\\\0') {
+            long long gc_sid = ptr_to_str((long long)ep_active_session_id);
+            if (react_check_cancel(gc_sid) == 1) {
+                aborted = 1;
+                break;
+            }
+        }
+        n = recv(sockfd, recv_buf, sizeof(recv_buf), 0);
+        if (n > 0) {
+            if (resp_len + n >= resp_cap) {
+                resp_cap *= 2;
+                char* new_resp = realloc(resp, resp_cap);
+                if (!new_resp) {
+                    free(resp);
+                    close(sockfd);
+                    return (long long)strdup(\"Error: memory allocation failed\");
+                }
+                resp = new_resp;
+            }
+            memcpy(resp + resp_len, recv_buf, n);
+            resp_len += n;
+        } else if (n == 0) {
+            break;
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(50000); // 50ms
+                continue;
+            } else {
+                break;
+            }
+        }
+    }
+    if (aborted) {
+        free(resp);
+        close(sockfd);
+        long long gc_sid = ptr_to_str((long long)ep_active_session_id);
+        react_request_cancel(gc_sid);
+        return (long long)strdup(\"Error: Request aborted by user\");
+    }
+    resp[resp_len] = '\\\\0';
+    close(sockfd);'''
+
+        if old_recv_loop in content:
+            content = content.replace(old_recv_loop, new_recv_loop)
+            with open('node_compiled.c', 'w') as f:
+                f.write(content)
+            print('[*] Patched HTTP Client non-blocking session check in node_compiled.c')
+        else:
+            print('WARNING: could not find old_recv_loop exactly, trying normalized spacing replacement')
+            import re
+            loop_pattern = r'char\\\\s+recv_buf\\\\[4096\\\\];.*?while\\\\s*\\\\(\\\\(n\\\\s*=\\\\s*recv.*?close\\\\(sockfd\\\\);'
+            content, count = re.subn(loop_pattern, new_recv_loop, content, flags=re.DOTALL)
+            if count > 0:
+                with open('node_compiled.c', 'w') as f:
+                    f.write(content)
+                print('[*] Patched HTTP Client non-blocking session check via regex in node_compiled.c')
+            else:
+                print('ERROR: HTTP client patch failed to locate recv loop target.')
+    else:
+        print('ERROR: HTTP client patch failed to locate ep_http_request.')
+"
 
 # Step 3: Set platform-specific library paths and compile
-CFLAGS="-O2 -lpthread -DEP_HAS_SQLITE -lsqlite3 -Wno-int-conversion -Wno-parentheses-equality"
+CFLAGS="-g -O0 -lpthread -DEP_HAS_SQLITE -lsqlite3 -Wno-int-conversion -Wno-parentheses-equality"
 
 case "$OS" in
     Darwin)

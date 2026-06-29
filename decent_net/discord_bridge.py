@@ -725,6 +725,30 @@ def parse_clarify_questions(resp):
     opts = [b.strip() for b in bits[1:] if b.strip()]
     return [(qtext, opts)]
 
+class ClarifyCommentModal(discord.ui.Modal):
+    def __init__(self, view):
+        super().__init__(title="Provide Direct Clarification")
+        self.view = view
+        self.comment_input = discord.ui.TextInput(
+            label="Your comment / feedback",
+            style=discord.TextStyle.long,
+            placeholder="Type your response/clarification here...",
+            required=True,
+            max_length=1000
+        )
+        self.add_item(self.comment_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user != self.view.author:
+            await interaction.response.send_message("❌ Only the original sender can answer this.", ephemeral=True)
+            return
+        
+        self.view.value = self.comment_input.value
+        for item in self.view.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=interaction.message.content, view=self.view)
+        self.view.stop()
+
 class ClarifyView(discord.ui.View):
     """Buttons for the agent's clarifying options (one click = one answer), plus a
     'Work with what we have' escape. Only the original asker may answer."""
@@ -736,16 +760,26 @@ class ClarifyView(discord.ui.View):
         count = 0
         for qi, (qtext, opts) in enumerate(questions):
             for opt in opts:
-                if count >= 20:  # leave room for the escape button (Discord max 25)
+                if count >= 20:  # leave room for the escape buttons (Discord max 25)
                     break
                 answer = f"Q{qi+1}: {opt}" if multi else opt
                 btn = discord.ui.Button(label=answer[:80], style=discord.ButtonStyle.secondary)
                 btn.callback = self._make_cb(answer)
                 self.add_item(btn)
                 count += 1
+        
         esc = discord.ui.Button(label="Work with what we have", style=discord.ButtonStyle.primary)
         esc.callback = self._make_cb("__USE_CURRENT__")
         self.add_item(esc)
+        
+        comment_btn = discord.ui.Button(label="Leave Comment...", style=discord.ButtonStyle.primary)
+        async def comment_cb(interaction: discord.Interaction):
+            if interaction.user != self.author:
+                await interaction.response.send_message("❌ Only the original sender can answer this.", ephemeral=True)
+                return
+            await interaction.response.send_modal(ClarifyCommentModal(self))
+        comment_btn.callback = comment_cb
+        self.add_item(comment_btn)
 
     def _make_cb(self, answer):
         async def cb(interaction: discord.Interaction):
