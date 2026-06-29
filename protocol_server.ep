@@ -45,6 +45,18 @@ set PROTO_PORT_P2P to 9100
 set PROTO_PORT_DHT to 9101
 set PROTO_PORT_RELAY to 9102
 
+# Per-protocol rate limiters. These are PERSISTENT node state (ban lists / request
+# counts accumulate over the node's whole life), so they live as module-level globals
+# — which are permanent GC roots. Previously each server thread created its limiter as
+# a THREAD-LOCAL: while the thread was blocked in accept() (a syscall, never a GC
+# safepoint, so the thread's stack is under-scanned by the conservative collector),
+# the GC could collect the limiter map; the next connection then made
+# security_check_rate_limit dereference a freed map -> SIGSEGV at startup. As globals
+# they can never be collected.
+set RL_DHT to security_create_rate_limiter()
+set RL_RELAY to security_create_rate_limiter()
+set RL_P2P to security_create_rate_limiter()
+
 # Running count of inbound Noise handshake failures (unauthenticated/incompatible
 # peers or port scanners). Used to throttle logging — these were being emitted as
 # raw stdout spam, one identical line per failed connection.
@@ -70,7 +82,7 @@ define dht_server_thread with dht as Int and port as Int:
         display f"[P2P] ERROR: DHT server failed to bind port {port}"
         return PROTO_ERR_LISTEN_FAILED
 
-    set rl_dht to security_create_rate_limiter()
+    set rl_dht to RL_DHT  # persistent global (GC-rooted); see RL_* note above
     repeat while 1 == 1:
         set client_fd to ep_net_accept(listen_fd)
         if client_fd >= 0:
@@ -97,7 +109,7 @@ define relay_server_thread with relay as Int and port as Int:
         display f"[P2P] ERROR: Relay server failed to bind port {port}"
         return PROTO_ERR_LISTEN_FAILED
 
-    set rl_relay to security_create_rate_limiter()
+    set rl_relay to RL_RELAY  # persistent global (GC-rooted); see RL_* note above
     repeat while 1 == 1:
         set client_fd to ep_net_accept(listen_fd)
         if client_fd >= 0:
@@ -336,7 +348,7 @@ define p2p_server_thread with port as Int and static_secret as Int and static_pu
         display f"[P2P] ERROR: P2P server failed to bind port {port}"
         return PROTO_ERR_LISTEN_FAILED
 
-    set rl_p2p to security_create_rate_limiter()
+    set rl_p2p to RL_P2P  # persistent global (GC-rooted); see RL_* note above
     repeat while 1 == 1:
         set client_fd to ep_net_accept(listen_fd)
         if client_fd >= 0:
