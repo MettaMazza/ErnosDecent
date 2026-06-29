@@ -113,6 +113,7 @@ def wrap_second_occ(content, sig, impl_sig, call_wrapper_body):
         content = content[:target] + wrapper + impl_sig + content[target + len(sig):]
     return content
 
+content = wrap_second_occ(content, 'long long ep_run_command(long long cmd_ptr)', 'long long ep_run_command_impl(long long cmd_ptr)', '    ep_gc_enter_blocking();\n    long long res = ep_run_command_impl(cmd_ptr);\n    ep_gc_exit_blocking();\n    return res;')
 content = wrap_second_occ(content, 'long long ep_sleep_ms(long long ms)', 'long long ep_sleep_ms_impl(long long ms)', '    ep_gc_enter_blocking();\\n    long long res = ep_sleep_ms_impl(ms);\\n    ep_gc_exit_blocking();\\n    return res;')
 content = wrap_second_occ(content, 'long long ep_net_accept(long long server_fd)', 'long long ep_net_accept_impl(long long server_fd)', '    ep_gc_enter_blocking();\\n    long long res = ep_net_accept_impl(server_fd);\\n    ep_gc_exit_blocking();\\n    return res;')
 content = wrap_second_occ(content, 'char* ep_net_recv(long long fd, long long max_len)', 'char* ep_net_recv_impl(long long fd, long long max_len)', '    ep_gc_enter_blocking();\\n    char* res = ep_net_recv_impl(fd, max_len);\\n    ep_gc_exit_blocking();\\n    return res;')
@@ -121,19 +122,19 @@ content = wrap_second_occ(content, 'long long ep_http_request(long long method_v
 # 3. Inject SQLite thread-safety patch to test_agent_compiled.c
 content = content.replace(
     'long long sql_execute(long long db, long long sql) {',
-    'static pthread_mutex_t ep_sqlite_global_mutex = PTHREAD_MUTEX_INITIALIZER;\\nlong long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'
+    'static pthread_mutex_t ep_sqlite_global_mutex = PTHREAD_MUTEX_INITIALIZER;\\nlong long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'
 )
 content = content.replace(
     'long long sql_query(long long db, long long sql) {',
-    'long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'
+    'long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'
 )
 content = content.replace(
     'long long sql_execute_params(long long db, long long sql, long long params) {',
-    'long long sql_execute_params_impl(long long db, long long sql, long long params);\\nlong long sql_execute_params(long long db, long long sql, long long params) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_execute_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_params_impl(long long db, long long sql, long long params) {'
+    'long long sql_execute_params_impl(long long db, long long sql, long long params);\\nlong long sql_execute_params(long long db, long long sql, long long params) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_execute_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_params_impl(long long db, long long sql, long long params) {'
 )
 content = content.replace(
     'long long sql_query_params(long long db, long long sql, long long params) {',
-    'long long sql_query_params_impl(long long db, long long sql, long long params);\\nlong long sql_query_params(long long db, long long sql, long long params) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_query_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_params_impl(long long db, long long sql, long long params) {'
+    'long long sql_query_params_impl(long long db, long long sql, long long params);\\nlong long sql_query_params(long long db, long long sql, long long params) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_query_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_params_impl(long long db, long long sql, long long params) {'
 )
 
 with open('decent_agent/test_agent_compiled.c', 'w') as f:
@@ -781,22 +782,22 @@ inject = '''static pthread_mutex_t ep_sqlite_global_mutex = PTHREAD_MUTEX_INITIA
 
 content = content.replace(
     'long long sql_execute(long long db, long long sql) {',
-    inject + '''long long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'''
+    inject + '''long long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'''
 )
 
 content = content.replace(
     'long long sql_query(long long db, long long sql) {',
-    '''long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'''
+    '''long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'''
 )
 
 content = content.replace(
     'long long sql_execute_params(long long db, long long sql, long long params) {',
-    '''long long sql_execute_params_impl(long long db, long long sql, long long params);\\nlong long sql_execute_params(long long db, long long sql, long long params) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_execute_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_params_impl(long long db, long long sql, long long params) {'''
+    '''long long sql_execute_params_impl(long long db, long long sql, long long params);\\nlong long sql_execute_params(long long db, long long sql, long long params) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_execute_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_params_impl(long long db, long long sql, long long params) {'''
 )
 
 content = content.replace(
     'long long sql_query_params(long long db, long long sql, long long params) {',
-    '''long long sql_query_params_impl(long long db, long long sql, long long params);\\nlong long sql_query_params(long long db, long long sql, long long params) {\\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\\n    long long res = sql_query_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_params_impl(long long db, long long sql, long long params) {'''
+    '''long long sql_query_params_impl(long long db, long long sql, long long params);\\nlong long sql_query_params(long long db, long long sql, long long params) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_query_params_impl(db, sql, params);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_params_impl(long long db, long long sql, long long params) {'''
 )
 
 # 2. Wrap blocking calls in node_compiled.c
@@ -809,6 +810,7 @@ def wrap_second_occ(content, sig, impl_sig, call_wrapper_body):
         content = content[:target] + wrapper + impl_sig + content[target + len(sig):]
     return content
 
+content = wrap_second_occ(content, 'long long ep_run_command(long long cmd_ptr)', 'long long ep_run_command_impl(long long cmd_ptr)', '    ep_gc_enter_blocking();\n    long long res = ep_run_command_impl(cmd_ptr);\n    ep_gc_exit_blocking();\n    return res;')
 content = wrap_second_occ(content, 'long long ep_sleep_ms(long long ms)', 'long long ep_sleep_ms_impl(long long ms)', '    ep_gc_enter_blocking();\\n    long long res = ep_sleep_ms_impl(ms);\\n    ep_gc_exit_blocking();\\n    return res;')
 content = wrap_second_occ(content, 'long long ep_net_accept(long long server_fd)', 'long long ep_net_accept_impl(long long server_fd)', '    ep_gc_enter_blocking();\\n    long long res = ep_net_accept_impl(server_fd);\\n    ep_gc_exit_blocking();\\n    return res;')
 content = wrap_second_occ(content, 'char* ep_net_recv(long long fd, long long max_len)', 'char* ep_net_recv_impl(long long fd, long long max_len)', '    ep_gc_enter_blocking();\\n    char* res = ep_net_recv_impl(fd, max_len);\\n    ep_gc_exit_blocking();\\n    return res;')
