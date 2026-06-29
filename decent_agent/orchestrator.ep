@@ -62,15 +62,82 @@ define orchestrator_spawn_worker with task_id as Str and instruction as Str and 
 
 
 # ─────────────────────────────────────────────────────
+# _orch_clone_map
+# Performs a shallow copy of a map structure.
+# ─────────────────────────────────────────────────────
+define _orch_clone_map with src as Map returning Map:
+    set dest to create_map()
+    set keys to map_keys(src)
+    set len to length_list(keys)
+    set i to 0
+    repeat while i < len:
+        set k to get_list(keys and i)
+        set v to map_get_val(src and k)
+        set ok to map_insert(dest and k and v)
+        set i to i + 1
+    free_list(keys)
+    return dest
+
+
+# ─────────────────────────────────────────────────────
+# _orch_clone_memory
+# Creates an isolated Hebbian memory state for a sub-agent.
+# Copies read-only knowledge references but allocates clean
+# reasoning, timeline, and scratchpad structures.
+# ─────────────────────────────────────────────────────
+define _orch_clone_memory with src as Map returning Map:
+    set dest to create_map()
+    set scratchpad to create_map()
+    set timeline to create_list()
+    set reasoning to create_list()
+
+    set ok to map_insert(dest and "scratchpad" and scratchpad)
+    set ok to map_insert(dest and "lessons" and map_get_val(src and "lessons"))
+    set ok to map_insert(dest and "timeline" and timeline)
+    set ok to map_insert(dest and "reasoning" and reasoning)
+    set ok to map_insert(dest and "synaptic_graph" and map_get_val(src and "synaptic_graph"))
+    set ok to map_insert(dest and "edges" and map_get_val(src and "edges"))
+    set ok to map_insert(dest and "permanent_edges" and map_get_val(src and "permanent_edges"))
+    set ok to map_insert(dest and "synaptic_nodes" and map_get_val(src and "synaptic_nodes"))
+    set ok to map_insert(dest and "synaptic_edges" and map_get_val(src and "synaptic_edges"))
+    set ok to map_insert(dest and "synaptic_layers" and map_get_val(src and "synaptic_layers"))
+    set ok to map_insert(dest and "lessons_count" and map_get_val(src and "lessons_count"))
+    set ok to map_insert(dest and "graph_edges_count" and map_get_val(src and "graph_edges_count"))
+    return dest
+
+
+# ─────────────────────────────────────────────────────
 # orchestrator_spawn
 # Public API to spawn a new sub-agent. Generates a
-# unique task ID, creates a channel and task metadata
-# map, stores it under the orchestrator's "tasks" map,
-# spawns the worker thread, and returns the task_id.
+# unique task ID, creates isolated ctx and memory managers,
+# stores them in the task_map to keep them GC-safe,
+# and spawns the worker thread.
 # ─────────────────────────────────────────────────────
 define orchestrator_spawn with orch as Int and instruction as Str and role as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int returning Str:
     set task_id to orchestrator_generate_id(orch)
     set ch to create_channel()
+
+    # Clone context and memory to prevent concurrent mutations and data races
+    set child_ctx to _orch_clone_map(cast_borrow_to_map(ctx))
+    set child_memory to _orch_clone_memory(cast_borrow_to_map(memory_mgr))
+
+    # Clean transient query-local properties from child context
+    set ok to map_delete(child_ctx and "session_id")
+    set ok to map_delete(child_ctx and "was_cancelled")
+    set ok to map_delete(child_ctx and "pending_action")
+    set ok to map_delete(child_ctx and "pending_clarification")
+    set ok to map_delete(child_ctx and "auto_approve")
+    set ok to map_delete(child_ctx and "tool_approved")
+    set ok to map_delete(child_ctx and "consecutive_denials")
+    set ok to map_delete(child_ctx and "last_reasoning")
+    set ok to map_delete(child_ctx and "clarify_rounds")
+    set ok to map_delete(child_ctx and "clarify_done")
+
+    # Set sub-agent properties
+    set ok to map_insert(child_ctx and "session_id" and task_id)
+    set ok to map_insert(child_ctx and "memory" and child_memory)
+    set ok to map_insert(child_ctx and "memory_mgr" and child_memory)
+
     # Build task metadata map
     set task_map to create_map()
     set ok to map_insert(task_map and "channel" and ch)
@@ -78,14 +145,21 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
     set ok to map_insert(task_map and "status" and "running")
     set ok to map_insert(task_map and "result" and "")
     set ok to map_insert(task_map and "task_id" and task_id)
+    
+    # Store references to prevent GC sweep of thread args on thread startup
+    set ok to map_insert(task_map and "child_ctx" and child_ctx)
+    set ok to map_insert(task_map and "child_memory" and child_memory)
+    set ok to map_insert(task_map and "instruction" and instruction)
+
     # Store task under orchestrator with mutex protection
     set mtx to map_get_val(orch and "mutex")
     set ok to lock_mutex(mtx)
     set tasks to map_get_val(orch and "tasks")
     set ok to map_insert(tasks and task_id and task_map)
     set ok to unlock_mutex(mtx)
+
     # Spawn the worker thread
-    spawn orchestrator_spawn_worker(task_id and instruction and role and model and memory_mgr and tools_mgr and ctx and ch)
+    spawn orchestrator_spawn_worker(task_id and instruction and role and model and cast_map_to_int(child_memory) and tools_mgr and cast_map_to_int(child_ctx) and ch)
     return task_id
 
 
