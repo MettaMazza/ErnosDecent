@@ -51,7 +51,21 @@ define observer_parse_verdict with audit_raw as Str returning Map:
         if reason_node == 0:
             set reason_node to get_json_object_value(audit_node and "justification")
         if verd_node != 0:
-            set raw_verdict to string_to_upper(get_json_value(verd_node))
+            # Read the verdict BY ITS JSON TYPE. CRITICAL: a non-string verdict (the
+            # model emitted a JSON boolean/number, e.g. {"verdict": true}) must NOT be
+            # passed to string_to_upper — get_json_value returns a raw int for those, and
+            # string_to_upper would dereference that int as a pointer and SEGFAULT (this
+            # crashed the daemon on an approved run_command audit). Booleans parse to int
+            # nodes (true -> 1, false -> 0). Anything unexpected fails closed (BLOCKED).
+            set raw_verdict to "BLOCKED"
+            set vtype to get_json_type(verd_node)
+            if vtype == 2:
+                set raw_verdict to string_to_upper(get_json_value(verd_node))
+            else if vtype == 1:
+                if get_json_value(verd_node) == 0:
+                    set raw_verdict to "BLOCKED"
+                else:
+                    set raw_verdict to "ALLOWED"
             # Normalise verdict value: map common synonyms to ALLOWED/BLOCKED
             if string_contains(raw_verdict and "ALLOW") == 1:
                 set ok to map_insert(result and "verdict" and "ALLOWED")
