@@ -15,6 +15,35 @@ import "datetime"
 import "collections"
 import "string"
 
+# Strip ANSI escape sequences (ESC [ … final-byte) and stray control characters from
+# tool output. The ErnosPlain compiler emits coloured diagnostics; the raw ESC (0x1b)
+# bytes are invalid inside a JSON string, which breaks BOTH the run_ep_result frame
+# sent to the browser (it hangs on "Running…") AND the JSON sent to the LLM (it errors
+# with "invalid character '\x1b'"). Newlines and tabs are kept; other control chars dropped.
+define strip_ansi with s as Str returning Str:
+    set n to string_length(s)
+    set out to create_list()
+    set i to 0
+    repeat while i < n:
+        set ch to get_character(s and i)
+        if ch == 27:
+            set i to i + 1
+            if i < n and also get_character(s and i) == 91:
+                set i to i + 1
+                set scanning to 1
+                repeat while i < n and also scanning == 1:
+                    set c2 to get_character(s and i)
+                    set i to i + 1
+                    if c2 >= 64 and also c2 <= 126:
+                        set scanning to 0
+        else:
+            if ch >= 32 or else ch == 10 or else ch == 9:
+                set ok to append_list(out and ch)
+            set i to i + 1
+    set res to string_from_list(out)
+    free_list(out)
+    return res
+
 define run_ep_code with code as Str returning Str:
     set ts to ep_time_now_ms()
     set dir to concat("/tmp/eprun_" and int_to_string(ts))
@@ -30,16 +59,16 @@ define run_ep_code with code as Str returning Str:
     set pok to write_file(concat(dir and "/sb.sb") and prof)
 
     # 1) ErnosPlain transpile (trusted — produces C, does not run learner logic)
-    set ern to run_command(f"cd {dir} && $HOME/.local/bin/ernos prog.ep 2>&1")
+    set ern to run_command(f"cd {dir} && NO_COLOR=1 TERM=dumb $HOME/.local/bin/ernos prog.ep 2>&1")
     if file_exists(concat(dir and "/prog_compiled.c")) == 0:
         set rm1 to run_command(f"rm -rf {dir}")
-        return concat("Your ErnosPlain code did not compile:\n\n" and ern)
+        return concat("Your ErnosPlain code did not compile:\n\n" and strip_ansi(ern))
 
     # 2) C compile (trusted)
     set cl to run_command(f"cd {dir} && clang prog_compiled.c -O2 -lpthread -lm -o prog 2>&1")
     if file_exists(concat(dir and "/prog")) == 0:
         set rm2 to run_command(f"rm -rf {dir}")
-        return concat("Your code transpiled but the native compile failed:\n\n" and cl)
+        return concat("Your code transpiled but the native compile failed:\n\n" and strip_ansi(cl))
 
     # 3) Run the learner binary INSIDE the sandbox: no network, writes confined to the
     #    scratch dir, 5s wall-clock timeout, 6s CPU + 50MB file caps. $? is the run's
@@ -48,6 +77,8 @@ define run_ep_code with code as Str returning Str:
     set raw to run_command(runcmd)
     set rm3 to run_command(f"rm -rf {dir}")
 
+    # Strip ANSI/control chars so the output is valid inside JSON (browser + LLM).
+    set raw to strip_ansi(raw)
     # Separate program output from the exit-code marker.
     set body to raw
     set rc to "0"
