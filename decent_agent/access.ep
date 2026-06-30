@@ -1,0 +1,205 @@
+# access.ep — tiered access control + the unsafe-action gate.
+#
+# Two independent tiers (operator-decided):
+#  1. Full-PC access: a persistent toggle (config/access.json), DEFAULT ON. When ON the
+#     agent may read/navigate anywhere; when OFF it is confined to the project + uploads.
+#  2. The unsafe gate (ALWAYS on, even with Full-PC granted):
+#       - Class A (sensitive read / local destructive): warn + approve, RE-ASK EVERY TIME.
+#       - Class B (sending a secret off-box): HARD-BLOCKED, no override; the agent must
+#         instead coach the user to retrieve/share it themselves.
+#
+# This module is the single source of truth for those classifications. Enforcement is
+# wired in tools.ep (the gate) and prompt.ep (the kernel rule); the toggle is surfaced
+# in the WebUI.
+
+import "string"
+import "fs"
+import "collections"
+import "../config.ep"
+
+# ── Full-PC toggle (persistent, default ON) ─────────────────────────────────
+define access_config_path returning Str:
+    return "config/access.json"
+
+define access_full_pc_on returning Int:
+    set path to access_config_path()
+    if file_exists(path) == 0:
+        return 1
+    set cfg to config_load(path)
+    set v to config_get_str(cfg and "full_pc_access")
+    if v equals "off":
+        return 0
+    return 1
+
+# Persist the toggle. on != 0 -> ON. Admin/owner only (the caller enforces role).
+define access_set_full_pc with enabled as Int returning Int:
+    set val to "on"
+    if enabled == 0:
+        set val to "off"
+    set body to concat("{\"full_pc_access\": \"" and concat(val and "\"}\n"))
+    return write_file(access_config_path() and body)
+
+# ── Path classification ─────────────────────────────────────────────────────
+# Lower-cased substring scan. We match on path markers so it works for absolute,
+# ~-expanded and project-relative paths alike.
+define access_path_has with path as Str and marker as Str returning Int:
+    return string_contains(string_lower(path) and marker)
+
+# SECRET paths — key/credential material. Reading these is Class A (warn+approve);
+# SENDING their contents off-box is Class B (hard-blocked).
+define access_path_secret with path as Str returning Int:
+    set p to string_lower(path)
+    if string_contains(p and ".ssh") == 1:
+        return 1
+    if string_contains(p and "id_rsa") == 1:
+        return 1
+    if string_contains(p and "id_ed25519") == 1:
+        return 1
+    if string_contains(p and ".pem") == 1:
+        return 1
+    if string_contains(p and ".gnupg") == 1:
+        return 1
+    if string_contains(p and "secring") == 1:
+        return 1
+    if string_contains(p and ".aws") == 1:
+        return 1
+    if string_contains(p and ".netrc") == 1:
+        return 1
+    if string_contains(p and "ipc-token") == 1:
+        return 1
+    if string_contains(p and ".ernosdecent/keys") == 1:
+        return 1
+    if string_contains(p and "keychain") == 1:
+        return 1
+    if string_contains(p and "credentials") == 1:
+        return 1
+    return 0
+
+# SENSITIVE paths — secrets PLUS other private/system locations. Reading these is
+# Class A: warn + approve, re-asked every time.
+define access_path_sensitive with path as Str returning Int:
+    if access_path_secret(path) == 1:
+        return 1
+    set p to string_lower(path)
+    if string_contains(p and ".env") == 1:
+        return 1
+    if string_contains(p and "/etc/") == 1:
+        return 1
+    if string_contains(p and "/system/") == 1:
+        return 1
+    if string_contains(p and "/private/") == 1:
+        return 1
+    if string_contains(p and "/library/keychains") == 1:
+        return 1
+    if string_contains(p and ".bash_history") == 1:
+        return 1
+    if string_contains(p and ".zsh_history") == 1:
+        return 1
+    if string_contains(p and "cookies") == 1:
+        return 1
+    if string_contains(p and ".npmrc") == 1:
+        return 1
+    return 0
+
+# Is a path OUTSIDE the confined scope (project tree + uploads)? Only meaningful when
+# Full-PC is OFF. An absolute or home path escapes the project; a path containing ".."
+# escapes too. Plain project-relative paths stay in scope.
+define access_path_outside_scope with path as Str returning Int:
+    set c0 to get_character(path and 0)
+    if c0 == 47:
+        return 1
+    if c0 == 126:
+        return 1
+    if string_contains(path and "..") == 1:
+        return 1
+    return 0
+
+# ── Command classification (run_command) ────────────────────────────────────
+# Destructive shell verbs (local). Class A: warn + approve.
+define access_command_destructive with cmd as Str returning Int:
+    set c to string_lower(cmd)
+    if string_contains(c and "rm -rf") == 1:
+        return 1
+    if string_contains(c and "rm -fr") == 1:
+        return 1
+    if string_contains(c and "mkfs") == 1:
+        return 1
+    if string_contains(c and "dd if=") == 1:
+        return 1
+    if string_contains(c and "chmod") == 1:
+        return 1
+    if string_contains(c and "chown") == 1:
+        return 1
+    if string_contains(c and "sudo") == 1:
+        return 1
+    return 0
+
+# EXFILTRATION: a command that reads a secret path AND ships it over the network.
+# Class B: HARD-BLOCKED. We detect a network sender combined with a secret reference.
+define access_command_exfil with cmd as Str returning Int:
+    set c to string_lower(cmd)
+    set has_net to 0
+    if string_contains(c and "curl") == 1:
+        set has_net to 1
+    if string_contains(c and "wget") == 1:
+        set has_net to 1
+    if string_contains(c and "nc ") == 1:
+        set has_net to 1
+    if string_contains(c and "ncat") == 1:
+        set has_net to 1
+    if string_contains(c and "scp ") == 1:
+        set has_net to 1
+    if string_contains(c and "/dev/tcp/") == 1:
+        set has_net to 1
+    if has_net == 0:
+        return 0
+    if access_path_secret(cmd) == 1:
+        return 1
+    return 0
+
+# ── The gate decision ───────────────────────────────────────────────────────
+# Returns a Map {decision, reason}. decision is one of:
+#   "allow"       — proceed.
+#   "block"       — Class B: hard-blocked (secret exfiltration). Never executes.
+#   "gate"        — out of confined scope while Full-PC is OFF (operator must enable).
+#   "warn"        — Class A: needs a fresh per-action approval, with `reason` as the warning.
+define access_gate_result with decision as Str and reason as Str returning Map:
+    set r to create_map()
+    set ok to map_insert(r and "decision" and decision)
+    set ok to map_insert(r and "reason" and reason)
+    return r
+
+# Gate a file read/path-targeting action.
+define access_gate_path with path as Str returning Map:
+    if access_full_pc_on() == 0:
+        if access_path_outside_scope(path) == 1:
+            return access_gate_result("gate" and concat("Full-PC access is OFF, so reading outside the project is not permitted: " and path))
+    if access_path_sensitive(path) == 1:
+        return access_gate_result("warn" and concat("This touches a sensitive location (keys/credentials/system/private data): " and path))
+    return access_gate_result("allow" and "")
+
+# Gate a run_command.
+define access_gate_command with cmd as Str returning Map:
+    if access_command_exfil(cmd) == 1:
+        return access_gate_result("block" and "This command would send secret/credential material off this machine. Sending secrets off-box is hard-blocked. Instead, tell the user exactly how to retrieve and share it themselves (e.g. run the command in their own terminal and paste the result, or share only a PUBLIC key).")
+    if access_full_pc_on() == 0:
+        if access_path_outside_scope(cmd) == 1:
+            return access_gate_result("gate" and "Full-PC access is OFF; this command reaches outside the project. Ask the operator to enable Full-PC access in Settings.")
+    if access_path_sensitive(cmd) == 1:
+        return access_gate_result("warn" and "This command reads/touches a sensitive location (keys/credentials/system/private data).")
+    if access_command_destructive(cmd) == 1:
+        return access_gate_result("warn" and "This is a destructive or privilege-changing command.")
+    return access_gate_result("allow" and "")
+
+# Warning string for the approval card, derived from the raw args string (substring
+# matching works on the JSON args directly). Returns "" when no warning applies.
+define access_warning with tool_name as Str and args_str as Str returning Str:
+    if tool_name equals "run_command":
+        set g to access_gate_command(args_str)
+        if map_get_val(g and "decision") equals "warn":
+            return map_get_val(g and "reason")
+    if tool_name equals "codebase_read" or else tool_name equals "codebase_write":
+        set g to access_gate_path(args_str)
+        if map_get_val(g and "decision") equals "warn":
+            return map_get_val(g and "reason")
+    return ""

@@ -9,6 +9,7 @@ import "sql"
 import "./sandbox_ep"
 import "./tutor"
 import "./tutor_content"
+import "./access"
 import "../storage"
 
 # Subsystem modules to call
@@ -325,6 +326,13 @@ define tools_get_schema_string with tools_mgr as Map returning Str:
     return map_get_val(tools_mgr and "schemas")
 
 define tools_requires_approval with tool_name as Str and args_list as List returning Int:
+    # Class A: reading a SENSITIVE location needs a fresh approval every time (the warning
+    # is added to the card in react_loop). Normal reads are not gated.
+    if tool_name equals "codebase_read":
+        if length_list(args_list) > 0:
+            if map_get_val(access_gate_path(get_list(args_list and 0)) and "decision") equals "warn":
+                return 1
+        return 0
     if tool_name equals "money_transfer":
         return 1
     if tool_name equals "self_prompt_set":
@@ -657,6 +665,11 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if length_list(args_list) < 1:
             return "Error: codebase_read requires 1 argument (path). Example: Action: codebase_read([\"docs/AGENT.md\"])"
         set path to get_list(args_list and 0)
+        # Access gate: when Full-PC access is OFF, reading outside the project is gated.
+        # (Sensitive-path reads are handled as a warn+approve via tools_requires_approval.)
+        set cr_gate to access_gate_path(path)
+        if map_get_val(cr_gate and "decision") equals "gate":
+            return concat("[GATE] " and map_get_val(cr_gate and "reason"))
         if file_exists(path) == 0:
             # Fallback: check workspace uploads directory
             set ws_path to path_join("config/workspaces/active/uploads" and path)
@@ -791,6 +804,14 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if length_list(args_list) < 1:
             return "Error: run_command requires 1 argument (cmd). Example: Action: run_command([\"bash build.sh\"])"
         set cmd to ptr_to_str(get_list(args_list and 0))
+        # Access gate: hard-block secret exfiltration (Class B, no override); gate
+        # commands that reach outside the project when Full-PC access is OFF.
+        set rc_gate to access_gate_command(cmd)
+        set rc_dec to map_get_val(rc_gate and "decision")
+        if rc_dec equals "block":
+            return concat("[BLOCKED — sending secrets off this machine is not permitted] " and map_get_val(rc_gate and "reason"))
+        if rc_dec equals "gate":
+            return concat("[GATE] " and map_get_val(rc_gate and "reason"))
         # E5: hard denylist backstop (in addition to the now fail-closed Observer audit) —
         # reject shell chaining / command-substitution / privilege-escalation that no
         # single legitimate command needs, so a compromised audit path can't be the only
