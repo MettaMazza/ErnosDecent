@@ -6,6 +6,9 @@ import "os"
 import "collections"
 import "string"
 import "sql"
+import "./sandbox_ep"
+import "./tutor"
+import "./tutor_content"
 import "../storage"
 
 # Subsystem modules to call
@@ -184,12 +187,36 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: workspace_write([\"notes.txt\", \"these are my notes\"])\n\n")
         
         set schemas to concat(schemas and "- workspace_read([filename: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Read a file from workspace. Returns metadata header [File: name | Lines: N | Size: M bytes] followed by content. Large files show a continuation hint with workspace_read_range.\n")
+        set schemas to concat(schemas and "  Description: Read a file from workspace. Small files return in full. LARGE files return only the first chunk plus a header '[Lines X-Y of N total]' and a continuation hint. To read a large file IN FULL you MUST keep calling workspace_read_range for each next chunk shown in the hint until you reach line N — do not assume the first chunk is the whole file.\n")
         set schemas to concat(schemas and "  Example: Action: workspace_read([\"uploads/file.md\"])\n\n")
-        
+
         set schemas to concat(schemas and "- workspace_read_range([filename: Str, start_line: Int, end_line: Int]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Read a line range (1-indexed, inclusive). Returns [Lines X-Y of N total] header and continuation hint if more lines exist.\n")
+        set schemas to concat(schemas and "  Description: Read a line range (1-indexed, inclusive). Returns '[Lines X-Y of N total]' and a continuation hint while Y < N. Keep calling with the next range from the hint until Y == N to cover the whole file, then synthesize across all chunks you read.\n")
         set schemas to concat(schemas and "  Example: Action: workspace_read_range([\"uploads/file.md\", 1, 500])\n\n")
+
+        set schemas to concat(schemas and "- run_ep([code: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Compile and run a snippet of ErnosPlain code in a SECURE SANDBOX (no network, filesystem confined, time/CPU/memory limited) and return its output or the exact compile errors. Use this to TEACH coding by running the learner's own code and coaching from the real result — set a task, have them write code, run it, and guide them from the actual output/error. Safe to call without approval; the OS sandbox is the safety boundary.\n")
+        set schemas to concat(schemas and "  Example: Action: run_ep([\"define main:\\n    display \\\"hello\\\"\\n    return 0\"])\n\n")
+
+        set schemas to concat(schemas and "- lookup_ernos([query: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Search the fixed ErnosPlain reference corpus (stdlib + language reference) for REAL syntax/usage. When teaching, use this to ground a concept in actual stdlib source rather than inventing syntax. Returns the most relevant excerpts.\n")
+        set schemas to concat(schemas and "  Example: Action: lookup_ernos([\"how to split a string\"])\n\n")
+
+        set schemas to concat(schemas and "- get_lesson([number: Int]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Fetch a registered ErnosPlain lesson (objective, concepts, the learner's exercise, and your private tutor_notes for coaching). In tutor mode, use this to run a lesson; coach from tutor_notes but NEVER paste the solution.\n")
+        set schemas to concat(schemas and "  Example: Action: get_lesson([1])\n\n")
+
+        set schemas to concat(schemas and "- list_lessons([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: List the registered ErnosPlain lessons (number + title).\n")
+        set schemas to concat(schemas and "  Example: Action: list_lessons([])\n\n")
+
+        set schemas to concat(schemas and "- seed_curriculum([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Install the built-in ErnosPlain lessons into content-addressed storage + the curriculum index (idempotent). Run once before first use if no lessons are registered.\n")
+        set schemas to concat(schemas and "  Example: Action: seed_curriculum([])\n\n")
+
+        set schemas to concat(schemas and "- index_ernos_reference([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: One-time admin action: index the stdlib + language reference into the searchable reference corpus used by lookup_ernos. Requires the embedding backend.\n")
+        set schemas to concat(schemas and "  Example: Action: index_ernos_reference([])\n\n")
 
         set schemas to concat(schemas and "- file_info([filename: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Get metadata (byte size and line count) for a workspace file.\n")
@@ -263,7 +290,7 @@ define tools_create with role as Str returning Map:
         
         set schemas to concat(schemas and "ORCHESTRATION (agent delegation):\n")
         set schemas to concat(schemas and "- delegate_task([instruction: Str, role: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Spawn a local sub-agent thread to work on a task. Returns a task_id for tracking.\n")
+        set schemas to concat(schemas and "  Description: Dispatch a local sub-agent to work on one focused task in the BACKGROUND. Returns immediately with a task id — it does NOT block and does NOT return the result here. The sub-agent runs in parallel; its result arrives automatically as a mid-turn update on a later turn, and you report it to the user then. After calling this, finish your turn (e.g. tell the user you've dispatched it). You may dispatch several at once. Do NOT call delegate_wait.\n")
         set schemas to concat(schemas and "  Example: Action: delegate_task([\"Research the security implications of this change\", \"Security Analyst\"])\n\n")
         
         set schemas to concat(schemas and "- delegate_wait([task_id: Str]) -> Str\n")
@@ -727,6 +754,39 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ok to changelog_log_change(cl_sess and "codebase_write" and path and "write" and cl_hash_before and cl_hash_after and cl_size_before and cl_size_after and f"File '{path}' written.")
         return f"File '{path}' written successfully."
         
+    if action_name equals "run_ep":
+        if length_list(args_list) < 1:
+            return "Error: run_ep requires 1 argument (code: Str)."
+        set rep_code to get_list(args_list and 0)
+        # Safe to run directly (no approval/denylist): run_ep_code executes the learner's
+        # binary inside an OS sandbox (no network, scratch-only FS, time/CPU/mem caps).
+        return run_ep_code(rep_code)
+
+    # ── Tutor / Decentralised Education tools (safe, read-only knowledge) ──────
+    if action_name equals "get_lesson":
+        if length_list(args_list) < 1:
+            return "Error: get_lesson requires 1 argument (lesson number: Int)."
+        set gl_num to string_to_int(get_list(args_list and 0))
+        set gl_body to tutor_get_lesson(gl_num)
+        if string_length(gl_body) == 0:
+            return concat("No lesson found with number " and concat(int_to_string(gl_num) and ". Use list_lessons to see what is available, or seed_curriculum to install the built-in lessons."))
+        return gl_body
+
+    if action_name equals "list_lessons":
+        return tutor_lesson_list()
+
+    if action_name equals "lookup_ernos":
+        if length_list(args_list) < 1:
+            return "Error: lookup_ernos requires 1 argument (query: Str)."
+        set le_q to get_list(args_list and 0)
+        return tutor_reference_search(le_q and 4)
+
+    if action_name equals "seed_curriculum":
+        return tutor_seed_curriculum()
+
+    if action_name equals "index_ernos_reference":
+        return tutor_index_reference()
+
     if action_name equals "run_command":
         if length_list(args_list) < 1:
             return "Error: run_command requires 1 argument (cmd). Example: Action: run_command([\"bash build.sh\"])"
@@ -1313,7 +1373,15 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set dt_model to map_get_val(ctx and "model")
         set dt_memory to map_get_val(ctx and "memory_mgr")
         set dt_tools to map_get_val(ctx and "tools_mgr")
-        return orchestrator_spawn(dt_orch and dt_instruction and dt_role and dt_model and dt_memory and dt_tools and cast_map_to_int(ctx))
+        # ASYNC dispatch: orchestrator_spawn launches the sub-agent on its OWN thread
+        # and returns its task id immediately — we do NOT block. The sub-agent runs in
+        # the background; when it finishes it drops its result into this session's
+        # whisper queue, so the agent is reprompted with it on a later turn. This lets
+        # the agent fan out several sub-agents and keep talking to the user meanwhile.
+        display concat("[DELEGATE] delegate_task tool ENTER role=" and concat(dt_role and concat(" instruction=" and dt_instruction)))
+        set dt_tid to orchestrator_spawn(dt_orch and dt_instruction and dt_role and dt_model and dt_memory and dt_tools and cast_map_to_int(ctx))
+        display concat("[DELEGATE] delegate_task: dispatched (async) tid=" and dt_tid)
+        return concat("Dispatched sub-agent '" and concat(dt_role and concat("' as background task '" and concat(dt_tid and "'. It is running now; you do NOT need to wait. Finish your turn — tell the user you've dispatched it. Its result will arrive automatically as a mid-turn update later, and you can report it to the user then. Do NOT call delegate_wait."))))
 
     if action_name equals "delegate_wait":
         if length_list(args_list) < 1:
@@ -1322,7 +1390,10 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set dw_orch to map_get_val(ctx and "orchestrator")
         if dw_orch == 0:
             return "Error: Orchestrator not initialized."
-        return orchestrator_wait(dw_orch and dw_task_id)
+        # NON-BLOCKING by design: blocking here would deadlock the serialized run lock
+        # (the worker needs the lock this turn holds). Return current status instead;
+        # the result is delivered to the user automatically when the sub-agent finishes.
+        return concat("Sub-agents run in the background and report automatically when done — do not wait. Current status of '" and concat(dw_task_id and concat("': " and orchestrator_check(dw_orch and dw_task_id))))
 
     if action_name equals "delegate_check":
         if length_list(args_list) < 1:

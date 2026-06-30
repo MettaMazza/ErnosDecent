@@ -55,17 +55,14 @@ define workspace_trim_newline with s as Str returning Str:
 
 # ---- Count newlines in a string (returns line count) ----
 define workspace_count_lines with content as Str returning Int:
-    set len to string_length(content)
-    if len == 0:
+    # O(n) via string_split. The old char-by-char loop used get_character, which is
+    # O(n) per call (internal strlen) → O(n²) overall, hanging on large files.
+    if string_length(content) == 0:
         return 0
-    set lines to 1
-    set i to 0
-    repeat while i < len:
-        set ch to get_character(content and i)
-        if ch == 10:
-            set lines to lines + 1
-        set i to i + 1
-    return lines
+    set parts to string_split(content and "\n")
+    set n to length_list(parts)
+    free_list(parts)
+    return n
 
 # ================================================================
 # workspace_init — Initialize per-session workspace directory
@@ -216,29 +213,22 @@ define workspace_list_recursive with dir_path as Str and relative_prefix as Str 
 # Prepends metadata header and appends continuation hint for large files
 # ================================================================
 define workspace_read_file with filename as Str returning Str:
-    set full_path to path_join("config/workspaces/active" and filename)
-    if file_exists(full_path) == 0:
+    set rpath to path_join("config/workspaces/active" and filename)
+    if file_exists(rpath) == 0:
         # Check fallback inside uploads/ folder
         set fallback_path to path_join("config/workspaces/active/uploads" and filename)
         if file_exists(fallback_path) == 1:
-            set content to read_file(fallback_path)
-            set total_lines to workspace_count_lines(content)
-            set total_size to string_length(content)
-            set header to concat("[File: " and concat(filename and concat(" | Lines: " and concat(int_to_string(total_lines) and concat(" | Size: " and concat(int_to_string(total_size) and " bytes]\n"))))))
-            set output to concat(header and content)
-            if total_lines > 500:
-                set hint to concat("\n[File has " and concat(int_to_string(total_lines) and concat(" lines total — use workspace_read_range([\"" and concat(filename and "\", 501, 1000]) to continue]"))))
-                set output to concat(output and hint)
-            return output
-        display f"[workspace] Error: file not found: {full_path}"
-        return ""
-    set content to read_file(full_path)
+            set rpath to fallback_path
+        else:
+            display f"[workspace] Error: file not found: {rpath}"
+            return ""
+    set content to read_file(rpath)
     set total_lines to workspace_count_lines(content)
     set total_size to string_length(content)
     set header to concat("[File: " and concat(filename and concat(" | Lines: " and concat(int_to_string(total_lines) and concat(" | Size: " and concat(int_to_string(total_size) and " bytes]\n"))))))
     set output to concat(header and content)
     if total_lines > 500:
-        set hint to concat("\n[File has " and concat(int_to_string(total_lines) and concat(" lines total — use workspace_read_range([\"" and concat(filename and "\", 501, 1000]) to continue]"))))
+        set hint to concat("\n[File has " and concat(int_to_string(total_lines) and " lines total — if you need more, use workspace_read_range]"))
         set output to concat(output and hint)
     return output
 
@@ -293,58 +283,44 @@ define workspace_read_range with filename as Str and start_line as Int and end_l
             return f"Error: file not found: {filename}"
             
     set content to read_file(full_path)
-    set len to string_length(content)
-    if len == 0:
+    if string_length(content) == 0:
         return ""
 
-    # Count total lines and find start/end positions in a single pass
-    set total_lines to 1
-    set current_line to 1
-    set start_pos to -1
-    set end_pos to -1
-    
-    set i to 0
-    if start_line <= 1:
-        set start_pos to 0
-        
-    repeat while i < len:
-        set ch to get_character(content and i)
-        if ch == 10: # \n
-            set total_lines to total_lines + 1
-            set current_line to current_line + 1
-            if current_line == start_line:
-                set start_pos to i + 1
-            if current_line == end_line + 1:
-                set end_pos to i
-                set i to len # Break loop
-        set i to i + 1
-        
-    if end_pos == -1:
-        set end_pos to len
-        
-    if start_pos == -1 or else start_pos >= len:
+    # O(n) line slice via string_split. The previous version scanned char-by-char
+    # with get_character (O(n²) — hung large files) AND broke the loop as soon as it
+    # reached end_line, so total_lines was wrong (it reported end_line+1, not the real
+    # total) — which made the continuation hints and "of N total" lie and the agent
+    # stop early. Splitting gives the correct total and a clean range every time.
+    set lines to string_split(content and "\n")
+    set total_lines to length_list(lines)
+
+    set s to start_line
+    if s < 1:
+        set s to 1
+    set e to end_line
+    if e > total_lines:
+        set e to total_lines
+    if s > total_lines:
+        free_list(lines)
         return f"[Lines {start_line}-{end_line} of {total_lines} total | File: {filename}]\n(Requested range is beyond end of file)"
-        
-    set slice_len to end_pos - start_pos
-    if slice_len <= 0:
-        return f"[Lines {start_line}-{end_line} of {total_lines} total | File: {filename}]\n(Empty range)"
 
-    # Determine actual last line shown (may be less than end_line if file is shorter)
-    set actual_end to end_line
-    if actual_end > total_lines:
-        set actual_end to total_lines
+    set body to ""
+    set i to s
+    repeat while i <= e:
+        set body to concat(body and concat(get_list(lines and i - 1) and "\n"))
+        set i to i + 1
+    free_list(lines)
 
-    set header to f"[Lines {start_line}-{actual_end} of {total_lines} total | File: {filename}]\n"
-    set file_slice to substring(content and start_pos and slice_len)
-    set output to concat(header and file_slice)
+    set header to f"[Lines {s}-{e} of {total_lines} total | File: {filename}]\n"
+    set output to concat(header and body)
 
-    # Append continuation hint if there are more lines
-    if actual_end < total_lines:
-        set next_start to actual_end + 1
+    # Append continuation hint if there are more lines (now with the CORRECT total).
+    if e < total_lines:
+        set next_start to e + 1
         set next_end to next_start + 499
         if next_end > total_lines:
             set next_end to total_lines
-        set hint to f"\n[Use workspace_read_range([\"{filename}\", {next_start}, {next_end}]) to continue]"
+        set hint to f"\n[Use workspace_read_range([\"{filename}\", {next_start}, {next_end}]) to continue until line {total_lines}]"
         set output to concat(output and hint)
     return output
 

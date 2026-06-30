@@ -380,6 +380,19 @@ async def send_discord_reply(message, text, speakable=False, edit_msg=None):
         print(f"[DELIVERY] send_discord_reply OUTER EXCEPTION: {type(e).__name__}: {e}", flush=True)
 
 
+async def post_mid_message(channel, content):
+    """Post a mid-turn / sub-agent message to a channel, CHUNKED across multiple
+    Discord messages (2000-char limit) instead of truncating. Sub-agent results can
+    be long summaries — they must arrive in full, like the main agent's reply."""
+    body = f"💬 {content}"
+    # Split on 1990 to leave headroom under Discord's 2000 hard limit.
+    for i in range(0, max(len(body), 1), 1990):
+        try:
+            await channel.send(body[i:i + 1990])
+        except Exception as e:
+            print(f"[Discord Bridge] mid_message chunk send error: {e}", flush=True)
+
+
 def parse_pending_approval(resp):
     """Parse 'ai:pending_approval,tool:<name>,summary:<args>' into (tool, summary)."""
     tool_name = "unknown"
@@ -920,15 +933,9 @@ async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
                 etype = ev.get("type", "info")
                 content = ev.get("content", "")
                 emoji = TYPE_EMOJI.get(etype, "ℹ️")
-                # mid_message: post to main channel as a visible agent reply
+                # mid_message: post to main channel as a visible agent reply (chunked, not truncated)
                 if etype == "mid_message" and main_channel:
-                    mid_text = f"💬 {content}"
-                    if len(mid_text) > 2000:
-                        mid_text = mid_text[:1997] + "..."
-                    try:
-                        await main_channel.send(mid_text)
-                    except Exception as e:
-                        print(f"[Discord Bridge] mid_message send error: {e}", flush=True)
+                    await post_mid_message(main_channel, content)
                     continue
                 # All other events: post to trace thread
                 msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
@@ -950,13 +957,7 @@ async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
             content = ev.get("content", "")
             emoji = TYPE_EMOJI.get(etype, "ℹ️")
             if etype == "mid_message" and main_channel:
-                mid_text = f"💬 {content}"
-                if len(mid_text) > 2000:
-                    mid_text = mid_text[:1997] + "..."
-                try:
-                    await main_channel.send(mid_text)
-                except Exception as e:
-                    print(f"[Discord Bridge] mid_message final-drain send error: {e}", flush=True)
+                await post_mid_message(main_channel, content)
                 continue
             msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
             if len(msg) > 2000:
@@ -1158,9 +1159,19 @@ async def _run_query_bg(message, reply_msg):
                 print("[DELIVERY] WARNING: ai_resp was empty, replacing with '...'", flush=True)
                 ai_resp = "..."
                 
-            # Send reply on Discord (editing the initial placeholder message)
+            # Post the final answer as a NEW message at completion time rather than
+            # editing the early "🧠 Thinking..." placeholder. Editing the placeholder
+            # made the answer appear at the placeholder's ORIGINAL timestamp — i.e.
+            # behind any whispers / mid-turn sub-agent messages that arrived while the
+            # agent worked, so the latest reply showed out of chronological order.
+            # Posting fresh + removing the placeholder keeps the timeline correct.
             print(f"[DELIVERY] Calling send_discord_reply len={len(ai_resp)}", flush=True)
-            await send_discord_reply(message, ai_resp, speakable=True, edit_msg=reply_msg)
+            if reply_msg:
+                try:
+                    await reply_msg.delete()
+                except Exception as del_err:
+                    print(f"[DELIVERY] placeholder delete failed (continuing): {type(del_err).__name__}: {del_err}", flush=True)
+            await send_discord_reply(message, ai_resp, speakable=True, edit_msg=None)
             print("[DELIVERY] send_discord_reply returned OK", flush=True)
     except Exception as e:
         print(f"[DELIVERY] EXCEPTION in response path: {type(e).__name__}: {e}", flush=True)

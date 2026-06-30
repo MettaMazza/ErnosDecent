@@ -339,17 +339,138 @@ define appendMessage with container and sender and text and type:
         saveAiMessage(sender and text and type and timeStr)
 
 # ---- Append streaming AI token ----
+# Which message surface the streaming AI response should render into. Defaults to the
+# AI Playground tab; the Learning tab flips window.aiSurface to "learning" when it
+# sends a tutor prompt so the response streams into the tutor chat instead.
+define activeAiMessages:
+    if window.aiSurface == "learning":
+        set lc to document.getElementById("learning-messages-container")
+        if lc:
+            return lc
+    return window.aiContainer
+
+# ---- Learning tab: Socratic tutor chat + sandbox playground ----
+# Send a message to the tutor (mode=tutor). Routes the streamed response into the
+# Learning chat by flipping the AI surface, and locks the input while it runs.
+define sendTutorPrompt with text:
+    if not text || not window.isConnected:
+        return 0
+    set container to document.getElementById("learning-messages-container")
+    appendMessage(container and "You" and text and "sent")
+    set window.aiSurface to "learning"
+    set loader to document.getElementById("learning-loader")
+    if loader:
+        set_prop(loader.style and "display" and "flex")
+    set inp to document.getElementById("learning-input-text")
+    if inp:
+        set inp.disabled to true
+    set sb to document.getElementById("btn-submit-learning")
+    if sb:
+        set sb.disabled to true
+    set stp to document.getElementById("btn-stop-learning")
+    if stp:
+        set stp.disabled to false
+        set stp.textContent to "Stop"
+        set_prop(stp.style and "display" and "inline-block")
+    set modelSel to document.getElementById("learning-model-select")
+    set modelVal to ""
+    if modelSel:
+        set modelVal to modelSel.value
+    set msg to Object()
+    set msg.type to "ai_prompt"
+    set msg.prompt to text
+    set msg.mode to "tutor"
+    set msg.system to ""
+    set msg.model to modelVal
+    send_msg(window.ws and JSON.stringify(msg))
+    return 0
+
+define renderLessonsList with items:
+    set container to document.getElementById("learning-lessons-list")
+    if not container:
+        return 0
+    if not items || items.length == 0:
+        set container.innerHTML to "<p style=\"font-size:12px;color:var(--text-secondary);margin:4px 0;\">No lessons yet. Click \"Install\" to load the built-in lessons.</p>"
+        return 0
+    set html to ""
+    items.forEach(given it:
+        set num to it.number
+        set title to escapeHTML(it.title)
+        set html to concat(html and f"<button class=\"room-item\" data-lesson=\"{num}\"><span class=\"model-name\">Lesson {num}</span><span class=\"model-meta\">{title}</span></button>")
+    )
+    set container.innerHTML to html
+    return 0
+
+define requestLessonsList:
+    if window.isConnected && window.ws:
+        set m to Object()
+        set m.type to "lessons_list"
+        send_msg(window.ws and JSON.stringify(m))
+    return 0
+
+define setupLearningTab:
+    set form to document.getElementById("learning-send-form")
+    if form:
+        form.addEventListener("submit" and given event:
+            event.preventDefault()
+            set inp to document.getElementById("learning-input-text")
+            set text to inp.value.trim()
+            if text:
+                set inp.value to ""
+                sendTutorPrompt(text)
+        )
+    set startBtn to document.getElementById("btn-learning-start-1")
+    if startBtn:
+        startBtn.addEventListener("click" and given event:
+            sendTutorPrompt("I'd like to start Lesson 1. Please load it with the get_lesson tool and guide me through the first step — remember, coach me, don't give me the full answer.")
+        )
+    set seedBtn to document.getElementById("btn-seed-curriculum")
+    if seedBtn:
+        seedBtn.addEventListener("click" and given event:
+            if window.isConnected && window.ws:
+                set m to Object()
+                set m.type to "seed_curriculum"
+                send_msg(window.ws and JSON.stringify(m))
+        )
+    set lessonsList to document.getElementById("learning-lessons-list")
+    if lessonsList:
+        lessonsList.addEventListener("click" and given event:
+            set btn to event.target.closest("[data-lesson]")
+            if btn:
+                set num to btn.getAttribute("data-lesson")
+                sendTutorPrompt(concat("I'd like to start Lesson " and concat(num and ". Please load it with get_lesson and guide me through the first step without giving me the full answer.")))
+        )
+    set runBtn to document.getElementById("btn-run-ep")
+    if runBtn:
+        runBtn.addEventListener("click" and given event:
+            if window.isConnected && window.ws:
+                set editor to document.getElementById("learning-code-editor")
+                set code to editor.value
+                if code.trim():
+                    set out to document.getElementById("learning-run-output")
+                    if out:
+                        set_prop(out.style and "display" and "block")
+                        set out.textContent to "Running in the secure sandbox..."
+                    set runBtn.disabled to true
+                    set m to Object()
+                    set m.type to "run_ep"
+                    set m.code to code
+                    send_msg(window.ws and JSON.stringify(m))
+        )
+    requestLessonsList()
+    return 0
+
 define appendAiToken with token:
     if not window.currentAiResponseBubble:
         set bubble to document.createElement("div")
         set bubble.className to "chat-bubble received ai-bot"
         set bubble.innerHTML to "<span class=\"sender\">AI (Local Model)</span><p class=\"ai-text\"></p>"
-        window.aiContainer.appendChild(bubble)
+        activeAiMessages().appendChild(bubble)
         set window.currentAiResponseBubble to bubble
-        
+
     set textNode to window.currentAiResponseBubble.querySelector(".ai-text")
     set textNode.textContent to concat(textNode.textContent and token)
-    set window.aiContainer.scrollTop to window.aiContainer.scrollHeight
+    set_prop(activeAiMessages() and "scrollTop" and activeAiMessages().scrollHeight)
 
 # ---- Tool Pending Approval Card ----
 define appendApprovalCard with toolName and summary:
@@ -372,8 +493,8 @@ define appendApprovalCard with toolName and summary:
     set actionsHtml to concat(actionsHtml and "</div>")
     
     set_prop(bubble and "innerHTML" and concat(contentHtml and actionsHtml))
-    window.aiContainer.appendChild(bubble)
-    set_prop(window.aiContainer and "scrollTop" and window.aiContainer.scrollHeight)
+    activeAiMessages().appendChild(bubble)
+    set_prop(activeAiMessages() and "scrollTop" and activeAiMessages().scrollHeight)
     
     set_prop(window.aiInput and "disabled" and true)
     set btnSubmit to document.getElementById("btn-submit-ai")
@@ -480,8 +601,8 @@ define appendClarifyCard with questionsJson:
     )
     set window.clarifyHtml to concat(window.clarifyHtml and "<div class=\"clarify-actions\" style=\"margin-top:8px;\"><button type=\"button\" class=\"clarify-send btn-primary\">Send answers</button> <button type=\"button\" class=\"clarify-current btn-secondary\">Work with what we have</button></div>")
     set_prop(bubble and "innerHTML" and window.clarifyHtml)
-    window.aiContainer.appendChild(bubble)
-    set_prop(window.aiContainer and "scrollTop" and window.aiContainer.scrollHeight)
+    activeAiMessages().appendChild(bubble)
+    set_prop(activeAiMessages() and "scrollTop" and activeAiMessages().scrollHeight)
 
     # The run is paused waiting on the user — stop the spinner and the Stop button,
     # keep the input disabled until they answer.
@@ -550,8 +671,8 @@ define appendReasoningBubble with b64:
     set_prop(bubble.style and "fontSize" and "0.85em")
     set html to concat("<details><summary style=\"cursor:pointer;\">💭 Reasoning</summary><pre style=\"white-space:pre-wrap;margin:6px 0 0;\">" and concat(escapeHTML(decoded) and "</pre></details>"))
     set_prop(bubble and "innerHTML" and html)
-    window.aiContainer.appendChild(bubble)
-    set_prop(window.aiContainer and "scrollTop" and window.aiContainer.scrollHeight)
+    activeAiMessages().appendChild(bubble)
+    set_prop(activeAiMessages() and "scrollTop" and activeAiMessages().scrollHeight)
 
 define updateHostsTableUI with jsonStr:
     set tbody to document.getElementById("hosts-table-body")
@@ -687,12 +808,25 @@ define updateAiModelsUI with models:
             aiModelSelect.appendChild(opt)
         )
         set aiModelSelect.value to currentSelected
-        
+
         if currentSelected:
             set isIncluded to models.includes(currentSelected)
             if not isIncluded:
                 set window.selectedAiModel to ""
                 set aiModelSelect.value to ""
+
+    # Mirror the same model options into the Learning tab's tutor-model selector.
+    set learnModelSelect to document.getElementById("learning-model-select")
+    if learnModelSelect:
+        set prevLearn to learnModelSelect.value
+        set learnModelSelect.innerHTML to "<option value=\"\">Auto (Cascade)</option>"
+        models.forEach(given m:
+            set lopt to document.createElement("option")
+            set lopt.value to m
+            set lopt.textContent to m
+            learnModelSelect.appendChild(lopt)
+        )
+        set learnModelSelect.value to prevLearn
                 
     if window.aiModelsListContainer:
         set activeClass to ""
@@ -1755,7 +1889,20 @@ define handleDaemonMessage with msg:
         
     else if type == "ai_token":
         appendAiToken(msg.token)
-        
+
+    else if type == "run_ep_result":
+        set repOut to document.getElementById("learning-run-output")
+        if repOut:
+            set_prop(repOut.style and "display" and "block")
+            set repOut.textContent to msg.output
+        set repBtn to document.getElementById("btn-run-ep")
+        if repBtn:
+            set repBtn.disabled to false
+    else if type == "lessons_list_result":
+        renderLessonsList(msg.items)
+    else if type == "seed_result":
+        requestLessonsList()
+
     else if type == "tool_pending_approval":
         appendApprovalCard(msg.tool and msg.summary)
     else if type == "clarify":
@@ -1764,6 +1911,7 @@ define handleDaemonMessage with msg:
         appendReasoningBubble(msg.b64)
         
     else if type == "ai_complete":
+        set isLearning to (window.aiSurface == "learning")
         if window.currentAiResponseBubble:
             set textNode to window.currentAiResponseBubble.querySelector(".ai-text")
             if textNode:
@@ -1773,19 +1921,34 @@ define handleDaemonMessage with msg:
                 set timeStrSec to get_list(timeParts and 4)
                 set secParts to timeStrSec.split(":")
                 set timeStr to concat(get_list(secParts and 0) and concat(":" and get_list(secParts and 1)))
-                saveAiMessage("AI (Local Model)" and aiText and "received" and timeStr)
-                attachTtsButton(window.currentAiResponseBubble and aiText)
+                # Don't persist tutor turns into the AI-Playground history.
+                if not isLearning:
+                    saveAiMessage("AI (Local Model)" and aiText and "received" and timeStr)
+                    attachTtsButton(window.currentAiResponseBubble and aiText)
 
-        set_prop(window.aiLoader.style and "display" and "none")
-        set window.aiInput.disabled to false
-
-        set btnSubmit to document.getElementById("btn-submit-ai")
-        set btnSubmit.disabled to false
-
-        # F4: run finished (or was halted) — hide the Stop button.
-        set stopBtn to document.getElementById("btn-stop-ai")
-        if stopBtn != 0:
-            set_prop(stopBtn.style and "display" and "none")
+        # Reset the surface that actually issued the request.
+        if isLearning:
+            set lLoader to document.getElementById("learning-loader")
+            if lLoader:
+                set_prop(lLoader.style and "display" and "none")
+            set lInput to document.getElementById("learning-input-text")
+            if lInput:
+                set lInput.disabled to false
+            set lSubmit to document.getElementById("btn-submit-learning")
+            if lSubmit:
+                set lSubmit.disabled to false
+            set lStop to document.getElementById("btn-stop-learning")
+            if lStop != 0:
+                set_prop(lStop.style and "display" and "none")
+        else:
+            set_prop(window.aiLoader.style and "display" and "none")
+            set window.aiInput.disabled to false
+            set btnSubmit to document.getElementById("btn-submit-ai")
+            set btnSubmit.disabled to false
+            # F4: run finished (or was halted) — hide the Stop button.
+            set stopBtn to document.getElementById("btn-stop-ai")
+            if stopBtn != 0:
+                set_prop(stopBtn.style and "display" and "none")
 
         set window.currentAiResponseBubble to null
         
@@ -3582,6 +3745,8 @@ define main:
                 renderChatHistory(window.activeChannel)
             else if targetTab == "ai":
                 renderAiHistory()
+            else if targetTab == "learning":
+                requestLessonsList()
             else if targetTab == "guide":
                 set navList to document.getElementById("guide-nav-list")
                 if navList:
@@ -3745,6 +3910,8 @@ define main:
             set stopBtn.textContent to "Stop"
             set_prop(stopBtn.style and "display" and "inline-block")
 
+        # Normal AI Playground send — responses stream into the AI tab.
+        set window.aiSurface to "ai"
         set msg to Object()
         set msg.type to "ai_prompt"
         set msg.prompt to prompt
@@ -3752,7 +3919,10 @@ define main:
         set msg.model to window.selectedAiModel
         send_msg(window.ws and JSON.stringify(msg))
     )
-    
+
+    # ---- Learning tab: Socratic tutor chat + sandbox playground ----
+    setupLearningTab()
+
     set channelBtns to document.querySelectorAll("[data-channel]")
     channelBtns.forEach(given btn:
         btn.addEventListener("click" and given event:

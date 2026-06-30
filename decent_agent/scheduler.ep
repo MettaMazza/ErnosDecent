@@ -10,6 +10,7 @@ import "prompt"
 import "tools"
 import "memory"
 import "react_loop"
+import "./orchestrator"
 import "../logging"
 
 external define cast_borrow_to_map with b returning Map
@@ -318,6 +319,34 @@ define get_total_ram_gb returning Int:
                 return kb / 1048576
     return ram_gb
 
+# ─────────────────────────────────────────────────────
+# scheduler_report_completion
+# Runs in its own thread: re-prompts the agent with a finished background sub-agent's
+# result so it reports back to the user proactively (the "agent pings you when done"
+# path). Uses a CLONED ctx (own session_id, own active_runs) so it never clobbers a
+# concurrent user turn, and pushes the reply via a mid_message the client polls.
+# ─────────────────────────────────────────────────────
+define scheduler_report_completion with task_id as Str and parent_sid as Str and role as Str and result as Str and model as Map and memory as Map and tools as Map and ctx as Map returning Int:
+    log_info("scheduler" and concat("Proactively reporting finished sub-agent task=" and task_id))
+    # Isolate this proactive turn's mutable state (fresh memory, cloned tools, no
+    # shared session manager) so it can't race a concurrent user turn on the shared
+    # agent maps. `model` is read-only so it stays shared. The reply is pushed to the
+    # user via a mid_message regardless of session, so dropping sessions is safe.
+    set rep_ctx to _orch_clone_map(ctx)
+    set ok to map_delete(rep_ctx and "sessions")
+    set rep_mem to memory_create()
+    set ok to memory_init_synaptic_graph(rep_mem)
+    set rep_tools to _orch_clone_map(tools)
+    set ok to map_insert(rep_ctx and "session_id" and parent_sid)
+    set ok to map_insert(rep_ctx and "memory_mgr" and rep_mem)
+    set ok to map_insert(rep_ctx and "memory" and rep_mem)
+    set ok to map_insert(rep_ctx and "tools_mgr" and rep_tools)
+    set rep_prompt to concat("A background sub-agent you dispatched ('" and concat(role and concat("', task " and concat(task_id and concat(") has completed. Its result is below. Report it to the user clearly and concisely, then end your turn with reply_request.\n\n" and result)))))
+    set rep_reply to react_run(model and rep_mem and rep_tools and rep_ctx and rep_prompt)
+    set ok to react_write_mid_message(parent_sid and rep_reply)
+    log_info("scheduler" and concat("Proactive report delivered for task=" and task_id))
+    return 0
+
 # Background tick loop
 define scheduler_tick_loop with model as Map and memory as Map and tools as Map and ctx as Map returning Int:
     log_info("scheduler" and "Starting background task scheduler ticker loop.")
@@ -375,6 +404,12 @@ define scheduler_tick_loop with model as Map and memory as Map and tools as Map 
                     # Spawn job execution thread
                     spawn scheduler_execute_job(job_id and inst_val and cast_borrow_to_map(model) and cast_borrow_to_map(memory) and cast_borrow_to_map(tools) and cast_borrow_to_map(ctx))
             set i to i + 1
-            
+
         free_list(jobs_list)
+
+        # NOTE: proactive idle re-prompting was removed with the move to the async
+        # single-thread model — re-invoking react_run from this scheduler thread would
+        # drive the event loop concurrently with the IPC thread (a heap race).
+        # Completed sub-agent results are delivered on the user's next turn instead,
+        # via orchestrator_drain_completed in the active react loop.
     return 0

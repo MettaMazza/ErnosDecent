@@ -1,0 +1,70 @@
+# sandbox_ep.ep — safe execution of a learner's ErnosPlain snippet.
+#
+# The Decentralised Education plan's gating, safety-critical component (§3.3). The
+# compile steps (ernos transpile + clang) run trusted — they only transform source,
+# never execute the learner's logic. The learner's compiled BINARY runs INSIDE an OS
+# sandbox: network denied, writes confined to a throwaway scratch dir, a wall-clock
+# timeout (perl SIGALRM) and ulimit CPU/file caps. Verified by running to contain
+# infinite loops (killed at the limit), network connects (blocked), and writes outside
+# the scratch dir (blocked). This must NOT route through the approval-gated run_command
+# TOOL — the OS isolation, not a human gate, is what makes auto-running learner code safe.
+
+import "fs"
+import "os"
+import "datetime"
+import "collections"
+import "string"
+
+define run_ep_code with code as Str returning Str:
+    set ts to ep_time_now_ms()
+    set dir to concat("/tmp/eprun_" and int_to_string(ts))
+    set mk to create_directory(dir)
+    if file_exists(dir) == 0:
+        return "Error: could not create sandbox directory."
+
+    set wok to write_file(concat(dir and "/prog.ep") and code)
+
+    # Seatbelt profile: permit normally but DENY all network and DENY filesystem writes
+    # outside the scratch dir. SCRATCH is passed in via `sandbox-exec -D SCRATCH=...`.
+    set prof to "(version 1)\n(allow default)\n(deny network*)\n(deny file-write* (subpath \"/\"))\n(allow file-write* (subpath (param \"SCRATCH\")))\n(allow file-write-data (literal \"/dev/null\")(literal \"/dev/stdout\")(literal \"/dev/stderr\")(literal \"/dev/tty\")(literal \"/dev/dtracehelper\"))\n"
+    set pok to write_file(concat(dir and "/sb.sb") and prof)
+
+    # 1) ErnosPlain transpile (trusted — produces C, does not run learner logic)
+    set ern to run_command(f"cd {dir} && $HOME/.local/bin/ernos prog.ep 2>&1")
+    if file_exists(concat(dir and "/prog_compiled.c")) == 0:
+        set rm1 to run_command(f"rm -rf {dir}")
+        return concat("Your ErnosPlain code did not compile:\n\n" and ern)
+
+    # 2) C compile (trusted)
+    set cl to run_command(f"cd {dir} && clang prog_compiled.c -O2 -lpthread -lm -o prog 2>&1")
+    if file_exists(concat(dir and "/prog")) == 0:
+        set rm2 to run_command(f"rm -rf {dir}")
+        return concat("Your code transpiled but the native compile failed:\n\n" and cl)
+
+    # 3) Run the learner binary INSIDE the sandbox: no network, writes confined to the
+    #    scratch dir, 5s wall-clock timeout, 6s CPU + 50MB file caps. $? is the run's
+    #    exit (142=SIGALRM timeout, 152=CPU, 137=killed).
+    set runcmd to f"cd {dir} && ( ulimit -t 6 -f 51200 2>/dev/null; perl -e 'alarm 5; exec @ARGV' -- sandbox-exec -D SCRATCH={dir} -f sb.sb ./prog ) 2>&1; echo __EPRC__$?"
+    set raw to run_command(runcmd)
+    set rm3 to run_command(f"rm -rf {dir}")
+
+    # Separate program output from the exit-code marker.
+    set body to raw
+    set rc to "0"
+    set midx to string_index_of(raw and "__EPRC__")
+    if midx >= 0:
+        set body to substring(raw and 0 and midx)
+        set rc to substring(raw and midx + 8 and string_length(raw) - midx - 8)
+
+    if string_length(body) > 6000:
+        set body to concat(substring(body and 0 and 6000) and "\n...[output truncated]")
+
+    set suffix to ""
+    if string_contains(rc and "142") == 1:
+        set suffix to "\n\n[Stopped: hit the 5-second time limit — likely an infinite loop.]"
+    else if string_contains(rc and "152") == 1:
+        set suffix to "\n\n[Stopped: hit the CPU time limit.]"
+    else if string_contains(rc and "137") == 1:
+        set suffix to "\n\n[Stopped: killed by a resource limit.]"
+
+    return concat("Program output:\n" and concat(body and suffix))

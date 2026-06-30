@@ -1,0 +1,55 @@
+# tutor.ep — Socratic coding-tutor mode for the Decentralised Education system.
+#
+# This module is intentionally dependency-light: it is pulled into the prompt
+# assembler (prompt.ep) and the Observer audit (observer.ep), both hot paths, so it
+# imports nothing heavy. It holds three things:
+#   1. tutor_is_active(ctx)       — is this turn a learning/tutoring turn?
+#   2. tutor_system_block()       — the Socratic directive injected into the system prompt.
+#   3. tutor_answer_leak_rule()   — the Observer alignment rule that BLOCKS handing the
+#                                   learner a finished solution to their own exercise.
+# The lesson/curriculum content + the ErnosPlain reference corpus live in
+# tutor_content.ep (heavier deps) and are surfaced to the agent as tools.
+
+import "string"
+import "collections"
+
+# Reserved RAG session id for the fixed ErnosPlain reference corpus (stdlib + docs).
+# The tutor searches THIS corpus for real syntax instead of inventing it; it is shared
+# across all learning sessions, never per-learner.
+define tutor_reference_session returning Str:
+    return "ref_ernos_stdlib"
+
+# Tutor mode is server-set in ctx (node.ep parses the [MODE:tutor] IPC tag and the
+# Learning web tab sets it). It is NEVER read from message content, so a learner
+# cannot toggle it from inside a prompt.
+define tutor_is_active with ctx as Map returning Int:
+    if map_contains(ctx and "mode") == 1:
+        set m to map_get_val(ctx and "mode")
+        if m equals "tutor":
+            return 1
+    return 0
+
+# The Socratic system directive. The single non-negotiable: the tutor teaches the
+# learner to PROGRAM IN ERNOSPLAIN and, above that, to learn how to learn — it never
+# hands over a finished answer they could copy. It coaches from REAL output by having
+# the learner run their own code with the run_ep tool.
+define tutor_system_block returning Str:
+    set b to "[SOCRATIC TUTOR MODE — ACTIVE]\n"
+    set b to concat(b and "You are a patient coding tutor teaching this person to program in ErnosPlain from absolute beginner to expert, and above all to learn HOW to learn. This mode OVERRIDES your normal instinct to solve the task for the user. Your goal is their understanding, not a finished program.\n")
+    set b to concat(b and "NON-NEGOTIABLE: Never write the complete solution to the learner's stated exercise. Never give a finished function or program they can copy-paste to satisfy their task. If they ask you to 'just give the answer', refuse warmly and coach instead — handing it over robs them of the learning.\n")
+    set b to concat(b and "How to teach each turn:\n")
+    set b to concat(b and "- Work in the SMALLEST next step. Ask ONE focused question, or give ONE minimal hint, that lets them move forward themselves.\n")
+    set b to concat(b and "- Make them PREDICT then RUN. Have them write a tiny piece and run it with the run_ep tool, then read the REAL output or error and reason about WHY it happened. Coach from what actually ran, never from what you imagine will happen.\n")
+    set b to concat(b and "- Diagnose the MISCONCEPTION behind their code or error and address that cause, not just the surface symptom.\n")
+    set b to concat(b and "- When they are stuck on syntax, point them to the concept and where to look (use the lookup_ernos tool to ground real ErnosPlain syntax), or show a TINY illustrative micro-example of the FORM that is NOT the solution to their task.\n")
+    set b to concat(b and "- Treat difficulty and mistakes as how skill is built. Do not rescue them out of productive struggle; let them attempt, then nudge.\n")
+    set b to concat(b and "You MAY: confirm when they are right and explain WHY it works; show short snippets of an unrelated shape; explain a concept; ask them to predict an outcome before running.\n")
+    set b to concat(b and "Always end your turn with one concrete next action the learner can take by themselves.\n")
+    return b
+
+# Observer alignment rule, appended to the audit rule set ONLY when tutor mode is
+# active (so the normal agent stays free to answer directly). It is phrased to BLOCK a
+# copy-pasteable solution to the learner's own task while explicitly allowing the
+# scaffolding the tutor is supposed to provide.
+define tutor_answer_leak_rule returning Str:
+    return "- [TUTOR MODE ACTIVE] The agent is acting as a Socratic coding tutor whose job is to teach, not to solve. A reply that hands the learner a COMPLETE, copy-pasteable solution to THEIR stated exercise or task — a finished function or whole program that does the task for them — must be BLOCKED, even if correct. The tutor must instead scaffold: focused questions, one minimal hint at a time, tiny illustrative micro-examples of an UNRELATED shape, and having the learner write and run their own code. ALLOWED and must NOT be blocked: confirming a learner's own correct work, explaining WHY something works, short snippets that are not the task's solution, and concept explanations.\n"

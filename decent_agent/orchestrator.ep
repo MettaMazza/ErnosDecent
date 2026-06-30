@@ -8,9 +8,105 @@
 
 import "collections"
 import "string"
+import "memory"
 
 external define cast_borrow_to_map with b returning Map
 external define cast_map_to_int with m returning Int
+# react_run keeps its active session id in a thread-local (ep_active_session_id is
+# __thread), so each spawned sub-agent thread has its own and no longer clobbers the
+# parent's or its siblings'.
+external define tools_set_active_session with sid as Str returning Int
+
+# ─────────────────────────────────────────────────────
+# Completion delivery model
+# ─────────────────────────────────────────────────────
+# A spawned sub-agent records its result on its task map (status=completed, result)
+# and leaves reported=0. Delivery is PULL-based, exactly-once via the reported flag:
+#   • orchestrator_drain_completed(orch, sid) — the parent's ACTIVE react loop pulls
+#     its session's finished sub-agents each iteration and injects them mid-turn
+#     (labelled as sub-agent results, NOT user input).
+#   • orchestrator_pull_completed / orchestrator_claim_report — the background
+#     scheduler proactively reports finished sub-agents whose session is IDLE.
+# Whichever path marks reported=1 first wins, so each result is delivered once.
+
+# orchestrator_drain_completed: framed text for this session's finished, unreported
+# sub-agents; marks them reported. Returns "" if none. Used by the active react loop.
+define orchestrator_drain_completed with orch as Int and session_id as Str returning Str:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set tkeys to map_keys(tasks)
+    set tlen to length_list(tkeys)
+    set out to ""
+    set i to 0
+    repeat while i < tlen:
+        set k to get_list(tkeys and i)
+        set tm to map_get_val(tasks and k)
+        set st to ptr_to_str(map_get_val(tm and "status"))
+        set rep to map_get_val(tm and "reported")
+        set psid to ptr_to_str(map_get_val(tm and "parent_sid"))
+        if st equals "completed" and rep == 0 and psid equals session_id:
+            set trole to ptr_to_str(map_get_val(tm and "role"))
+            set tres to ptr_to_str(map_get_val(tm and "result"))
+            set hdr to concat("[SUB-AGENT '" and concat(trole and concat("' (task " and concat(k and ") completed. Result:]\n"))))
+            set out to concat(out and concat(hdr and concat(tres and "\n")))
+            set ok to map_insert(tm and "reported" and 1)
+        set i to i + 1
+    free_list(tkeys)
+    set ok to unlock_mutex(mtx)
+    return out
+
+# orchestrator_pull_completed: list of task_ids that are completed & not yet reported
+# (no marking). The scheduler peeks, then claims the idle ones.
+define orchestrator_pull_completed with orch as Int returning List:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set tkeys to map_keys(tasks)
+    set tlen to length_list(tkeys)
+    set out to create_list()
+    set i to 0
+    repeat while i < tlen:
+        set k to get_list(tkeys and i)
+        set tm to map_get_val(tasks and k)
+        set st to ptr_to_str(map_get_val(tm and "status"))
+        set rep to map_get_val(tm and "reported")
+        if st equals "completed" and rep == 0:
+            set ok to append_list(out and k)
+        set i to i + 1
+    free_list(tkeys)
+    set ok to unlock_mutex(mtx)
+    return out
+
+# orchestrator_claim_report: atomically claim a task for proactive reporting. Returns
+# 1 if THIS caller marked it reported (it was completed & unreported), else 0.
+define orchestrator_claim_report with orch as Int and task_id as Str returning Int:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set claimed to 0
+    if map_contains(tasks and task_id) == 1:
+        set tm to map_get_val(tasks and task_id)
+        set st to ptr_to_str(map_get_val(tm and "status"))
+        set rep to map_get_val(tm and "reported")
+        if st equals "completed" and rep == 0:
+            set ok to map_insert(tm and "reported" and 1)
+            set claimed to 1
+    set ok to unlock_mutex(mtx)
+    return claimed
+
+# orchestrator_task_field: read a string field from a task map (parent_sid/role/result).
+define orchestrator_task_field with orch as Int and task_id as Str and field as Str returning Str:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set val to ""
+    if map_contains(tasks and task_id) == 1:
+        set tm to map_get_val(tasks and task_id)
+        if map_contains(tm and field) == 1:
+            set val to ptr_to_str(map_get_val(tm and field))
+    set ok to unlock_mutex(mtx)
+    return val
 
 # ─────────────────────────────────────────────────────
 # orchestrator_create
@@ -53,10 +149,41 @@ define orchestrator_generate_id with orch as Int returning Str:
 # prompt, calls react_run to execute the ReAct loop,
 # then sends the result through the provided channel.
 # ─────────────────────────────────────────────────────
-define orchestrator_spawn_worker with task_id as Str and instruction as Str and role as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int and result_ch as Int returning Int:
+async define orchestrator_spawn_worker with task_id as Str and instruction as Str and role as Str and model as Int and memory_mgr as Map and tools_mgr as Map and ctx as Map and result_ch as Int and orch as Int and parent_sid as Str returning Int:
     set role_prefix to concat("[Role: " and role)
     set prompt to concat(role_prefix and concat("] " and instruction))
-    set result to react_run(cast_borrow_to_map(model) and cast_borrow_to_map(memory_mgr) and cast_borrow_to_map(tools_mgr) and cast_borrow_to_map(ctx) and prompt)
+    display concat("[DELEGATE] worker thread BEGIN task=" and task_id)
+    # react_run sets its OWN thread-local active session (ep_active_session_id is
+    # __thread), so this worker no longer clobbers the parent's or sibling agents'.
+    # memory_mgr, tools_mgr and ctx are the caller's freshly-cloned, owned Maps handed
+    # off to this thread (so concurrent map writes can't race the main agent). Only
+    # `model` stays shared — it is read-only during a run.
+    set result to react_run(cast_borrow_to_map(model) and memory_mgr and tools_mgr and ctx and prompt)
+    display concat("[DELEGATE] worker thread END   task=" and concat(task_id and concat(" result_len=" and int_to_string(string_length(result)))))
+    # Record the result on the task map + results map (mutex-guarded) so a polling
+    # orchestrator_check sees completion even if no one is blocked in orchestrator_wait.
+    set wmtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(wmtx)
+    set wtasks to map_get_val(orch and "tasks")
+    if map_contains(wtasks and task_id) == 1:
+        set wtm to map_get_val(wtasks and task_id)
+        set ok to map_insert(wtm and "status" and "completed")
+        set ok to map_insert(wtm and "result" and result)
+    set wresults to map_get_val(orch and "results")
+    set ok to map_insert(wresults and task_id and result)
+    set ok to unlock_mutex(wmtx)
+    display concat("[DELEGATE] worker recorded completion task=" and concat(task_id and concat(" parent_sid=" and parent_sid)))
+    # PROACTIVE PING: notify the user the moment the background sub-agent finishes by
+    # pushing its result as a mid-turn message (trace 'mid_message' — the web/Discord
+    # client polls it). orchestrator_claim_report atomically marks the task reported,
+    # so if the parent's active turn already drained+reported it we skip (delivered once).
+    set claimed to orchestrator_claim_report(orch and task_id)
+    if claimed == 1:
+        set pmsg to concat("✓ Sub-agent '" and concat(role and concat("' (" and concat(task_id and concat(") finished:\n" and result)))))
+        set ok to react_write_mid_message(parent_sid and pmsg)
+        display concat("[DELEGATE] worker pinged user with result task=" and task_id)
+    # Wake any blocked orchestrator_wait. Channel is buffered (cap 1024) so this
+    # never blocks the worker even if the parent hasn't called wait yet.
     send result to result_ch
     return 0
 
@@ -86,23 +213,14 @@ define _orch_clone_map with src as Map returning Map:
 # reasoning, timeline, and scratchpad structures.
 # ─────────────────────────────────────────────────────
 define _orch_clone_memory with src as Map returning Map:
-    set dest to create_map()
-    set scratchpad to create_map()
-    set timeline to create_list()
-    set reasoning to create_list()
-
-    set ok to map_insert(dest and "scratchpad" and scratchpad)
-    set ok to map_insert(dest and "lessons" and map_get_val(src and "lessons"))
-    set ok to map_insert(dest and "timeline" and timeline)
-    set ok to map_insert(dest and "reasoning" and reasoning)
-    set ok to map_insert(dest and "synaptic_graph" and map_get_val(src and "synaptic_graph"))
-    set ok to map_insert(dest and "edges" and map_get_val(src and "edges"))
-    set ok to map_insert(dest and "permanent_edges" and map_get_val(src and "permanent_edges"))
-    set ok to map_insert(dest and "synaptic_nodes" and map_get_val(src and "synaptic_nodes"))
-    set ok to map_insert(dest and "synaptic_edges" and map_get_val(src and "synaptic_edges"))
-    set ok to map_insert(dest and "synaptic_layers" and map_get_val(src and "synaptic_layers"))
-    set ok to map_insert(dest and "lessons_count" and map_get_val(src and "lessons_count"))
-    set ok to map_insert(dest and "graph_edges_count" and map_get_val(src and "graph_edges_count"))
+    # FULLY ISOLATED memory for the sub-agent. The previous version shared the
+    # synaptic graph / edges / nodes by reference (map_get_val(src ...)), so the
+    # sub-agent thread and the main agent wrote the same maps concurrently — EP maps
+    # are not thread-safe, so that raced and segfaulted (map_contains during a resize).
+    # A fresh, correctly-typed memory via memory_create gives the sub-agent its own
+    # structures; nothing mutable is shared with the parent.
+    set dest to memory_create()
+    set ok to memory_init_synaptic_graph(dest)
     return dest
 
 
@@ -116,13 +234,28 @@ define _orch_clone_memory with src as Map returning Map:
 define orchestrator_spawn with orch as Int and instruction as Str and role as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int returning Str:
     set task_id to orchestrator_generate_id(orch)
     set ch to create_channel()
+    display concat("[DELEGATE] orchestrator_spawn ENTRY task=" and concat(task_id and concat(" role=" and role)))
 
-    # Clone context and memory to prevent concurrent mutations and data races
+    # Clone context, memory AND tools to prevent concurrent mutations / data races.
+    # tools_mgr is cloned because tool/schema building writes back into it (e.g. the
+    # cached "schemas" string) — sharing it with the running main agent raced.
     set child_ctx to _orch_clone_map(cast_borrow_to_map(ctx))
     set child_memory to _orch_clone_memory(cast_borrow_to_map(memory_mgr))
+    set child_tools to _orch_clone_map(cast_borrow_to_map(tools_mgr))
+
+    # Capture the parent's session id from the CLONE (a legitimately-owned Map),
+    # before we strip it below. Reading it via an assigned `cast_borrow_to_map(ctx)`
+    # local instead would make the codegen free that owned borrow-view at scope exit
+    # — i.e. free the parent's real ctx — corrupting it (the crash after delegate).
+    set parent_sid to ""
+    if map_contains(child_ctx and "session_id") == 1:
+        set parent_sid to ptr_to_str(map_get_val(child_ctx and "session_id"))
 
     # Clean transient query-local properties from child context
     set ok to map_delete(child_ctx and "session_id")
+    # Drop the shared session manager — the sub-agent has its own session (task_id)
+    # and does not persist; sharing the live sessions_mgr raced with the main agent.
+    set ok to map_delete(child_ctx and "sessions")
     set ok to map_delete(child_ctx and "was_cancelled")
     set ok to map_delete(child_ctx and "pending_action")
     set ok to map_delete(child_ctx and "pending_clarification")
@@ -133,10 +266,13 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
     set ok to map_delete(child_ctx and "clarify_rounds")
     set ok to map_delete(child_ctx and "clarify_done")
 
-    # Set sub-agent properties
+    # Set sub-agent properties — point the ctx at the sub-agent's OWN isolated tools
+    # and memory so any nested delegation / tool lookup uses the clones, not the
+    # parent's shared maps.
     set ok to map_insert(child_ctx and "session_id" and task_id)
     set ok to map_insert(child_ctx and "memory" and child_memory)
     set ok to map_insert(child_ctx and "memory_mgr" and child_memory)
+    set ok to map_insert(child_ctx and "tools_mgr" and child_tools)
 
     # Build task metadata map
     set task_map to create_map()
@@ -145,10 +281,13 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
     set ok to map_insert(task_map and "status" and "running")
     set ok to map_insert(task_map and "result" and "")
     set ok to map_insert(task_map and "task_id" and task_id)
+    set ok to map_insert(task_map and "parent_sid" and parent_sid)
+    set ok to map_insert(task_map and "reported" and 0)
     
     # Store references to prevent GC sweep of thread args on thread startup
     set ok to map_insert(task_map and "child_ctx" and child_ctx)
     set ok to map_insert(task_map and "child_memory" and child_memory)
+    set ok to map_insert(task_map and "child_tools" and child_tools)
     set ok to map_insert(task_map and "instruction" and instruction)
 
     # Store task under orchestrator with mutex protection
@@ -158,8 +297,20 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
     set ok to map_insert(tasks and task_id and task_map)
     set ok to unlock_mutex(mtx)
 
-    # Spawn the worker thread
-    spawn orchestrator_spawn_worker(task_id and instruction and role and model and cast_map_to_int(child_memory) and tools_mgr and cast_map_to_int(child_ctx) and ch)
+    # Spawn the sub-agent on its OWN thread so multiple sub-agents run in parallel.
+    # Each thread has: its own thread-local active session (ep_active_session_id is
+    # __thread), its own cloned ctx + memory, and its own task_id as session id — so
+    # workers no longer clobber the parent or each other. The worker records its
+    # result on the task map and sends it down the channel; orchestrator_wait blocks
+    # on the channel, orchestrator_check polls the task map. Returns the task_id
+    # immediately so the caller can fan out many agents and keep working.
+    # Dispatch the sub-agent as an ASYNC TASK on the event loop (not an OS thread).
+    # The async call enqueues the task and returns immediately; it runs cooperatively
+    # — interleaved at LLM await points with the parent turn and sibling sub-agents —
+    # on the single agent thread, so there is no shared-heap race. We don't await the
+    # future; completion is recorded on the task map and drained on a later turn.
+    display concat("[DELEGATE] dispatching async sub-agent task=" and concat(task_id and concat(" role=" and concat(role and concat(" parent_sid=" and parent_sid)))))
+    set subfut to orchestrator_spawn_worker(task_id and instruction and role and model and child_memory and child_tools and child_ctx and ch and orch and parent_sid)
     return task_id
 
 
@@ -173,27 +324,28 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
 # ─────────────────────────────────────────────────────
 define orchestrator_wait with orch as Int and task_id as Str returning Str:
     set mtx to map_get_val(orch and "mutex")
-    # Check existence
     set ok to lock_mutex(mtx)
     set tasks to map_get_val(orch and "tasks")
     set has_task to map_contains(tasks and task_id)
-    set ok to unlock_mutex(mtx)
     if has_task == 0:
+        set ok to unlock_mutex(mtx)
         return "error:task_not_found"
-    # Retrieve channel (safe — only this task_id's data)
-    set ok to lock_mutex(mtx)
     set task_map to map_get_val(tasks and task_id)
+    # If the worker already finished, return its recorded result without touching the
+    # channel (a second receive on a drained channel would block forever).
+    set cur_status to ptr_to_str(map_get_val(task_map and "status"))
+    if cur_status equals "completed":
+        set done_result to ptr_to_str(map_get_val(task_map and "result"))
+        set ok to unlock_mutex(mtx)
+        display concat("[DELEGATE] orchestrator_wait (already done) task=" and task_id)
+        return done_result
     set ch to map_get_val(task_map and "channel")
     set ok to unlock_mutex(mtx)
-    # Block until result arrives
-    set result to receive from ch
-    # Update status and store result
-    set ok to lock_mutex(mtx)
-    set ok to map_insert(task_map and "status" and "completed")
-    set ok to map_insert(task_map and "result" and result)
-    set results_map to map_get_val(orch and "results")
-    set ok to map_insert(results_map and task_id and result)
-    set ok to unlock_mutex(mtx)
+    display concat("[DELEGATE] orchestrator_wait BLOCKING on channel task=" and task_id)
+    # Block until the worker thread sends its result down the buffered channel.
+    set rcv to receive from ch
+    set result to ptr_to_str(rcv)
+    display concat("[DELEGATE] orchestrator_wait GOT result task=" and concat(task_id and concat(" len=" and int_to_string(string_length(result)))))
     return result
 
 
@@ -409,38 +561,21 @@ define orchestrator_swarm with orch as Int and instruction as Str and sub_tasks_
     if num_tasks == 0:
         free_list(parts)
         return "error:no_sub_tasks"
-    # Phase 1: Spawn one agent per sub-task
-    set task_ids to create_list()
+    # ASYNC dispatch: spawn one background sub-agent per sub-task and return
+    # immediately. We do NOT block waiting for results (that would deadlock under the
+    # global run lock, since the workers need that same lock). Each sub-agent runs in
+    # the background — serialized one at a time — and reports its result to the user
+    # proactively on completion (see scheduler_report_completion). join_strategy is
+    # accepted for compatibility but no longer merges synchronously; results arrive as
+    # individual proactive updates.
+    set dispatched to ""
     set i to 0
     repeat while i < num_tasks:
         set sub_task to ptr_to_str(get_list(parts and i))
         set full_instruction to concat(instruction and concat(": " and sub_task))
         set role to concat("swarm_worker_" and int_to_string(i))
         set tid to orchestrator_spawn(orch and full_instruction and role and model and memory_mgr and tools_mgr and ctx)
-        set ok to append_list(task_ids and str_to_ptr(tid))
+        set dispatched to concat(dispatched and concat("\n - " and concat(role and concat(" (" and concat(tid and concat("): " and sub_task))))))
         set i to i + 1
     free_list(parts)
-    # Phase 2: Wait for all results
-    set results to create_list()
-    set i to 0
-    repeat while i < num_tasks:
-        set tid to ptr_to_str(get_list(task_ids and i))
-        set result to orchestrator_wait(orch and tid)
-        set ok to append_list(results and str_to_ptr(result))
-        set i to i + 1
-    free_list(task_ids)
-    # Phase 3: Merge results by strategy
-    set merged to ""
-    if join_strategy equals "concat":
-        set merged to _orch_merge_concat(results)
-    else:
-        if join_strategy equals "best":
-            set merged to _orch_merge_best(results)
-        else:
-            if join_strategy equals "vote":
-                set merged to _orch_merge_vote(results)
-            else:
-                # Unknown strategy — fall back to concat
-                set merged to _orch_merge_concat(results)
-    free_list(results)
-    return merged
+    return concat("Dispatched " and concat(int_to_string(num_tasks) and concat(" background sub-agents. They are running now and will each report their result to the user as they finish. Tell the user you've dispatched them; do NOT wait.\nDispatched:" and dispatched)))

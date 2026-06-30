@@ -18,6 +18,8 @@ import "../decent_id/keys.ep"
 import "../decent_store/rag"
 import "../storage"
 import "../decent_ai/tts"
+import "../decent_agent/sandbox_ep"
+import "../decent_agent/tutor_content"
 
 set IPC_DAEMON_PORT to 5000
 
@@ -433,6 +435,10 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set prompt to json_get_string(payload and "prompt")
                     set system_prompt to json_get_string(payload and "system")
                     set model_name to json_get_string(payload and "model")
+                    # Interaction mode (e.g. "tutor" for the Learning tab's Socratic
+                    # coding teacher). Empty for the normal chat. The daemon persists it
+                    # on the session, so the tab stays Socratic across turns.
+                    set mode_name to json_get_string(payload and "mode")
                     # E2: the WebUI is the authenticated local operator (the WS is
                     # Origin/loopback-gated), so assert admin server-side as the FIRST
                     # marker — role is locked before any [SYSTEM:] is parsed.
@@ -440,6 +446,10 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     if string_length(model_name) > 0:
                         set ai_cmd to concat(ai_cmd and "[MODEL:")
                         set ai_cmd to concat(ai_cmd and model_name)
+                        set ai_cmd to concat(ai_cmd and "] ")
+                    if string_length(mode_name) > 0:
+                        set ai_cmd to concat(ai_cmd and "[MODE:")
+                        set ai_cmd to concat(ai_cmd and mode_name)
                         set ai_cmd to concat(ai_cmd and "] ")
                     if string_length(system_prompt) > 0:
                         set ai_cmd to concat(ai_cmd and "[SYSTEM:")
@@ -460,6 +470,22 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set ai_resp to query_daemon_ipc(ai_cmd)
                     display f"[ws] IPC AI -> {ai_resp}"
                     set ok to ws_dispatch_ai_response(client_fd and ai_resp)
+                else if msg_type equals "run_ep":
+                    # Learning playground: compile + run the learner's snippet in the
+                    # OS sandbox (no network, scratch-only FS, time/CPU caps) and return
+                    # the real output/errors. Same isolation as the agent's run_ep tool.
+                    set rep_code to json_get_string(payload and "code")
+                    set rep_out to run_ep_code(rep_code)
+                    set rep_msg to concat("{\"type\":\"run_ep_result\",\"output\":\"" and concat(escape_json_string(rep_out) and "\"}"))
+                    ws_send_text(client_fd and rep_msg)
+                else if msg_type equals "lessons_list":
+                    set ll_json to tutor_lesson_list_json()
+                    set ll_msg to concat("{\"type\":\"lessons_list_result\",\"items\":" and concat(ll_json and "}"))
+                    ws_send_text(client_fd and ll_msg)
+                else if msg_type equals "seed_curriculum":
+                    set sc_res to tutor_seed_curriculum()
+                    set sc_msg to concat("{\"type\":\"seed_result\",\"message\":\"" and concat(escape_json_string(sc_res) and "\"}"))
+                    ws_send_text(client_fd and sc_msg)
                 else if msg_type equals "clarify_answer":
                     # F3: the user answered the agent's clarifying question(s) (or chose
                     # "work with what we have" -> answers == "__USE_CURRENT__"). Resume.

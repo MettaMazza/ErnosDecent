@@ -8,6 +8,7 @@ import "llm"
 
 import "prompt"
 import "tools"
+import "./orchestrator"
 import "memory"
 import "observer"
 import "session"
@@ -23,6 +24,12 @@ import "sql"
 # session id normalises to "default" so both sides agree on a key.
 set RUN_CANCEL_MAP to create_map()
 set RUN_CANCEL_LOCK to create_mutex()
+
+# Concurrency model: agents run as cooperative ASYNC TASKS on a single thread (the
+# LLM call yields at `await http_post_async`). The main user turn and every background
+# sub-agent interleave at those await points on ONE thread, so there is no concurrent
+# heap access and no GC race — and therefore no global run lock is needed. (An earlier
+# thread-based design used a process-wide lock here; it's gone with the move to async.)
 
 define react_cancel_key with session_id as Str returning Str:
     if string_length(session_id) == 0:
@@ -452,7 +459,20 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             display f"[ReAct] Received mid-turn whisper(s) from user."
             set ok to trace_emit(trace_db and trace_sid and "whisper_received" and whispers)
             set query_prompt to concat(query_prompt and f"\n[MID-TURN USER GUIDANCE — the user has sent additional direction while you are processing. This is NOT a new request — it is live guidance for your CURRENT task. Read it carefully and adjust your approach. You may acknowledge it with mid_message but do NOT end your turn with reply_request unless the user explicitly tells you to stop.]\n{whispers}[/MID-TURN USER GUIDANCE]\n")
-        
+
+        # Sub-agent completion checkpoint — pull any of THIS session's finished
+        # background sub-agents and inject their results, labelled distinctly from
+        # the user whispers above (these are agent outputs, not user input).
+        set sub_orch to 0
+        if map_contains(ctx and "orchestrator") == 1:
+            set sub_orch to map_get_val(ctx and "orchestrator")
+        if sub_orch != 0:
+            set sub_done to orchestrator_drain_completed(sub_orch and trace_sid)
+            if string_length(sub_done) > 0:
+                display f"[ReAct] Incorporating completed sub-agent result(s) mid-turn."
+                set ok to trace_emit(trace_db and trace_sid and "subagent_result" and sub_done)
+                set query_prompt to concat(query_prompt and concat("\n[SUB-AGENT RESULTS — background agents you dispatched have finished. The following are THEIR outputs (not user input). Use them and report to the user as appropriate.]\n" and concat(sub_done and "[/SUB-AGENT RESULTS]\n")))
+
         set raw_output to ""
         if string_length(override_output) > 0:
             set raw_output to override_output
@@ -533,7 +553,15 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set item_i to 0
                     repeat while item_i < items_len:
                         set json_item to get_list(parsed_items and item_i)
-                        set val to get_json_value(json_item)
+                        # JSON type 1 is an Integer — get_json_value returns a raw int,
+                        # not a string. Tool handlers (and the truncation guard below,
+                        # which calls string_length on args[0]) expect STRINGS, so coerce
+                        # numeric args to their string form. Without this, any tool called
+                        # with a single numeric arg (e.g. get_lesson([1])) crashes.
+                        if get_json_type(json_item) == 1:
+                            set val to int_to_string(get_json_value(json_item))
+                        else:
+                            set val to get_json_value(json_item)
                         set ok to append_list(args_list and val)
                         set item_i to item_i + 1
                     # Truncation guard: if JSON parsed a single string that is
@@ -546,7 +574,10 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                             display f"[react] JSON truncation detected ({parsed_len} vs {raw_len} chars). Using raw extraction."
                             set ok to set_list(args_list and 0 and react_extract_raw_arg(args_str))
                 else:
-                    set ok to append_list(args_list and get_json_value(json_node))
+                    if get_json_type(json_node) == 1:
+                        set ok to append_list(args_list and int_to_string(get_json_value(json_node)))
+                    else:
+                        set ok to append_list(args_list and get_json_value(json_node))
             else:
                 set ok to append_list(args_list and args_str)
                 
@@ -815,6 +846,13 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set obs_model to ""
                 if map_contains(ctx and "selected_model") == 1:
                     set obs_model to map_get_val(ctx and "selected_model")
+                # Align the budget with the model the LLM call ACTUALLY uses. When no
+                # model is selected, query_local_llm falls back to gemma4:26b — so the
+                # budget must use that too, otherwise it'd size for the unknown-model
+                # default (8192) and clamp tool output to 2048 chars, truncating file
+                # reads even though the real model window is large.
+                if string_length(obs_model) == 0:
+                    set obs_model to "gemma4:26b"
                 set obs_budget to react_observation_budget(obs_model and string_length(current_prompt))
                 set current_prompt to concat(current_prompt and "\n")
                 set current_prompt to concat(current_prompt and raw_output)
@@ -1045,7 +1083,7 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
 
     if active_runs >= max_runs:
         return "Error: System is at capacity (concurrency limit reached). Please try again later."
-        
+
     set ok to map_insert(ctx and "active_runs" and active_runs + 1)
 
     set ok to map_insert(ctx and "auto_approve" and 0)

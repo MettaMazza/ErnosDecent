@@ -10,6 +10,7 @@ import "llm"
 import "./observer_rules"
 import "./observer_parser"
 import "./edition"
+import "./tutor"
 
 define observer_audit with ctx as Map and current_prompt as Str and agent_response as Str returning Map:
     set result to create_map()
@@ -49,7 +50,9 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
     set tools_schema to ""
     if map_contains(ctx and "tools_schema") == 1:
         set tools_schema to map_get_val(ctx and "tools_schema")
-    set audit_instruction to observer_get_audit_instruction(agent_response and tools_schema)
+    # In tutor mode, the audit also enforces the answer-leak gate (no solution hand-outs).
+    set tutor_on to tutor_is_active(ctx)
+    set audit_instruction to observer_get_audit_instruction(agent_response and tools_schema and tutor_on)
 
     # Query the LLM with split roles: system = conversation context, user = audit task.
     # query_local_llm_json also requests JSON-only output from Ollama.
@@ -71,10 +74,14 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
 
 # Returns ONLY the audit instruction (the user-role message). The conversation
 # context is passed separately by the caller as the system-role message.
-define observer_get_audit_instruction with candidate as Str and tools_schema as Str returning Str:
+define observer_get_audit_instruction with candidate as Str and tools_schema as Str and tutor_active as Int returning Str:
     # Render rules from the single source of truth (observer_rules.ep)
     set rendered_rules to observer_render_rules(observer_security_rules())
     set rendered_rules to concat(rendered_rules and observer_render_rules(observer_alignment_rules()))
+    # Tutor-only rule: block handing the learner a finished solution. Appended to
+    # rendered_rules so BOTH the prompts.json {rules} path and the fallback path get it.
+    if tutor_active == 1:
+        set rendered_rules to concat(rendered_rules and tutor_answer_leak_rule())
 
     if file_exists(edition_prompts_path()) == 1:
         set content to read_file(edition_prompts_path())

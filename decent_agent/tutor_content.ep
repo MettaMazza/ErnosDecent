@@ -1,0 +1,229 @@
+# tutor_content.ep — lessons, curriculum index, and the ErnosPlain reference corpus.
+#
+# Separated from tutor.ep so the prompt/observer hot path stays dependency-light.
+# This module owns the heavier work: content-addressed lessons (CAS), a small on-disk
+# curriculum index, and one-time indexing of the stdlib + language reference into a
+# fixed RAG corpus the tutor can search for REAL syntax (tutor_reference_search).
+
+import "string"
+import "fs"
+import "json"
+import "collections"
+import "../storage"
+import "../decent_store/rag"
+import "../decent_store/content"
+import "./tutor"
+
+# ── small helpers ───────────────────────────────────────────────────────────
+define tutor_has_suffix with s as Str and suf as Str returning Int:
+    set sl to string_length(s)
+    set ql to string_length(suf)
+    if ql > sl:
+        return 0
+    set tail to substring(s and sl - ql and ql)
+    if tail equals suf:
+        return 1
+    return 0
+
+# create_directory is not recursive, so ensure each path component exists.
+define tutor_curriculum_dir returning Str:
+    if file_exists("config") == 0:
+        set ok to create_directory("config")
+    if file_exists("config/curriculum") == 0:
+        set ok to create_directory("config/curriculum")
+    return "config/curriculum"
+
+define tutor_index_path returning Str:
+    return "config/curriculum/index.jsonl"
+
+# ── reference corpus ─────────────────────────────────────────────────────────
+# Index every *.ep / *.md file directly under `dir` into the shared reference
+# session. rag_index is idempotent per (doc_name, session) — re-running replaces.
+define tutor_index_dir with db as Int and dir as Str and suffix as Str and ref_sess as Str returning Int:
+    if is_directory(dir) == 0:
+        return 0
+    set entries to list_directory(dir)
+    set n to length_list(entries)
+    set indexed to 0
+    set i to 0
+    repeat while i < n:
+        set entry to get_list(entries and i)
+        set fc to get_character(entry and 0)
+        if fc != 46:
+            set full to path_join(dir and entry)
+            if is_directory(full) == 0:
+                if tutor_has_suffix(entry and suffix) == 1:
+                    set body to read_file(full)
+                    if string_length(body) > 0:
+                        set nc to rag_index(db and entry and body and ref_sess)
+                        set indexed to indexed + 1
+        set i to i + 1
+    free_list(entries)
+    return indexed
+
+# One-time admin action. Indexes the whole stdlib (the canonical, compiling source of
+# truth for ErnosPlain syntax) plus the language reference doc into tutor_reference_session.
+# Requires the embedding backend at runtime — same dependency as all other RAG.
+define tutor_index_reference returning Str:
+    set db to storage_get_db()
+    set ref to tutor_reference_session()
+    set nstd to tutor_index_dir(db and "stdlib" and ".ep" and ref)
+    set ndoc to 0
+    if file_exists("docs/ERNOS_REFERENCE.md") == 1:
+        set refdoc to read_file("docs/ERNOS_REFERENCE.md")
+        if string_length(refdoc) > 0:
+            set nc to rag_index(db and "ERNOS_REFERENCE.md" and refdoc and ref)
+            set ndoc to 1
+    set out to concat("reference corpus indexed: " and int_to_string(nstd))
+    set out to concat(out and concat(" stdlib files + " and int_to_string(ndoc)))
+    set out to concat(out and " reference doc(s) into session ")
+    set out to concat(out and ref)
+    return out
+
+# Search the fixed ErnosPlain reference corpus. Returns the rag_search JSON.
+define tutor_reference_search with query as Str and k as Int returning Str:
+    set db to storage_get_db()
+    return rag_search(db and query and tutor_reference_session() and k)
+
+# ── lessons (content-addressed) ──────────────────────────────────────────────
+# Store a lesson JSON in CAS and return its content hash.
+define tutor_store_lesson with lesson_json as Str returning Str:
+    set h to cas_hash_content(lesson_json)
+    set put_err to storage_content_put(h and lesson_json and "application/json")
+    if put_err != 0:
+        return ""
+    return h
+
+# The curriculum index is a simple TAB-delimited file (one lesson per line):
+#   <number>\t<hash>\t<title>
+# Deliberately not JSON — the index is tiny and parsing JSON number-nodes per line is
+# fragile; the lesson CONTENT itself stays JSON in content-addressed storage.
+define tutor_index_field with line as Str and idx as Int returning Str:
+    set parts to string_split(line and "\t")
+    set out to ""
+    if idx < length_list(parts):
+        set out to get_list(parts and idx)
+    free_list(parts)
+    return out
+
+# Register/replace a lesson: rewrite the index dropping any existing same-numbered
+# entry, then append the new one. Title tabs/newlines are stripped to keep one record
+# per line. Returns write_file's result (1 success / 0 failure).
+define tutor_register_lesson with number as Int and title as Str and hash as Str returning Int:
+    set dir to tutor_curriculum_dir()
+    set path to tutor_index_path()
+    set clean_title to string_replace(title and "\t" and " ")
+    set clean_title to string_replace(clean_title and "\n" and " ")
+    set rebuilt to ""
+    if file_exists(path) == 1:
+        set existing to read_file(path)
+        set lines to string_split(existing and "\n")
+        set n to length_list(lines)
+        set i to 0
+        repeat while i < n:
+            set line to get_list(lines and i)
+            if string_length(line) > 0:
+                if string_to_int(tutor_index_field(line and 0)) != number:
+                    set rebuilt to concat(rebuilt and concat(line and "\n"))
+            set i to i + 1
+        free_list(lines)
+    set entry to concat(int_to_string(number) and concat("\t" and concat(hash and concat("\t" and concat(clean_title and "\n")))))
+    set rebuilt to concat(rebuilt and entry)
+    return write_file(path and rebuilt)
+
+# Look up a lesson by number → its CAS hash via the index, then fetch the content.
+define tutor_get_lesson with number as Int returning Str:
+    set path to tutor_index_path()
+    if file_exists(path) == 0:
+        return ""
+    set existing to read_file(path)
+    set lines to string_split(existing and "\n")
+    set n to length_list(lines)
+    set hash to ""
+    set i to 0
+    repeat while i < n:
+        set line to get_list(lines and i)
+        if string_length(line) > 0:
+            if string_to_int(tutor_index_field(line and 0)) == number:
+                set hash to tutor_index_field(line and 1)
+        set i to i + 1
+    free_list(lines)
+    if string_length(hash) == 0:
+        return ""
+    return storage_content_get(hash)
+
+# Human-readable list of registered lessons (number + title).
+define tutor_lesson_list returning Str:
+    set path to tutor_index_path()
+    if file_exists(path) == 0:
+        return "No lessons registered yet. Run seed_curriculum first."
+    set existing to read_file(path)
+    set lines to string_split(existing and "\n")
+    set n to length_list(lines)
+    set out to "Available ErnosPlain lessons:\n"
+    set found to 0
+    set i to 0
+    repeat while i < n:
+        set line to get_list(lines and i)
+        if string_length(line) > 0:
+            set num to tutor_index_field(line and 0)
+            set title to tutor_index_field(line and 2)
+            set out to concat(out and concat("- Lesson " and concat(num and concat(": " and concat(title and "\n")))))
+            set found to 1
+        set i to i + 1
+    free_list(lines)
+    if found == 0:
+        return "No lessons registered yet. Run seed_curriculum first."
+    return out
+
+# JSON array of registered lessons [{"number":N,"title":"..."}] for the web UI.
+define tutor_lesson_list_json returning Str:
+    set path to tutor_index_path()
+    if file_exists(path) == 0:
+        return "[]"
+    set existing to read_file(path)
+    set lines to string_split(existing and "\n")
+    set n to length_list(lines)
+    set out to "["
+    set count to 0
+    set i to 0
+    repeat while i < n:
+        set line to get_list(lines and i)
+        if string_length(line) > 0:
+            set num to tutor_index_field(line and 0)
+            set title to tutor_index_field(line and 2)
+            set etitle to string_replace(title and "\\" and "\\\\")
+            set etitle to string_replace(etitle and "\"" and "\\\"")
+            if count > 0:
+                set out to concat(out and ",")
+            set out to concat(out and concat("{\"number\":" and concat(num and concat(",\"title\":\"" and concat(etitle and "\"}")))))
+            set count to count + 1
+        set i to i + 1
+    free_list(lines)
+    set out to concat(out and "]")
+    return out
+
+# ── Lesson 1 (hand-written) ──────────────────────────────────────────────────
+# The exercise is given to the learner; tutor_notes are the tutor's PRIVATE coaching
+# guide (smallest hints + common misconceptions) and must scaffold, never hand the
+# finished solution to the learner.
+define tutor_lesson_1_json returning Str:
+    set j to "{\"number\":1,"
+    set j to concat(j and "\"title\":\"Your first ErnosPlain program — display and variables\",")
+    set j to concat(j and "\"objective\":\"Print text to the screen, then store and reuse a value with a variable.\",")
+    set j to concat(j and "\"concepts\":[\"display\",\"set (variables)\",\"combining text with a variable\"],")
+    set j to concat(j and "\"exercise\":\"First, write a program that displays the word Hello on its own line. Once that runs, create a variable holding your name and display a greeting that includes it.\",")
+    set j to concat(j and "\"tutor_notes\":\"Smallest first step: get them to display a single literal string before touching variables. The ErnosPlain form is the display STATEMENT (there is no print() function — a very common beginner assumption from other languages; let them hit that and read the error rather than pre-warning them). For the variable, the shape is 'set <name> to <value>'. Do NOT write their greeting line for them: ask how they think the fixed text and the variable should be joined, and let them try either concat(...) or an f-string and RUN it with run_ep to discover which behaves how. If they get a compile error, have them read the exact token it points at and reason about it. Confirm and explain WHY once their own version runs.\",")
+    set j to concat(j and "\"success_check\":\"Running their own program with run_ep prints Hello, then a greeting containing their name, with no compile errors.\"}")
+    return j
+
+# Seed the built-in curriculum (idempotent: CAS hash is stable, index dedupes by number).
+define tutor_seed_curriculum returning Str:
+    set l1 to tutor_lesson_1_json()
+    set h1 to tutor_store_lesson(l1)
+    if string_length(h1) == 0:
+        return "seed:error storing lesson 1"
+    set reg to tutor_register_lesson(1 and "Your first ErnosPlain program — display and variables" and h1)
+    if reg == 0:
+        return "seed:error writing curriculum index"
+    return concat("seed:ok lesson 1 stored at " and h1)

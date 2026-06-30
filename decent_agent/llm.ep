@@ -11,6 +11,60 @@ import "./model_registry"
 
 external define ep_net_connect with host and port
 external define ep_net_close with fd
+external define ep_net_send with fd and data returning Int
+external define ep_net_recv with fd and max_len returning Str
+
+# ─────────────────────────────────────────────────────────────────────────────
+# http_post_async — ASYNC HTTP POST.
+# Connects, sends the request, then loops awaiting socket-readability and reading
+# available bytes. Because it `await`s, the single-threaded event loop runs OTHER
+# agent tasks (e.g. a sibling sub-agent's LLM call) during the network/inference
+# wait — true concurrency on one thread, no OS-thread heap race. Returns the HTTP
+# BODY (after the headers), exactly like the old blocking http_post, so callers and
+# http_dechunk are unchanged. Uses Connection: close and reads until EOF.
+# ─────────────────────────────────────────────────────────────────────────────
+async define http_post_async with url as Str and headers as Str and body as Str returning Str:
+    # Parse  http://host:port/path
+    set rest to url
+    if string_contains(url and "://") == 1:
+        set sep2 to string_index_of(url and "://")
+        set rest to substring(url and sep2 + 3 and string_length(url) - sep2 - 3)
+    set slash to string_index_of(rest and "/")
+    set hostport to rest
+    set path to "/"
+    if slash >= 0:
+        set hostport to substring(rest and 0 and slash)
+        set path to substring(rest and slash and string_length(rest) - slash)
+    set host to hostport
+    set port to 80
+    set colon to string_index_of(hostport and ":")
+    if colon >= 0:
+        set host to substring(hostport and 0 and colon)
+        set port to string_to_int(substring(hostport and colon + 1 and string_length(hostport) - colon - 1))
+    set fd to ep_net_connect(host and port)
+    if fd <= 0:
+        return "Error: connection failed"
+    set req to concat("POST " and concat(path and " HTTP/1.1\r\nHost: "))
+    set req to concat(req and concat(hostport and "\r\n"))
+    set req to concat(req and concat(headers and "\r\n"))
+    set req to concat(req and concat("Connection: close\r\nContent-Length: " and concat(int_to_string(string_length(body)) and "\r\n\r\n")))
+    set req to concat(req and body)
+    set sent to ep_net_send(fd and req)
+    set raw to ""
+    set go to 1
+    repeat while go == 1:
+        set ready to await async_wait_readable(fd)
+        set chunk to ep_net_recv(fd and 65536)
+        if string_length(chunk) == 0:
+            set go to 0
+        else:
+            set raw to concat(raw and chunk)
+    set ok to ep_net_close(fd)
+    # Strip HTTP headers — return the body (chunked or not), like the old http_post.
+    set hsep to string_index_of(raw and "\r\n\r\n")
+    if hsep >= 0:
+        return substring(raw and hsep + 4 and string_length(raw) - hsep - 4)
+    return raw
 
 define is_port_open with host as Str and port as Int returning Int:
     set fd to ep_net_connect(host and port)
@@ -235,7 +289,7 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
         set body to concat(body and "\"}]}")
 
     display f"[LLM DEBUG] POST (split) {url} model={model_name} body_len={string_length(body)}"
-    set response to http_post(url and headers and body)
+    set response to await http_post_async(url and headers and body)
     display f"[LLM DEBUG] Raw response length: {string_length(response)}"
 
     if string_length(response) == 0:
@@ -308,7 +362,7 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
         set body to concat(body and "\"}]}")
     
     display f"[LLM DEBUG] POST {url} model={model_name} body_len={string_length(body)}"
-    set response to http_post(url and headers and body)
+    set response to await http_post_async(url and headers and body)
     display f"[LLM DEBUG] Raw response length: {string_length(response)}"
     
     if string_length(response) == 0:

@@ -7,7 +7,7 @@ function set_prop(target, key, value) {
 }
 
 function send_msg(ws, payload) {
-    let readyState, sendFn;
+    let sendFn, readyState;
     if (!ws) {
         return 0;
     }
@@ -45,7 +45,7 @@ function string_length(str) {
 }
 
 function escapeHTML(str) {
-    let reAmp, reQuot, reGt, reApos, res, reClass, reLt;
+    let reApos, reQuot, reLt, reClass, reAmp, res, reGt;
     if (!str) {
         return "";
     }
@@ -87,7 +87,7 @@ function setControlsEnabled(enabled) {
 }
 
 function handleDisconnect() {
-    let indicator, nodeRole, headerDid, nodePeers, walletVal, nodeTerm, didFull, chunkCount, dhtSize, statusText;
+    let nodeRole, statusText, dhtSize, didFull, headerDid, walletVal, nodePeers, chunkCount, indicator, nodeTerm;
     window.isConnected = false;
     indicator = document.getElementById("connection-indicator");
     indicator.classList.remove("online");
@@ -114,7 +114,7 @@ function handleDisconnect() {
 }
 
 function connectDaemon() {
-    let port, wsClass, hostname, wsUrl, ws;
+    let hostname, wsClass, ws, port, wsUrl;
     port = (window.location.port || "8080");
     hostname = (window.location.hostname || "127.0.0.1");
     if ((hostname === "localhost")) {
@@ -214,7 +214,7 @@ function connectDaemon() {
 }
 
 function saveChatMessage(chanName, sender, text, type, timeStr) {
-    let historyStr, msg, hasChannel, historyObj, channelList;
+    let historyObj, channelList, historyStr, hasChannel, msg;
     historyStr = window.localStorage.getItem("ernode_chat_history");
     historyObj = Object();
     if (historyStr) {
@@ -235,7 +235,7 @@ function saveChatMessage(chanName, sender, text, type, timeStr) {
 }
 
 function saveAiMessage(sender, text, type, timeStr) {
-    let historyList, msg, historyStr;
+    let historyStr, historyList, msg;
     historyStr = window.localStorage.getItem("ernode_ai_history");
     historyList = [];
     if (historyStr) {
@@ -251,7 +251,7 @@ function saveAiMessage(sender, text, type, timeStr) {
 }
 
 function renderChatHistory(chanName) {
-    let historyObj, historyStr, hasChannel, channelList;
+    let historyStr, hasChannel, historyObj, channelList;
     window.chatContainer.innerHTML = "";
     historyStr = window.localStorage.getItem("ernode_chat_history");
     if (!historyStr) {
@@ -272,7 +272,7 @@ function renderChatHistory(chanName) {
 }
 
 function renderAiHistory() {
-    let historyList, historyStr;
+    let historyStr, historyList;
     window.aiContainer.innerHTML = "";
     historyStr = window.localStorage.getItem("ernode_ai_history");
     if (!historyStr) {
@@ -337,7 +337,7 @@ function attachTtsButton(bubble, text) {
 }
 
 function appendMessage(container, sender, text, type) {
-    let dateStr, timeStrSec, timeStr, secParts, timeParts;
+    let dateStr, timeParts, timeStrSec, secParts, timeStr;
     dateStr = Date();
     timeParts = dateStr.split(" ");
     timeStrSec = timeParts[4];
@@ -351,22 +351,169 @@ function appendMessage(container, sender, text, type) {
     }
 }
 
+function activeAiMessages() {
+    let lc;
+    if ((window.aiSurface === "learning")) {
+        lc = document.getElementById("learning-messages-container");
+        if (lc) {
+            return lc;
+        }
+    }
+    return window.aiContainer;
+}
+
+function sendTutorPrompt(text) {
+    let msg, container, sb, modelSel, loader, inp, modelVal, stp;
+    if ((!text || !window.isConnected)) {
+        return 0;
+    }
+    container = document.getElementById("learning-messages-container");
+    appendMessage(container, "You", text, "sent");
+    window.aiSurface = "learning";
+    loader = document.getElementById("learning-loader");
+    if (loader) {
+        set_prop(loader.style, "display", "flex");
+    }
+    inp = document.getElementById("learning-input-text");
+    if (inp) {
+        inp.disabled = true;
+    }
+    sb = document.getElementById("btn-submit-learning");
+    if (sb) {
+        sb.disabled = true;
+    }
+    stp = document.getElementById("btn-stop-learning");
+    if (stp) {
+        stp.disabled = false;
+        stp.textContent = "Stop";
+        set_prop(stp.style, "display", "inline-block");
+    }
+    modelSel = document.getElementById("learning-model-select");
+    modelVal = "";
+    if (modelSel) {
+        modelVal = modelSel.value;
+    }
+    msg = Object();
+    msg.type = "ai_prompt";
+    msg.prompt = text;
+    msg.mode = "tutor";
+    msg.system = "";
+    msg.model = modelVal;
+    send_msg(window.ws, JSON.stringify(msg));
+    return 0;
+}
+
+function renderLessonsList(items) {
+    let container, html;
+    container = document.getElementById("learning-lessons-list");
+    if (!container) {
+        return 0;
+    }
+    if ((!items || (items.length === 0))) {
+        container.innerHTML = "<p style=\"font-size:12px;color:var(--text-secondary);margin:4px 0;\">No lessons yet. Click \"Install\" to load the built-in lessons.</p>";
+        return 0;
+    }
+    html = "";
+    items.forEach((it) => {
+    num = it.number;
+    title = escapeHTML(it.title);
+    html = (html + (((((("<button class=\"room-item\" data-lesson=\"" + String(num)) + "\"><span class=\"model-name\">Lesson ") + String(num)) + "</span><span class=\"model-meta\">") + String(title)) + "</span></button>"));
+});
+    container.innerHTML = html;
+    return 0;
+}
+
+function requestLessonsList() {
+    let m;
+    if ((window.isConnected && window.ws)) {
+        m = Object();
+        m.type = "lessons_list";
+        send_msg(window.ws, JSON.stringify(m));
+    }
+    return 0;
+}
+
+function setupLearningTab() {
+    let startBtn, lessonsList, runBtn, form, seedBtn;
+    form = document.getElementById("learning-send-form");
+    if (form) {
+        form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    inp = document.getElementById("learning-input-text");
+    text = inp.value.trim();
+    if (text) {
+        inp.value = "";
+        sendTutorPrompt(text);
+    }
+});
+    }
+    startBtn = document.getElementById("btn-learning-start-1");
+    if (startBtn) {
+        startBtn.addEventListener("click", (event) => {
+    sendTutorPrompt("I'd like to start Lesson 1. Please load it with the get_lesson tool and guide me through the first step — remember, coach me, don't give me the full answer.");
+});
+    }
+    seedBtn = document.getElementById("btn-seed-curriculum");
+    if (seedBtn) {
+        seedBtn.addEventListener("click", (event) => {
+    if ((window.isConnected && window.ws)) {
+        m = Object();
+        m.type = "seed_curriculum";
+        send_msg(window.ws, JSON.stringify(m));
+    }
+});
+    }
+    lessonsList = document.getElementById("learning-lessons-list");
+    if (lessonsList) {
+        lessonsList.addEventListener("click", (event) => {
+    btn = event.target.closest("[data-lesson]");
+    if (btn) {
+        num = btn.getAttribute("data-lesson");
+        sendTutorPrompt(("I'd like to start Lesson " + (num + ". Please load it with get_lesson and guide me through the first step without giving me the full answer.")));
+    }
+});
+    }
+    runBtn = document.getElementById("btn-run-ep");
+    if (runBtn) {
+        runBtn.addEventListener("click", (event) => {
+    if ((window.isConnected && window.ws)) {
+        editor = document.getElementById("learning-code-editor");
+        code = editor.value;
+        if (code.trim()) {
+            out = document.getElementById("learning-run-output");
+            if (out) {
+                set_prop(out.style, "display", "block");
+                out.textContent = "Running in the secure sandbox...";
+            }
+            runBtn.disabled = true;
+            m = Object();
+            m.type = "run_ep";
+            m.code = code;
+            send_msg(window.ws, JSON.stringify(m));
+        }
+    }
+});
+    }
+    requestLessonsList();
+    return 0;
+}
+
 function appendAiToken(token) {
-    let bubble, textNode;
+    let textNode, bubble;
     if (!window.currentAiResponseBubble) {
         bubble = document.createElement("div");
         bubble.className = "chat-bubble received ai-bot";
         bubble.innerHTML = "<span class=\"sender\">AI (Local Model)</span><p class=\"ai-text\"></p>";
-        window.aiContainer.appendChild(bubble);
+        activeAiMessages().appendChild(bubble);
         window.currentAiResponseBubble = bubble;
     }
     textNode = window.currentAiResponseBubble.querySelector(".ai-text");
     textNode.textContent = (textNode.textContent + token);
-    window.aiContainer.scrollTop = window.aiContainer.scrollHeight;
+    set_prop(activeAiMessages(), "scrollTop", activeAiMessages().scrollHeight);
 }
 
 function appendApprovalCard(toolName, summary) {
-    let btnSubmit, bubble, approveBtn, escapedTool, actionsHtml, approveAllBtn, denyBtn, escapedSummary, contentHtml;
+    let bubble, approveBtn, actionsHtml, escapedTool, denyBtn, btnSubmit, approveAllBtn, escapedSummary, contentHtml;
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
     set_prop(bubble.style, "border", "1px solid rgba(245, 158, 11, 0.3)");
@@ -382,8 +529,8 @@ function appendApprovalCard(toolName, summary) {
     actionsHtml = (actionsHtml + "<button class=\"btn-deny\" id=\"btn-deny-action\">Deny ❌</button>");
     actionsHtml = (actionsHtml + "</div>");
     set_prop(bubble, "innerHTML", (contentHtml + actionsHtml));
-    window.aiContainer.appendChild(bubble);
-    set_prop(window.aiContainer, "scrollTop", window.aiContainer.scrollHeight);
+    activeAiMessages().appendChild(bubble);
+    set_prop(activeAiMessages(), "scrollTop", activeAiMessages().scrollHeight);
     set_prop(window.aiInput, "disabled", true);
     btnSubmit = document.getElementById("btn-submit-ai");
     if ((btnSubmit !== 0)) {
@@ -453,7 +600,7 @@ function appendApprovalCard(toolName, summary) {
 }
 
 function appendClarifyCard(questionsJson) {
-    let nq, questions, bubble, stopB;
+    let stopB, questions, bubble, nq;
     questions = JSON.parse(questionsJson);
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -479,8 +626,8 @@ function appendClarifyCard(questionsJson) {
 });
     window.clarifyHtml = (window.clarifyHtml + "<div class=\"clarify-actions\" style=\"margin-top:8px;\"><button type=\"button\" class=\"clarify-send btn-primary\">Send answers</button> <button type=\"button\" class=\"clarify-current btn-secondary\">Work with what we have</button></div>");
     set_prop(bubble, "innerHTML", window.clarifyHtml);
-    window.aiContainer.appendChild(bubble);
-    set_prop(window.aiContainer, "scrollTop", window.aiContainer.scrollHeight);
+    activeAiMessages().appendChild(bubble);
+    set_prop(activeAiMessages(), "scrollTop", activeAiMessages().scrollHeight);
     set_prop(window.aiLoader.style, "display", "none");
     set_prop(window.aiInput, "disabled", true);
     stopB = document.getElementById("btn-stop-ai");
@@ -549,7 +696,7 @@ function appendClarifyCard(questionsJson) {
 }
 
 function appendReasoningBubble(b64) {
-    let decoded, html, bubble;
+    let bubble, html, decoded;
     decoded = decodeURIComponent(escape(atob(b64)));
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -557,12 +704,12 @@ function appendReasoningBubble(b64) {
     set_prop(bubble.style, "fontSize", "0.85em");
     html = ("<details><summary style=\"cursor:pointer;\">💭 Reasoning</summary><pre style=\"white-space:pre-wrap;margin:6px 0 0;\">" + (escapeHTML(decoded) + "</pre></details>"));
     set_prop(bubble, "innerHTML", html);
-    window.aiContainer.appendChild(bubble);
-    set_prop(window.aiContainer, "scrollTop", window.aiContainer.scrollHeight);
+    activeAiMessages().appendChild(bubble);
+    set_prop(activeAiMessages(), "scrollTop", activeAiMessages().scrollHeight);
 }
 
 function updateHostsTableUI(jsonStr) {
-    let electedHostEl, tbody, list, primary, i;
+    let list, tbody, i, primary, electedHostEl;
     tbody = document.getElementById("hosts-table-body");
     if (!tbody) {
         return 0;
@@ -636,7 +783,7 @@ function handleDhtResult(msg) {
 }
 
 function handleNameResult(msg) {
-    let entry, nameLog, headerDid;
+    let nameLog, entry, headerDid;
     nameLog = document.getElementById("name-log");
     if (!nameLog) {
         return 0;
@@ -669,7 +816,7 @@ function handleNameResult(msg) {
 }
 
 function selectAiModel(modelName, skipSave) {
-    let modelText, msg, aiModelSelect, btns;
+    let btns, aiModelSelect, modelText, msg;
     window.selectedAiModel = modelName;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
@@ -697,7 +844,7 @@ function selectAiModel(modelName, skipSave) {
 }
 
 function updateAiModelsUI(models) {
-    let aiModelSelect, currentSelected, isIncluded, activeClass;
+    let activeClass, currentSelected, aiModelSelect, isIncluded, learnModelSelect, prevLearn;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
         currentSelected = window.selectedAiModel;
@@ -716,6 +863,18 @@ function updateAiModelsUI(models) {
                 aiModelSelect.value = "";
             }
         }
+    }
+    learnModelSelect = document.getElementById("learning-model-select");
+    if (learnModelSelect) {
+        prevLearn = learnModelSelect.value;
+        learnModelSelect.innerHTML = "<option value=\"\">Auto (Cascade)</option>";
+        models.forEach((m) => {
+    lopt = document.createElement("option");
+    lopt.value = m;
+    lopt.textContent = m;
+    learnModelSelect.appendChild(lopt);
+});
+        learnModelSelect.value = prevLearn;
     }
     if (window.aiModelsListContainer) {
         activeClass = "";
@@ -769,7 +928,7 @@ function deleteSession(id) {
 }
 
 function updatePlatformsUI() {
-    let statusText, waToggle, whatsappConfig, discToken, waPhoneId, tgToken, discordConfig, waToken, discStatus, waStatus, telegramConfig, tgStatus, discToggle, tgToggle, discChannel;
+    let waPhoneId, discordConfig, statusText, waToggle, discChannel, tgToggle, discToggle, waToken, discToken, discStatus, tgToken, whatsappConfig, telegramConfig, waStatus, tgStatus;
     if (!window.platforms) {
         return 0;
     }
@@ -869,7 +1028,7 @@ function updatePlatformsUI() {
 }
 
 function updatePromptsUI() {
-    let observerArea, kernelArea, personaArea;
+    let kernelArea, personaArea, observerArea;
     if (!window.prompts) {
         return 0;
     }
@@ -908,7 +1067,7 @@ function showPromptsStatus(text, isSuccess) {
 }
 
 function renderPluginsUI() {
-    let toggleBtns, body, deleteBtns;
+    let body, toggleBtns, deleteBtns;
     body = document.getElementById("plugins-list-body");
     if (!body) {
         return 0;
@@ -1008,7 +1167,7 @@ function savePluginsSettings() {
 }
 
 function savePromptsConfig() {
-    let kernelArea, payload, personaArea, observerArea;
+    let kernelArea, observerArea, personaArea, payload;
     if ((!window.ws || !window.isConnected)) {
         showPromptsStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1031,7 +1190,7 @@ function savePromptsConfig() {
 }
 
 function updateSystemConfigUI() {
-    let nodeName, maxMsg, maxConn, p2pPort, dhtPort, seedAddr, seedPort, dhtTtl, listenAddr, maxContent, ipcPort, logLevel, webPort, electTimeout, rateLimit, dataDir, banDur, isStaticHost, enableHostElect, banThresh, heartbeat, relayPort, raftPort;
+    let electTimeout, seedPort, heartbeat, listenAddr, p2pPort, seedAddr, maxMsg, dataDir, banThresh, raftPort, enableHostElect, dhtPort, relayPort, rateLimit, nodeName, maxContent, logLevel, dhtTtl, maxConn, ipcPort, banDur, webPort, isStaticHost;
     if (!window.systemConfig) {
         return 0;
     }
@@ -1152,7 +1311,7 @@ function showSystemConfigStatus(text, statusType) {
 }
 
 function saveSystemConfig() {
-    let isStaticHost, valElect, payload, enableHostElect, valStatic, val;
+    let payload, enableHostElect, valStatic, isStaticHost, valElect, val;
     if ((!window.ws || !window.isConnected)) {
         showSystemConfigStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1220,7 +1379,7 @@ function saveSystemConfig() {
 }
 
 function savePlatformConfig(platformId) {
-    let telegramConfig, tokenVal, whatsappConfig, chanVal, enabledVal, payload, phoneVal, discConfig;
+    let chanVal, whatsappConfig, payload, telegramConfig, tokenVal, discConfig, enabledVal, phoneVal;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1283,7 +1442,7 @@ function savePlatformConfig(platformId) {
 }
 
 function handlePlatformToggle(platformId) {
-    let enabledVal, whatsappConfig, discConfig, payload, telegramConfig;
+    let discConfig, enabledVal, whatsappConfig, telegramConfig, payload;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1330,7 +1489,7 @@ function handlePlatformToggle(platformId) {
 }
 
 function registerPlugin() {
-    let endpoint, name, newPlugin, desc;
+    let desc, name, endpoint, newPlugin;
     if (!window.plugins) {
         window.plugins = [];
     }
@@ -1440,7 +1599,7 @@ function updateSessionsUI(sessions) {
 }
 
 function initMemoryCanvas() {
-    let emptyState, canvas, container, oldCanvas, width, height;
+    let emptyState, oldCanvas, height, container, canvas, width;
     container = document.getElementById("memory-graph-viz");
     if (!container) {
         return 0;
@@ -1468,7 +1627,7 @@ function initMemoryCanvas() {
 }
 
 function updateMemoryGraphData(edges) {
-    let width, incomingNodes, currentIds, height;
+    let currentIds, height, width, incomingNodes;
     if (!window.canvasElement) {
         initMemoryCanvas();
     }
@@ -1505,7 +1664,7 @@ function updateMemoryGraphData(edges) {
 }
 
 function animateGraph() {
-    let fx, n2, dist, width, dx, nodeIds, height, dy, fy, j, i, force, n1;
+    let height, width, n1, n2, dx, nodeIds, dy, i, j, dist, force, fx, fy;
     if (!window.isConnected) {
         window.animationFrameId = requestAnimationFrame((dummy) => {
     animateGraph();
@@ -1613,7 +1772,7 @@ function animateGraph() {
 }
 
 function renderTuringGrid(data) {
-    let cellClass, turingHeadPos, turingCellsCount, container, r, c, headY, html, headX, cellKey, value, headZ, isHead;
+    let cellClass, headY, turingHeadPos, value, c, headX, html, r, container, cellKey, isHead, headZ, turingCellsCount;
     container = document.getElementById("turing-grid-viz");
     if (!container) {
         return 0;
@@ -1660,7 +1819,7 @@ function renderTuringGrid(data) {
 }
 
 function updateMemoryTables(data) {
-    let lBody, keys, sBody;
+    let sBody, lBody, keys;
     sBody = document.getElementById("scratchpad-body");
     if (sBody) {
         sBody.innerHTML = "";
@@ -1694,7 +1853,7 @@ function updateMemoryTables(data) {
 }
 
 function handleDaemonMessage(msg) {
-    let timeStr, activeCircuits, dhtSize, encKeyEl, textNode, type, ttsAudio, rvRepos, headerDid, stopBtn, dateStr, sess_id, nameInput, secParts, sess, computeSlots, nodeTerm, btnSubmit, storageBody, didFull, summaryNotice, msgSessions, noSelected, nodePeers, detailsPanel, auToggle, sigKeyEl, timeStrSec, timeParts, natMode, walletVal, idNameEl, bwUp, rvFile, roleUpper, aiText, refresh, nodeRole, uiStaticHost, gdBadge, uiHostElect, chunkCount, bwDown;
+    let roleUpper, isLearning, summaryNotice, uiHostElect, bwUp, lLoader, headerDid, sess, didFull, bwDown, lSubmit, lStop, storageBody, secParts, btnSubmit, stopBtn, msgSessions, sess_id, nameInput, nodeRole, encKeyEl, natMode, walletVal, computeSlots, activeCircuits, ttsAudio, timeParts, rvRepos, timeStrSec, sigKeyEl, chunkCount, nodePeers, dhtSize, uiStaticHost, refresh, nodeTerm, noSelected, type, detailsPanel, gdBadge, timeStr, lInput, textNode, repOut, idNameEl, dateStr, rvFile, auToggle, repBtn, aiText;
     type = msg.type;
     if ((type === "status")) {
         roleUpper = msg.role.toUpperCase();
@@ -1813,6 +1972,20 @@ function handleDaemonMessage(msg) {
         appendMessage(window.chatContainer, msg.sender, msg.text, "received");
     } else if ((type === "ai_token")) {
         appendAiToken(msg.token);
+    } else if ((type === "run_ep_result")) {
+        repOut = document.getElementById("learning-run-output");
+        if (repOut) {
+            set_prop(repOut.style, "display", "block");
+            repOut.textContent = msg.output;
+        }
+        repBtn = document.getElementById("btn-run-ep");
+        if (repBtn) {
+            repBtn.disabled = false;
+        }
+    } else if ((type === "lessons_list_result")) {
+        renderLessonsList(msg.items);
+    } else if ((type === "seed_result")) {
+        requestLessonsList();
     } else if ((type === "tool_pending_approval")) {
         appendApprovalCard(msg.tool, msg.summary);
     } else if ((type === "clarify")) {
@@ -1820,6 +1993,7 @@ function handleDaemonMessage(msg) {
     } else if ((type === "reasoning")) {
         appendReasoningBubble(msg.b64);
     } else if ((type === "ai_complete")) {
+        isLearning = (window.aiSurface === "learning");
         if (window.currentAiResponseBubble) {
             textNode = window.currentAiResponseBubble.querySelector(".ai-text");
             if (textNode) {
@@ -1829,17 +2003,38 @@ function handleDaemonMessage(msg) {
                 timeStrSec = timeParts[4];
                 secParts = timeStrSec.split(":");
                 timeStr = (secParts[0] + (":" + secParts[1]));
-                saveAiMessage("AI (Local Model)", aiText, "received", timeStr);
-                attachTtsButton(window.currentAiResponseBubble, aiText);
+                if (!isLearning) {
+                    saveAiMessage("AI (Local Model)", aiText, "received", timeStr);
+                    attachTtsButton(window.currentAiResponseBubble, aiText);
+                }
             }
         }
-        set_prop(window.aiLoader.style, "display", "none");
-        window.aiInput.disabled = false;
-        btnSubmit = document.getElementById("btn-submit-ai");
-        btnSubmit.disabled = false;
-        stopBtn = document.getElementById("btn-stop-ai");
-        if ((stopBtn !== 0)) {
-            set_prop(stopBtn.style, "display", "none");
+        if (isLearning) {
+            lLoader = document.getElementById("learning-loader");
+            if (lLoader) {
+                set_prop(lLoader.style, "display", "none");
+            }
+            lInput = document.getElementById("learning-input-text");
+            if (lInput) {
+                lInput.disabled = false;
+            }
+            lSubmit = document.getElementById("btn-submit-learning");
+            if (lSubmit) {
+                lSubmit.disabled = false;
+            }
+            lStop = document.getElementById("btn-stop-learning");
+            if ((lStop !== 0)) {
+                set_prop(lStop.style, "display", "none");
+            }
+        } else {
+            set_prop(window.aiLoader.style, "display", "none");
+            window.aiInput.disabled = false;
+            btnSubmit = document.getElementById("btn-submit-ai");
+            btnSubmit.disabled = false;
+            stopBtn = document.getElementById("btn-stop-ai");
+            if ((stopBtn !== 0)) {
+                set_prop(stopBtn.style, "display", "none");
+            }
         }
         window.currentAiResponseBubble = null;
     } else if ((type === "tts_ready")) {
@@ -1995,7 +2190,7 @@ function handleDaemonMessage(msg) {
 }
 
 function handleOnionResult(msg) {
-    let resultsBox, html, results;
+    let results, html, resultsBox;
     resultsBox = document.getElementById("onion-results-box");
     if (!resultsBox) {
         return 0;
@@ -2097,7 +2292,7 @@ function renderBrowserTabs() {
 }
 
 function switchBrowserTab(tabId) {
-    let addressInput, loader, contentArea, tab;
+    let tab, contentArea, addressInput, loader;
     window.activeTabId = tabId;
     renderBrowserTabs();
     tab = null;
@@ -2138,7 +2333,7 @@ function switchBrowserTab(tabId) {
 }
 
 function closeBrowserTab(tabId) {
-    let idx, tObj, i, modal;
+    let idx, i, tObj, modal;
     idx = (0 - 1);
     i = 0;
     window.browserTabs.forEach((t) => {
@@ -2170,7 +2365,7 @@ function closeBrowserTab(tabId) {
 }
 
 function navigateTab(tab, url) {
-    let addressInput, hasDot, hasProtocol, isSearch, viewMsg, targetUrl, contentArea, loader, progressBar;
+    let contentArea, targetUrl, viewMsg, loader, hasDot, addressInput, hasProtocol, progressBar, isSearch;
     targetUrl = url.trim();
     if ((targetUrl === "")) {
         return 0;
@@ -2238,7 +2433,7 @@ function navigateActiveTab(url, isHistoryNavigation) {
 }
 
 function updateNavButtons(tab) {
-    let btnBack, btnForward;
+    let btnForward, btnBack;
     btnBack = document.getElementById("btn-browser-back");
     if (btnBack) {
         btnBack.disabled = (tab.historyIndex <= 0);
@@ -2278,7 +2473,7 @@ function updateStarButton(tab) {
 }
 
 function toggleBookmarkActiveTab() {
-    let newBookmark, i, existingIdx, activeTab;
+    let activeTab, existingIdx, i, newBookmark;
     activeTab = getActiveTab();
     if ((!activeTab || (activeTab.url === "ernos://newtab"))) {
         return 0;
@@ -2305,7 +2500,7 @@ function toggleBookmarkActiveTab() {
 }
 
 function renderBookmarksBar() {
-    let bar, homeItem;
+    let homeItem, bar;
     bar = document.getElementById("browser-bookmarks-bar");
     if (!bar) {
         return 0;
@@ -2336,7 +2531,7 @@ function renderBookmarksBar() {
 }
 
 function resolveRelativeUrl(baseUrl, relativeUrl) {
-    let lastSlash, afterProto, baseFolder, firstSlash, protoIdx, domain;
+    let afterProto, domain, protoIdx, firstSlash, baseFolder, lastSlash;
     if (((string_index_of(relativeUrl, "://") >= 0) || (string_index_of(relativeUrl, "data:") === 0))) {
         return relativeUrl;
     }
@@ -2365,7 +2560,7 @@ function resolveRelativeUrl(baseUrl, relativeUrl) {
 }
 
 function interceptViewportClicks() {
-    let contentArea, links;
+    let links, contentArea;
     contentArea = document.getElementById("reader-modal-content");
     if (!contentArea) {
         return 0;
@@ -2386,7 +2581,7 @@ function interceptViewportClicks() {
 }
 
 function renderNewTabPage(tab) {
-    let scGithub, contentArea, scDdg, form, scWiki, scTor, newTabHtml;
+    let form, scTor, scGithub, contentArea, scDdg, scWiki, newTabHtml;
     contentArea = document.getElementById("reader-modal-content");
     if ((tab.id !== window.activeTabId)) {
         return 0;
@@ -2428,7 +2623,7 @@ function renderNewTabPage(tab) {
 }
 
 function handleOnionViewResult(msg) {
-    let tEnd, progressBar, title, tStart, loader, tabId, contentArea, activeTab, htmlLower, targetTab, urlParts;
+    let contentArea, activeTab, tabId, title, htmlLower, targetTab, loader, tStart, progressBar, tEnd, urlParts;
     tabId = msg.tabId;
     targetTab = null;
     window.browserTabs.forEach((t) => {
@@ -2497,7 +2692,7 @@ function handleOnionViewResult(msg) {
 }
 
 function updateGitDecRepos(reposStr) {
-    let parts, listContainer;
+    let listContainer, parts;
     listContainer = document.getElementById("gitdec-repo-list");
     if (!listContainer) {
         return 0;
@@ -2543,7 +2738,7 @@ function updateGitDecRepos(reposStr) {
 }
 
 function selectGitDecRepo(repoId) {
-    let detailsPanel, noSelected, activeIdEl, msgFileList, viewerContent, msg1, viewerName, msg3, msg2;
+    let viewerName, activeIdEl, msg1, detailsPanel, msg3, msgFileList, msg2, viewerContent, noSelected;
     window.gitdecActiveRepo = repoId;
     noSelected = document.getElementById("gitdec-no-repo-selected");
     detailsPanel = document.getElementById("gitdec-repo-details");
@@ -2582,7 +2777,7 @@ function selectGitDecRepo(repoId) {
 }
 
 function handleGitDecFile(repoId, filename, content) {
-    let sRepoId, data, prListEl, activeFileSpan, manifest, guideViewer, opt, listEl, visVal, isOwner, issueListEl, fileViewer, visBadge, sRepoName, titleEl, commitListEl, b_keys, branchSelect, removeBtns, localRole, visToggle, auQuery, keys, branches;
+    let localRole, titleEl, branchSelect, keys, removeBtns, fileViewer, opt, commitListEl, prListEl, sRepoName, b_keys, listEl, data, activeFileSpan, manifest, visVal, sRepoId, issueListEl, auQuery, isOwner, visBadge, branches, guideViewer, visToggle;
     if (((repoId === "ErnosDecent") && ((((((((((((filename === "docs/gitdec_user_guide.md") || (filename === "docs/system_guide_synthesis.md")) || (filename === "docs/ERNOS_REFERENCE.md")) || (filename === "README.md")) || (filename === "docs/settings_guide.md")) || (filename === "docs/identity_registry_guide.md")) || (filename === "docs/network_dht_guide.md")) || (filename === "docs/resource_pooling_guide.md")) || (filename === "docs/turing_hebbian_guide.md")) || (filename === "docs/messaging_social_guide.md")) || (filename === "docs/storage_crdt_guide.md")) || (filename === "docs/ledger_dex_guide.md")))) {
         guideViewer = document.getElementById("guide-text-content");
         if (guideViewer) {
@@ -2781,7 +2976,7 @@ function handleGitDecFile(repoId, filename, content) {
 }
 
 function renderGitDecFiles(repoId, filesStr) {
-    let files, fileListEl, count;
+    let files, count, fileListEl;
     if ((repoId !== window.gitdecActiveRepo)) {
         return 0;
     }
@@ -2838,7 +3033,7 @@ function renderGitDecFiles(repoId, filesStr) {
 }
 
 function showGitDecIssueDetail(issue) {
-    let detailCard, commentsContainer, titleEl, bodyRow;
+    let bodyRow, detailCard, titleEl, commentsContainer;
     window.gitdecActiveIssue = issue;
     detailCard = document.getElementById("gitdec-issue-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -2864,7 +3059,7 @@ function showGitDecIssueDetail(issue) {
 }
 
 function showGitDecPrDetail(pr) {
-    let detailCard, branchEl, titleEl, reviewsContainer, descRow;
+    let branchEl, titleEl, descRow, detailCard, reviewsContainer;
     window.gitdecActivePr = pr;
     detailCard = document.getElementById("gitdec-pr-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -2898,7 +3093,7 @@ function showGitDecPrDetail(pr) {
 }
 
 function initGuide() {
-    let activeBtn, btns, msg, navList, file;
+    let file, btns, activeBtn, navList, msg;
     navList = document.getElementById("guide-nav-list");
     if (!navList) {
         return 0;
@@ -2935,7 +3130,7 @@ function initGuide() {
 }
 
 function initGitDec() {
-    let btnCloseImportRepo, prsPanel, autoUpdateToggle, repoSearch, formCloneRepo, formCreateIssue, modalNewIssue, btnImportRepo, formCommentIssue, formCreatePr, filesPanel, formCreateRepo, btnNewPr, commitsBtn, issuesPanel, formReviewPr, btnCloseNewRepo, btnCloseNewIssue, btnCloseIssue, formImportRepo, btnCloneRepo, btnNewRepo, btnDeleteRepo, modalNewPr, filesBtn, settingsBtn, modalNewRepo, modalCloneRepo, btnToggleVis, formSettingsAddCollab, settingsPanel, prsBtn, btnCloseNewPr, modalImportRepo, btnMergeMain, commitsPanel, issuesBtn, btnCloseCloneRepo, btnNewIssue;
+    let btnCloseIssue, modalImportRepo, btnToggleVis, formSettingsAddCollab, commitsBtn, btnImportRepo, formCreatePr, prsBtn, autoUpdateToggle, btnNewRepo, formImportRepo, commitsPanel, btnCloseImportRepo, btnCloseNewPr, filesPanel, prsPanel, formReviewPr, issuesPanel, settingsPanel, modalCloneRepo, btnCloseCloneRepo, btnCloneRepo, btnMergeMain, repoSearch, formCloneRepo, settingsBtn, formCommentIssue, btnNewIssue, filesBtn, modalNewIssue, formCreateRepo, issuesBtn, btnDeleteRepo, modalNewPr, formCreateIssue, modalNewRepo, btnNewPr, btnCloseNewRepo, btnCloseNewIssue;
     commitsBtn = document.getElementById("gitdec-tab-commits");
     filesBtn = document.getElementById("gitdec-tab-files");
     issuesBtn = document.getElementById("gitdec-tab-issues");
@@ -3336,7 +3531,7 @@ function initGitDec() {
 }
 
 function main() {
-    let turingForm, btnHome, btnMenu, tabPanels, toggleTelegram, targetBtn, subTabs, savedLastName, readerModal, torBookmark, btnSaveDiscord, btnAddTab, btnStar, savedTab, btnDecayMemory, dhtCardWide, menuNewIncognito, pageTitle, nameForm, addressInput, menuExitOption, menuBookmarkOption, btnForward, nameInput, readerModalHtml, toggleDiscord, onionForm, btnSaveTelegram, btnSaveSystemConfig, wikiBookmark, channelBtns, transferForm, btnNewSession, clickFn, menuReloadOption, toggleWhatsapp, btnSaveWhatsapp, btnSwapTokens, guideBtns, menuNewTab, aiModelSelect, btnSavePrompts, ddgBookmark, btnTriggerAutonomy, aiForm, chatForm, navItems, dhtForm, guideSections, btnAddPlugin, btnCloseBrowser, onionCard, btnReload, btnBack, onionSearchHtml, networkGrid, btnRefreshHosts;
+    let nameInput, ddgBookmark, tabPanels, readerModalHtml, menuExitOption, btnSavePrompts, btnHome, channelBtns, btnSaveTelegram, btnBack, btnForward, btnSwapTokens, toggleDiscord, btnSaveSystemConfig, onionForm, turingForm, btnSaveDiscord, menuNewIncognito, readerModal, menuNewTab, btnAddTab, guideSections, guideBtns, aiForm, toggleTelegram, btnTriggerAutonomy, aiModelSelect, btnReload, btnAddPlugin, navItems, clickFn, targetBtn, savedTab, dhtForm, wikiBookmark, btnMenu, pageTitle, btnCloseBrowser, addressInput, toggleWhatsapp, dhtCardWide, torBookmark, onionCard, btnRefreshHosts, btnStar, btnSaveWhatsapp, menuBookmarkOption, menuReloadOption, savedLastName, nameForm, networkGrid, transferForm, btnDecayMemory, btnNewSession, onionSearchHtml, subTabs, chatForm;
     window.ws = null;
     window.isConnected = false;
     window.uptimeSeconds = 0;
@@ -3585,6 +3780,8 @@ function main() {
         renderChatHistory(window.activeChannel);
     } else if ((targetTab === "ai")) {
         renderAiHistory();
+    } else if ((targetTab === "learning")) {
+        requestLessonsList();
     } else if ((targetTab === "guide")) {
         navList = document.getElementById("guide-nav-list");
         if (navList) {
@@ -3736,6 +3933,7 @@ function main() {
         stopBtn.textContent = "Stop";
         set_prop(stopBtn.style, "display", "inline-block");
     }
+    window.aiSurface = "ai";
     msg = Object();
     msg.type = "ai_prompt";
     msg.prompt = prompt;
@@ -3743,6 +3941,7 @@ function main() {
     msg.model = window.selectedAiModel;
     send_msg(window.ws, JSON.stringify(msg));
 });
+    setupLearningTab();
     channelBtns = document.querySelectorAll("[data-channel]");
     channelBtns.forEach((btn) => {
     btn.addEventListener("click", (event) => {

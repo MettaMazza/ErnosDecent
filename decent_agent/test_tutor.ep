@@ -1,0 +1,64 @@
+# test_tutor.ep — verifies the Decentralised Education lesson pipeline end to end
+# WITHOUT the LLM: seed the curriculum into content-addressed storage, retrieve the
+# lesson by number, list it, and confirm the round-trip is byte-identical.
+
+import "string"
+import "collections"
+import "../storage"
+import "./tutor"
+import "./tutor_content"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set ok to storage_init("/tmp/ernos_tutor_test")
+    # Start from a clean curriculum index so the test is deterministic.
+    if file_exists("config/curriculum/index.jsonl") == 1:
+        set rm to write_file("config/curriculum/index.jsonl" and "")
+
+    # 1) is_active reads ctx "mode"
+    set ctx_off to create_map()
+    set ok to pass_if("tutor inactive by default" and tutor_is_active(ctx_off) == 0)
+    set ctx_on to create_map()
+    set ok to map_insert(ctx_on and "mode" and "tutor")
+    set ok to pass_if("tutor active when mode=tutor" and tutor_is_active(ctx_on) == 1)
+
+    # 2) reference session id is the reserved corpus
+    set ok to pass_if("reference session reserved id" and string_contains(tutor_reference_session() and "ref_ernos"))
+
+    # 3) Socratic block + answer-leak rule carry their core directives
+    set ok to pass_if("system block forbids full solutions" and string_contains(tutor_system_block() and "Never write the complete solution"))
+    set ok to pass_if("answer-leak rule blocks copy-pasteable solution" and string_contains(tutor_answer_leak_rule() and "copy-pasteable solution"))
+
+    # 4) seed → store in CAS, register in index
+    set seed_res to tutor_seed_curriculum()
+    display concat("seed -> " and seed_res)
+    set ok to pass_if("seed reports ok" and string_contains(seed_res and "seed:ok"))
+
+    # 5) get_lesson(1) round-trips the exact stored JSON
+    set lesson to tutor_get_lesson(1)
+    set ok to pass_if("lesson 1 retrieved" and string_length(lesson) > 0)
+    set ok to pass_if("lesson 1 is the authored content" and string_contains(lesson and "Your first ErnosPlain program"))
+    set ok to pass_if("lesson carries the learner exercise" and string_contains(lesson and "displays the word Hello"))
+    set ok to pass_if("lesson carries private tutor_notes" and string_contains(lesson and "tutor_notes"))
+    # The round-trip must be byte-identical to what we authored.
+    set ok to pass_if("CAS round-trip is byte-identical" and (lesson equals tutor_lesson_1_json()))
+
+    # 6) list_lessons shows lesson 1
+    set listing to tutor_lesson_list()
+    set ok to pass_if("list_lessons shows lesson 1" and string_contains(listing and "Lesson 1"))
+
+    # 7) idempotent re-seed does not duplicate the index entry
+    set seed2 to tutor_seed_curriculum()
+    set listing2 to tutor_lesson_list()
+    set first to string_index_of(listing2 and "Lesson 1")
+    set rest to substring(listing2 and first + 8 and string_length(listing2) - first - 8)
+    set ok to pass_if("re-seed does not duplicate lesson 1" and (string_index_of(rest and "Lesson 1") < 0))
+
+    display "tutor pipeline test done."
+    return 0

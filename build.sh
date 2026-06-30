@@ -52,7 +52,7 @@ long long ep_net_send_raw(long long fd, long long buf, long long count) {
     return total;
 }
 
-char ep_active_session_id[256] = \"\";
+__thread char ep_active_session_id[256] = \"\";
 
 long long tools_set_active_session(long long sid_ptr) {
     const char* sid = (const char*)sid_ptr;
@@ -662,7 +662,7 @@ long long react_check_cancel(long long);
 long long react_request_cancel(long long);
 long long ptr_to_str(long long);
 
-char ep_active_session_id[256] = \"\";
+__thread char ep_active_session_id[256] = \"\";
 
 long long tools_set_active_session(long long sid_ptr) {
     const char* sid = (const char*)sid_ptr;
@@ -822,7 +822,7 @@ print('[+] Applied SQLite thread-safety and GC blocking barrier patches to node_
 "
 
 # Step 3: Set platform-specific library paths and compile
-CFLAGS="-g -O0 -lpthread -DEP_HAS_SQLITE -lsqlite3 -Wno-int-conversion -Wno-parentheses-equality"
+CFLAGS="-O2 -lpthread -DEP_HAS_SQLITE -lsqlite3 -Wno-int-conversion -Wno-parentheses-equality"
 
 case "$OS" in
     Darwin)
