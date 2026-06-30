@@ -1,0 +1,99 @@
+# awareness.ep — situational awareness + tool routing for the ErnOS agent.
+#
+# Assembled fresh every turn and injected high into the system prompt so the agent
+# always knows its REAL state (where it is, what mode it's in, what it can reach, what
+# it can already see) and WHICH tool maps to which intent. This is the fix for the
+# class of failure where the agent flailed ("I can't see the Civ directory") when a
+# different tool (codebase_read) could reach the file all along.
+
+import "string"
+import "fs"
+import "os"
+import "collections"
+import "sql"
+import "../storage"
+import "../config.ep"
+
+# Full-PC access tier. Default ON (the operator can turn it off in the WebUI; the
+# setting persists in config/access.json). OFF confines the agent to the project +
+# uploads.
+define awareness_full_pc_on returning Int:
+    set path to "config/access.json"
+    if file_exists(path) == 0:
+        return 1
+    set cfg to config_load(path)
+    set v to config_get_str(cfg and "full_pc_access")
+    if v equals "off":
+        return 0
+    return 1
+
+# Names of documents currently indexed in RAG (what rag_retrieve can search), capped.
+define awareness_rag_docs returning Str:
+    set db to storage_get_db()
+    if db == 0:
+        return ""
+    set rows to sql_query(db and "SELECT DISTINCT document_name FROM rag_chunks LIMIT 12;")
+    set n to length_list(rows)
+    if n == 0:
+        return ""
+    set out to ""
+    set i to 0
+    repeat while i < n:
+        set row to get_list(rows and i)
+        set name to ptr_to_str(get_list(row and 0))
+        if i > 0:
+            set out to concat(out and ", ")
+        set out to concat(out and name)
+        set i to i + 1
+    return out
+
+define awareness_block with ctx as Map returning Str:
+    set b to "[SITUATIONAL AWARENESS — your REAL, current state. Trust this over any assumption about what you can or cannot access.]\n"
+    set b to concat(b and concat("- Working directory: the ErnosDecent project root. Your home directory is " and concat(get_home_dir() and ".\n")))
+
+    set mode to "general"
+    if map_contains(ctx and "mode") == 1:
+        set m to map_get_val(ctx and "mode")
+        if string_length(m) > 0:
+            set mode to m
+    set b to concat(b and concat("- Current mode: " and concat(mode and ".\n")))
+
+    if awareness_full_pc_on() == 1:
+        set b to concat(b and "- Full-PC access: ON. You MAY read and navigate anywhere on this Mac (project files, the home folder, the Desktop, other projects) using codebase_read or run_command. Sensitive locations still need a per-action confirmation; secrets can NEVER be sent off-box.\n")
+    else:
+        set b to concat(b and "- Full-PC access: OFF. You are confined to the project tree and config/workspaces/active/uploads. To read anything outside, ask the operator to turn Full-PC access on in Settings — do not claim you are permanently unable.\n")
+
+    set up_dir to "config/workspaces/active/uploads"
+    set listed to 0
+    if is_directory(up_dir) == 1:
+        set entries to list_directory(up_dir)
+        set n to length_list(entries)
+        set i to 0
+        repeat while i < n:
+            set e to get_list(entries and i)
+            if get_character(e and 0) != 46:
+                if listed == 0:
+                    set b to concat(b and "- Files already uploaded to your workspace (read with codebase_read([\"uploads/<name>\"]) or workspace_read):\n")
+                set b to concat(b and concat("    - uploads/" and concat(e and "\n")))
+                set listed to 1
+            set i to i + 1
+        free_list(entries)
+    if listed == 0:
+        set b to concat(b and "- Your upload workspace is currently empty.\n")
+
+    set ragdocs to awareness_rag_docs()
+    if string_length(ragdocs) > 0:
+        set b to concat(b and concat("- Documents indexed in RAG (search them with rag_retrieve): " and concat(ragdocs and ".\n")))
+    return b
+
+# The routing map: which tool for which intent. Static, but the single most important
+# behavioural correction — it stops the agent from giving up when a reachable tool exists.
+define awareness_routing_map returning Str:
+    set r to "[TOOL ROUTING — pick the right tool by intent; do not guess or give up while a reachable tool exists.]\n"
+    set r to concat(r and "- READ a file the user names: try codebase_read([path]) FIRST. It reads any project-relative OR absolute path, and falls back to your uploads/ folder. NEVER tell the user you cannot see a file before you have actually tried codebase_read on the exact path they gave you.\n")
+    set r to concat(r and "- workspace_read / workspace_list see ONLY config/workspaces/active/uploads — they are NOT the whole project or the disk. An empty workspace listing does NOT mean a file is missing; use codebase_read for project and disk files.\n")
+    set r to concat(r and "- LIST or EXPLORE a directory on disk: run_command([\"ls -la <path>\"]) (allowed when Full-PC access is on; it may be gated).\n")
+    set r to concat(r and "- SEARCH a long document rather than read it whole: rag_retrieve([query]). If it isn't indexed yet, index it first, then search.\n")
+    set r to concat(r and "- RUN ErnosPlain code: run_ep (secure sandbox). RECALL earlier context: memory_tool / timeline_tool.\n")
+    set r to concat(r and "- DELEGATE to a sub-agent only for genuinely long or parallel work. A single file read or quick lookup should be done inline — delegation adds latency.\n")
+    return r
