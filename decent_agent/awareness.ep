@@ -21,9 +21,11 @@ define awareness_full_pc_on returning Int:
     set path to "config/access.json"
     if file_exists(path) == 0:
         return 1
-    set cfg to config_load(path)
-    set v to config_get_str(cfg and "full_pc_access")
-    if v equals "off":
+    # PLAIN read — do NOT use config_load/toml_parse here (it runs every turn in the
+    # prompt-assembly hot path; toml_parse on a non-TOML file hangs the agent before
+    # the LLM is called). The file just contains "on" or "off".
+    set content to read_file(path)
+    if string_contains(content and "off") == 1:
         return 0
     return 1
 
@@ -80,10 +82,10 @@ define awareness_block with ctx as Map returning Str:
         free_list(entries)
     if listed == 0:
         set b to concat(b and "- Your upload workspace is currently empty.\n")
-
-    set ragdocs to awareness_rag_docs()
-    if string_length(ragdocs) > 0:
-        set b to concat(b and concat("- Documents indexed in RAG (search them with rag_retrieve): " and concat(ragdocs and ".\n")))
+    # NOTE: do NOT run any SQL (e.g. a rag_chunks query) here. prompt_assemble runs on the
+    # IPC thread every turn; a DB query in this hot path contends on the node's global
+    # SQLite mutex with background threads and HANGS the whole turn before the LLM is ever
+    # called. The RAG corpus is surfaced to the agent via the rag_retrieve tool instead.
     return b
 
 # The routing map: which tool for which intent. Static, but the single most important
