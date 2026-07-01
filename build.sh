@@ -122,11 +122,11 @@ content = wrap_second_occ(content, 'long long ep_http_request(long long method_v
 # 3. Inject SQLite thread-safety patch to test_agent_compiled.c
 content = content.replace(
     'long long sql_execute(long long db, long long sql) {',
-    'static pthread_mutex_t ep_sqlite_global_mutex = PTHREAD_MUTEX_INITIALIZER;\\nlong long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'
+    'static pthread_mutex_t ep_sqlite_global_mutex = PTHREAD_MUTEX_INITIALIZER;\\nlong long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    ep_gc_exit_blocking();\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'
 )
 content = content.replace(
     'long long sql_query(long long db, long long sql) {',
-    'long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'
+    'long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    ep_gc_exit_blocking();\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'
 )
 content = content.replace(
     'long long sql_execute_params(long long db, long long sql, long long params) {',
@@ -782,12 +782,12 @@ inject = '''static pthread_mutex_t ep_sqlite_global_mutex = PTHREAD_MUTEX_INITIA
 
 content = content.replace(
     'long long sql_execute(long long db, long long sql) {',
-    inject + '''long long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'''
+    inject + '''long long sql_execute_impl(long long db, long long sql);\\nlong long sql_execute(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    long long res = sql_execute_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    ep_gc_exit_blocking();\\n    return res;\\n}\\nlong long sql_execute_impl(long long db, long long sql) {'''
 )
 
 content = content.replace(
     'long long sql_query(long long db, long long sql) {',
-    '''long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    ep_gc_exit_blocking();\\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'''
+    '''long long sql_query_impl(long long db, long long sql);\\nlong long sql_query(long long db, long long sql) {\\n    ep_gc_enter_blocking();\n    pthread_mutex_lock(&ep_sqlite_global_mutex);\n    long long res = sql_query_impl(db, sql);\\n    pthread_mutex_unlock(&ep_sqlite_global_mutex);\\n    ep_gc_exit_blocking();\\n    return res;\\n}\\nlong long sql_query_impl(long long db, long long sql) {'''
 )
 
 content = content.replace(
