@@ -282,11 +282,15 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
         set num_ctx_str to int_to_string(num_ctx)
         # /v1/chat/completions is the OpenAI-compatible endpoint — it requires
         # "response_format": {"type": "json_object"}, NOT the Ollama-native "format": "json".
-        set body to concat(body and "\"}], \"response_format\": {\"type\": \"json_object\"}, \"options\": {\"num_ctx\": ")
+        set body to concat(body and "\"}]")
+        set body to concat(body and llm_bound_fragment())
+        set body to concat(body and ", \"response_format\": {\"type\": \"json_object\"}, \"options\": {\"num_ctx\": ")
         set body to concat(body and num_ctx_str)
         set body to concat(body and "}}")
     else:
-        set body to concat(body and "\"}]}")
+        set body to concat(body and "\"}]")
+        set body to concat(body and llm_bound_fragment())
+        set body to concat(body and "}")
 
     display f"[LLM DEBUG] POST (split) {url} model={model_name} body_len={string_length(body)}"
     set response to await http_post_async(url and headers and body)
@@ -344,10 +348,20 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
     display f"[LLM DEBUG] SUCCESS: got content length={string_length(content_str)}"
     return content_str
 
+# ReAct generation bound. Without stop sequences the model doesn't halt at the
+# Thought/Action boundary — it writes its own fake Observation, more turns, then
+# rambles, filling the context (a single call was seen decoding 162K tokens / ~48 min).
+# Because the IPC daemon is single-threaded, that unbounded turn blocks the whole
+# control plane (STATUS/cancel/everything) => the permanent "hang". The stop sequences
+# halt each turn at its Action; max_tokens is a hard seatbelt. Keeps turns finite so the
+# node stays responsive between them.
+define llm_bound_fragment returning Str:
+    return ", \"stop\": [\"\\nObservation:\", \"\\nThought:\", \"\\nUser:\"], \"max_tokens\": 8192"
+
 define try_chat_completion with url as Str and model_name as Str and prompt as Str returning Str:
     set headers to "Content-Type: application/json"
     set escaped_prompt to json_escape_string(prompt)
-    
+
     set body to "{\"model\": \""
     set body to concat(body and model_name)
     set body to concat(body and "\", \"messages\": [{\"role\": \"user\", \"content\": \"")
@@ -355,11 +369,15 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
     if string_contains(url and "11434") == 1:
         set num_ctx to get_model_context_limit(model_name)
         set num_ctx_str to int_to_string(num_ctx)
-        set body to concat(body and "\"}], \"options\": {\"num_ctx\": ")
+        set body to concat(body and "\"}]")
+        set body to concat(body and llm_bound_fragment())
+        set body to concat(body and ", \"options\": {\"num_ctx\": ")
         set body to concat(body and num_ctx_str)
         set body to concat(body and "}}")
     else:
-        set body to concat(body and "\"}]}")
+        set body to concat(body and "\"}]")
+        set body to concat(body and llm_bound_fragment())
+        set body to concat(body and "}")
     
     display f"[LLM DEBUG] POST {url} model={model_name} body_len={string_length(body)}"
     set response to await http_post_async(url and headers and body)

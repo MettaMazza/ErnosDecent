@@ -18,6 +18,14 @@ import "trace"
 import "../storage"
 import "sql"
 
+# Global cancel-all flag (C-level; injected by build.sh). A plain process word set by the
+# web thread's /api/cancel and read here at each turn boundary. Used instead of a SQLite
+# row (which contends on the global SQLite mutex and, under DB-heavy turns, delayed the
+# cancel by seconds) and instead of a cross-thread ErnosPlain map (which would mutate a
+# GC-managed object from another thread). ep_cancel_get takes a dummy arg for ABI parity.
+external define ep_cancel_set with v returning Int
+external define ep_cancel_get with dummy returning Int
+
 # F4: cooperative cancellation registry. A Stop button / `AI CANCEL` IPC sets a
 # per-session flag on a SEPARATE connection while react_run_loop is blocked on the
 # first; the loop checks (and consumes) it at each turn boundary and halts cleanly.
@@ -61,18 +69,27 @@ define react_check_cancel with session_id as Str returning Int:
     set ok to unlock_mutex(RUN_CANCEL_LOCK)
     if hit == 1:
         return 1
-        
-    # Check SQLite DB
+
+    # Global cancel-all flag: the /api/cancel Stop path. Checked before any SQLite so a
+    # Stop is seen at the very next turn boundary regardless of how DB-busy the turn was.
+    if ep_cancel_get(0) == 1:
+        set ok to ep_cancel_set(0)
+        return 1
+
+    # Check SQLite DB. Also honor the global '__CANCEL_ALL__' sentinel, which the web
+    # server's /api/cancel writes directly (in-process) to halt whatever run is active —
+    # this is the Stop path that does NOT depend on the (single-threaded, busy) IPC
+    # daemon accepting an 'AI CANCEL' connection mid-run.
     set db to storage_get_db()
     if db != 0:
         set es to string_replace(key and "'" and "''")
-        set rows to sql_query(db and f"SELECT COUNT(*) FROM trace_cancellations WHERE session_id='{es}';")
+        set rows to sql_query(db and f"SELECT COUNT(*) FROM trace_cancellations WHERE session_id='{es}' OR session_id='__CANCEL_ALL__';")
         if length_list(rows) > 0:
             set first_row to get_list(rows and 0)
             set count_str to get_list(first_row and 0)
             if string_to_int(count_str) > 0:
-                # Consume it: delete from trace_cancellations
-                set ok to sql_execute(db and f"DELETE FROM trace_cancellations WHERE session_id='{es}';")
+                # Consume it (both the per-session row and the global sentinel).
+                set ok to sql_execute(db and f"DELETE FROM trace_cancellations WHERE session_id='{es}' OR session_id='__CANCEL_ALL__';")
                 return 1
     return 0
 
@@ -690,6 +707,21 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set has_approval to 1
                 
                 if has_approval == 0:
+                    # If the user hit Stop while this turn was running, do NOT surface an
+                    # approval prompt for a run they are killing — halt now. The top-of-loop
+                    # cancel check cannot catch a Stop that arrives mid-turn (after that check
+                    # but before we pause here); this closes that window so Stop always wins
+                    # over a pending approval dialog.
+                    set cxl_sess to ""
+                    if map_contains(ctx and "session_id") == 1:
+                        set cxl_sess to map_get_val(ctx and "session_id")
+                    if react_check_cancel(cxl_sess) == 1:
+                        display "[ReAct] Run halted by user (cancel) instead of pausing for approval."
+                        set ok to map_insert(ctx and "was_cancelled" and 1)
+                        free_list(args_list)
+                        free_list(values_list)
+                        set ok to tools_set_active_session("")
+                        return "Run halted at your request."
                     set denials to 0
                     if map_contains(ctx and "consecutive_denials") == 1:
                         set denials to map_get_val(ctx and "consecutive_denials")
@@ -1101,6 +1133,17 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set stale_whispers to react_drain_whispers(stale_sid)
     if string_length(stale_whispers) > 0:
         display f"[ReAct] Discarded {string_length(stale_whispers)} chars of stale whispers from previous query."
+    # Clear any stale global cancel sentinel left by a PREVIOUS run. /api/cancel writes a
+    # '__CANCEL_ALL__' row; if a prior run exited (e.g. via a reply_request) without
+    # crossing a turn boundary to consume it, that row would otherwise halt THIS fresh run
+    # on turn 1. A Stop click issued DURING this run is written after this point and is
+    # still honored at the next turn boundary.
+    set cancel_db to storage_get_db()
+    if cancel_db != 0:
+        set ok to sql_execute(cancel_db and "DELETE FROM trace_cancellations WHERE session_id='__CANCEL_ALL__';")
+    # Clear the C-level cancel-all flag too, so a Stop meant for a prior run cannot halt
+    # this fresh one on turn 1. A Stop during THIS run is set after this point and honored.
+    set ok to ep_cancel_set(0)
     set sanitized_user_prompt to prompt_sanitize_input(user_prompt)
     # Trigger Hebbian learning on prompt concepts
     set ok to react_hebbian_trigger(memory_mgr and sanitized_user_prompt)

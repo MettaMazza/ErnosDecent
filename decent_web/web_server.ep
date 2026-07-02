@@ -22,6 +22,11 @@ import "../decent_agent/sandbox_ep"
 import "../decent_agent/tutor_content"
 import "../decent_agent/access"
 
+# Global cancel-all flag (C-level; injected by build.sh). Set here from the web thread on
+# /api/cancel; read by the ReAct loop at each turn boundary. Setting it is a single word
+# write — no SQLite mutex, no cross-thread GC-object mutation — so Stop is instant.
+external define ep_cancel_set with v returning Int
+
 set IPC_DAEMON_PORT to 5000
 
 define query_daemon_ipc with command as Str returning Str:
@@ -1680,10 +1685,15 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         return 0
 
     if raw_path equals "/api/cancel":
-        # F4 stop/halt. Served on its own connection (run_web_server spawns a thread
-        # per request), so it is NOT blocked behind the in-flight WS ai_prompt. Sets
-        # the daemon's per-session cancel flag; the running loop halts at its next turn.
-        set cancel_resp to query_daemon_ipc("AI CANCEL")
+        # F4 stop/halt. Do NOT route this through the IPC daemon: it is single-threaded
+        # and, during a run, is busy inside the turn — an 'AI CANCEL' connection would
+        # just queue behind the very run we are trying to stop (that was the "Stop button
+        # hangs everything" bug). Set the C-level cancel-all flag directly on this web
+        # thread: a single word write, no SQLite mutex to contend on, no GC-managed object
+        # touched cross-thread. The running loop's react_check_cancel reads it at its next
+        # turn boundary and halts. Generation is bounded (stop sequences + max_tokens), so
+        # that boundary arrives in seconds, not never.
+        set ok to ep_cancel_set(1)
         set ok to send_response(client_fd and 200 and "application/json" and "{\"status\":\"ok\",\"cancelled\":true}")
         return 0
 

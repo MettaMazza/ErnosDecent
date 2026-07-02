@@ -410,6 +410,20 @@ long long cast_map_to_int(long long m) {
     return m;
 }
 
+/* Global cancel-all flag. Set by the web thread (/api/cancel) and read by the ReAct
+   loop at each turn boundary. A plain process global — deliberately NOT a SQLite row
+   (avoids contending on the global SQLite mutex, which under DB-heavy turns delayed the
+   cancel by seconds) and NOT an ErnosPlain map (avoids cross-thread mutation of a
+   GC-managed object). A single word written/read atomically enough for a stop signal. */
+volatile long long ep_cancel_all_flag = 0;
+long long ep_cancel_set(long long v) {
+    ep_cancel_all_flag = v;
+    return 0;
+}
+long long ep_cancel_get(long long dummy) {
+    return ep_cancel_all_flag;
+}
+
 '''
 pat = 'long long ep_net_send(long long fd, const char* data) {'
 first = content.find(pat)
