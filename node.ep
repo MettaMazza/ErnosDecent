@@ -1258,7 +1258,14 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                     # F2: gossip the freshly-produced block to peers over the
                                                                     # authenticated Noise channel (non-blocking; the receiver
                                                                     # applies it via ledger_receive_block with fork-choice).
-                                                                    spawn broadcast_block_to_peers(cast_map_to_int(ledger) and dht_node and static_secret and static_public)
+                                                                    # Serialize the tip block HERE, on the IPC thread that owns the
+                                                                    # ledger, and hand the spawned thread only the wire string — so
+                                                                    # the broadcast never reads the shared ledger map cross-thread
+                                                                    # (that raced the GC and could corrupt the heap).
+                                                                    set bcast_blocks to map_get_val(cast_borrow_to_map(ledger) and "blocks")
+                                                                    set bcast_tip to get_list(bcast_blocks and length_list(bcast_blocks) - 1)
+                                                                    set bcast_wire to ledger_serialize_block(bcast_tip)
+                                                                    spawn broadcast_block_to_peers(bcast_wire and dht_node and static_secret and static_public)
                                                                     set new_bal to ledger_get_balance(cast_borrow_to_map(ledger) and sign_pub)
                                                                     set resp to f"transfer:ok,tx_id:{tx_hash},amount:{amount},to:{recipient},new_balance:{new_bal}"
                                                                 else:
