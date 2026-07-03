@@ -457,6 +457,51 @@ long long ep_json_escape(long long s_ptr) {
     return r;
 }
 
+/* Awaitable readable-OR-timeout. Returns a future that completes with 1 when fd is
+   readable, or 0 when timeout_ms elapses — whichever fires first. Built from the same
+   primitives async_wait_readable uses (a future + a read task) plus a timer task on the
+   SAME future, so the normal await state machine drives it with no nested event-loop
+   pump. Without this, http_post_async read loop blocks forever if the LLM server
+   accepts the connection then never responds, freezing the single-threaded daemon. The
+   loser step is a no-op (guards on !completed) so there is no value clobber or double
+   enqueue; each task self-frees when it eventually fires. */
+static long long ep_readto_read_step(void* r) {
+    EpReadReadyArgs* a = (EpReadReadyArgs*)r;
+    if (a && a->fut && !a->fut->completed) {
+        a->fut->completed = 1; a->fut->value = 1;
+        if (a->fut->waiting_task) { ep_task_enqueue(a->fut->waiting_task); a->fut->waiting_task = NULL; }
+    }
+    return 0;
+}
+static long long ep_readto_timer_step(void* r) {
+    EpReadReadyArgs* a = (EpReadReadyArgs*)r;
+    if (a && a->fut && !a->fut->completed) {
+        a->fut->completed = 1; a->fut->value = 0;
+        if (a->fut->waiting_task) { ep_task_enqueue(a->fut->waiting_task); a->fut->waiting_task = NULL; }
+    }
+    return 0;
+}
+long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
+    EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
+    fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;
+    { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
+    EpReadReadyArgs* rargs = (EpReadReadyArgs*)malloc(sizeof(EpReadReadyArgs));
+    rargs->fut = fut;
+    EpTask* rtask = (EpTask*)malloc(sizeof(EpTask));
+    rtask->step = ep_readto_read_step; rtask->args = rargs;
+    rtask->args_size_bytes = sizeof(EpReadReadyArgs);
+    rtask->fut = NULL; rtask->state = 0; rtask->is_cancelled = 0; rtask->parent = ep_current_task;
+    ep_async_register_read((int)fd, rtask);
+    EpReadReadyArgs* targs = (EpReadReadyArgs*)malloc(sizeof(EpReadReadyArgs));
+    targs->fut = fut;
+    EpTask* ttask = (EpTask*)malloc(sizeof(EpTask));
+    ttask->step = ep_readto_timer_step; ttask->args = targs;
+    ttask->args_size_bytes = sizeof(EpReadReadyArgs);
+    ttask->fut = NULL; ttask->state = 0; ttask->is_cancelled = 0; ttask->parent = ep_current_task;
+    ep_async_register_timer(timeout_ms, ttask);
+    return (long long)fut;
+}
+
 '''
 pat = 'long long ep_net_send(long long fd, const char* data) {'
 first = content.find(pat)

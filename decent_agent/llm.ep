@@ -53,12 +53,21 @@ async define http_post_async with url as Str and headers as Str and body as Str 
     set raw to ""
     set go to 1
     repeat while go == 1:
-        set ready to await async_wait_readable(fd)
-        set chunk to ep_net_recv(fd and 65536)
-        if string_length(chunk) == 0:
+        # 300s per-read watchdog. A normal generation — even a full max_tokens one —
+        # completes well under this, but a server that accepts the connection then dies
+        # mid-request would otherwise block this read (and the single-threaded daemon)
+        # forever. On timeout we abort the read and return what we have (usually nothing,
+        # so the caller treats the endpoint as failed).
+        set ready to await async_wait_readable_timeout(fd and 300000)
+        if ready == 0:
+            display "[LLM] read timeout (300s) — server stopped responding; aborting read."
             set go to 0
         else:
-            set raw to concat(raw and chunk)
+            set chunk to ep_net_recv(fd and 65536)
+            if string_length(chunk) == 0:
+                set go to 0
+            else:
+                set raw to concat(raw and chunk)
     set ok to ep_net_close(fd)
     # Strip HTTP headers — return the body (chunked or not), like the old http_post.
     set hsep to string_index_of(raw and "\r\n\r\n")
@@ -82,6 +91,10 @@ define is_port_open with host as Str and port as Int returning Int:
 # control byte. This helper is O(n) and escapes every control char (< 32) correctly.
 external define ep_json_escape with s returning Str
 external define ep_time_now_ms returning Int
+# Awaitable readable-or-timeout (injected by build.sh). Returns 1 when fd is readable, 0
+# on timeout. Lets the LLM read loop bound how long it waits so a dead server can't hang
+# the single-threaded daemon forever.
+external define async_wait_readable_timeout with fd and timeout_ms returning Int
 
 define llm_json_escape with s as Str returning Str:
     if string_length(s) == 0:
