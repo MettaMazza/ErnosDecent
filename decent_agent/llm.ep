@@ -73,33 +73,20 @@ define is_port_open with host as Str and port as Int returning Int:
         return 1
     return 0
 
-define json_escape_string with s as Str returning Str:
-    set len to string_length(s)
-    set result_list to create_list()
-    set i to 0
-    repeat while i < len:
-        set ch to get_character(s and i)
-        if ch == 34: # "
-            set ok to append_list(result_list and 92)
-            set ok to append_list(result_list and 34)
-        else if ch == 92: # \
-            set ok to append_list(result_list and 92)
-            set ok to append_list(result_list and 92)
-        else if ch == 10: # \n
-            set ok to append_list(result_list and 92)
-            set ok to append_list(result_list and 110)
-        else if ch == 13: # \r
-            set ok to append_list(result_list and 92)
-            set ok to append_list(result_list and 114)
-        else if ch == 9: # \t
-            set ok to append_list(result_list and 92)
-            set ok to append_list(result_list and 116)
-        else if ch >= 32:
-            set ok to append_list(result_list and ch)
-        set i to i + 1
-    set escaped to string_from_list(result_list)
-    free_list(result_list)
-    return escaped
+# Fast JSON escaper for the LLM hot path. Delegates to a one-pass C helper (ep_json_escape,
+# injected by build.sh). Named distinctly from the `json` stdlib's json_escape_string on
+# purpose: that name collides (stdlib wins the symbol), and the stdlib version loops
+# get_character + substring per char (O(n^2)) AND passes control chars through raw — which
+# both cost ~2-4s per LLM call on a 42-63K-char prompt (the dominant per-turn latency) and
+# produced malformed JSON (Ollama: "invalid character '\f'…") when a prompt contained a
+# control byte. This helper is O(n) and escapes every control char (< 32) correctly.
+external define ep_json_escape with s returning Str
+external define ep_time_now_ms returning Int
+
+define llm_json_escape with s as Str returning Str:
+    if string_length(s) == 0:
+        return ""
+    return ep_json_escape(s)
 define http_dechunk with body as Str returning Str:
     set len to string_length(body)
     if len < 5:
@@ -271,7 +258,7 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
     set combined_prompt to concat(combined_prompt and "\n\n[OBSERVER AUDIT DIRECTION: ")
     set combined_prompt to concat(combined_prompt and user_content)
     set combined_prompt to concat(combined_prompt and "]")
-    set escaped_prompt to json_escape_string(combined_prompt)
+    set escaped_prompt to llm_json_escape(combined_prompt)
 
     set body to "{\"model\": \""
     set body to concat(body and model_name)
@@ -293,7 +280,9 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
         set body to concat(body and "}")
 
     display f"[LLM DEBUG] POST (split) {url} model={model_name} body_len={string_length(body)}"
+    set _t0 to ep_time_now_ms()
     set response to await http_post_async(url and headers and body)
+    display f"[LLM TIMING] split HTTP call took {ep_time_now_ms() - _t0} ms (body_len={string_length(body)})"
     display f"[LLM DEBUG] Raw response length: {string_length(response)}"
 
     if string_length(response) == 0:
@@ -360,7 +349,7 @@ define llm_bound_fragment returning Str:
 
 define try_chat_completion with url as Str and model_name as Str and prompt as Str returning Str:
     set headers to "Content-Type: application/json"
-    set escaped_prompt to json_escape_string(prompt)
+    set escaped_prompt to llm_json_escape(prompt)
 
     set body to "{\"model\": \""
     set body to concat(body and model_name)
@@ -380,9 +369,11 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
         set body to concat(body and "}")
     
     display f"[LLM DEBUG] POST {url} model={model_name} body_len={string_length(body)}"
+    set _t0 to ep_time_now_ms()
     set response to await http_post_async(url and headers and body)
+    display f"[LLM TIMING] main HTTP call took {ep_time_now_ms() - _t0} ms (body_len={string_length(body)})"
     display f"[LLM DEBUG] Raw response length: {string_length(response)}"
-    
+
     if string_length(response) == 0:
         display "[LLM DEBUG] FAIL: http_post returned empty string"
         return ""

@@ -424,6 +424,39 @@ long long ep_cancel_get(long long dummy) {
     return ep_cancel_all_flag;
 }
 
+/* One-pass JSON string escaper. The ErnosPlain get_character builtin is O(n) (it
+   re-walks the string every call), so the pure-.ep json_escape_string looped
+   O(n^2) over the prompt — escaping a ~42K-char turn prompt was ~1.8 billion char
+   walks (~2s), and the ~63K observer prompt ~4 billion (~4s), on EVERY LLM call.
+   That was the bulk of per-turn latency and had nothing to do with model/context/
+   hardware. This does it in a single O(n) C pass. It also escapes control chars
+   (below 32) as backslash-u sequences, which the old code silently dropped. Worst
+   case every byte expands to 6 chars, so allocate len*6+1. */
+long long ep_json_escape(long long s_ptr) {
+    const char* s = (const char*)s_ptr;
+    if (!s) return (long long)strdup(\"\");
+    size_t len = strlen(s);
+    char* out = (char*)malloc(len * 6 + 1);
+    if (!out) return (long long)strdup(\"\");
+    static const char hexd[] = \"0123456789abcdef\";
+    size_t j = 0;
+    size_t i;
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 34)      { out[j++]=92; out[j++]=34;  }
+        else if (c == 92) { out[j++]=92; out[j++]=92;  }
+        else if (c == 10) { out[j++]=92; out[j++]=110; }
+        else if (c == 13) { out[j++]=92; out[j++]=114; }
+        else if (c == 9)  { out[j++]=92; out[j++]=116; }
+        else if (c < 32)  { out[j++]=92; out[j++]=117; out[j++]=48; out[j++]=48; out[j++]=hexd[(c>>4)&15]; out[j++]=hexd[c&15]; }
+        else              { out[j++]=(char)c; }
+    }
+    out[j] = 0;
+    long long r = (long long)strdup(out);
+    free(out);
+    return r;
+}
+
 '''
 pat = 'long long ep_net_send(long long fd, const char* data) {'
 first = content.find(pat)

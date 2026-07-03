@@ -12,8 +12,32 @@ import "memory"
 import "react_loop"
 import "./orchestrator"
 import "../logging"
+import "../decent_id/auth"
 
 external define cast_borrow_to_map with b returning Map
+
+# Submit a scheduled job's instruction to the LOCAL IPC daemon as a client, instead of
+# calling react_run() directly. The scheduler runs on its own spawned OS thread; react_run
+# is not thread-safe (conservative GC), so invoking it here raced the inline user turn over
+# shared agent maps — a latent heap-corruption crash. The IPC daemon is the single, serial
+# owner of react runs, so routing through it makes the scheduled turn run on the IPC thread,
+# serialized with user turns. This thread just blocks on the socket until the turn returns.
+define scheduler_submit_via_ipc with instruction as Str returning Str:
+    set fd to ep_net_connect("127.0.0.1" and 5000)
+    if fd < 0:
+        return "error:daemon_offline"
+    set tok to ipc_read_token()
+    set ok to ep_net_send(fd and concat("AUTH " and concat(tok and concat(" AI INFER " and instruction))))
+    set resp to ""
+    set reading to 1
+    repeat while reading == 1:
+        set chunk to ep_net_recv(fd and 65536)
+        if string_length(chunk) == 0:
+            set reading to 0
+        else:
+            set resp to concat(resp and chunk)
+    set ok to ep_net_close(fd)
+    return resp
 
 define cast_int_to_str with val as Int returning Str:
     set s to concat("" and ptr_to_str(val))
@@ -267,7 +291,9 @@ define scheduler_execute_job with job_id as Str and instruction as Str and model
             set ok to perform_cert_rotation()
         else:
             log_info("scheduler" and concat("Executing background scheduled job: " and instruction))
-            set agent_resp to react_run(model and memory and tools and ctx and instruction)
+            # Route through the serial IPC daemon (NOT react_run on this thread — that races
+            # the user turn over GC-managed maps and can corrupt the heap).
+            set agent_resp to scheduler_submit_via_ipc(instruction)
             log_info("scheduler" and concat("Job completed, response: " and agent_resp))
     
     # Reload jobs, record last_run, and save

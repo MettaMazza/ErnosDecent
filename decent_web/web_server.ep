@@ -1003,18 +1003,30 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                 else if msg_type equals "gitdec_get_repo_file":
                     set repo_id to json_get_string(payload and "repo_id")
                     set filename to json_get_string(payload and "filename")
-                    
+
                     set file_content to ""
-                    if repo_id equals "ErnosDecent":
+                    # Reject path traversal / absolute escapes: a repo filename must stay
+                    # inside the repo (or docs) tree. Without this, filename="../../../etc/…"
+                    # or an absolute/~ path read arbitrary files off disk via read_file().
+                    set fn_safe to 1
+                    if string_contains(filename and "..") == 1:
+                        set fn_safe to 0
+                    if string_length(filename) > 0:
+                        set fc0 to get_character(filename and 0)
+                        if fc0 == 47:
+                            set fn_safe to 0
+                        if fc0 == 126:
+                            set fn_safe to 0
+                    if fn_safe == 1 and repo_id equals "ErnosDecent":
                         if file_exists(filename) == 1:
                             set file_content to read_file(filename)
                         else:
-                            # Fallback for nested or absolute paths
+                            # Fallback for nested paths
                             set local_path to path_join("docs" and filename)
                             if file_exists(local_path) == 1:
                                 set file_content to read_file(local_path)
-                                
-                    if string_length(file_content) == 0:
+
+                    if fn_safe == 1 and string_length(file_content) == 0:
                         set ipc_resp to query_daemon_ipc(f"GITDEC REPO GET_FILE {repo_id} {filename}")
                         set payload_pos to string_index_of(ipc_resp and "payload:")
                         if payload_pos >= 0:
