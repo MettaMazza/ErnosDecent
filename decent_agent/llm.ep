@@ -360,8 +360,55 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
 # control plane (STATUS/cancel/everything) => the permanent "hang". The stop sequences
 # halt each turn at its Action; max_tokens is a hard seatbelt. Keeps turns finite so the
 # node stays responsive between them.
+#
+# DO NOT re-add "\nThought:" here. Root cause of the intermittent "Error: No LLM model
+# responded": gemma4 is a THINKING model — the "Thought:/Action:" text lands in the
+# response's `content` channel, and at temperature 1 it intermittently begins that channel
+# with a LEADING NEWLINE ("\nThought: ..."). A "\nThought:" stop then matches at index 0,
+# so Ollama strips everything and returns content="" (finish_reason=stop, ~2KB response).
+# The node reads content length=0, treats it as no-response, and the cascade surfaces
+# "No LLM model responded" — intermittent and size-independent (a 148K prompt worked; a
+# trivial 44K one failed). Measured: 2/15 empty WITH "\nThought:", 0/15 without.
+# "\nThought:" was also redundant — "\nObservation:" already ends the turn right after the
+# Action (verified 0/15 fabricated Observations, 0/15 missing Actions without it).
 define llm_bound_fragment returning Str:
-    return ", \"stop\": [\"\\nObservation:\", \"\\nThought:\", \"\\nUser:\"], \"max_tokens\": 8192"
+    return ", \"stop\": [\"\\nObservation:\", \"\\nUser:\"], \"max_tokens\": 8192"
+
+# Dechunk an HTTP response body and pull choices[0].message.content out of it.
+# Returns the content string, or "" on any structural failure (error key, bad JSON,
+# missing field). Factored out of try_chat_completion so the one-retry-on-empty path
+# can reuse the exact same extraction.
+define extract_content_from_response with response as Str returning Str:
+    set decoded to http_dechunk(response)
+    if string_contains(decoded and "\"error\":") == 1:
+        display "[LLM DEBUG] FAIL: response contains error JSON key"
+        return ""
+    set root_node to json_parse(decoded)
+    if root_node == 0:
+        display "[LLM DEBUG] FAIL: json_parse returned 0"
+        return ""
+    set choices_node to get_json_object_value(root_node and "choices")
+    if choices_node == 0:
+        display "[LLM DEBUG] FAIL: no 'choices' in JSON"
+        return ""
+    set choices_list to get_json_value(choices_node)
+    if length_list(choices_list) == 0:
+        display "[LLM DEBUG] FAIL: choices list empty"
+        return ""
+    set first_choice to get_list(choices_list and 0)
+    if first_choice == 0:
+        display "[LLM DEBUG] FAIL: first choice is null"
+        return ""
+    set message_node to get_json_object_value(first_choice and "message")
+    if message_node == 0:
+        display "[LLM DEBUG] FAIL: no 'message' in choice"
+        return ""
+    set content_node to get_json_object_value(message_node and "content")
+    if content_node == 0:
+        display "[LLM DEBUG] FAIL: no 'content' in message"
+        return ""
+    set content_str to get_json_value(content_node)
+    return content_str
 
 define try_chat_completion with url as Str and model_name as Str and prompt as Str returning Str:
     set headers to "Content-Type: application/json"
@@ -394,53 +441,30 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
     if string_length(response) == 0:
         display "[LLM DEBUG] FAIL: http_post returned empty string"
         return ""
-    
-    if string_length(response) < 200:
-        display f"[LLM DEBUG] Short response: {response}"
-        
+
     if response equals "Error: connection failed":
         display "[LLM DEBUG] FAIL: connection failed"
         return ""
-        
-    set response to http_dechunk(response)
-    display f"[LLM DEBUG] After dechunk length: {string_length(response)}"
-        
-    if string_contains(response and "\"error\":") == 1:
-        display f"[LLM DEBUG] FAIL: response contains error JSON key"
+
+    set content_str to extract_content_from_response(response)
+    if string_length(content_str) > 0:
+        display f"[LLM DEBUG] SUCCESS: got content length={string_length(content_str)}"
+        return content_str
+
+    # Valid HTTP response but empty content. Root cause of the "\nThought:" stop clobber
+    # is fixed in llm_bound_fragment, so this is now only a rare temperature-1 sampling
+    # residual (a remaining stop token leading the content channel). One fresh sample
+    # almost always fills it — cheaper and more correct than surfacing "No LLM model
+    # responded" to the user. A genuinely dead endpoint just fails fast a second time and
+    # the caller's cascade moves on.
+    display "[LLM DEBUG] empty content on valid response — one retry"
+    set _t1 to ep_time_now_ms()
+    set response to await http_post_async(url and headers and body)
+    display f"[LLM TIMING] retry HTTP call took {ep_time_now_ms() - _t1} ms"
+    if string_length(response) == 0:
         return ""
-        
-    set root_node to json_parse(response)
-    if root_node == 0:
-        display "[LLM DEBUG] FAIL: json_parse returned 0"
-        return ""
-        
-    set choices_node to get_json_object_value(root_node and "choices")
-    if choices_node == 0:
-        display "[LLM DEBUG] FAIL: no 'choices' in JSON"
-        return ""
-        
-    set choices_list to get_json_value(choices_node)
-    if length_list(choices_list) == 0:
-        display "[LLM DEBUG] FAIL: choices list empty"
-        return ""
-        
-    set first_choice to get_list(choices_list and 0)
-    if first_choice == 0:
-        display "[LLM DEBUG] FAIL: first choice is null"
-        return ""
-        
-    set message_node to get_json_object_value(first_choice and "message")
-    if message_node == 0:
-        display "[LLM DEBUG] FAIL: no 'message' in choice"
-        return ""
-        
-    set content_node to get_json_object_value(message_node and "content")
-    if content_node == 0:
-        display "[LLM DEBUG] FAIL: no 'content' in message"
-        return ""
-        
-    set content_str to get_json_value(content_node)
-    display f"[LLM DEBUG] SUCCESS: got content length={string_length(content_str)}"
+    set content_str to extract_content_from_response(response)
+    display f"[LLM DEBUG] after retry content length={string_length(content_str)}"
     return content_str
 
 define agent_list_models returning Str:
