@@ -16,6 +16,7 @@ import "string"
 import "fs"
 import "collections"
 import "../config.ep"
+import "./workspace_links"
 
 # ── Full-PC toggle (persistent, default ON) ─────────────────────────────────
 define access_config_path returning Str:
@@ -173,7 +174,10 @@ define access_gate_result with decision as Str and reason as Str returning Map:
 # Gate a file read/path-targeting action.
 define access_gate_path with path as Str returning Map:
     if access_full_pc_on() == 0:
-        if access_path_outside_scope(path) == 1:
+        # A path inside a project the user has explicitly linked is first-class scope, not
+        # "outside the project" — linking is the user saying "work here". (The secret
+        # warn/block below still applies within linked dirs, so this is not an exfil hole.)
+        if access_path_outside_scope(path) == 1 and also links_is_linked_path(path) == 0:
             return access_gate_result("gate" and concat("Full-PC access is OFF, so reading outside the project is not permitted: " and path))
     if access_path_sensitive(path) == 1:
         return access_gate_result("warn" and concat("This touches a sensitive location (keys/credentials/system/private data): " and path))
@@ -184,7 +188,7 @@ define access_gate_command with cmd as Str returning Map:
     if access_command_exfil(cmd) == 1:
         return access_gate_result("block" and "This command would send secret/credential material off this machine. Sending secrets off-box is hard-blocked. Instead, tell the user exactly how to retrieve and share it themselves (e.g. run the command in their own terminal and paste the result, or share only a PUBLIC key).")
     if access_full_pc_on() == 0:
-        if access_path_outside_scope(cmd) == 1:
+        if access_path_outside_scope(cmd) == 1 and also links_cmd_references_linked(cmd) == 0:
             return access_gate_result("gate" and "Full-PC access is OFF; this command reaches outside the project. Ask the operator to enable Full-PC access in Settings.")
     if access_path_sensitive(cmd) == 1:
         return access_gate_result("warn" and "This command reads/touches a sensitive location (keys/credentials/system/private data).")

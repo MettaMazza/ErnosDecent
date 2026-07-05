@@ -374,7 +374,7 @@ define rag_index with db as Int and doc_name as Str and text as Str and session_
 # Search the current session's chunks for the query; returns a JSON string
 # {status, results:[{document,chunk_index,content,score}]}. When session_id is
 # empty, searches all sessions (the explicit cross-session tool path).
-define rag_search with db as Int and query as Str and session_id as Str and k as Int returning Str:
+define rag_search_paged with db as Int and query as Str and session_id as Str and k as Int and offset as Int returning Str:
     set qemb_str to rag_embed(query)
     if string_length(qemb_str) == 0:
         return "{\"status\":\"error\",\"message\":\"Failed to embed query.\",\"results\":[]}"
@@ -405,12 +405,16 @@ define rag_search with db as Int and query as Str and session_id as Str and k as
         set ok to append_list(conts and content)
         set ok to append_list(scores and score)
         set i to i + 1
-    # select top-k indices by score (selection, nr is small for a session)
+    # Rank every chunk by score (selection sort; nr is small for a session) and return
+    # the window [offset, offset+k). total_matches + has_more let the agent page: call
+    # again with offset += k. Skipped picks below `offset` are consumed but not emitted.
     set total to length_list(scores)
     set used to create_map()
-    set out_json to "{\"status\":\"ok\",\"results\":["
-    set picked to 0
-    repeat while picked < k and also picked < total:
+    set results_json to ""
+    set rank to 0
+    set included to 0
+    set win_end to offset + k
+    repeat while rank < win_end and also rank < total:
         set best to -1
         set best_score to -2.0
         set j to 0
@@ -422,18 +426,37 @@ define rag_search with db as Int and query as Str and session_id as Str and k as
                     set best to j
             set j to j + 1
         if best < 0:
-            set picked to k
+            set rank to win_end
         else:
             set ok to map_insert(used and int_to_string(best) and 1)
-            if picked > 0:
-                set out_json to concat(out_json and ",")
-            set out_json to concat(out_json and "{\"document\":\"")
-            set out_json to concat(out_json and json_escape_string(ptr_to_str(get_list(docs and best))))
-            set out_json to concat(out_json and "\",\"chunk_index\":")
-            set out_json to concat(out_json and ptr_to_str(get_list(idxs and best)))
-            set out_json to concat(out_json and ",\"content\":\"")
-            set out_json to concat(out_json and json_escape_string(ptr_to_str(get_list(conts and best))))
-            set out_json to concat(out_json and "\"}")
-            set picked to picked + 1
+            if rank >= offset:
+                if included > 0:
+                    set results_json to concat(results_json and ",")
+                set results_json to concat(results_json and "{\"document\":\"")
+                set results_json to concat(results_json and json_escape_string(ptr_to_str(get_list(docs and best))))
+                set results_json to concat(results_json and "\",\"chunk_index\":")
+                set results_json to concat(results_json and ptr_to_str(get_list(idxs and best)))
+                set results_json to concat(results_json and ",\"content\":\"")
+                set results_json to concat(results_json and json_escape_string(ptr_to_str(get_list(conts and best))))
+                set results_json to concat(results_json and "\"}")
+                set included to included + 1
+            set rank to rank + 1
+    set has_more_str to "false"
+    if offset + included < total:
+        set has_more_str to "true"
+    set out_json to "{\"status\":\"ok\",\"total_matches\":"
+    set out_json to concat(out_json and int_to_string(total))
+    set out_json to concat(out_json and ",\"offset\":")
+    set out_json to concat(out_json and int_to_string(offset))
+    set out_json to concat(out_json and ",\"returned\":")
+    set out_json to concat(out_json and int_to_string(included))
+    set out_json to concat(out_json and ",\"has_more\":")
+    set out_json to concat(out_json and has_more_str)
+    set out_json to concat(out_json and ",\"results\":[")
+    set out_json to concat(out_json and results_json)
     set out_json to concat(out_json and "]}")
     return out_json
+
+# Backwards-compatible wrapper: first page (offset 0). Existing callers are unchanged.
+define rag_search with db as Int and query as Str and session_id as Str and k as Int returning Str:
+    return rag_search_paged(db and query and session_id and k and 0)

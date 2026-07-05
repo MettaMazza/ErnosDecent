@@ -5,11 +5,13 @@ import "fs"
 import "os"
 import "collections"
 import "string"
+import "datetime"
 import "sql"
 import "./sandbox_ep"
 import "./tutor"
 import "./tutor_content"
 import "./access"
+import "./workspace_links"
 import "../storage"
 
 # Subsystem modules to call
@@ -67,11 +69,19 @@ define tools_create with role as Str returning Map:
     
     if is_admin == 1:
         set schemas to concat(schemas and "- codebase_read([path: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Read the contents of a file from the codebase.\n")
+        set schemas to concat(schemas and "  Description: Read a file. The result begins with a header '[File: <path> | Lines: N | Size: B bytes]'. Files over 500 lines return ONLY the first 500 lines plus a hint — you MUST call codebase_read_range for the remaining chunks; do not assume the first chunk is the whole file.\n")
         set schemas to concat(schemas and "  Example: Action: codebase_read([\"docs/AGENT.md\"])\n\n")
+
+        set schemas to concat(schemas and "- codebase_read_range([path: Str, start_line: Int, end_line: Int]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Read a specific inclusive line range of any file. Returns '[Lines s-e of N total]' and a pre-computed hint for the next range. Use this to page through large files reported by codebase_read or file_info.\n")
+        set schemas to concat(schemas and "  Example: Action: codebase_read_range([\"src/main.ep\", 501, 1000])\n\n")
         
+        set schemas to concat(schemas and "- list_sessions([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: List ALL prior sessions (newest first) with their id, title, model, message count and start time. Call this FIRST when you need a session id — you do not need to know any id in advance.\n")
+        set schemas to concat(schemas and "  Example: Action: list_sessions([])\n\n")
+
         set schemas to concat(schemas and "- read_transcripts([session_id: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Read all historical message transcripts for a given session.\n")
+        set schemas to concat(schemas and "  Description: Read all historical message transcripts for a given session. Get the session_id from list_sessions first.\n")
         set schemas to concat(schemas and "  Example: Action: read_transcripts([\"session_1782564644774\"])\n\n")
         
     set schemas to concat(schemas and "- dht_get([key: Str]) -> Str\n")
@@ -219,21 +229,42 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: One-time admin action: index the stdlib + language reference into the searchable reference corpus used by lookup_ernos. Requires the embedding backend.\n")
         set schemas to concat(schemas and "  Example: Action: index_ernos_reference([])\n\n")
 
-        set schemas to concat(schemas and "- file_info([filename: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Get metadata (byte size and line count) for a workspace file.\n")
-        set schemas to concat(schemas and "  Example: Action: file_info([\"uploads/file.md\"])\n\n")
+        set schemas to concat(schemas and "- file_info([path: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Get metadata (byte size and line count) for ANY file — a codebase/project path or a workspace upload. Returns JSON {file,size,lines}. Probe with this first to decide whether to read a file whole or page it with codebase_read_range.\n")
+        set schemas to concat(schemas and "  Example: Action: file_info([\"src/main.ep\"])\n\n")
         
         set schemas to concat(schemas and "- workspace_list([]) -> Str\n")
         set schemas to concat(schemas and "  Description: List files in workspace with metadata (line count, byte size per file, item count per directory). Depth-limited to 3 levels.\n")
         set schemas to concat(schemas and "  Example: Action: workspace_list([])\n\n")
-        
+
+        set schemas to concat(schemas and "- workspace_link([path: Str, label?: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Link a project directory the user wants to work on so it becomes first-class scope. APPROVAL REQUIRED. Afterwards you can read it (codebase_read/file_info), target it in run_command via its id, and — once set active — use bare relative paths. Use this when the user says 'work on <project>'.\n")
+        set schemas to concat(schemas and "  Example: Action: workspace_link([\"/Users/me/Desktop/Smithian Fold Theory\", \"SFT\"])\n\n")
+
+        set schemas to concat(schemas and "- workspace_list_links([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: List all linked projects (id, label, path) with the active one marked.\n")
+        set schemas to concat(schemas and "  Example: Action: workspace_list_links([])\n\n")
+
+        set schemas to concat(schemas and "- workspace_set_active([id: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Set the active linked project. Bare relative paths in codebase_read/file_info then resolve against it.\n")
+        set schemas to concat(schemas and "  Example: Action: workspace_set_active([\"sft\"])\n\n")
+
+        set schemas to concat(schemas and "- workspace_current([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Show the active linked project's path.\n")
+        set schemas to concat(schemas and "  Example: Action: workspace_current([])\n\n")
+
+        set schemas to concat(schemas and "- workspace_unlink([id: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Remove a linked project by id.\n")
+        set schemas to concat(schemas and "  Example: Action: workspace_unlink([\"sft\"])\n\n")
+
+
         set schemas to concat(schemas and "- changelog([count_or_filter: Int/Str, val_or_empty: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: View recent codebase changelogs. Use with ['session', id] or ['path', file].\n")
         set schemas to concat(schemas and "  Example: Action: changelog([10])\n\n")
         
-        set schemas to concat(schemas and "- rag_retrieve([query: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Search indexed RAG text database segments from uploaded files.\n")
-        set schemas to concat(schemas and "  Example: Action: rag_retrieve([\"Claude session content\"])\n\n")
+        set schemas to concat(schemas and "- rag_retrieve([query: Str, offset?: Int]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Search indexed RAG segments from uploaded files. Returns JSON with total_matches, has_more, and up to 10 results. If has_more is true, call again with the next offset (offset += 10) to page through more matches.\n")
+        set schemas to concat(schemas and "  Example: Action: rag_retrieve([\"Claude session content\"])  (page 2: rag_retrieve([\"...\", 10]))\n\n")
         
         set schemas to concat(schemas and "WRITE OPERATIONS (requires user approval before execution):\n")
         
@@ -241,9 +272,9 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: Overwrite a file in the codebase. APPROVAL REQUIRED.\n")
         set schemas to concat(schemas and "  Example: Action: codebase_write([\"config.ep\", \"new config value\"])\n\n")
         
-        set schemas to concat(schemas and "- run_command([cmd: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Execute a shell command. APPROVAL REQUIRED.\n")
-        set schemas to concat(schemas and "  Example: Action: run_command([\"bash build.sh\"])\n\n")
+        set schemas to concat(schemas and "- run_command([cmd: Str, dir?: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Execute a SINGLE shell command and wait for it to finish. APPROVAL REQUIRED. Captures STDOUT only — append 2>&1 to also see stderr/errors. Output is prefixed with '[run_command output — B bytes, N lines]' and paged to the first 400 lines if large (re-run with | head/tail/grep/wc -l). Chaining with && or ; is NOT allowed and each call is a fresh shell (cd does not persist). Optional 2nd arg runs the command inside a directory — pass a linked-project id (from workspace_list_links) or a path — so you can e.g. build/test a linked project without cd.\n")
+        set schemas to concat(schemas and "  Example: Action: run_command([\"make prove\", \"sft\"])   (runs 'make prove' inside linked project 'sft')\n\n")
         
         set schemas to concat(schemas and "- self_prompt_set([section: 'behavior'|'skills', text: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Rewrite editable behavioral sections of your system prompt. APPROVAL REQUIRED.\n")
@@ -328,7 +359,7 @@ define tools_get_schema_string with tools_mgr as Map returning Str:
 define tools_requires_approval with tool_name as Str and args_list as List returning Int:
     # Class A: reading a SENSITIVE location needs a fresh approval every time (the warning
     # is added to the card in react_loop). Normal reads are not gated.
-    if tool_name equals "codebase_read":
+    if tool_name equals "codebase_read" or else tool_name equals "codebase_read_range":
         if length_list(args_list) > 0:
             if map_get_val(access_gate_path(get_list(args_list and 0)) and "decision") equals "warn":
                 return 1
@@ -345,6 +376,10 @@ define tools_requires_approval with tool_name as Str and args_list as List retur
         return 1
     if tool_name equals "run_command":
         return 1
+    if tool_name equals "workspace_link":
+        # Linking a new directory widens the agent's in-scope surface — the human confirms
+        # it once. (set_active/unlink/list operate within already-approved links: no gate.)
+        return 1
     if tool_name equals "system_recompile":
         return 1
     if tool_name equals "download_tool":
@@ -352,10 +387,12 @@ define tools_requires_approval with tool_name as Str and args_list as List retur
     if tool_name equals "discord_add_reaction":
         return 1
     if tool_name equals "operate_synaptic_graph":
-        if length_list(args_list) > 0:
-            set sub_action to get_list(args_list and 0)
-            if sub_action equals "store" or else sub_action equals "relate" or else sub_action equals "link_memory":
-                return 1
+        # Purely local, in-memory agent cognition (persists only to config/agent_memory.json;
+        # no network, no shell, no filesystem outside agent config). This is the agent's own
+        # associative memory — interrupting it to ask the human for permission to remember is
+        # incoherent, and every sibling cognitive tool (memory_tool, scratchpad_tool, kg_tool,
+        # consolidate_tool, timeline_tool) is already permissionless. Role gate still applies
+        # (write sub-actions remain admin/owner in tools_is_action_allowed).
         return 0
     if tool_name equals "operate_scheduler":
         if length_list(args_list) > 0:
@@ -648,6 +685,187 @@ define tools_self_write_section with section as Str and text as Str returning In
     set ok to write_file("config/agent_self_sections.json" and out)
     return 0
 
+# Enumerate every prior session on disk (config/sessions/*.json, excluding the
+# _transcript_ archive shards) and render a compact, newest-first index the agent can
+# read WITHOUT already knowing any session id — the fix for "blind without the ids".
+# Each row: id (+[ACTIVE] marker), title, model, message count, and start time parsed
+# from the timestamp embedded in "session_<ms>" ids. The id is what read_transcripts needs.
+define tools_list_sessions returning Str:
+    set dir to "config/sessions"
+    if file_exists(dir) == 0:
+        return "No sessions directory yet (config/sessions) — there are no prior sessions."
+    set active_id to ""
+    set active_file to path_join(dir and "active_session.txt")
+    if file_exists(active_file) == 1:
+        set active_id to string_trim(read_file(active_file))
+    set files to list_directory(dir)
+    set nfiles to length_list(files)
+    set keys to create_list()
+    set lines to create_list()
+    set count to 0
+    set i to 0
+    repeat while i < nfiles:
+        set fname to get_list(files and i)
+        if string_contains(fname and ".json") == 1 and also string_contains(fname and "_transcript_") == 0:
+            set fpath to path_join(dir and fname)
+            set sess to session_load(fpath)
+            if sess != 0:
+                set sid to map_get_val(sess and "id")
+                if string_length(sid) > 0:
+                    set title_val to map_get_val(sess and "title")
+                    set model_val to map_get_val(sess and "model")
+                    set msgs to map_get_val(sess and "messages")
+                    set msg_count to 0
+                    if msgs != 0:
+                        set msg_count to length_list(msgs)
+                    set started_str to "unknown"
+                    set sortkey to 0
+                    if starts_with(sid and "session_") == 1:
+                        set digits to substring(sid and 8 and string_length(sid) - 8)
+                        set ms to string_to_int(digits)
+                        if ms > 0:
+                            set sortkey to ms
+                            set started_str to format_time(ms / 1000 and "%Y-%m-%d %H:%M")
+                    set active_mark to ""
+                    if string_length(active_id) > 0 and also sid equals active_id:
+                        set active_mark to " [ACTIVE]"
+                    set line to concat("- " and sid)
+                    set line to concat(line and active_mark)
+                    set line to concat(line and "  \"")
+                    set line to concat(line and title_val)
+                    set line to concat(line and "\"  model=")
+                    set line to concat(line and model_val)
+                    set line to concat(line and "  msgs=")
+                    set line to concat(line and int_to_string(msg_count))
+                    set line to concat(line and "  started=")
+                    set line to concat(line and started_str)
+                    set ok to append_list(keys and sortkey)
+                    set ok to append_list(lines and line)
+                    set count to count + 1
+        set i to i + 1
+    if count == 0:
+        return "No prior sessions found in config/sessions."
+    # Selection sort the parallel lists by start time, newest first.
+    set a to 0
+    repeat while a < count:
+        set best to a
+        set b to a + 1
+        repeat while b < count:
+            if get_list(keys and b) > get_list(keys and best):
+                set best to b
+            set b to b + 1
+        if best != a:
+            set tk to get_list(keys and a)
+            set ok to set_list(keys and a and get_list(keys and best))
+            set ok to set_list(keys and best and tk)
+            set tl to get_list(lines and a)
+            set ok to set_list(lines and a and get_list(lines and best))
+            set ok to set_list(lines and best and tl)
+        set a to a + 1
+    set out to concat("=== Prior sessions (" and int_to_string(count))
+    set out to concat(out and " total, newest first) ===\n")
+    set j to 0
+    repeat while j < count:
+        set out to concat(out and get_list(lines and j))
+        set out to concat(out and "\n")
+        set j to j + 1
+    set out to concat(out and "\nUse read_transcripts([\"<id>\"]) to read a session's full transcript.")
+    return out
+
+# ── Generic paginated readers (used by codebase_read / codebase_read_range / file_info) ──
+# These give the model the same size + read-location + "there is more" metadata the
+# workspace_* tools already provide, but for ANY resolved path — so it can paginate a
+# large file instead of getting a bare dump that gets silently truncated downstream.
+
+# Resolve a read path to an actual on-disk location: the path as given, or the
+# workspace-uploads fallback. Returns "" if neither exists. Access gating is applied by
+# the caller so it can emit a distinct [GATE] message.
+define tools_resolve_read_path with path as Str returning Str:
+    if file_exists(path) == 1:
+        return path
+    # Relative path resolved against the active linked project, if one is set.
+    set linked to links_resolve(path)
+    if string_length(linked) > 0:
+        return linked
+    set ws_path to path_join("config/workspaces/active/uploads" and path)
+    if file_exists(ws_path) == 1:
+        return ws_path
+    return ""
+
+# Read `actual` and return it with a [File | Lines | Size] header. Small files (<=500
+# lines) return in full; larger files return the first 500 lines plus an explicit
+# codebase_read_range continuation hint keyed to `label` (the path the agent passed).
+define tools_paginated_read with actual as Str and label as Str returning Str:
+    set content to read_file(actual)
+    set total_size to string_length(content)
+    set lines to string_split(content and "\n")
+    set total_lines to length_list(lines)
+    set header to f"[File: {label} | Lines: {total_lines} | Size: {total_size} bytes]\n"
+    if total_lines <= 500:
+        free_list(lines)
+        return concat(header and content)
+    set body to ""
+    set i to 1
+    repeat while i <= 500:
+        set body to concat(body and concat(get_list(lines and i - 1) and "\n"))
+        set i to i + 1
+    free_list(lines)
+    set out to concat(header and "[Showing lines 1-500 — file is larger]\n")
+    set out to concat(out and body)
+    set out to concat(out and f"\n[Truncated to first 500 of {total_lines} lines — use codebase_read_range([\"{label}\", 501, 1000]) to continue until line {total_lines}]")
+    return out
+
+# Read a specific inclusive line range from `actual`, with a [Lines s-e of N] header and
+# a next-range hint keyed to `label`. The pagination gold standard, generalised off the
+# workspace root so it works on codebase and linked-project paths too.
+define tools_read_range_path with actual as Str and label as Str and start_line as Int and end_line as Int returning Str:
+    set content to read_file(actual)
+    if string_length(content) == 0:
+        return f"[Lines {start_line}-{end_line} of 0 total | File: {label}]\n(file is empty)"
+    set lines to string_split(content and "\n")
+    set total_lines to length_list(lines)
+    set s to start_line
+    if s < 1:
+        set s to 1
+    set e to end_line
+    if e > total_lines:
+        set e to total_lines
+    if s > total_lines:
+        free_list(lines)
+        return f"[Lines {start_line}-{end_line} of {total_lines} total | File: {label}]\n(Requested range is beyond end of file)"
+    set body to ""
+    set i to s
+    repeat while i <= e:
+        set body to concat(body and concat(get_list(lines and i - 1) and "\n"))
+        set i to i + 1
+    free_list(lines)
+    set header to f"[Lines {s}-{e} of {total_lines} total | File: {label}]\n"
+    set output to concat(header and body)
+    if e < total_lines:
+        set next_start to e + 1
+        set next_end to next_start + 499
+        if next_end > total_lines:
+            set next_end to total_lines
+        set hint to f"\n[Use codebase_read_range([\"{label}\", {next_start}, {next_end}]) to continue until line {total_lines}]"
+        set output to concat(output and hint)
+    return output
+
+# Size + line count of any resolved path, as JSON. The metadata-first probe: call this
+# before deciding whether to read a file whole or page it.
+define tools_file_info_path with actual as Str and label as Str returning Str:
+    set content to read_file(actual)
+    set size to string_length(content)
+    set lines to string_split(content and "\n")
+    set nlines to length_list(lines)
+    free_list(lines)
+    set out_json to concat("{\"file\":\"" and label)
+    set out_json to concat(out_json and "\",\"size\":")
+    set out_json to concat(out_json and int_to_string(size))
+    set out_json to concat(out_json and ",\"lines\":")
+    set out_json to concat(out_json and int_to_string(nlines))
+    set out_json to concat(out_json and "}")
+    return out_json
+
 define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str and args_list as List returning Str:
     set sender_role to ""
     if map_contains(ctx and "sender_role") == 1:
@@ -670,14 +888,28 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set cr_gate to access_gate_path(path)
         if map_get_val(cr_gate and "decision") equals "gate":
             return concat("[GATE] " and map_get_val(cr_gate and "reason"))
-        if file_exists(path) == 0:
-            # Fallback: check workspace uploads directory
-            set ws_path to path_join("config/workspaces/active/uploads" and path)
-            if file_exists(ws_path) == 1:
-                return read_file(ws_path)
+        set cr_actual to tools_resolve_read_path(path)
+        if string_length(cr_actual) == 0:
             return f"Error: File '{path}' does not exist. If this is an uploaded document, try rag_retrieve([\"query about the document\"]) to search the RAG database."
-        return read_file(path)
+        return tools_paginated_read(cr_actual and path)
+
+    if action_name equals "codebase_read_range":
+        if length_list(args_list) < 3:
+            return "Error: codebase_read_range requires 3 arguments: path (Str), start_line (Int), end_line (Int). Example: Action: codebase_read_range([\"src/main.ep\", 1, 500])"
+        set crr_path to get_list(args_list and 0)
+        set crr_gate to access_gate_path(crr_path)
+        if map_get_val(crr_gate and "decision") equals "gate":
+            return concat("[GATE] " and map_get_val(crr_gate and "reason"))
+        set crr_actual to tools_resolve_read_path(crr_path)
+        if string_length(crr_actual) == 0:
+            return f"Error: File '{crr_path}' does not exist."
+        set crr_start to tools_safe_int(get_list(args_list and 1))
+        set crr_end to tools_safe_int(get_list(args_list and 2))
+        return tools_read_range_path(crr_actual and crr_path and crr_start and crr_end)
             
+    if action_name equals "list_sessions":
+        return tools_list_sessions()
+
     if action_name equals "read_transcripts":
         if length_list(args_list) < 1:
             return "Error: read_transcripts requires 1 argument (session_id)."
@@ -820,7 +1052,47 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: command rejected (chaining/substitution/privilege-escalation patterns are not permitted)."
         if tools_grep_is_safe(cmd) == 0:
             return "Error: Recursive grep rejected. You MUST include the '-I' flag (ignore binary files) to prevent the command from hanging on large SQLite database files (e.g. node.db, 120MB+). Example: grep -rnI 'your_pattern' ."
-        return run_command(cmd)
+        # Optional 2nd arg = working directory: a linked-project id/label OR a path. Each
+        # run_command is a fresh shell (cd does not persist across calls) and && is blocked
+        # in user cmds, so we build the cd-prefix HERE — the model's cmd already passed the
+        # danger filter and dir is validated + gated below, so this cannot smuggle chaining.
+        set rc_exec to cmd
+        if length_list(args_list) >= 2:
+            set rc_dirarg to ptr_to_str(get_list(args_list and 1))
+            set rc_dir to links_path_for(rc_dirarg)
+            if string_length(rc_dir) == 0:
+                if file_exists(rc_dirarg) == 1:
+                    set rc_dir to rc_dirarg
+            if string_length(rc_dir) == 0:
+                return concat("Error: working directory not found (not a linked-project id/label or an existing path): " and rc_dirarg)
+            if string_contains(rc_dir and "'") == 1 or else string_contains(rc_dir and "\n") == 1:
+                return "Error: working directory path contains unsupported characters (single-quote or newline)."
+            set rc_dgate to access_gate_path(rc_dir)
+            if map_get_val(rc_dgate and "decision") equals "gate":
+                return concat("[GATE] " and map_get_val(rc_dgate and "reason"))
+            set rc_exec to concat("cd '" and concat(rc_dir and concat("' && ( " and concat(cmd and " )"))))
+        # Run and annotate. run_command captures STDOUT ONLY (append 2>&1 for stderr) and
+        # waits for the command to exit. Give the model output size + line count, and page
+        # very large output so it can target re-runs instead of drowning in a dump that
+        # react_fit_observation would truncate downstream with no pagination handle.
+        set rc_out to run_command(rc_exec)
+        set rc_bytes to string_length(rc_out)
+        if rc_bytes == 0:
+            return "[run_command produced no stdout. Note: only stdout is captured — append 2>&1 to the command to also see stderr/errors.]"
+        set rc_lines_list to string_split(rc_out and "\n")
+        set rc_lines to length_list(rc_lines_list)
+        set rc_header to f"[run_command output — {rc_bytes} bytes, {rc_lines} lines]\n"
+        if rc_lines <= 400:
+            free_list(rc_lines_list)
+            return concat(rc_header and rc_out)
+        set rc_body to ""
+        set rk to 0
+        repeat while rk < 400:
+            set rc_body to concat(rc_body and concat(get_list(rc_lines_list and rk) and "\n"))
+            set rk to rk + 1
+        free_list(rc_lines_list)
+        set rc_tip to f"\n[Output truncated to first 400 of {rc_lines} lines. Re-run targeting what you need: append ` | head -N`, ` | tail -N`, ` | grep PATTERN`, or ` | wc -l` (single pipes are allowed; && and ; are not).]"
+        return concat(rc_header and concat(rc_body and rc_tip))
 
     if action_name equals "self_prompt_get":
         if length_list(args_list) < 1:
@@ -1352,12 +1624,60 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
 
     if action_name equals "file_info":
         if length_list(args_list) < 1:
-            return "Error: file_info requires 1 argument (filename). Example: Action: file_info([\"uploads/file.md\"])"
-        set ws_filename to get_list(args_list and 0)
-        return workspace_file_info(ws_filename)
+            return "Error: file_info requires 1 argument (path). Example: Action: file_info([\"src/main.ep\"]) or file_info([\"uploads/file.md\"])"
+        set fi_path to get_list(args_list and 0)
+        # Any-path probe (size + line count). Gate outside-project paths when Full-PC is
+        # off, same as codebase_read. Falls back to the workspace variant so bare upload
+        # filenames still resolve against the active workspace root.
+        set fi_gate to access_gate_path(fi_path)
+        if map_get_val(fi_gate and "decision") equals "gate":
+            return concat("[GATE] " and map_get_val(fi_gate and "reason"))
+        set fi_actual to tools_resolve_read_path(fi_path)
+        if string_length(fi_actual) > 0:
+            return tools_file_info_path(fi_actual and fi_path)
+        return workspace_file_info(fi_path)
 
     if action_name equals "workspace_list":
         return workspace_list_active()
+
+    # ── Project linking (config/linked_projects.txt) ────────────────────────────
+    if action_name equals "workspace_link":
+        if length_list(args_list) < 1:
+            return "Error: workspace_link requires a path. Example: Action: workspace_link([\"/Users/me/Desktop/MyProject\", \"My Project\"])"
+        set wl_p to get_list(args_list and 0)
+        set wl_lbl to ""
+        if length_list(args_list) >= 2:
+            set wl_lbl to get_list(args_list and 1)
+        set wl_res to links_add(wl_p and wl_lbl)
+        if starts_with(wl_res and "ok:") == 1:
+            set wl_id to substring(wl_res and 3 and string_length(wl_res) - 3)
+            return concat("Linked project '" and concat(wl_id and concat("' -> " and concat(wl_p and ". It is now in-scope; read it with codebase_read/file_info and target it in run_command via its id. Use workspace_set_active to make relative paths resolve against it."))))
+        return concat("Error: could not link — " and substring(wl_res and 6 and string_length(wl_res) - 6))
+
+    if action_name equals "workspace_unlink":
+        if length_list(args_list) < 1:
+            return "Error: workspace_unlink requires a link id. Example: Action: workspace_unlink([\"my_project\"])"
+        set wu_id to get_list(args_list and 0)
+        if links_remove(wu_id) == 1:
+            return concat("Unlinked project '" and concat(wu_id and "'."))
+        return concat("Error: no linked project with id '" and concat(wu_id and "'. Use workspace_list_links to see ids."))
+
+    if action_name equals "workspace_set_active":
+        if length_list(args_list) < 1:
+            return "Error: workspace_set_active requires a link id. Example: Action: workspace_set_active([\"my_project\"])"
+        set wsa_id to get_list(args_list and 0)
+        if links_set_active(wsa_id) == 1:
+            return concat("Active project is now '" and concat(wsa_id and "'. Bare relative paths in codebase_read/file_info now resolve against it."))
+        return concat("Error: no linked project with id '" and concat(wsa_id and "'. Use workspace_list_links to see ids."))
+
+    if action_name equals "workspace_list_links":
+        return links_list_human()
+
+    if action_name equals "workspace_current":
+        set wc_path to links_active_path()
+        if string_length(wc_path) == 0:
+            return "No active project set. Use workspace_list_links to see linked projects and workspace_set_active([\"<id>\"]) to pick one."
+        return concat("Active project path: " and wc_path)
 
     if action_name equals "changelog":
         if length_list(args_list) >= 2:
@@ -1380,7 +1700,12 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set rr_sess to ""
         if map_contains(ctx and "session_id") == 1:
             set rr_sess to map_get_val(ctx and "session_id")
-        return rag_search(storage_get_db() and rr_query and rr_sess and 10)
+        # Optional 2nd arg = offset for pagination. Response carries total_matches +
+        # has_more so the agent knows whether to page again (offset += 10).
+        set rr_offset to 0
+        if length_list(args_list) >= 2:
+            set rr_offset to tools_safe_int(get_list(args_list and 1))
+        return rag_search_paged(storage_get_db() and rr_query and rr_sess and 10 and rr_offset)
 
     # ---- Orchestration tools ----
     if action_name equals "delegate_task":

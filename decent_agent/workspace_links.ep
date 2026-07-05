@@ -1,0 +1,316 @@
+# workspace_links.ep — persistent registry of project directories the user has asked
+# Echo to "work on". Linking a directory (a) lets the agent read it with bare relative
+# paths resolved against the active project, (b) lets run_command target it by id, and
+# (c) marks it in-scope for the access gate so navigating it is not treated as "outside
+# the project" when Full-PC is OFF. The SECRET hard-block still applies inside linked
+# dirs — linking never becomes a credential-exfil bypass.
+#
+# Storage: config/linked_projects.txt, one record per line "id|label|path", plus an
+# optional "@active=<id>" line. A line format (not JSON) is used deliberately so project
+# paths that contain spaces (e.g. "Smithian Fold Theory") need no escaping. id and label
+# are sanitised on write so they never contain "|".
+#
+# This module depends ONLY on stdlib so access.ep can consult it without an import cycle.
+
+import "string"
+import "fs"
+import "collections"
+
+define wl_path returning Str:
+    return "config/linked_projects.txt"
+
+# Lowercase slug of a label: [a-z0-9] kept, everything else -> "_", collapsed, trimmed.
+define wl_slug with s as Str returning Str:
+    set low to string_lower(s)
+    set n to string_length(low)
+    set out to ""
+    set prev_us to 1
+    set i to 0
+    repeat while i < n:
+        set ch to get_character(low and i)
+        set keep to 0
+        if ch >= 97 and ch <= 122:
+            set keep to 1
+        if ch >= 48 and ch <= 57:
+            set keep to 1
+        if keep == 1:
+            set out to concat(out and substring(low and i and 1))
+            set prev_us to 0
+        else:
+            if prev_us == 0:
+                set out to concat(out and "_")
+                set prev_us to 1
+        set i to i + 1
+    # strip a trailing underscore
+    set olen to string_length(out)
+    if olen > 1 and also get_character(out and olen - 1) == 95:
+        set out to substring(out and 0 and olen - 1)
+    if string_length(out) == 0:
+        return "proj"
+    return out
+
+# Basename of a path (last non-empty segment), used to derive a label when none given.
+define wl_basename with path as Str returning Str:
+    set parts to string_split(path and "/")
+    set n to length_list(parts)
+    set i to n - 1
+    repeat while i >= 0:
+        set seg to get_list(parts and i)
+        if string_length(seg) > 0:
+            free_list(parts)
+            return seg
+        set i to i - 1
+    free_list(parts)
+    return path
+
+# Read the registry into a Map: {"active": Str, "ids": List, "labels": List, "paths": List}.
+define links_load returning Map:
+    set m to create_map()
+    set ids to create_list()
+    set labels to create_list()
+    set paths to create_list()
+    set active to ""
+    set p to wl_path()
+    if file_exists(p) == 1:
+        set content to read_file(p)
+        set lines to string_split(content and "\n")
+        set n to length_list(lines)
+        set i to 0
+        repeat while i < n:
+            set raw to string_trim(get_list(lines and i))
+            if string_length(raw) > 0:
+                if starts_with(raw and "@active=") == 1:
+                    set active to string_trim(substring(raw and 8 and string_length(raw) - 8))
+                else:
+                    set fields to string_split(raw and "|")
+                    if length_list(fields) >= 3:
+                        set fid to string_trim(get_list(fields and 0))
+                        set flabel to string_trim(get_list(fields and 1))
+                        # path is the remainder after the 2nd '|' (paths never contain '|'
+                        # because they are validated on write, but rejoin defensively).
+                        set fpath to string_trim(get_list(fields and 2))
+                        set k to 3
+                        repeat while k < length_list(fields):
+                            set fpath to concat(fpath and concat("|" and get_list(fields and k)))
+                            set k to k + 1
+                        if string_length(fid) > 0 and also string_length(fpath) > 0:
+                            set ok to append_list(ids and fid)
+                            set ok to append_list(labels and flabel)
+                            set ok to append_list(paths and fpath)
+            set i to i + 1
+        free_list(lines)
+    set ok to map_insert(m and "active" and active)
+    set ok to map_insert(m and "ids" and ids)
+    set ok to map_insert(m and "labels" and labels)
+    set ok to map_insert(m and "paths" and paths)
+    return m
+
+# Serialise a loaded registry Map back to disk.
+define links_save with m as Map returning Int:
+    set ids to map_get_val(m and "ids")
+    set labels to map_get_val(m and "labels")
+    set paths to map_get_val(m and "paths")
+    set active to map_get_val(m and "active")
+    set out to ""
+    if string_length(active) > 0:
+        set out to concat("@active=" and concat(active and "\n"))
+    set n to length_list(ids)
+    set i to 0
+    repeat while i < n:
+        set line to concat(get_list(ids and i) and "|")
+        set line to concat(line and concat(get_list(labels and i) and "|"))
+        set line to concat(line and get_list(paths and i))
+        set out to concat(out and concat(line and "\n"))
+        set i to i + 1
+    return write_file(wl_path() and out)
+
+# Index of an id in the registry, or -1.
+define links_index_of with m as Map and id as Str returning Int:
+    set ids to map_get_val(m and "ids")
+    set n to length_list(ids)
+    set i to 0
+    repeat while i < n:
+        if get_list(ids and i) equals id:
+            return i
+        set i to i + 1
+    return -1
+
+# Resolve a key (id OR label OR exact path) to a stored project path, or "".
+define links_path_for with key as Str returning Str:
+    set m to links_load()
+    set ids to map_get_val(m and "ids")
+    set labels to map_get_val(m and "labels")
+    set paths to map_get_val(m and "paths")
+    set n to length_list(ids)
+    set i to 0
+    repeat while i < n:
+        if get_list(ids and i) equals key or else get_list(labels and i) equals key or else get_list(paths and i) equals key:
+            return get_list(paths and i)
+        set i to i + 1
+    return ""
+
+# The active project's path, or "" if none set / not found.
+define links_active_path returning Str:
+    set m to links_load()
+    set active to map_get_val(m and "active")
+    if string_length(active) == 0:
+        return ""
+    set idx to links_index_of(m and active)
+    if idx < 0:
+        return ""
+    return get_list(map_get_val(m and "paths") and idx)
+
+# Is `path` inside ANY linked project (exact dir or a descendant)? Used by the access gate.
+define links_is_linked_path with path as Str returning Int:
+    set m to links_load()
+    set paths to map_get_val(m and "paths")
+    set n to length_list(paths)
+    set i to 0
+    repeat while i < n:
+        set base to get_list(paths and i)
+        if string_length(base) > 0:
+            if path equals base:
+                return 1
+            if starts_with(path and concat(base and "/")) == 1:
+                return 1
+        set i to i + 1
+    return 0
+
+# Does a run_command string reference any linked project path? Used by the command gate
+# so a command operating inside a linked project is not treated as "outside the project".
+define links_cmd_references_linked with cmd as Str returning Int:
+    set m to links_load()
+    set paths to map_get_val(m and "paths")
+    set n to length_list(paths)
+    set i to 0
+    repeat while i < n:
+        set base to get_list(paths and i)
+        if string_length(base) > 0 and also string_contains(cmd and base) == 1:
+            return 1
+        set i to i + 1
+    return 0
+
+# If `rel` is a non-absolute path that does not exist as given but DOES exist under the
+# active project, return that resolved path; else "". Lets the agent read a linked
+# project with bare relative paths once it is set active.
+define links_resolve with rel as Str returning Str:
+    if string_length(rel) == 0:
+        return ""
+    set c0 to get_character(rel and 0)
+    if c0 == 47:
+        return ""
+    if c0 == 126:
+        return ""
+    set base to links_active_path()
+    if string_length(base) == 0:
+        return ""
+    set candidate to path_join(base and rel)
+    if file_exists(candidate) == 1:
+        return candidate
+    return ""
+
+# Add (or update) a link. Returns "ok:<id>" or "error:<reason>". label may be "".
+define links_add with path as Str and label as Str returning Str:
+    if string_length(path) == 0:
+        return "error:empty path"
+    if string_contains(path and "|") == 1:
+        return "error:path may not contain '|'"
+    if file_exists(path) == 0:
+        return concat("error:path does not exist: " and path)
+    set m to links_load()
+    set ids to map_get_val(m and "ids")
+    set labels to map_get_val(m and "labels")
+    set paths to map_get_val(m and "paths")
+    # Dedup by path: if already linked, just return its id.
+    set n to length_list(paths)
+    set j to 0
+    repeat while j < n:
+        if get_list(paths and j) equals path:
+            return concat("ok:" and get_list(ids and j))
+        set j to j + 1
+    set use_label to string_trim(label)
+    if string_length(use_label) == 0:
+        set use_label to wl_basename(path)
+    # sanitise label: no '|' or newlines
+    set use_label to string_replace(use_label and "|" and "/")
+    set base_id to wl_slug(use_label)
+    set new_id to base_id
+    set suffix to 2
+    repeat while links_index_of(m and new_id) >= 0:
+        set new_id to concat(base_id and concat("_" and int_to_string(suffix)))
+        set suffix to suffix + 1
+    set ok to append_list(ids and new_id)
+    set ok to append_list(labels and use_label)
+    set ok to append_list(paths and path)
+    set ok to map_insert(m and "ids" and ids)
+    set ok to map_insert(m and "labels" and labels)
+    set ok to map_insert(m and "paths" and paths)
+    # First link added becomes active by default.
+    if string_length(map_get_val(m and "active")) == 0:
+        set ok to map_insert(m and "active" and new_id)
+    set sr to links_save(m)
+    return concat("ok:" and new_id)
+
+# Remove a link by id. Returns 1 if removed, 0 if not found.
+define links_remove with id as Str returning Int:
+    set m to links_load()
+    set idx to links_index_of(m and id)
+    if idx < 0:
+        return 0
+    set ids to map_get_val(m and "ids")
+    set labels to map_get_val(m and "labels")
+    set paths to map_get_val(m and "paths")
+    set new_ids to create_list()
+    set new_labels to create_list()
+    set new_paths to create_list()
+    set n to length_list(ids)
+    set i to 0
+    repeat while i < n:
+        if i != idx:
+            set ok to append_list(new_ids and get_list(ids and i))
+            set ok to append_list(new_labels and get_list(labels and i))
+            set ok to append_list(new_paths and get_list(paths and i))
+        set i to i + 1
+    set ok to map_insert(m and "ids" and new_ids)
+    set ok to map_insert(m and "labels" and new_labels)
+    set ok to map_insert(m and "paths" and new_paths)
+    if map_get_val(m and "active") equals id:
+        set ok to map_insert(m and "active" and "")
+    set sr to links_save(m)
+    return 1
+
+# Set the active project by id. Returns 1 on success, 0 if id unknown.
+define links_set_active with id as Str returning Int:
+    set m to links_load()
+    if links_index_of(m and id) < 0:
+        return 0
+    set ok to map_insert(m and "active" and id)
+    set sr to links_save(m)
+    return 1
+
+# Human/model-readable listing of all linked projects, active one marked.
+define links_list_human returning Str:
+    set m to links_load()
+    set ids to map_get_val(m and "ids")
+    set labels to map_get_val(m and "labels")
+    set paths to map_get_val(m and "paths")
+    set active to map_get_val(m and "active")
+    set n to length_list(ids)
+    if n == 0:
+        return "No linked projects yet. Use workspace_link([\"/abs/path/to/project\", \"Label\"]) to add one."
+    set out to concat("=== Linked projects (" and concat(int_to_string(n) and ") ===\n"))
+    set i to 0
+    repeat while i < n:
+        set mark to ""
+        if get_list(ids and i) equals active:
+            set mark to " [ACTIVE]"
+        set line to concat("- " and get_list(ids and i))
+        set line to concat(line and mark)
+        set line to concat(line and "  \"")
+        set line to concat(line and get_list(labels and i))
+        set line to concat(line and "\"  -> ")
+        set line to concat(line and get_list(paths and i))
+        set out to concat(out and concat(line and "\n"))
+        set i to i + 1
+    set out to concat(out and "\nActive project is used to resolve bare relative paths in codebase_read/file_info and can be targeted by run_command via its id.")
+    return out
