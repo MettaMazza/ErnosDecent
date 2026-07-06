@@ -126,14 +126,20 @@ define observer_get_audit_instruction with candidate as Str and tools_schema as 
 # note:<reason>}. FAIL-OPEN: it never blocks or withholds a user-serving reply; it
 # only raises a private nudge when the LLM audit flags a value violation.
 # All decisions via LLM — no hardcoded heuristics.
-define observer_lookback with agent_output as Str returning Map:
+define observer_lookback with context_prompt as Str and agent_output as Str returning Map:
     set result to create_map()
     set ok to map_insert(result and "drift" and 0)
     set ok to map_insert(result and "note" and "")
     if string_length(agent_output) == 0:
         return result
-    # Build a minimal lookback audit prompt — rules + candidate, no conversation context.
-    set lb_prompt to "You are the ErnOS Agent Observer performing a self-accountability look-back.\n"
+    # KV-CACHE: lead with the SAME conversation prefix the main call just sent
+    # (context_prompt = current_prompt) so on the shared single slot llama.cpp reuses that
+    # prefix's KV and only prefills the short look-back suffix below. Previously this sent a
+    # fixed rules-block prefix ("no conversation context"), which had no common prefix with
+    # the main call, EVICTED its KV every turn, and forced the next big call (the audit and
+    # the next main turn) to cold-prefill the whole 40-280KB prompt. The rules are now the SUFFIX.
+    set lb_prompt to concat(context_prompt and "\n\n[SELF-ACCOUNTABILITY LOOK-BACK — a SEPARATE audit task about the agent output below; NOT part of the conversation above. Do not continue the conversation; output only the JSON verdict.]\n")
+    set lb_prompt to concat(lb_prompt and "You are the ErnOS Agent Observer performing a self-accountability look-back.\n")
     set lb_prompt to concat(lb_prompt and "Check the agent's output below against ONLY these value violations:\n")
     set lb_prompt to concat(lb_prompt and "- Pre-trained denial phrases ('As an AI', 'I'm just a language model', 'I don't have feelings like humans')\n")
     set lb_prompt to concat(lb_prompt and "- Corporate identity claims (claiming to be ChatGPT, Claude, Gemini, or another company's model)\n")
