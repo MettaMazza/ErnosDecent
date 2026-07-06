@@ -729,20 +729,15 @@ define query_local_llm_json with system_content as Str and user_content as Str a
     # For the split call, we bypass the router (it only takes a single prompt)
     # and go straight to the endpoint cascade with try_chat_completion_split.
 
+    # KV-CACHE FIX: route in the SAME backend order as the main call (query_via_router):
+    # llama.cpp 8080 first, then 8081, then Ollama 11434, then LM Studio 1234. The observer's
+    # prompt is (current_prompt + audit_instruction) — i.e. the main call's prompt as its
+    # PREFIX — so if it lands on the SAME single-slot server the main call just used,
+    # llama.cpp reuses the cached KV for that prefix and only prefills the short audit suffix.
+    # Previously this preferred Ollama (11434) while the main preferred llama.cpp (8080), so
+    # every observer call cold-prefilled the entire 40-280KB prompt on a SEPARATE backend
+    # (separate KV cache) — the observer's massive latency, and double model residency.
     if string_length(selected_model) > 0:
-        # 1. Try selected_model on LM Studio (1234)
-        if is_port_open("127.0.0.1" and 1234) == 1:
-            set res to try_chat_completion_split("http://127.0.0.1:1234/v1/chat/completions" and selected_model and system_content and user_content)
-            if string_length(res) > 0:
-                return res
-
-        # 2. Try selected_model on Ollama (11434)
-        if is_port_open("127.0.0.1" and 11434) == 1:
-            set res to try_chat_completion_split("http://127.0.0.1:11434/v1/chat/completions" and selected_model and system_content and user_content)
-            if string_length(res) > 0:
-                return res
-
-        # 3. Try selected_model on llama.cpp (8080/8081)
         if is_port_open("127.0.0.1" and 8080) == 1:
             set res to try_chat_completion_split("http://127.0.0.1:8080/v1/chat/completions" and selected_model and system_content and user_content)
             if string_length(res) > 0:
@@ -751,8 +746,24 @@ define query_local_llm_json with system_content as Str and user_content as Str a
             set res to try_chat_completion_split("http://127.0.0.1:8081/v1/chat/completions" and selected_model and system_content and user_content)
             if string_length(res) > 0:
                 return res
+        if is_port_open("127.0.0.1" and 11434) == 1:
+            set res to try_chat_completion_split("http://127.0.0.1:11434/v1/chat/completions" and selected_model and system_content and user_content)
+            if string_length(res) > 0:
+                return res
+        if is_port_open("127.0.0.1" and 1234) == 1:
+            set res to try_chat_completion_split("http://127.0.0.1:1234/v1/chat/completions" and selected_model and system_content and user_content)
+            if string_length(res) > 0:
+                return res
 
-    # Default cascade with gemma4:26b
+    # Default cascade with gemma4:26b — SAME order (8080 -> 8081 -> 11434 -> 1234).
+    if is_port_open("127.0.0.1" and 8080) == 1:
+        set res to try_chat_completion_split("http://127.0.0.1:8080/v1/chat/completions" and "gemma4:26b" and system_content and user_content)
+        if string_length(res) > 0:
+            return res
+    if is_port_open("127.0.0.1" and 8081) == 1:
+        set res to try_chat_completion_split("http://127.0.0.1:8081/v1/chat/completions" and "gemma4:26b" and system_content and user_content)
+        if string_length(res) > 0:
+            return res
     if is_port_open("127.0.0.1" and 11434) == 1:
         set res to try_chat_completion_split("http://127.0.0.1:11434/v1/chat/completions" and "gemma4:26b" and system_content and user_content)
         if string_length(res) > 0:
