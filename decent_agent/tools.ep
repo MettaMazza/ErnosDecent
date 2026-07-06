@@ -83,6 +83,10 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "- read_transcripts([session_id: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Read all historical message transcripts for a given session. Get the session_id from list_sessions first.\n")
         set schemas to concat(schemas and "  Example: Action: read_transcripts([\"session_1782564644774\"])\n\n")
+
+        set schemas to concat(schemas and "- search_sessions([query: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Keyword-search the CONTENT of ALL prior sessions at once; returns which sessions mention the term, each with a snippet. Use this to find where something was discussed instead of guessing session ids, THEN read_transcripts([id]) for the full thread.\n")
+        set schemas to concat(schemas and "  Example: Action: search_sessions([\"kokoro voice endpoint\"])\n\n")
         
     set schemas to concat(schemas and "- dht_get([key: Str]) -> Str\n")
     set schemas to concat(schemas and "  Description: Retrieve a value from the public distributed hash table (DHT).\n")
@@ -772,6 +776,76 @@ define tools_list_sessions returning Str:
     set out to concat(out and "\nUse read_transcripts([\"<id>\"]) to read a session's full transcript.")
     return out
 
+# Keyword-search the CONTENT of every prior session so the agent finds where something
+# was discussed instead of guessing ids. Greps each session's files (main .json + its
+# _transcript_ chunks) case-insensitively and returns the matching sessions with a
+# snippet. Read-only; reuses session_load + the same file layout as read_transcripts.
+# Admin/owner-only by the same rule as read_transcripts (reads private history), so it is
+# deliberately NOT added to the guest allowlist in tools_is_action_allowed.
+define tools_search_sessions with query as Str returning Str:
+    set q to string_trim(query)
+    if string_length(q) == 0:
+        return "Error: search_sessions requires a non-empty keyword or phrase. Example: Action: search_sessions([\"kokoro voice\"])"
+    set dir to "config/sessions"
+    if file_exists(dir) == 0:
+        return "No sessions directory yet (config/sessions) — there are no prior sessions to search."
+    set q_low to string_lower(q)
+    set files to list_directory(dir)
+    set nfiles to length_list(files)
+    set out to ""
+    set hits to 0
+    set i to 0
+    repeat while i < nfiles and also hits < 25:
+        set fname to get_list(files and i)
+        if string_contains(fname and ".json") == 1 and also string_contains(fname and "_transcript_") == 0:
+            set fpath to path_join(dir and fname)
+            set sess to session_load(fpath)
+            if sess != 0:
+                set sid to map_get_val(sess and "id")
+                if string_length(sid) > 0:
+                    # Files to grep: the main session file + its transcript chunks.
+                    set search_files to create_list()
+                    set ok to append_list(search_files and fpath)
+                    set comp_list to map_get_val(sess and "compressed_sessions")
+                    if comp_list != 0:
+                        set cl to length_list(comp_list)
+                        set ci to 0
+                        repeat while ci < cl:
+                            set ok to append_list(search_files and get_list(comp_list and ci))
+                            set ci to ci + 1
+                    set found to 0
+                    set snippet to ""
+                    set nf to length_list(search_files)
+                    set fi to 0
+                    repeat while fi < nf and also found == 0:
+                        set sfp to get_list(search_files and fi)
+                        if file_exists(sfp) == 1:
+                            set raw to read_file(sfp)
+                            set pos to string_index_of(string_lower(raw) and q_low)
+                            if pos >= 0:
+                                set found to 1
+                                set snstart to pos - 90
+                                if snstart < 0:
+                                    set snstart to 0
+                                set snend to pos + string_length(q) + 90
+                                if snend > string_length(raw):
+                                    set snend to string_length(raw)
+                                set snippet to substring(raw and snstart and snend - snstart)
+                                set snippet to string_replace(snippet and "\n" and " ")
+                                set snippet to string_replace(snippet and "\\n" and " ")
+                        set fi to fi + 1
+                    set ok to free_list(search_files)
+                    if found == 1:
+                        set title_val to map_get_val(sess and "title")
+                        set out to concat(out and concat("- " and concat(sid and concat("  \"" and concat(title_val and "\"\n")))))
+                        set out to concat(out and concat("    …" and concat(snippet and "…\n")))
+                        set hits to hits + 1
+        set i to i + 1
+    if hits == 0:
+        return concat("No prior sessions mention '" and concat(q and "'. Try a different keyword, or list_sessions([]) to browse."))
+    set head to concat("=== Sessions mentioning '" and concat(q and concat("' (" and concat(int_to_string(hits) and " shown, newest-first order not guaranteed) ===\n"))))
+    return concat(head and concat(out and "\nUse read_transcripts([\"<id>\"]) to read the full thread of any match."))
+
 # ── Generic paginated readers (used by codebase_read / codebase_read_range / file_info) ──
 # These give the model the same size + read-location + "there is more" metadata the
 # workspace_* tools already provide, but for ANY resolved path — so it can paginate a
@@ -909,6 +983,11 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             
     if action_name equals "list_sessions":
         return tools_list_sessions()
+
+    if action_name equals "search_sessions":
+        if length_list(args_list) < 1:
+            return "Error: search_sessions requires 1 argument (keyword/phrase). Example: Action: search_sessions([\"kokoro voice\"])"
+        return tools_search_sessions(get_list(args_list and 0))
 
     if action_name equals "read_transcripts":
         if length_list(args_list) < 1:
