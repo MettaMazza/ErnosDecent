@@ -35,6 +35,44 @@ define sleep_rank_heuristics with response as Str returning Int:
     set score to score + tool_count * 5
     return score
 
+# Strip every existing "Identity Update:" reflection line from the persona text and
+# return the base persona (trailing blank lines trimmed). The reflection is a CURRENT-
+# STATE line (timeline/lesson counts), not accumulated identity — history lives in the
+# timeline, so the persona keeps the base identity plus exactly ONE latest reflection.
+# Without this, every sleep cycle appended a near-identical line forever (observed: 94
+# duplicates), growing the file and the prompt unboundedly. Blank lines INSIDE the base
+# persona are preserved; only the reflection lines and the trailing blanks they left
+# behind are removed — so this also self-heals an already-polluted persona file.
+define sleep_strip_reflections with persona as Str returning Str:
+    set lines to string_split(persona and "\n")
+    set n to length_list(lines)
+    # Find the last line that is neither a reflection nor blank — everything after it
+    # is trailing whitespace once reflections are gone.
+    set last_keep to 0 - 1
+    set i to 0
+    repeat while i < n:
+        set line to get_list(lines and i)
+        set trimmed to string_trim(line)
+        if string_index_of(trimmed and "Identity Update:") == 0:
+            set i to i + 1
+        else:
+            if string_length(trimmed) > 0:
+                set last_keep to i
+            set i to i + 1
+    set out to ""
+    set i to 0
+    repeat while i <= last_keep:
+        set line to get_list(lines and i)
+        if string_index_of(string_trim(line) and "Identity Update:") == 0:
+            set i to i + 1
+        else:
+            if string_length(out) > 0:
+                set out to concat(out and "\n")
+            set out to concat(out and line)
+            set i to i + 1
+    free_list(lines)
+    return out
+
 define sleep_cycle with memory_mgr as Map returning Str:
     display "[*] Starting sleep cycle. Unloading inference model from memory..."
     
@@ -84,16 +122,23 @@ define sleep_cycle with memory_mgr as Map returning Str:
     set reflection_text to concat(reflection_text and f"Consolidated {int_to_string(lessons_count)} distilled lessons. ")
     set reflection_text to concat(reflection_text and "Sovereign cognitive alignment remains strong. Assume nothing, verify everything.")
     
-    # Write to agent_persona.txt
+    # Write to agent_persona.txt: base persona + exactly ONE latest reflection.
+    # ROOT FIX: the old code appended unconditionally, so a byte-identical status line
+    # accumulated on every sleep cycle (94 duplicates observed) — file and prompt grew
+    # without bound. Now all prior reflection lines are stripped, the fresh one is
+    # appended, and an unchanged result skips the disk write entirely.
     set persona_path to edition_persona_path()
     set current_persona to "Identity: You are a helpful, secure, and sovereign computational agent. You verify everything and assume nothing."
     if file_exists(persona_path) == 1:
         set current_persona to read_file(persona_path)
-        
-    # Append the reflection text
-    set updated_persona to concat(current_persona and concat("\n\n" and reflection_text))
-    set ok to write_file(persona_path and updated_persona)
-    display "[+] Identity reflection complete. Updated persona configuration."
+
+    set base_persona to sleep_strip_reflections(current_persona)
+    set updated_persona to concat(base_persona and concat("\n\n" and reflection_text))
+    if updated_persona equals current_persona:
+        display "[+] Identity reflection unchanged — persona already current, no write."
+    else:
+        set ok to write_file(persona_path and updated_persona)
+        display "[+] Identity reflection complete. Updated persona configuration."
     
     display "[*] Reloading upgraded inference model with newly trained weights..."
     display "[+] Sleep cycle complete. Model is re-loaded and online."
