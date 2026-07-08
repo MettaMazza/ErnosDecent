@@ -1433,6 +1433,21 @@ async def on_message(message):
                     pass
             return
         
+        # P9: /persona <name> | /persona list — activate or list registered personas.
+        if message.content.strip().lower().startswith("/persona"):
+            parts = message.content.strip().split(maxsplit=1)
+            arg = (parts[1].strip() if len(parts) > 1 else "list")
+            resp = await send_daemon_ipc(f"AI PERSONA {arg}")
+            if resp and resp.startswith("persona:active,"):
+                name = resp.split(",", 1)[1]
+                await message.reply(f"🎭 Persona **{name}** is now active — the agent speaks as it from the next message.")
+            elif resp:
+                # list output or a named error — show verbatim (both are user-facing text)
+                await message.reply(resp[:1900])
+            else:
+                await message.reply("⚠️ No response from the node.")
+            return
+
         # P8: /rename <name> — name the ACTIVE session so it can be referenced by name
         # later (read_transcripts / SESSION SET accept titles).
         if message.content.strip().lower().startswith("/rename"):

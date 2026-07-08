@@ -53,7 +53,115 @@ define prompt_get_context with memory_mgr as Map:
         set ctx to concat(ctx and "- Hebbian Graph edges: 0\n")
     return ctx
 
+# ── P9: persona registry ──────────────────────────────────────────────────────
+# File-based, mirroring the Hive/ErnOSAgent design (a plain persona text file) but as a
+# small REGISTRY: config/personas/<name>.txt (gitignored — personas are personal), with
+# the ACTIVE persona's name in a data-dir pointer (storage_active_persona_path — git ops
+# can never flip identity). personal_identity.txt auto-migrates in as persona "echo".
+
+define prompt_personas_dir returning Str:
+    return "config/personas"
+
+# Registry names are filesystem-safe: lowercase letters, digits, '_', '-'; 1..64 chars.
+define prompt_persona_name_safe with name as Str returning Int:
+    set n to string_length(name)
+    if n == 0 or else n > 64:
+        return 0
+    set i to 0
+    repeat while i < n:
+        set c to get_character(name and i)
+        set ok_char to 0
+        if c >= 97 and also c <= 122:
+            set ok_char to 1
+        if c >= 48 and also c <= 57:
+            set ok_char to 1
+        if c == 95 or else c == 45:
+            set ok_char to 1
+        if ok_char == 0:
+            return 0
+        set i to i + 1
+    return 1
+
+# Create the registry dir on first use and migrate the legacy personal_identity.txt in
+# as persona "echo" (copy — the legacy file stays untouched as the fallback).
+define prompt_persona_ensure_registry returning Int:
+    if file_exists(prompt_personas_dir()) == 0:
+        set ok to create_directory(prompt_personas_dir())
+    set echo_path to concat(prompt_personas_dir() and "/echo.txt")
+    if file_exists(echo_path) == 0:
+        if file_exists("config/personal_identity.txt") == 1:
+            set legacy to read_file("config/personal_identity.txt")
+            if string_length(legacy) > 0:
+                set ok to write_file(echo_path and legacy)
+    return 0
+
+# The active persona's registry name ("" when the pointer is unset).
+define prompt_persona_active returning Str:
+    set p to storage_active_persona_path()
+    if file_exists(p) == 0:
+        return ""
+    return string_trim(read_file(p))
+
+define prompt_persona_list returning Str:
+    set ok to prompt_persona_ensure_registry()
+    set active to prompt_persona_active()
+    set entries to list_directory(prompt_personas_dir())
+    set n to length_list(entries)
+    set out to "=== Personas ===\n"
+    set count to 0
+    set i to 0
+    repeat while i < n:
+        set e to get_list(entries and i)
+        set elen to string_length(e)
+        if elen > 4:
+            if string_contains(e and ".txt") == 1:
+                set pname to substring(e and 0 and elen - 4)
+                set marker to ""
+                if pname equals active:
+                    set marker to "  [ACTIVE]"
+                set out to concat(out and concat("- " and concat(pname and concat(marker and "\n"))))
+                set count to count + 1
+        set i to i + 1
+    if count == 0:
+        set out to concat(out and "(none registered — persona_register([\"name\",\"text\"]) or drop a .txt into config/personas/)\n")
+    if string_length(active) == 0:
+        set out to concat(out and "No active pointer set — the legacy identity chain (personal_identity.txt) is in effect.\n")
+    return out
+
+# Activate a registered persona. Writes the data-dir pointer and invalidates the cached
+# agent name so the very next prompt assembly (and system-role identity) speaks as it.
+define prompt_persona_set with name as Str returning Str:
+    set ok to prompt_persona_ensure_registry()
+    if prompt_persona_name_safe(name) == 0:
+        return "Error: invalid persona name (lowercase letters/digits/_/- only, max 64)."
+    set ppath to concat(prompt_personas_dir() and concat("/" and concat(name and ".txt")))
+    if file_exists(ppath) == 0:
+        return concat("Error: no persona named '" and concat(name and "'. Use persona list to see what is registered."))
+    set ok to write_file(storage_active_persona_path() and name)
+    set ok to prompt_refresh_agent_name()
+    return concat("persona:active," and name)
+
+# Register (or overwrite) a persona text under a name. Does NOT activate it.
+define prompt_persona_register with name as Str and text as Str returning Str:
+    set ok to prompt_persona_ensure_registry()
+    if prompt_persona_name_safe(name) == 0:
+        return "Error: invalid persona name (lowercase letters/digits/_/- only, max 64)."
+    if string_length(string_trim(text)) == 0:
+        return "Error: persona text is empty."
+    set ppath to concat(prompt_personas_dir() and concat("/" and concat(name and ".txt")))
+    set ok to write_file(ppath and text)
+    return concat("persona:registered," and name)
+
 define prompt_get_identity returning Str:
+    # P9: an explicitly ACTIVATED registry persona takes top priority.
+    set active_name to prompt_persona_active()
+    if string_length(active_name) > 0:
+        set active_path to concat(prompt_personas_dir() and concat("/" and concat(active_name and ".txt")))
+        if file_exists(active_path) == 1:
+            set active_text to read_file(active_path)
+            if string_length(active_text) > 0:
+                return active_text
+
     # Personal identity is the PRIMARY persona when present (local-only, gitignored)
     # This is the operator's actual identity file for their agent — it takes priority
     set personal_path to "config/personal_identity.txt"

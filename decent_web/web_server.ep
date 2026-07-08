@@ -1812,6 +1812,30 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         set ok to send_response(client_fd and 405 and "application/json" and "{\"status\":\"error\",\"message\":\"POST only\"}")
         return 0
 
+    if raw_path equals "/api/persona":
+        # P9: GET lists personas (plain text); POST {"name":"<x>"} activates one.
+        # Routed over IPC for the same cross-thread reason as /api/autoapprove.
+        if method equals "POST":
+            set pa_body to extract_request_body(req)
+            set pa_root to json_parse(pa_body)
+            set pa_name to ""
+            if pa_root != 0:
+                set pa_node to get_json_object_value(pa_root and "name")
+                if pa_node != 0:
+                    set pa_name to get_json_value(pa_node)
+            if string_length(pa_name) == 0:
+                set ok to send_response(client_fd and 400 and "application/json" and "{\"status\":\"error\",\"message\":\"missing name\"}")
+                return 0
+            set pa_resp to query_daemon_ipc(concat("AI PERSONA " and pa_name))
+            if string_contains(pa_resp and "persona:active") == 1:
+                set ok to send_response(client_fd and 200 and "application/json" and "{\"status\":\"ok\"}")
+            else:
+                set ok to send_response(client_fd and 400 and "text/plain" and pa_resp)
+            return 0
+        set pa_resp to query_daemon_ipc("AI PERSONA LIST")
+        set ok to send_response(client_fd and 200 and "text/plain" and pa_resp)
+        return 0
+
     if raw_path equals "/api/upload":
         if method equals "POST":
             set body to extract_request_body(req)
