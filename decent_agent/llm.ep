@@ -266,6 +266,62 @@ define get_model_context_limit with model_name as Str returning Int:
             set limit to model_max
     return limit
 
+# ── TTFT / prefill-vs-decode visibility ────────────────────────────────────────
+# stream=false means the literal first token is not observable client-side (the whole
+# body arrives when decoding finishes), but the backends REPORT the split: llama.cpp's
+# /v1 response carries a "timings" object (prompt_ms = real prefill time = TTFT,
+# predicted_ms = decode time), and Ollama's /v1 carries "usage" token counts
+# (prompt_tokens / completion_tokens). Token counts attribute a slow call: when
+# prompt_tokens is large and completion_tokens small, the wait was PREFILL (KV-cache
+# work) — e.g. a cold 40KB base prompt, or a cache evicted by an interleaved call with
+# a different prompt (moderation_tool's bare audit) forcing a full re-prefill.
+# Numeric JSON fields are read only when integer-typed (llama.cpp emits float ms;
+# ErnosPlain json exposes ints) — missing fields simply don't print.
+define llm_log_call_metrics with tag as Str and decoded as Str and total_ms as Int returning Int:
+    if string_length(decoded) == 0:
+        return 0
+    set root to json_parse(decoded)
+    if root == 0:
+        return 0
+    set pt to 0 - 1
+    set ct to 0 - 1
+    set usage to get_json_object_value(root and "usage")
+    if usage != 0:
+        set ptn to get_json_object_value(usage and "prompt_tokens")
+        if ptn != 0:
+            if get_json_type(ptn) == 1:
+                set pt to get_json_value(ptn)
+        set ctn to get_json_object_value(usage and "completion_tokens")
+        if ctn != 0:
+            if get_json_type(ctn) == 1:
+                set ct to get_json_value(ctn)
+    set prompt_ms to 0 - 1
+    set predicted_ms to 0 - 1
+    set timings to get_json_object_value(root and "timings")
+    if timings != 0:
+        set pmn to get_json_object_value(timings and "prompt_ms")
+        if pmn != 0:
+            if get_json_type(pmn) == 1:
+                set prompt_ms to get_json_value(pmn)
+        set dmn to get_json_object_value(timings and "predicted_ms")
+        if dmn != 0:
+            if get_json_type(dmn) == 1:
+                set predicted_ms to get_json_value(dmn)
+    if prompt_ms >= 0:
+        # llama.cpp-served: exact split.
+        display f"[LLM TTFT] {tag}: prefill(TTFT) {prompt_ms} ms, decode {predicted_ms} ms, total {total_ms} ms (prompt {pt} tok, output {ct} tok)"
+        return 0
+    if pt >= 0 and also ct > 0:
+        # Ollama /v1: no durations, but token counts attribute the time. ms/output-token
+        # is an UPPER bound on decode rate (it includes prefill); a value far above the
+        # model's known decode speed (~20-60 ms/tok local) means the call was prefill-bound.
+        set per_tok to total_ms / ct
+        display f"[LLM TTFT] {tag}: total {total_ms} ms for prompt {pt} tok -> output {ct} tok ({per_tok} ms/output-tok incl. prefill; >>decode-rate = prefill-bound)"
+        return 0
+    if pt >= 0:
+        display f"[LLM TTFT] {tag}: total {total_ms} ms, prompt {pt} tok, output 0 tok (all prefill)"
+    return 0
+
 # ── Split-message chat completion for observer audits ─────────────────────────
 # Sends system_content as a "system" role message (reference context) and
 # user_content as a "user" role message (the current audit instruction).
@@ -306,7 +362,8 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
     display f"[LLM DEBUG] POST (split) {url} model={model_name} body_len={string_length(body)}"
     set _t0 to ep_time_now_ms()
     set response to await http_post_async(url and headers and body)
-    display f"[LLM TIMING] split HTTP call took {ep_time_now_ms() - _t0} ms (body_len={string_length(body)})"
+    set _total_ms to ep_time_now_ms() - _t0
+    display f"[LLM TIMING] split HTTP call took {_total_ms} ms (body_len={string_length(body)})"
     display f"[LLM DEBUG] Raw response length: {string_length(response)}"
 
     if string_length(response) == 0:
@@ -322,6 +379,7 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
 
     set response to http_dechunk(response)
     display f"[LLM DEBUG] After dechunk length: {string_length(response)}"
+    set ok to llm_log_call_metrics("split" and response and _total_ms)
 
     if string_contains(response and "\"error\":") == 1:
         display f"[LLM DEBUG] FAIL: response contains error JSON key"
@@ -460,7 +518,8 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
     display f"[LLM DEBUG] POST {url} model={model_name} body_len={string_length(body)}"
     set _t0 to ep_time_now_ms()
     set response to await http_post_async(url and headers and body)
-    display f"[LLM TIMING] main HTTP call took {ep_time_now_ms() - _t0} ms (body_len={string_length(body)})"
+    set _total_ms to ep_time_now_ms() - _t0
+    display f"[LLM TIMING] main HTTP call took {_total_ms} ms (body_len={string_length(body)})"
     display f"[LLM DEBUG] Raw response length: {string_length(response)}"
 
     if string_length(response) == 0:
@@ -471,6 +530,7 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
         display "[LLM DEBUG] FAIL: connection failed"
         return ""
 
+    set ok to llm_log_call_metrics("main" and http_dechunk(response) and _total_ms)
     set content_str to extract_content_from_response(response)
     if string_length(content_str) > 0:
         display f"[LLM DEBUG] SUCCESS: got content length={string_length(content_str)}"
@@ -520,9 +580,13 @@ define query_vision with prompt as Str and image_path as Str and model_name as S
     set url to "http://127.0.0.1:8091/v1/chat/completions"
     set headers to "Content-Type: application/json"
     display f"[Vision] POST {url} model={mdl} img={image_path} body_len={string_length(body)}"
+    set _t0 to ep_time_now_ms()
     set response to await http_post_async(url and headers and body)
+    set _total_ms to ep_time_now_ms() - _t0
+    display f"[LLM TIMING] vision HTTP call took {_total_ms} ms"
     if string_length(response) == 0:
         return ""
+    set ok to llm_log_call_metrics("vision" and http_dechunk(response) and _total_ms)
     return extract_content_from_response(response)
 
 define agent_list_models returning Str:
