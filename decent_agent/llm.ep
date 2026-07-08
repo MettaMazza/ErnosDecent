@@ -50,12 +50,32 @@ async define http_post_async with url as Str and headers as Str and body as Str 
     set req to concat(req and concat("Connection: close\r\nContent-Length: " and concat(int_to_string(string_length(body)) and "\r\n\r\n")))
     set req to concat(req and body)
     set sent to ep_net_send(fd and req)
+    # The tick-loop lives in llm_read_response — a PLAIN function, deliberately. See
+    # the COMPILER BUG note on that function: an await inside a repeat-while in an
+    # ASYNC define mis-lowers (the wait registration is hoisted before the loop, so
+    # iterations re-read the same completed future instantly — the live symptom was
+    # '[LLM] read timeout (300s)' firing after 1002 ms). Plain functions lower awaits
+    # to ep_await_future per call, which pumps the event loop cooperatively.
+    set raw to llm_read_response(fd)
+    set ok to ep_net_close(fd)
+    # Strip HTTP headers — return the body (chunked or not), like the old http_post.
+    set hsep to string_index_of(raw and "\r\n\r\n")
+    if hsep >= 0:
+        return substring(raw and hsep + 4 and string_length(raw) - hsep - 4)
+    return raw
+
+# Read the full HTTP response from fd with a Stop-abort and a dead-server watchdog.
+# PLAIN define ON PURPOSE — COMPILER BUG (2026-07-08): an `await` inside a repeat-while
+# in an ASYNC define is mis-lowered: the state machine hoists the wait registration
+# BEFORE the loop and later iterations re-read the same already-completed future with
+# no new wait — 300 'ticks' spun in ~1 ms and the 300s watchdog fired instantly. In a
+# PLAIN function every await compiles to ep_await_future, which registers freshly and
+# PUMPS the event loop (sibling tasks keep running) — the bridge_wait_result shape.
+# Behavior: 1s wait slices; a Stop (cancel-epoch bump) aborts within ~1s; 300s of
+# consecutive silence = dead-server timeout; data resets the watchdog.
+define llm_read_response with fd as Int returning Str:
     set raw to ""
     set go to 1
-    # SAFETY: capture the cancel epoch at call start. The wait below is sliced into 1s
-    # ticks; a Stop (epoch bump) ABORTS the in-flight read within ~1s — an inference
-    # that would otherwise decode for minutes cannot delay a halt. The 300s total
-    # watchdog (dead-server guard) is preserved across ticks.
     set call_epoch to ep_cancel_epoch_get(0)
     set waited_ms to 0
     repeat while go == 1:
@@ -71,8 +91,8 @@ async define http_post_async with url as Str and headers as Str and body as Str 
                     display "[LLM] read timeout (300s) — server stopped responding; aborting read."
                     set go to 0
         else:
-            # Check the epoch on data ticks too — a long streaming-style read must not
-            # ride out a Stop just because bytes keep arriving.
+            # Check the epoch on data ticks too — a long read must not ride out a Stop
+            # just because bytes keep arriving.
             if ep_cancel_epoch_get(0) > call_epoch:
                 display "[LLM] read ABORTED by Stop — abandoning the in-flight inference."
                 set raw to ""
@@ -84,11 +104,6 @@ async define http_post_async with url as Str and headers as Str and body as Str 
                     set go to 0
                 else:
                     set raw to concat(raw and chunk)
-    set ok to ep_net_close(fd)
-    # Strip HTTP headers — return the body (chunked or not), like the old http_post.
-    set hsep to string_index_of(raw and "\r\n\r\n")
-    if hsep >= 0:
-        return substring(raw and hsep + 4 and string_length(raw) - hsep - 4)
     return raw
 
 define is_port_open with host as Str and port as Int returning Int:

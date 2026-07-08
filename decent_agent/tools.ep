@@ -56,6 +56,13 @@ external define ep_cancel_epoch_get with dummy returning Int
 # Single-flight guard for the background validation coordinator — one run at a time.
 set TEST_ALL_RUNNING to create_map()
 
+# PLAIN await wrapper — COMPILER BUG guard (see llm_read_response in llm.ep): an await
+# inside a repeat-while in an ASYNC define mis-lowers and spins instead of sleeping.
+# Calling this plain function from the async worker's poll loop lowers to
+# ep_await_future per call (fresh timer each time, pumps the event loop).
+define tools_sleep_yield with ms as Int returning Int:
+    return await ep_async_sleep_ms(ms)
+
 # P11 coordinator — runs as a BACKGROUND async task (called WITHOUT await, the
 # orchestrator_spawn pattern), so test_all_systems returns instantly and the agent can
 # answer the user while validation proceeds. Spawns the 13 master_prompt.md blocks as
@@ -144,7 +151,8 @@ async define tools_test_all_worker with ctx as Map and orch as Int and model as 
                                     set result to concat("(sub-agent " and concat(st and ")"))
                                     set done to 1
                                 else:
-                                    set ok to await ep_async_sleep_ms(2000)
+                                    # tools_sleep_yield, NOT a direct await — async+loop mis-lowering.
+                                    set ok to tools_sleep_yield(2000)
                                     set waited to waited + 2000
                         if done == 0:
                             set result to "⏰ TIMEOUT: block did not complete within 15 minutes."
