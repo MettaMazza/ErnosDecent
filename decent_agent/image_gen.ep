@@ -44,8 +44,39 @@ define image_gen_out_path with name as Str returning Str:
     set ok to create_directory("config/workspaces/active")
     return concat("config/workspaces/active/" and name)
 
+# Millisecond clock for stage timing (same injected helper llm.ep uses).
+external define ep_time_now_ms returning Int
+
+# Pre-flight one configured weight file. Returns "" when present (or not configured),
+# else a NAMED error — the real reason reaches the user verbatim instead of a bare
+# "shim code N". These files live on an external drive that sleeps/unmounts, so the
+# error says so.
+define image_gen_preflight with label as Str and path as Str returning Str:
+    if string_length(path) == 0:
+        return ""
+    if file_exists(path) == 1:
+        return ""
+    return concat("ERROR: " and concat(label and concat(" file not found: " and concat(path and " — is the external drive mounted?"))))
+
+# Map a shim return code to its meaning (codes defined in vendor/sd/sd_ep_shim.cpp).
+define image_gen_rc_reason with rc as Int returning Str:
+    if rc == 2:
+        return "bad arguments reached the shim (empty model/prompt/output path)"
+    if rc == 3:
+        return "model context failed to LOAD — check the [ImageGen] path lines above (external drive asleep/unmounted, or a wrong path in config/image.json)"
+    if rc == 4:
+        return "the pipeline ran but produced no image (see [ImageGen shim] stderr lines)"
+    if rc == 5:
+        return "generation succeeded but the PNG could not be written (output path/disk)"
+    if rc == 99:
+        return "image runtime not built on this machine (~/.ernosdecent/lib/libstable-diffusion missing at build time)"
+    return "unknown shim code"
+
 # Generate an image from a prompt. Returns the PNG path on success, or "ERROR: <reason>".
 # FLUX mode when config/image.json has a "diffusion_model" (+ clip_l/t5xxl/vae); else single-file.
+# OBSERVABILITY: every run logs mode, all configured paths + their pre-flight, the
+# parameters, the shim rc, and wall time — a silent 'Image generation failed' with no
+# trace anywhere (2026-07-08 17:13) is what this prevents.
 define image_gen_run with prompt as Str and out_name as Str and width as Int and height as Int and steps as Int and cfg as Int and seed as Int returning Str:
     if string_length(prompt) == 0:
         return "ERROR: empty prompt"
@@ -53,22 +84,53 @@ define image_gen_run with prompt as Str and out_name as Str and width as Int and
     set diffusion to image_gen_config_str("diffusion_model")
     if string_length(diffusion) > 0:
         # Flux: transformer gguf + separate CLIP/T5/VAE (Maria's diffusers CLIP+VAE load directly).
-        if file_exists(diffusion) == 0:
-            return concat("ERROR: flux diffusion model not found: " and diffusion)
         set clip_l to image_gen_config_str("clip_l")
         set t5xxl to image_gen_config_str("t5xxl")
         set vae to image_gen_config_str("vae")
+        display f"[ImageGen] mode=flux {width}x{height} steps={steps} cfg=1 seed={seed}"
+        display f"[ImageGen] diffusion={diffusion}"
+        display f"[ImageGen] clip_l={clip_l}"
+        display f"[ImageGen] t5xxl={t5xxl}"
+        display f"[ImageGen] vae={vae}"
+        # Pre-flight ALL configured files, not just the transformer — a missing encoder
+        # used to surface only as an opaque ctx-load failure.
+        set pf to image_gen_preflight("flux diffusion model" and diffusion)
+        if string_length(pf) > 0:
+            display f"[ImageGen] {pf}"
+            return pf
+        set pf to image_gen_preflight("flux clip_l" and clip_l)
+        if string_length(pf) > 0:
+            display f"[ImageGen] {pf}"
+            return pf
+        set pf to image_gen_preflight("flux t5xxl" and t5xxl)
+        if string_length(pf) > 0:
+            display f"[ImageGen] {pf}"
+            return pf
+        set pf to image_gen_preflight("flux vae" and vae)
+        if string_length(pf) > 0:
+            display f"[ImageGen] {pf}"
+            return pf
         # Flux is a guidance-distilled model: it uses CFG ~1 (NOT the SD-style 7 the tool passes)
         # with its own distilled guidance. High CFG wrecks Flux output, so force 1 here.
+        set _t0 to ep_time_now_ms()
         set rc to sd_ep_generate("" and diffusion and clip_l and t5xxl and vae and prompt and "" and width and height and steps and 1 and seed and out_path)
+        set _ms to ep_time_now_ms() - _t0
+        display f"[ImageGen] shim rc={rc} in {_ms} ms -> {out_path}"
         if rc == 0:
             return out_path
-        return concat("ERROR: flux generation failed (shim code " and concat(int_to_string(rc) and ")"))
+        return concat("ERROR: flux generation failed (shim code " and concat(int_to_string(rc) and concat("): " and image_gen_rc_reason(rc))))
     # Single-file (SD1.5/SDXL): CLIP+VAE baked into the checkpoint.
     set model to image_gen_default_model()
-    if file_exists(model) == 0:
-        return concat("ERROR: image model not found on disk at: " and model)
+    display f"[ImageGen] mode=single-file {width}x{height} steps={steps} cfg={cfg} seed={seed}"
+    display f"[ImageGen] model={model}"
+    set pf to image_gen_preflight("image model" and model)
+    if string_length(pf) > 0:
+        display f"[ImageGen] {pf}"
+        return pf
+    set _t0 to ep_time_now_ms()
     set rc to sd_ep_generate(model and "" and "" and "" and "" and prompt and "" and width and height and steps and cfg and seed and out_path)
+    set _ms to ep_time_now_ms() - _t0
+    display f"[ImageGen] shim rc={rc} in {_ms} ms -> {out_path}"
     if rc == 0:
         return out_path
-    return concat("ERROR: image generation failed (shim code " and concat(int_to_string(rc) and ")"))
+    return concat("ERROR: image generation failed (shim code " and concat(int_to_string(rc) and concat("): " and image_gen_rc_reason(rc))))

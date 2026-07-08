@@ -40,8 +40,11 @@ static sd_ctx_t* sd_ep_ctx_for(const char* model_path, const char* diffusion_mod
     int flux = (diffusion_model && diffusion_model[0]);
     const char* key = flux ? diffusion_model : model_path;
     if (g_sd_ctx != NULL && strncmp(g_sd_model, key, sizeof(g_sd_model) - 1) == 0) {
+        fprintf(stderr, "[ImageGen shim] ctx cache HIT (%s)\n", key);
         return g_sd_ctx;
     }
+    fprintf(stderr, "[ImageGen shim] ctx cache MISS — loading %s weights (%s)\n",
+            flux ? "flux" : "single-file", key);
     /* Model switch: deliberately DO NOT free_sd_ctx here. The ggml-metal backend aborts in
      * ggml_metal_device_free (GGML_ASSERT rsets->data count == 0) on teardown — freeing mid-run
      * would crash the whole node. Switching models is rare, so we leak the old ctx instead of
@@ -64,6 +67,9 @@ static sd_ctx_t* sd_ep_ctx_for(const char* model_path, const char* diffusion_mod
     if (g_sd_ctx != NULL) {
         strncpy(g_sd_model, key, sizeof(g_sd_model) - 1);
         g_sd_model[sizeof(g_sd_model) - 1] = '\0';
+        fprintf(stderr, "[ImageGen shim] ctx loaded OK\n");
+    } else {
+        fprintf(stderr, "[ImageGen shim] new_sd_ctx FAILED (rc 3 path) — check the weight file paths above\n");
     }
     return g_sd_ctx;
 }
@@ -106,10 +112,13 @@ extern "C" int sd_ep_generate(const char* model_path,
 
     sd_image_t* images = NULL;
     int num_images = 0;
+    fprintf(stderr, "[ImageGen shim] generating %dx%d steps=%d cfg=%d seed=%lld\n",
+            width, height, steps, cfg, (long long)seed);
     bool ok = generate_image(ctx, &gp, &images, &num_images);
 
     int rc = 0;
     if (!ok || num_images < 1 || images == NULL || images[0].data == NULL) {
+        fprintf(stderr, "[ImageGen shim] generate_image FAILED (ok=%d n=%d) — rc 4\n", (int)ok, num_images);
         rc = 4;  /* generation produced no image */
     } else {
         int stride = (int)(images[0].width * images[0].channel);
