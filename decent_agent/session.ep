@@ -71,13 +71,18 @@ define session_serialize with sess as Map and path as Str returning Int:
     set summary_val to ""
     if map_contains(sess and "compression_summary") == 1:
         set summary_val to map_get_val(sess and "compression_summary")
-    
+    # Session-scoped guidance self-prompt: agent-set direction for THIS conversation only.
+    set guidance_val to ""
+    if map_contains(sess and "session_guidance") == 1:
+        set guidance_val to map_get_val(sess and "session_guidance")
+
     set json_str to "{\n"
     set json_str to concat(json_str and f"  \"id\": \"{session_json_escape(id_val)}\",\n")
     set json_str to concat(json_str and f"  \"title\": \"{session_json_escape(title_val)}\",\n")
     set json_str to concat(json_str and f"  \"model\": \"{session_json_escape(model_val)}\",\n")
     set json_str to concat(json_str and f"  \"system_prompt\": \"{session_json_escape(system_val)}\",\n")
     set json_str to concat(json_str and f"  \"compression_summary\": \"{session_json_escape(summary_val)}\",\n")
+    set json_str to concat(json_str and f"  \"session_guidance\": \"{session_json_escape(guidance_val)}\",\n")
     
     # messages list
     set json_str to concat(json_str and "  \"messages\": [\n")
@@ -127,7 +132,8 @@ define session_deserialize_json with content as Str returning Map:
     set messages_node to get_json_object_value(root and "messages")
     set comp_node to get_json_object_value(root and "compressed_sessions")
     set summary_node to get_json_object_value(root and "compression_summary")
-    
+    set guidance_node to get_json_object_value(root and "session_guidance")
+
     set sess to create_map()
     if id_node != 0:
         set ok to map_insert(sess and "id" and get_json_value(id_node))
@@ -139,6 +145,8 @@ define session_deserialize_json with content as Str returning Map:
         set ok to map_insert(sess and "system_prompt" and get_json_value(system_node))
     if summary_node != 0:
         set ok to map_insert(sess and "compression_summary" and get_json_value(summary_node))
+    if guidance_node != 0:
+        set ok to map_insert(sess and "session_guidance" and get_json_value(guidance_node))
         
     set msg_list to create_list()
     if messages_node != 0:
@@ -239,6 +247,30 @@ define session_manager_get_active with mgr as Map returning Map:
         
     return map_get_val(sessions_map and active_id)
 
+# Session-scoped guidance self-prompt: the agent's own direction for THIS conversation only
+# (distinct from the GLOBAL behavior/skills in ~/.ernosdecent/agent_self_sections.json). Stored
+# on the session record, so it persists with the session across reboots and starts empty in a
+# /new session.
+define session_manager_get_guidance with mgr as Map returning Str:
+    set sess to session_manager_get_active(mgr)
+    if sess == 0:
+        return ""
+    if map_contains(sess and "session_guidance") == 0:
+        return ""
+    return map_get_val(sess and "session_guidance")
+
+define session_manager_set_guidance with mgr as Map and text as Str returning Int:
+    set sess to session_manager_get_active(mgr)
+    if sess == 0:
+        return 1
+    set ok to map_insert(sess and "session_guidance" and text)
+    # Persist immediately to the session's own JSON file so a reboot keeps it.
+    set active_id to map_get_val(mgr and "active_session_id")
+    set dir to map_get_val(mgr and "sessions_dir")
+    set filepath to path_join(dir and concat(active_id and ".json"))
+    set ok to session_serialize(sess and filepath)
+    return 0
+
 define session_manager_new_session with mgr as Map and id as Str and title as Str and model as Str and sys_prompt as Str returning Map:
     set sessions_map to map_get_val(mgr and "sessions")
     set sess to session_create_new(id and title and model and sys_prompt)
@@ -329,7 +361,10 @@ define session_serialize_json_string with sess as Map returning Str:
     set summary_val to ""
     if map_contains(sess and "compression_summary") == 1:
         set summary_val to map_get_val(sess and "compression_summary")
-        
+    set guidance_val to ""
+    if map_contains(sess and "session_guidance") == 1:
+        set guidance_val to map_get_val(sess and "session_guidance")
+
     set json_str to "{\"id\":\""
     set json_str to concat(json_str and session_json_escape(id_val))
     set json_str to concat(json_str and "\",\"title\":\"")
@@ -340,6 +375,8 @@ define session_serialize_json_string with sess as Map returning Str:
     set json_str to concat(json_str and session_json_escape(system_val))
     set json_str to concat(json_str and "\",\"compression_summary\":\"")
     set json_str to concat(json_str and session_json_escape(summary_val))
+    set json_str to concat(json_str and "\",\"session_guidance\":\"")
+    set json_str to concat(json_str and session_json_escape(guidance_val))
     set json_str to concat(json_str and "\",")
     
     # messages list

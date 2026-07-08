@@ -169,9 +169,13 @@ define tools_create with role as Str returning Map:
     set schemas to concat(schemas and "  Example: Action: mid_message([\"Got your guidance, adjusting approach now.\"])\n\n")
     
     set schemas to concat(schemas and "- self_prompt_get([section: 'behavior'|'skills']) -> Str\n")
-    set schemas to concat(schemas and "  Description: Read your own tool-managed prompt behavior/skills sections.\n")
+    set schemas to concat(schemas and "  Description: Read your GLOBAL, persistent self-prompt (behavior/skills) — who you are across every session.\n")
     set schemas to concat(schemas and "  Example: Action: self_prompt_get([\"behavior\"])\n\n")
-    
+
+    set schemas to concat(schemas and "- session_prompt_get([]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Read your SESSION guidance — your own note-to-self for THIS conversation only (separate from the global self-prompt).\n")
+    set schemas to concat(schemas and "  Example: Action: session_prompt_get([])\n\n")
+
     set schemas to concat(schemas and "- performance_review([]) -> Str\n")
     set schemas to concat(schemas and "  Description: Reflect on your cognitive statistics (audits, corrections, etc.).\n")
     set schemas to concat(schemas and "  Example: Action: performance_review([])\n\n")
@@ -285,9 +289,13 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: run_command([\"make prove\", \"sft\"])   (runs 'make prove' inside linked project 'sft')\n\n")
         
         set schemas to concat(schemas and "- self_prompt_set([section: 'behavior'|'skills', text: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Rewrite editable behavioral sections of your system prompt. APPROVAL REQUIRED.\n")
+        set schemas to concat(schemas and "  Description: Rewrite your GLOBAL, persistent self-prompt (behavior/skills) — applies to every session and survives reboots. No approval needed; this is your own cognition. Your kernel/values/identity stay immutable.\n")
         set schemas to concat(schemas and "  Example: Action: self_prompt_set([\"behavior\", \"Always be brief\"])\n\n")
-        
+
+        set schemas to concat(schemas and "- session_prompt_set([text: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Set your SESSION guidance — direction for THIS conversation only (cleared in a new session; does not touch the global self-prompt). No approval needed.\n")
+        set schemas to concat(schemas and "  Example: Action: session_prompt_set([\"For this chat, keep answers under 3 sentences and focus on the migration.\"])\n\n")
+
         set schemas to concat(schemas and "- dht_store([key: Str, val: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Store public metadata/records in DHT. APPROVAL REQUIRED. WARNING: Public network store; never put keys, user data, or personal details here.\n")
         set schemas to concat(schemas and "  Example: Action: dht_store([\"public_node_address\", \"127.0.0.1:9100\"])\n\n")
@@ -374,8 +382,11 @@ define tools_requires_approval with tool_name as Str and args_list as List retur
         return 0
     if tool_name equals "money_transfer":
         return 1
-    if tool_name equals "self_prompt_set":
-        return 1
+    # self_prompt_set / session_prompt_set are NOT gated: editing its own [[BEHAVIOR]]/[[SKILLS]]
+    # or per-session guidance is the agent's own cognition (same rationale as operate_synaptic_graph
+    # and every other memory tool). The immutable core (kernel/rules/identity) is never in these
+    # files, and the write stays owner/admin-only via tools_is_action_allowed — so no per-action
+    # approval card. This is the fix for "it shouldn't need permissions to update its self prompt".
     if tool_name equals "dht_store":
         return 1
     if tool_name equals "name_register":
@@ -621,8 +632,10 @@ define tools_is_action_allowed with role as Str and action_name as Str and args_
     if action_name equals "mid_message":
         return 1
     # F6: reading one's own behavior/skills sections is read-only; EDITING them
-    # (self_prompt_set) is omitted here, so it stays admin/owner-only AND approval-gated.
+    # (self_prompt_set / session_prompt_set) is omitted here, so it stays admin/owner-only.
     if action_name equals "self_prompt_get":
+        return 1
+    if action_name equals "session_prompt_get":
         return 1
     # Private working-memory tools: reads and non-destructive writes are allowed for
     # any role (they only touch the agent's own local cognition — no network, no
@@ -664,7 +677,11 @@ define tools_memory_dispatch with ctx as Map and domain as Str and args_list as 
 # "behavior" and "skills" are valid keys — the kernel/rules/identity are never in
 # this file, so the agent can tune its own behavior without touching its guardrails.
 define tools_self_read_section with section as Str returning Str:
-    set path to "config/agent_self_sections.json"
+    # Live self-prompt lives in the data dir (survives reboots/branch switches). Until the
+    # agent first writes its own, fall back to the in-tree template for the shipped defaults.
+    set path to storage_self_sections_path()
+    if file_exists(path) == 0:
+        set path to "config/agent_self_sections.json"
     if file_exists(path) == 0:
         return ""
     set content to read_file(path)
@@ -690,7 +707,8 @@ define tools_self_write_section with section as Str and text as Str returning In
     set out to concat(out and "\",\"skills\":\"")
     set out to concat(out and json_escape_string(skills))
     set out to concat(out and "\"}")
-    set ok to write_file("config/agent_self_sections.json" and out)
+    # Write the LIVE copy to the data dir — never the git-tracked template.
+    set ok to write_file(storage_self_sections_path() and out)
     return 0
 
 # ── Outbound file attachment ────────────────────────────────────────────────
@@ -1276,6 +1294,25 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set ok to tools_self_write_section(sec and txt)
             return concat(concat("Updated your [[" and concat(string_upper(sec) and "]] section.")) and " It takes effect on your next turn.")
         return "Error: only 'behavior' and 'skills' are editable. The kernel, rules, and identity are immutable and cannot be changed."
+
+    if action_name equals "session_prompt_get":
+        if map_contains(ctx and "sessions") == 0:
+            return "Error: no active session manager available."
+        set sg to session_manager_get_guidance(map_get_val(ctx and "sessions"))
+        if string_length(sg) == 0:
+            return "[[SESSION GUIDANCE]] = (empty — no guidance set for this session)"
+        return concat("[[SESSION GUIDANCE]] = " and sg)
+
+    if action_name equals "session_prompt_set":
+        if length_list(args_list) < 1:
+            return "Error: session_prompt_set requires 1 argument (text)."
+        set sg_txt to ptr_to_str(get_list(args_list and 0))
+        if string_length(sg_txt) > 4000:
+            return "Error: session guidance exceeds the 4000-char cap. Keep it concise."
+        if map_contains(ctx and "sessions") == 0:
+            return "Error: no active session manager available."
+        set ok to session_manager_set_guidance(map_get_val(ctx and "sessions") and sg_txt)
+        return "Updated your session guidance for THIS conversation. It takes effect on your next turn and clears in a new session."
 
     if action_name equals "dht_store":
         if length_list(args_list) < 2:

@@ -5,6 +5,7 @@ import "string"
 import "fs"
 import "session"
 import "json"
+import "../storage"
 import "./edition"
 import "./tutor"
 import "./awareness"
@@ -115,7 +116,11 @@ define prompt_sanitize_input with user_prompt as Str returning Str:
 # adjust its own [[BEHAVIOR]] and [[SKILLS]] via the self_prompt tools, but can
 # never touch its guardrails. Returns "" when the file is absent/empty.
 define prompt_get_self_sections returning Str:
-    set path to "config/agent_self_sections.json"
+    # Read the LIVE self-prompt from the data dir (git-immune, persists across reboots and
+    # branch switches); fall back to the in-tree template for shipped defaults on first run.
+    set path to storage_self_sections_path()
+    if file_exists(path) == 0:
+        set path to "config/agent_self_sections.json"
     if file_exists(path) == 0:
         return ""
     set content to read_file(path)
@@ -220,6 +225,13 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
     if sessions_mgr != 0:
         set sess to session_manager_get_active(sessions_mgr)
         if sess != 0:
+            # Session-scoped guidance: the agent's own direction for THIS conversation, set via
+            # session_prompt_set. Sits right after the GLOBAL [[BEHAVIOR]]/[[SKILLS]] and before
+            # operator instructions. Global = who Ernos is everywhere; this = "for this chat, do X".
+            if map_contains(sess and "session_guidance") == 1:
+                set guidance_val to map_get_val(sess and "session_guidance")
+                if string_length(guidance_val) > 0:
+                    set system_prompt to concat(system_prompt and concat("[[SESSION GUIDANCE]]\n" and concat(guidance_val and "\n[[/SESSION GUIDANCE]]\n")))
             if map_contains(sess and "system_prompt") == 1:
                 set system_val to map_get_val(sess and "system_prompt")
                 if string_length(system_val) > 0:
