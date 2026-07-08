@@ -321,6 +321,9 @@ async def query_daemon_ipc(prompt, author=None, message=None):
                 tags += f"[MSGID:{message.id}] [CHANID:{message.channel.id}] "
             except Exception:
                 pass
+        # P7: which surface this message arrived from — the awareness block tells the
+        # agent which platform tools apply this turn (react/attach-on-reply are Discord).
+        tags += "[PLATFORM:discord] "
 
         # Search the RAG database using the query
         rag_res = await search_rag_database(clean_prompt)
