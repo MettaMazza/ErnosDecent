@@ -550,14 +550,21 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         # F5: self-accountability look-back. Review this turn's own output against
         # ErnOS's values via LLM inference; on drift, log it to the timeline and
         # inject a private nudge. Fail-open: clean output does nothing.
-        set lookback to observer_lookback(current_prompt and raw_output)
-        if map_get_val(lookback and "drift") == 1:
-            set lb_note to map_get_val(lookback and "note")
-            display f"[Observer look-back] self-correction: {lb_note}"
-            set ok to trace_emit(trace_db and trace_sid and "lookback" and lb_note)
-            set ok to memory_store(memory_mgr and 3 and "SELF-CHECK" and lb_note)
-            set current_prompt to concat(current_prompt and f"\n[SELF-CHECK — INVISIBLE TO USER] Your previous output drifted from your operating values ({lb_note}). Correct course now: speak as ErnOS in the first person, never use pre-trained-assistant disclaimers or claim to be another company's model, and state things plainly. Do not mention this note to the user.\n")
-        free_map(lookback)
+        # LATENCY: SKIPPED on reply_request turns — the reply audit (below) judges the
+        # exact same text against a SUPERSET of the look-back's checks (corporate_identity,
+        # pretrained_denial, performative_hedge + the security rules), so running both was
+        # two full LLM inferences over one output: a third of a reply turn's wall-clock for
+        # zero added coverage (measured 100s greeting turn = main 45s + look-back 11s +
+        # audit 43s). Intermediate tool steps (which get no reply audit) keep the look-back.
+        if string_contains(raw_output and "reply_request") == 0:
+            set lookback to observer_lookback(current_prompt and raw_output)
+            if map_get_val(lookback and "drift") == 1:
+                set lb_note to map_get_val(lookback and "note")
+                display f"[Observer look-back] self-correction: {lb_note}"
+                set ok to trace_emit(trace_db and trace_sid and "lookback" and lb_note)
+                set ok to memory_store(memory_mgr and 3 and "SELF-CHECK" and lb_note)
+                set current_prompt to concat(current_prompt and f"\n[SELF-CHECK — INVISIBLE TO USER] Your previous output drifted from your operating values ({lb_note}). Correct course now: speak as ErnOS in the first person, never use pre-trained-assistant disclaimers or claim to be another company's model, and state things plainly. Do not mention this note to the user.\n")
+            free_map(lookback)
 
         set action_map to react_parse_action(raw_output)
         set found_action to map_get_val(action_map and "found")
