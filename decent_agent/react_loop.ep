@@ -376,6 +376,52 @@ define react_slice_from_next_action with raw as Str and from_pos as Int returnin
     return substring(tail and off and string_length(tail) - off)
 
 
+# Scan a DROPPED text segment for orphaned tool calls — `name([...])` continuations the
+# model emitted WITHOUT an 'Action:' marker (e.g. "Action: a([...]) → b([...]) → c([...])").
+# The batching slicer only recognizes Action:/call: markers, so such calls were silently
+# skipped (observed live: operate_scheduler list/delete reported "no observation
+# returned" — they were never executed). Names are validated against the registered
+# schema text ("- <name>(") so prose words never trigger a nudge; the caller injects a
+# format note NAMING the dropped calls so the model re-emits them properly. Bare names
+# are deliberately NOT auto-executed — tools only run from the auditable Action grammar.
+# Segment is capped at 2000 chars (get_character is O(n); dropped segments are small).
+define react_find_orphan_calls with segment as Str and schemas as Str returning Str:
+    set found to ""
+    set n to string_length(segment)
+    if n > 2000:
+        set n to 2000
+    set i to 0
+    repeat while i < n - 1:
+        set ch to get_character(segment and i)
+        if ch == 40:
+            if get_character(segment and i + 1) == 91:
+                # "([": walk back over [a-z0-9_] to recover the candidate tool name.
+                set s to i
+                set walking to 1
+                repeat while walking == 1 and also s > 0:
+                    set pc to get_character(segment and s - 1)
+                    set is_ident to 0
+                    if pc >= 97 and also pc <= 122:
+                        set is_ident to 1
+                    if pc >= 48 and also pc <= 57:
+                        set is_ident to 1
+                    if pc == 95:
+                        set is_ident to 1
+                    if is_ident == 1:
+                        set s to s - 1
+                    else:
+                        set walking to 0
+                if i - s >= 3:
+                    set cand to substring(segment and s and i - s)
+                    if string_contains(schemas and concat("- " and concat(cand and "("))) == 1:
+                        if string_contains(found and cand) == 0:
+                            if string_length(found) > 0:
+                                set found to concat(found and ", ")
+                            set found to concat(found and cand)
+        set i to i + 1
+    return found
+
+
 define react_hebbian_trigger with memory_mgr as Map and text as Str returning Int:
     set concepts to create_list()
     set ok to append_list(concepts and "wallet")
@@ -615,12 +661,28 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             # whole remainder each time.
             set batch_rest to react_slice_from_next_action(raw_output and map_get_val(action_map and "end_pos"))
             set assistant_text to raw_output
+            # P10: detect orphaned `tool([...])` continuations in the segment the slicer
+            # DROPS — between this action's end and the next Action: marker (or the end of
+            # the response). If any registered tool appears there without its Action:
+            # prefix, a format note (appended after this action's Observation) names it so
+            # the model re-emits it properly instead of believing it ran.
+            set orphan_nudge to ""
+            set a_end to map_get_val(action_map and "end_pos")
+            set tail_len to string_length(raw_output) - a_end
+            if tail_len > 0:
+                set dropped_len to tail_len - string_length(batch_rest)
+                if dropped_len > 0:
+                    set dropped_seg to substring(raw_output and a_end and dropped_len)
+                    set orphan_names to react_find_orphan_calls(dropped_seg and map_get_val(tools_mgr and "schemas"))
+                    if string_length(orphan_names) > 0:
+                        display f"[ReAct] Orphaned tool calls dropped by the batch slicer: {orphan_names}"
+                        set ok to trace_emit(trace_db and trace_sid and "no_action" and f"Orphaned calls not executed: {orphan_names}")
+                        set orphan_nudge to f"[FORMAT NOTE — INVISIBLE TO USER] Your response ALSO contained tool call(s) WITHOUT the 'Action:' prefix, which were NOT executed: {orphan_names}. A bare name([...]) in prose does not run. Re-emit each as its own 'Action: <name>([...])' line.\n"
             if string_length(batch_rest) > 0:
                 set override_output to batch_rest
                 # Record the transcript from the start (keeps any Thought:) THROUGH this action,
                 # dropping only the trailing actions that haven't run yet — they get recorded as
                 # each one executes on its own chained iteration.
-                set a_end to map_get_val(action_map and "end_pos")
                 set assistant_text to substring(raw_output and 0 and a_end)
             display f"Parsed action: '{tool_name}' with args: '{args_str}'"
             set ok to trace_emit(trace_db and trace_sid and "action" and f"{tool_name}({args_str})")
@@ -722,6 +784,8 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set current_prompt to concat(current_prompt and "\n")
                 set current_prompt to concat(current_prompt and assistant_text)
                 set current_prompt to concat(current_prompt and "\nObservation: Mid-message delivered to the user. Continue your current task.\n")
+                if string_length(orphan_nudge) > 0:
+                    set current_prompt to concat(current_prompt and orphan_nudge)
                 free_list(args_list)
                 if is_batched_turn == 0:
                     set loop_idx to loop_idx + 1
@@ -956,7 +1020,9 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set current_prompt to concat(current_prompt and "\nObservation: ")
                 set current_prompt to concat(current_prompt and react_fit_observation(obs_text and obs_budget))
                 set current_prompt to concat(current_prompt and "\n")
-                
+                if string_length(orphan_nudge) > 0:
+                    set current_prompt to concat(current_prompt and orphan_nudge)
+
                 set denials to 0
                 if map_contains(ctx and "consecutive_denials") == 1:
                     set denials to map_get_val(ctx and "consecutive_denials")
