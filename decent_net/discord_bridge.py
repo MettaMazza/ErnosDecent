@@ -301,11 +301,11 @@ def format_rag_context(rag_res):
             formatted.append(f"\n[Document: {doc}, Segment: {idx}]\n{content}\n")
     return "\n".join(formatted)
 
-async def query_daemon_ipc(prompt, author=None):
+async def query_daemon_ipc(prompt, author=None, message=None):
     try:
         # Prepare query (avoid newlines inside query to keep it clean)
         clean_prompt = prompt.replace('\r', ' ').replace('\n', ' ')
-        
+
         # Build IPC command with sender identity and role tags
         global active_session_id
         tags = ""
@@ -315,7 +315,13 @@ async def query_daemon_ipc(prompt, author=None):
             username = str(author.display_name).replace('[', '(').replace(']', ')')
             role = "admin" if is_admin_author(author) else "guest"
             tags += f"[SENDER:{username}] [ROLE:{role}] "
-            
+        # Current message coordinates → the agent can react([emoji]) to THIS message with no ids.
+        if message is not None:
+            try:
+                tags += f"[MSGID:{message.id}] [CHANID:{message.channel.id}] "
+            except Exception:
+                pass
+
         # Search the RAG database using the query
         rag_res = await search_rag_database(clean_prompt)
         if rag_res and (rag_res.get("results") or rag_res.get("structural_chunks")):
@@ -1080,8 +1086,9 @@ async def _start_ai_with_traces(message, query_text, author, reply_msg=None):
             trace_poll_loop(thread, sess, trace_ctx["done_event"], main_channel=message.channel)
         )
 
-    # Run the actual AI query (blocking IPC call)
-    resp = await query_daemon_ipc(query_text, author=author)
+    # Run the actual AI query (blocking IPC call). Pass the message so the agent can
+    # react([emoji]) to THIS message without handling ids itself.
+    resp = await query_daemon_ipc(query_text, author=author, message=message)
 
     return resp, trace_ctx
 

@@ -333,8 +333,20 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: Download file from url into content-addressed store. APPROVAL REQUIRED.\n")
         set schemas to concat(schemas and "  Example: Action: download_tool([\"https://example.com/data.txt\"])\n\n")
         
+        set schemas to concat(schemas and "- react([emoji: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: React to the CURRENT message with an emoji — it auto-applies to the message you are responding to (no ids needed). Use it to acknowledge, agree, or add a light touch. Works on a live Discord turn.\n")
+        set schemas to concat(schemas and "  Example: Action: react([\"👍\"])\n\n")
+
+        set schemas to concat(schemas and "- discord_list_channels([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: List the Discord text channels the bot can see (id: #name (guild)), via the bridge.\n")
+        set schemas to concat(schemas and "  Example: Action: discord_list_channels([])\n\n")
+
+        set schemas to concat(schemas and "- discord_read_channel([channel_id: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Read the recent messages of a Discord channel by id, via the bridge.\n")
+        set schemas to concat(schemas and "  Example: Action: discord_read_channel([\"11223344\"])\n\n")
+
         set schemas to concat(schemas and "- discord_add_reaction([channel_id: Str, message_id: Str, emoji: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Add emoji reaction to Discord message via bridge. APPROVAL REQUIRED.\n")
+        set schemas to concat(schemas and "  Description: React to a SPECIFIC message by id (use react([emoji]) instead for the current message). Via the bridge.\n")
         set schemas to concat(schemas and "  Example: Action: discord_add_reaction([\"11223344\", \"55667788\", \"🛑\"])\n\n")
         
         set schemas to concat(schemas and "- submit_issue([repo_id: Str, title: Str, body: Str]) -> Str\n")
@@ -1800,6 +1812,25 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ddb to storage_get_db()
         set did to bridge_enqueue(ddb and "discord" and "list_channels" and "")
         return bridge_wait_result(ddb and did and 30)
+    if action_name equals "react":
+        # React to the CURRENT message with just an emoji — the message + channel are taken
+        # from this turn's context (threaded from the Discord bridge). No ids for the agent.
+        if length_list(args_list) < 1:
+            return "Error: react requires 1 argument (emoji). Example: Action: react([\"👍\"])"
+        set rx_emoji to ptr_to_str(get_list(args_list and 0))
+        set rx_msg to ""
+        if map_contains(ctx and "discord_msg_id") == 1:
+            set rx_msg to map_get_val(ctx and "discord_msg_id")
+        set rx_chan to ""
+        if map_contains(ctx and "discord_chan_id") == 1:
+            set rx_chan to map_get_val(ctx and "discord_chan_id")
+        if string_length(rx_msg) == 0 or else string_length(rx_chan) == 0:
+            return "Error: no current Discord message to react to (react works on a live Discord turn)."
+        set rx_args to concat(rx_chan and concat("|" and concat(rx_msg and concat("|" and rx_emoji))))
+        set ddb to storage_get_db()
+        set did to bridge_enqueue(ddb and "discord" and "add_reaction" and rx_args)
+        return bridge_wait_result(ddb and did and 30)
+
     if action_name equals "discord_add_reaction":
         if length_list(args_list) < 3:
             return "Error: discord_add_reaction requires channel_id, message_id and emoji."
