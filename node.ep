@@ -104,6 +104,14 @@ import "fs"
 # react_loop.ep). AI CANCEL bumps it so one Stop halts every concurrent run.
 external define ep_cancel_epoch_bump with dummy returning Int
 
+# CONCURRENCY (Phase A): the IPC accept loop waits for a connection through the ASYNC
+# event loop instead of blocking, so the loop stays live between/among turns and
+# background work (async turns, sub-agents, renders, validation) keeps progressing.
+# async_wait_readable_timeout(fd, ms) → 1 readable / 0 timeout; ep_net_set_nonblocking
+# makes accept never block. Both injected by build.sh.
+external define async_wait_readable_timeout with fd and timeout_ms returning Int
+external define ep_net_set_nonblocking with fd returning Int
+
 # /factory support: recursive tree delete in pure ErnosPlain (no shell). Depth-capped
 # as a runaway guard; only ever called on the FIXED agent-state paths listed in the
 # AI FACTORY handler — never on user-supplied input.
@@ -2042,10 +2050,19 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
 
 
 define ipc_server_loop with listen_fd as Int and borrow raft_node as Map and borrow identity as Map and dht_node as Int and relay_node as Int and msg_store as Int and ledger as Map and name_reg as Int and seed_addr as Str and seed_port as Int and borrow agent_memory as Map and borrow agent_tools as Map and borrow agent_ctx as Map and borrow agent_model as Map and static_secret as Int and static_public as Int and bft_node as Map:
+    # Phase A: make the listen socket non-blocking and wait for connections through the
+    # async event loop. This is a PLAIN define, so `await` lowers to ep_await_future,
+    # which PUMPS the entire run queue + timers during each 200ms idle window — the
+    # daemon is now a continuously-running event loop, not a thread parked in a blocking
+    # accept(). Background async tasks (detached turns, sub-agents, image renders, the
+    # validation chain, sub-agent approval waits) progress between and during turns.
+    set ok to ep_net_set_nonblocking(listen_fd)
     repeat while 1 == 1:
-        set client_fd to ep_net_accept(listen_fd)
-        if client_fd >= 0:
-            handle_ipc_client(client_fd and raft_node and identity and dht_node and relay_node and msg_store and borrow ledger and name_reg and seed_addr and seed_port and agent_memory and agent_tools and agent_ctx and agent_model and static_secret and static_public and borrow bft_node)
+        set ready to await async_wait_readable_timeout(listen_fd and 200)
+        if ready == 1:
+            set client_fd to ep_net_accept(listen_fd)
+            if client_fd >= 0:
+                handle_ipc_client(client_fd and raft_node and identity and dht_node and relay_node and msg_store and borrow ledger and name_reg and seed_addr and seed_port and agent_memory and agent_tools and agent_ctx and agent_model and static_secret and static_public and borrow bft_node)
     return 0
 
 # ================================================================

@@ -147,6 +147,17 @@ long long ep_async_sleep_ms(long long ms) {
     return (long long)fut;
 }
 
+/* Set a socket non-blocking. Used on the IPC LISTEN socket so the accept loop can wait
+   for a connection via the async event loop (async_wait_readable_timeout) and then
+   accept without ever blocking the single thread — the foundation for a continuously
+   running loop and concurrent turns. Returns 0 ok, -1 on error. */
+long long ep_net_set_nonblocking(long long fd) {
+    int flags = fcntl((int)fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (fcntl((int)fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+    return 0;
+}
+
 /* Read a file binary-safe (length-aware) and return base64 — for embedding a generated
    image into a multimodal LLM request. ep_base64_encode is strlen-based (truncates at NULs). */
 long long ep_file_to_base64(long long path_ptr) {
