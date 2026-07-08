@@ -550,13 +550,15 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         # F5: self-accountability look-back. Review this turn's own output against
         # ErnOS's values via LLM inference; on drift, log it to the timeline and
         # inject a private nudge. Fail-open: clean output does nothing.
-        # LATENCY: SKIPPED on reply_request turns — the reply audit (below) judges the
-        # exact same text against a SUPERSET of the look-back's checks (corporate_identity,
-        # pretrained_denial, performative_hedge + the security rules), so running both was
-        # two full LLM inferences over one output: a third of a reply turn's wall-clock for
-        # zero added coverage (measured 100s greeting turn = main 45s + look-back 11s +
-        # audit 43s). Intermediate tool steps (which get no reply audit) keep the look-back.
-        if string_contains(raw_output and "reply_request") == 0:
+        # LATENCY + VALUE: run the look-back ONLY on mid_message turns. reply_request text is
+        # already judged by the reply audit (below) against a SUPERSET of these checks, and a
+        # pure tool-call turn (search/read/store/run_command) has NO user-facing text to drift
+        # on — its reasoning surfaces in a later reply, which IS audited. Firing a full LLM
+        # look-back on every intermediate tool step cost ~11–31s each for zero added coverage
+        # (measured: one multi-step request spent ~97s in look-back calls, ALL failing
+        # "Audit unavailable"). mid_message is the single user-facing output that gets NO reply
+        # audit, so it is the only turn where the look-back adds real coverage.
+        if string_contains(raw_output and "mid_message") == 1:
             set lookback to observer_lookback(current_prompt and raw_output)
             if map_get_val(lookback and "drift") == 1:
                 set lb_note to map_get_val(lookback and "note")

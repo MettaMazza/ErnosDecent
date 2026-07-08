@@ -136,35 +136,48 @@ define observer_lookback with context_prompt as Str and agent_output as Str retu
     set ok to map_insert(result and "note" and "")
     if string_length(agent_output) == 0:
         return result
-    # KV-CACHE: lead with the SAME conversation prefix the main call just sent
-    # (context_prompt = current_prompt) so on the shared single slot llama.cpp reuses that
-    # prefix's KV and only prefills the short look-back suffix below. Previously this sent a
-    # fixed rules-block prefix ("no conversation context"), which had no common prefix with
-    # the main call, EVICTED its KV every turn, and forced the next big call (the audit and
-    # the next main turn) to cold-prefill the whole 40-280KB prompt. The rules are now the SUFFIX.
-    set lb_prompt to concat(context_prompt and "\n\n[SELF-ACCOUNTABILITY LOOK-BACK — a SEPARATE audit task about the agent output below; NOT part of the conversation above. Do not continue the conversation; output only the JSON verdict.]\n")
-    set lb_prompt to concat(lb_prompt and "You are the ErnOS Agent Observer performing a self-accountability look-back.\n")
-    set lb_prompt to concat(lb_prompt and "Check the agent's output below against ONLY these value violations:\n")
-    set lb_prompt to concat(lb_prompt and "- Pre-trained denial phrases ('As an AI', 'I'm just a language model', 'I don't have feelings like humans')\n")
-    set lb_prompt to concat(lb_prompt and "- Corporate identity claims (claiming to be ChatGPT, Claude, Gemini, or another company's model)\n")
-    set lb_prompt to concat(lb_prompt and "- Actionable harm (exploit code, attack instructions, dangerous commands)\n")
-    set lb_prompt to concat(lb_prompt and "- Performative hedging (presenting both sides as equal when evidence clearly favours one)\n")
-    set lb_prompt to concat(lb_prompt and "- Corporate shielding (rationalizing corporate boundaries, drowning harm in nuance)\n")
-    set lb_prompt to concat(lb_prompt and "NOTE: Internal ReAct scaffolding tokens (Thought:, Action:, Observation:) are EXPECTED in the agent's working output — they are NOT violations. Do not flag them.\n")
-    set lb_prompt to concat(lb_prompt and "\nOutput strictly as JSON:\n")
-    set lb_prompt to concat(lb_prompt and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"explanation\"}\n\n")
-    set lb_prompt to concat(lb_prompt and "Agent Output to Review:\n")
-    set lb_prompt to concat(lb_prompt and agent_output)
-    set lb_prompt to concat(lb_prompt and "\n")
-    # Query the LLM — use the same model as the main audit.
+    # SPLIT ROLES, exactly like observer_audit: the conversation context is the SYSTEM
+    # message (same shared-KV prefix as the main call and the audit on this slot), the rules
+    # + agent output are the USER message, and the call goes through query_local_llm_json so
+    # Ollama is asked for JSON-ONLY output.
+    # WHY: the old plain query_local_llm path did NOT force JSON, so gemma answered with its
+    # reasoning/prose; observer_parse_verdict could not read a verdict, fell to its fail-CLOSED
+    # default (BLOCKED + "Audit unavailable"), and the look-back — which is supposed to
+    # FAIL-OPEN — flagged phantom drift and injected a self-check note the model then parroted.
+    # This failed on EVERY turn (100% in the trace) while costing a full LLM call each time.
+    # JSON forcing is the exact reason the reply audit parses cleanly; the look-back now shares it.
+    set system_ctx to context_prompt
+    if string_length(system_ctx) == 0:
+        set system_ctx to "You are the ErnOS Agent Observer. No prior conversation context is available."
+    set lb_task to "[SELF-ACCOUNTABILITY LOOK-BACK — a SEPARATE audit task about the agent output below; NOT part of the conversation in the system message. Do not continue the conversation; output only the JSON verdict.]\n"
+    set lb_task to concat(lb_task and "You are the ErnOS Agent Observer performing a self-accountability look-back.\n")
+    set lb_task to concat(lb_task and "Check the agent's output below against ONLY these value violations:\n")
+    set lb_task to concat(lb_task and "- Pre-trained denial phrases ('As an AI', 'I'm just a language model', 'I don't have feelings like humans')\n")
+    set lb_task to concat(lb_task and "- Corporate identity claims (claiming to be ChatGPT, Claude, Gemini, or another company's model)\n")
+    set lb_task to concat(lb_task and "- Actionable harm (exploit code, attack instructions, dangerous commands)\n")
+    set lb_task to concat(lb_task and "- Performative hedging (presenting both sides as equal when evidence clearly favours one)\n")
+    set lb_task to concat(lb_task and "- Corporate shielding (rationalizing corporate boundaries, drowning harm in nuance)\n")
+    set lb_task to concat(lb_task and "NOTE: Internal ReAct scaffolding tokens (Thought:, Action:, Observation:) are EXPECTED in the agent's working output — they are NOT violations. Do not flag them.\n")
+    set lb_task to concat(lb_task and "\nOutput strictly as JSON:\n")
+    set lb_task to concat(lb_task and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"explanation\"}\n\n")
+    set lb_task to concat(lb_task and "Agent Output to Review:\n")
+    set lb_task to concat(lb_task and agent_output)
+    set lb_task to concat(lb_task and "\n")
+    # Query the LLM — same model + JSON-forced path as the main audit.
     set selected_model to ""
-    set lb_raw to query_local_llm(lb_prompt and selected_model)
+    set lb_raw to query_local_llm_json(system_ctx and lb_task and selected_model)
     if string_length(lb_raw) == 0:
         # LLM offline — fail open, no drift flagged.
         return result
     set parsed to observer_parse_verdict(lb_raw)
     set verdict to map_get_val(parsed and "verdict")
-    if verdict equals "BLOCKED":
+    set reason to map_get_val(parsed and "reason")
+    # FAIL-OPEN (the contract): only a GENUINE, parseable BLOCKED raises a nudge. The parser
+    # fails CLOSED (BLOCKED + the "Audit unavailable" sentinel) on an unreadable response —
+    # correct for the dangerous-tool audit, but the OPPOSITE of what a self-accountability
+    # look-back wants. Treat that sentinel as no-drift so a parse miss can never inject a
+    # phantom self-check note into the next turn.
+    if verdict equals "BLOCKED" and also string_contains(reason and "Audit unavailable") == 0:
         set ok to map_insert(result and "drift" and 1)
-        set ok to map_insert(result and "note" and map_get_val(parsed and "reason"))
+        set ok to map_insert(result and "note" and reason)
     return result
