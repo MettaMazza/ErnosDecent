@@ -402,6 +402,28 @@ _ATTACH_DENY_MARKERS = (
 )
 _ATTACH_MAX_BYTES = 24 * 1024 * 1024  # 24 MB — under Discord's non-nitro upload cap
 
+async def post_trace_event(thread, etype, content, emoji):
+    """Post a trace event to the thinking thread IN FULL, chunked across messages instead
+    of truncating — full transparency: every action result, command output, reasoning and
+    raw model output arrives complete, never clipped."""
+    content = content if content is not None else ""
+    header = f"{emoji} **{etype}**"
+    CHUNK = 1850  # leave room for header + code fences under Discord's 2000 cap
+    if len(content) <= CHUNK:
+        try:
+            await thread.send(f"{header}\n```\n{content}\n```")
+        except Exception as e:
+            print(f"[Discord Bridge] trace send error: {e}", flush=True)
+        return
+    parts = [content[i:i + CHUNK] for i in range(0, len(content), CHUNK)]
+    for idx, part in enumerate(parts):
+        h = header if idx == 0 else f"{emoji} **{etype}** (cont. {idx + 1}/{len(parts)})"
+        try:
+            await thread.send(f"{h}\n```\n{part}\n```")
+        except Exception as e:
+            print(f"[Discord Bridge] trace chunk send error: {e}", flush=True)
+
+
 async def post_attachment(channel, path):
     """Deliver a file the agent produced/shared as a REAL Discord attachment in the
     main channel. Node-side queued via a trace_events row of type 'attachment'."""
@@ -976,14 +998,8 @@ async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
                 if etype == "attachment" and main_channel:
                     await post_attachment(main_channel, content)
                     continue
-                # All other events: post to trace thread
-                msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
-                if len(msg) > 2000:
-                    msg = msg[:1997] + "..."
-                try:
-                    await thread.send(msg)
-                except Exception as e:
-                    print(f"[Discord Bridge] trace thread send error: {e}", flush=True)
+                # All other events: post to trace thread IN FULL (chunked, never truncated)
+                await post_trace_event(thread, etype, content, emoji)
         except Exception as e:
             print(f"[Discord Bridge] trace poll error: {e}", flush=True)
         await asyncio.sleep(0.5)  # Poll every 500ms for near-real-time
@@ -998,13 +1014,10 @@ async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
             if etype == "mid_message" and main_channel:
                 await post_mid_message(main_channel, content)
                 continue
-            msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
-            if len(msg) > 2000:
-                msg = msg[:1997] + "..."
-            try:
-                await thread.send(msg)
-            except Exception as e:
-                print(f"[Discord Bridge] trace thread final-drain send error: {e}", flush=True)
+            if etype == "attachment" and main_channel:
+                await post_attachment(main_channel, content)
+                continue
+            await post_trace_event(thread, etype, content, emoji)
     except Exception as e:
         print(f"[Discord Bridge] final trace drain error: {e}", flush=True)
 
