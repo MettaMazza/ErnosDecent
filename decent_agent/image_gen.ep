@@ -14,22 +14,29 @@ import "collections"
 import "../storage"
 
 # FFI declaration — resolved from the shim object linked into the node by build.sh.
-external define sd_ep_generate with model_path and prompt and negative and width and height and steps and cfg and seed and out_png_path returning Int
+# Two modes: single-file (model_path set; SD1.5/SDXL — CLIP+VAE built in) OR Flux
+# (diffusion_model + clip_l + t5xxl + vae set; model_path ""). Empty "" means unused.
+external define sd_ep_generate with model_path and diffusion_model and clip_l and t5xxl and vae and prompt and negative and width and height and steps and cfg and seed and out_png_path returning Int
 
-# Default image model: SD1.5 single-file checkpoint. It is self-contained (CLIP + VAE
-# baked in), so sd.cpp loads it from one path with no companion encoder files — unlike
-# Flux, which needs separate T5-XXL/CLIP-L/VAE. Path is configurable via config/image.json.
-define image_gen_default_model returning Str:
+# Read a string field from config/image.json (empty if absent).
+define image_gen_config_str with key as Str returning Str:
     set cfg_path to "config/image.json"
-    if file_exists(cfg_path) == 1:
-        set content to read_file(cfg_path)
-        set root to json_parse(content)
-        if root != 0:
-            set mnode to get_json_object_value(root and "model_path")
-            if mnode != 0:
-                set mval to get_json_value(mnode)
-                if string_length(mval) > 0:
-                    return mval
+    if file_exists(cfg_path) == 0:
+        return ""
+    set content to read_file(cfg_path)
+    set root to json_parse(content)
+    if root == 0:
+        return ""
+    set node to get_json_object_value(root and key)
+    if node == 0:
+        return ""
+    return get_json_value(node)
+
+# Default single-file model (SD1.5) if config has no explicit model / Flux paths.
+define image_gen_default_model returning Str:
+    set m to image_gen_config_str("model_path")
+    if string_length(m) > 0:
+        return m
     return "/Volumes/One Touch/models library/Creative_Models/v1-5-pruned-emaonly.safetensors"
 
 # Where generated images land: the active workspace, so the tool layer auto-attaches them.
@@ -38,15 +45,30 @@ define image_gen_out_path with name as Str returning Str:
     return concat("config/workspaces/active/" and name)
 
 # Generate an image from a prompt. Returns the PNG path on success, or "ERROR: <reason>".
-# seed >= 0 is deterministic; pass -1 for a fixed default here (EP has no RNG in this path).
+# FLUX mode when config/image.json has a "diffusion_model" (+ clip_l/t5xxl/vae); else single-file.
 define image_gen_run with prompt as Str and out_name as Str and width as Int and height as Int and steps as Int and cfg as Int and seed as Int returning Str:
     if string_length(prompt) == 0:
         return "ERROR: empty prompt"
+    set out_path to image_gen_out_path(out_name)
+    set diffusion to image_gen_config_str("diffusion_model")
+    if string_length(diffusion) > 0:
+        # Flux: transformer gguf + separate CLIP/T5/VAE (Maria's diffusers CLIP+VAE load directly).
+        if file_exists(diffusion) == 0:
+            return concat("ERROR: flux diffusion model not found: " and diffusion)
+        set clip_l to image_gen_config_str("clip_l")
+        set t5xxl to image_gen_config_str("t5xxl")
+        set vae to image_gen_config_str("vae")
+        # Flux is a guidance-distilled model: it uses CFG ~1 (NOT the SD-style 7 the tool passes)
+        # with its own distilled guidance. High CFG wrecks Flux output, so force 1 here.
+        set rc to sd_ep_generate("" and diffusion and clip_l and t5xxl and vae and prompt and "" and width and height and steps and 1 and seed and out_path)
+        if rc == 0:
+            return out_path
+        return concat("ERROR: flux generation failed (shim code " and concat(int_to_string(rc) and ")"))
+    # Single-file (SD1.5/SDXL): CLIP+VAE baked into the checkpoint.
     set model to image_gen_default_model()
     if file_exists(model) == 0:
         return concat("ERROR: image model not found on disk at: " and model)
-    set out_path to image_gen_out_path(out_name)
-    set rc to sd_ep_generate(model and prompt and "" and width and height and steps and cfg and seed and out_path)
+    set rc to sd_ep_generate(model and "" and "" and "" and "" and prompt and "" and width and height and steps and cfg and seed and out_path)
     if rc == 0:
         return out_path
     return concat("ERROR: image generation failed (shim code " and concat(int_to_string(rc) and ")"))

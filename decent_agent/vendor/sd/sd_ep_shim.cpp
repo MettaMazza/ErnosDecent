@@ -30,9 +30,16 @@ static pthread_mutex_t g_sd_mutex = PTHREAD_MUTEX_INITIALIZER;
 static sd_ctx_t* g_sd_ctx = NULL;
 static char g_sd_model[2048] = "";
 
-/* Load (or reuse a cached) context for model_path. Caller holds g_sd_mutex. */
-static sd_ctx_t* sd_ep_ctx_for(const char* model_path) {
-    if (g_sd_ctx != NULL && strncmp(g_sd_model, model_path, sizeof(g_sd_model) - 1) == 0) {
+/* Load (or reuse a cached) context. Two modes:
+ *  - single-file (SD1.5/SDXL): model_path set, encoders empty — CLIP+VAE are built in.
+ *  - Flux: diffusion_model set + clip_l + t5xxl + vae as separate files (Maria's diffusers
+ *    CLIP/VAE load directly; the T5 is one merged file). Cache key = the primary path.
+ * Caller holds g_sd_mutex. Empty ("") strings mean "unset". */
+static sd_ctx_t* sd_ep_ctx_for(const char* model_path, const char* diffusion_model,
+                               const char* clip_l, const char* t5xxl, const char* vae) {
+    int flux = (diffusion_model && diffusion_model[0]);
+    const char* key = flux ? diffusion_model : model_path;
+    if (g_sd_ctx != NULL && strncmp(g_sd_model, key, sizeof(g_sd_model) - 1) == 0) {
         return g_sd_ctx;
     }
     /* Model switch: deliberately DO NOT free_sd_ctx here. The ggml-metal backend aborts in
@@ -45,10 +52,17 @@ static sd_ctx_t* sd_ep_ctx_for(const char* model_path) {
     }
     sd_ctx_params_t cp;
     sd_ctx_params_init(&cp);
-    cp.model_path = model_path;   /* single-file checkpoint (SD1.5/SDXL): CLIP+VAE built in */
+    if (flux) {
+        cp.diffusion_model_path = diffusion_model;
+        if (clip_l && clip_l[0]) cp.clip_l_path = clip_l;
+        if (t5xxl && t5xxl[0])   cp.t5xxl_path = t5xxl;
+        if (vae && vae[0])       cp.vae_path = vae;
+    } else {
+        cp.model_path = model_path;   /* single-file checkpoint (SD1.5/SDXL): CLIP+VAE built in */
+    }
     g_sd_ctx = new_sd_ctx(&cp);
     if (g_sd_ctx != NULL) {
-        strncpy(g_sd_model, model_path, sizeof(g_sd_model) - 1);
+        strncpy(g_sd_model, key, sizeof(g_sd_model) - 1);
         g_sd_model[sizeof(g_sd_model) - 1] = '\0';
     }
     return g_sd_ctx;
@@ -58,6 +72,10 @@ static sd_ctx_t* sd_ep_ctx_for(const char* model_path) {
  * compiles as C++ (sd.cpp's stb_image_write.h uses C++ default args), but EP links the
  * plain C name `sd_ep_generate`. */
 extern "C" int sd_ep_generate(const char* model_path,
+                   const char* diffusion_model,  /* Flux: transformer gguf ("" = single-file mode) */
+                   const char* clip_l,           /* Flux: CLIP-L path ("" if unused) */
+                   const char* t5xxl,            /* Flux: T5-XXL path ("" if unused) */
+                   const char* vae,              /* Flux: VAE path ("" if unused) */
                    const char* prompt,
                    const char* negative,
                    int width,
@@ -69,7 +87,7 @@ extern "C" int sd_ep_generate(const char* model_path,
     if (!model_path || !prompt || !out_png_path) return 2;
     pthread_mutex_lock(&g_sd_mutex);
 
-    sd_ctx_t* ctx = sd_ep_ctx_for(model_path);
+    sd_ctx_t* ctx = sd_ep_ctx_for(model_path, diffusion_model, clip_l, t5xxl, vae);
     if (ctx == NULL) {
         pthread_mutex_unlock(&g_sd_mutex);
         return 3;  /* model failed to load */
@@ -117,10 +135,13 @@ extern "C" int sd_ep_generate(const char* model_path,
 
 #else  /* !SD_EP_HAVE_LIB — stub so the build always links */
 
-extern "C" int sd_ep_generate(const char* model_path, const char* prompt, const char* negative,
+extern "C" int sd_ep_generate(const char* model_path, const char* diffusion_model,
+                   const char* clip_l, const char* t5xxl, const char* vae,
+                   const char* prompt, const char* negative,
                    int width, int height, int steps, int cfg, long long seed,
                    const char* out_png_path) {
-    (void)model_path; (void)prompt; (void)negative; (void)width; (void)height;
+    (void)model_path; (void)diffusion_model; (void)clip_l; (void)t5xxl; (void)vae;
+    (void)prompt; (void)negative; (void)width; (void)height;
     (void)steps; (void)cfg; (void)seed; (void)out_png_path;
     return 99;  /* image runtime not built on this machine */
 }
