@@ -41,6 +41,23 @@ if [ -n "$GEMMA4_BLOB" ] && [ -f "$GEMMA4_BLOB" ] && [ -f "$GEMMA4_MMPROJ" ] && 
   fi
 fi
 
+# OPT-IN (P5 latency proposal — adopt only after [LLM TTFT] confirms it wins): serve
+# gemma-4-31b's MAIN inference via llama-server instead of Ollama — exact prefill/decode
+# timings in every [LLM TTFT] line, faster prefill (-b/-ub 2048), and slot-cache control.
+# Off by default; enable with: GEMMA4_MAIN_LLAMACPP=1 ./run_node.sh
+# No node config change needed — the discovery cascade tries llama.cpp :8080 before Ollama.
+if [ "${GEMMA4_MAIN_LLAMACPP:-0}" = "1" ]; then
+  GEMMA4_MAIN_BLOB=$(ollama show gemma-4-31b --modelfile 2>/dev/null | awk '/^FROM/{print $2; exit}')
+  if [ -n "$GEMMA4_MAIN_BLOB" ] && [ -f "$GEMMA4_MAIN_BLOB" ] && [ -x "$LLS" ]; then
+    if ! curl -s -m 2 http://127.0.0.1:8080/health 2>/dev/null | grep -q '"status":"ok"'; then
+      echo "[run_node] starting gemma-4-31b MAIN server on :8080 (llama.cpp, -b/-ub 2048, fa on)"
+      "$LLS" --model "$GEMMA4_MAIN_BLOB" --host 127.0.0.1 --port 8080 \
+        --alias gemma-4-31b -c 65536 -b 2048 -ub 2048 -ngl 999 -fa on -np 1 \
+        > "${HOME}/.ernosdecent/gemma4main.log" 2>&1 &
+    fi
+  fi
+fi
+
 # Keep the previous session's log so a crash + relaunch doesn't erase it.
 [ -f "$LOG" ] && mv -f "$LOG" "$LOG.prev" 2>/dev/null
 
