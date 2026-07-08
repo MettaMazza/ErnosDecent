@@ -52,22 +52,38 @@ async define http_post_async with url as Str and headers as Str and body as Str 
     set sent to ep_net_send(fd and req)
     set raw to ""
     set go to 1
+    # SAFETY: capture the cancel epoch at call start. The wait below is sliced into 1s
+    # ticks; a Stop (epoch bump) ABORTS the in-flight read within ~1s — an inference
+    # that would otherwise decode for minutes cannot delay a halt. The 300s total
+    # watchdog (dead-server guard) is preserved across ticks.
+    set call_epoch to ep_cancel_epoch_get(0)
+    set waited_ms to 0
     repeat while go == 1:
-        # 300s per-read watchdog. A normal generation — even a full max_tokens one —
-        # completes well under this, but a server that accepts the connection then dies
-        # mid-request would otherwise block this read (and the single-threaded daemon)
-        # forever. On timeout we abort the read and return what we have (usually nothing,
-        # so the caller treats the endpoint as failed).
-        set ready to await async_wait_readable_timeout(fd and 300000)
+        set ready to await async_wait_readable_timeout(fd and 1000)
         if ready == 0:
-            display "[LLM] read timeout (300s) — server stopped responding; aborting read."
-            set go to 0
-        else:
-            set chunk to ep_net_recv(fd and 65536)
-            if string_length(chunk) == 0:
+            if ep_cancel_epoch_get(0) > call_epoch:
+                display "[LLM] read ABORTED by Stop — abandoning the in-flight inference."
+                set raw to ""
                 set go to 0
             else:
-                set raw to concat(raw and chunk)
+                set waited_ms to waited_ms + 1000
+                if waited_ms >= 300000:
+                    display "[LLM] read timeout (300s) — server stopped responding; aborting read."
+                    set go to 0
+        else:
+            # Check the epoch on data ticks too — a long streaming-style read must not
+            # ride out a Stop just because bytes keep arriving.
+            if ep_cancel_epoch_get(0) > call_epoch:
+                display "[LLM] read ABORTED by Stop — abandoning the in-flight inference."
+                set raw to ""
+                set go to 0
+            else:
+                set waited_ms to 0
+                set chunk to ep_net_recv(fd and 65536)
+                if string_length(chunk) == 0:
+                    set go to 0
+                else:
+                    set raw to concat(raw and chunk)
     set ok to ep_net_close(fd)
     # Strip HTTP headers — return the body (chunked or not), like the old http_post.
     set hsep to string_index_of(raw and "\r\n\r\n")
@@ -95,6 +111,9 @@ external define ep_time_now_ms returning Int
 # on timeout. Lets the LLM read loop bound how long it waits so a dead server can't hang
 # the single-threaded daemon forever.
 external define async_wait_readable_timeout with fd and timeout_ms returning Int
+# SAFETY: global cancel EPOCH (monotonic latch; injected by build.sh). Compared, never
+# consumed — every concurrent run/read sees the same Stop.
+external define ep_cancel_epoch_get with dummy returning Int
 
 define llm_json_escape with s as Str returning Str:
     if string_length(s) == 0:

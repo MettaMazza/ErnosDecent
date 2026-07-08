@@ -46,6 +46,24 @@ long long ep_cancel_get(long long dummy) {
     return ep_cancel_all_flag;
 }
 
+/* SAFETY: cancel EPOCH — a monotonic latch replacing the consume-once flag for
+   halt-EVERYTHING semantics. The old flag was consumed (set back to 0) by the FIRST
+   loop that saw it, so with a main agent + sub-agents + a background coordinator
+   running concurrently, exactly ONE halted and the rest kept working. With the epoch,
+   every run captures the value at its start and halts when the current value is
+   GREATER — nothing consumes, every concurrent run sees the same stop, and runs
+   started AFTER the stop are unaffected. Atomics because the web thread bumps while
+   the agent thread reads. */
+volatile long long ep_cancel_all_epoch = 0;
+long long ep_cancel_epoch_get(long long dummy) {
+    (void)dummy;
+    return __atomic_load_n((long long*)&ep_cancel_all_epoch, __ATOMIC_SEQ_CST);
+}
+long long ep_cancel_epoch_bump(long long dummy) {
+    (void)dummy;
+    return __atomic_add_fetch((long long*)&ep_cancel_all_epoch, 1, __ATOMIC_SEQ_CST);
+}
+
 /* One-pass O(n) JSON string escaper (replaces the O(n^2) pure-.ep version). */
 long long ep_json_escape(long long s_ptr) {
     const char* s = (const char*)s_ptr;
@@ -942,7 +960,8 @@ else:
 #include <fcntl.h>
 #include <unistd.h>
 
-long long react_check_cancel(long long);
+long long react_check_cancel(long long, long long); /* (session_id, run_epoch) - epoch latch, see react_loop.ep */
+long long ep_cancel_epoch_get(long long);
 long long react_request_cancel(long long);
 long long ptr_to_str(long long);
 
@@ -993,10 +1012,11 @@ long long tools_set_active_session(long long sid_ptr) {
     char recv_buf[4096];
     ssize_t n;
     int aborted = 0;
+    long long rc_epoch = ep_cancel_epoch_get(0); /* epoch at read start: any Stop after this aborts */
     while (1) {
         if (ep_active_session_id[0] != '\\\\0') {
             long long gc_sid = ptr_to_str((long long)ep_active_session_id);
-            if (react_check_cancel(gc_sid) == 1) {
+            if (react_check_cancel(gc_sid, rc_epoch) == 1) {
                 aborted = 1;
                 break;
             }

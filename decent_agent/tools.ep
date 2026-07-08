@@ -50,6 +50,8 @@ external define ep_async_sleep_ms with ms returning Int
 external define ep_cancel_get with dummy returning Int
 external define ep_cancel_set with v returning Int
 external define ep_time_now_ms returning Int
+# SAFETY: cancel EPOCH (monotonic latch; compared, never consumed) — see react_loop.ep.
+external define ep_cancel_epoch_get with dummy returning Int
 
 # Single-flight guard for the background validation coordinator — one run at a time.
 set TEST_ALL_RUNNING to create_map()
@@ -62,6 +64,9 @@ set TEST_ALL_RUNNING to create_map()
 # + attaching the scorecard report and announcing completion.
 async define tools_test_all_worker with ctx as Map and orch as Int and model as Int and memory as Int and tools as Int and sid as Str and platform as Str and aa_on as Int and db as Int returning Int:
     set started to ep_time_now_ms()
+    # SAFETY: capture the cancel epoch — a Stop halts this coordinator (checked between
+    # blocks AND every 2s inside the poll) alongside every sub-agent, no consumption.
+    set worker_epoch to ep_cancel_epoch_get(0)
     set mp to read_file("master_prompt.md")
     if string_length(mp) == 0:
         set ok to trace_emit(db and sid and "mid_message" and "🧪 test_all_systems: master_prompt.md unreadable — validation aborted.")
@@ -97,9 +102,9 @@ async define tools_test_all_worker with ctx as Map and orch as Int and model as 
             if f2 > 0:
                 set block to string_trim(substring(rest and 0 and f2))
             if string_length(block) > 0:
-                # Honor a user Stop between blocks (consume it and report partial).
-                if ep_cancel_get(0) == 1:
-                    set ok to ep_cancel_set(0)
+                # Honor a user Stop between blocks (epoch latch — no consumption, so the
+                # same Stop also halts every other run).
+                if ep_cancel_epoch_get(0) > worker_epoch:
                     set report to concat(report and "\n**HALTED by user Stop — remaining blocks not run.**\n")
                     set halted to 1
                 else:
@@ -124,16 +129,23 @@ async define tools_test_all_worker with ctx as Map and orch as Int and model as 
                         set done to 0
                         set result to ""
                         repeat while waited < 900000 and also done == 0:
-                            set st to orchestrator_check(orch and tid)
-                            if string_index_of(st and "completed:") == 0:
-                                set result to substring(st and 10 and string_length(st) - 10)
+                            # SAFETY: a Stop mid-block halts the coordinator within 2s
+                            # (the sub-agent halts itself via the same epoch).
+                            if ep_cancel_epoch_get(0) > worker_epoch:
+                                set result to "🛑 HALTED by user Stop mid-block."
                                 set done to 1
-                            else if st equals "cancelled" or else st equals "not_found":
-                                set result to concat("(sub-agent " and concat(st and ")"))
-                                set done to 1
+                                set halted to 1
                             else:
-                                set ok to await ep_async_sleep_ms(2000)
-                                set waited to waited + 2000
+                                set st to orchestrator_check(orch and tid)
+                                if string_index_of(st and "completed:") == 0:
+                                    set result to substring(st and 10 and string_length(st) - 10)
+                                    set done to 1
+                                else if st equals "cancelled" or else st equals "not_found":
+                                    set result to concat("(sub-agent " and concat(st and ")"))
+                                    set done to 1
+                                else:
+                                    set ok to await ep_async_sleep_ms(2000)
+                                    set waited to waited + 2000
                         if done == 0:
                             set result to "⏰ TIMEOUT: block did not complete within 15 minutes."
                             set fail_blocks to fail_blocks + 1

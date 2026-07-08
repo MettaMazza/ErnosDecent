@@ -1,9 +1,15 @@
 # F4 gate: cooperative cancellation registry. Request sets a per-session flag the
 # loop consumes once; empty session normalises to "default"; thread-safe.
+# EPOCH UPDATE: react_check_cancel now also takes the run start EPOCH (a global
+# latch - one Stop halts every concurrent run). Each check here captures the CURRENT
+# epoch so only the per-session flags under test can trigger it; consuming a flag
+# bumps the epoch by design (broadcast), hence per-call capture rather than one.
 
 import "string"
 import "collections"
 import "./react_loop"
+
+external define ep_cancel_epoch_get with dummy returning Int
 
 define pass_if with label as Str and cond as Int returning Int:
     if cond == 1:
@@ -28,25 +34,25 @@ define main:
     # 1. Request then check -> 1; consumed -> next check 0.
     set ok to react_request_cancel("s1")
     set total to total + 1
-    set passes to passes + pass_if("cancel flag set + read" and (react_check_cancel("s1") == 1))
+    set passes to passes + pass_if("cancel flag set + read" and (react_check_cancel("s1" and ep_cancel_epoch_get(0)) == 1))
     set total to total + 1
-    set passes to passes + pass_if("consume-once: second read 0" and (react_check_cancel("s1") == 0))
+    set passes to passes + pass_if("consume-once: second read 0" and (react_check_cancel("s1" and ep_cancel_epoch_get(0)) == 0))
 
     # 2. No request -> 0 (a fresh run is never falsely cancelled).
     set total to total + 1
-    set passes to passes + pass_if("unset session reads 0" and (react_check_cancel("never") == 0))
+    set passes to passes + pass_if("unset session reads 0" and (react_check_cancel("never" and ep_cancel_epoch_get(0)) == 0))
 
     # 3. Empty session normalises to 'default' (both sides agree).
     set ok to react_request_cancel("")
     set total to total + 1
-    set passes to passes + pass_if("empty session normalises to default" and (react_check_cancel("") == 1))
+    set passes to passes + pass_if("empty session normalises to default" and (react_check_cancel("" and ep_cancel_epoch_get(0)) == 1))
 
     # 4. Sessions are independent.
     set ok to react_request_cancel("a")
     set total to total + 1
-    set passes to passes + pass_if("session a set" and (react_check_cancel("b") == 0))
+    set passes to passes + pass_if("session a set" and (react_check_cancel("b" and ep_cancel_epoch_get(0)) == 0))
     set total to total + 1
-    set passes to passes + pass_if("session a still set after checking b" and (react_check_cancel("a") == 1))
+    set passes to passes + pass_if("session a still set after checking b" and (react_check_cancel("a" and ep_cancel_epoch_get(0)) == 1))
 
     # 5. Concurrency: 4 workers requesting 500 sessions each, no crash; then all
     #    consumable.
@@ -62,7 +68,7 @@ define main:
     set total to total + 1
     set passes to passes + pass_if("concurrent requests no crash" and (j == 4))
     set total to total + 1
-    set passes to passes + pass_if("concurrently-set flag readable" and (react_check_cancel("c100") == 1))
+    set passes to passes + pass_if("concurrently-set flag readable" and (react_check_cancel("c100" and ep_cancel_epoch_get(0)) == 1))
 
     display f"=== {passes}/{total} passed ==="
     if passes == total:

@@ -26,6 +26,10 @@ import "../decent_agent/access"
 # /api/cancel; read by the ReAct loop at each turn boundary. Setting it is a single word
 # write — no SQLite mutex, no cross-thread GC-object mutation — so Stop is instant.
 external define ep_cancel_set with v returning Int
+# SAFETY: cancel EPOCH bump — halts EVERY concurrent run (main + sub-agents +
+# background coordinators) and aborts in-flight LLM reads within ~1s. Latch, not a
+# consumable flag; see react_loop.ep.
+external define ep_cancel_epoch_bump with dummy returning Int
 
 set IPC_DAEMON_PORT to 5000
 
@@ -1788,6 +1792,12 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         # turn boundary and halts. Generation is bounded (stop sequences + max_tokens), so
         # that boundary arrives in seconds, not never.
         set ok to ep_cancel_set(1)
+        # SAFETY: bump the cancel EPOCH too — the flag above is consume-once (only the
+        # first run to see it halted; sub-agents kept working). The epoch is a latch:
+        # every concurrent run compares against its start value, so ONE Stop halts the
+        # main agent, every sub-agent, and background coordinators, and aborts their
+        # in-flight LLM reads within ~1s.
+        set ok to ep_cancel_epoch_bump(0)
         set ok to send_response(client_fd and 200 and "application/json" and "{\"status\":\"ok\",\"cancelled\":true}")
         return 0
 

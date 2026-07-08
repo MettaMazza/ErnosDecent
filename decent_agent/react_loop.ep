@@ -25,6 +25,14 @@ import "sql"
 # GC-managed object from another thread). ep_cancel_get takes a dummy arg for ABI parity.
 external define ep_cancel_set with v returning Int
 external define ep_cancel_get with dummy returning Int
+# SAFETY: cancel EPOCH (monotonic latch) — the consume-once flag above could only halt
+# ONE of N concurrent runs (main agent + sub-agents + background coordinators): whoever
+# read it first cleared it. Every run now captures the epoch at its start and halts when
+# the current value is GREATER; nothing consumes, so a single Stop halts EVERYTHING at
+# once, and runs started after the Stop are unaffected. Any targeted cancel (per-session
+# map/row) also BUMPS the epoch so a Stop from any surface is a global stop.
+external define ep_cancel_epoch_get with dummy returning Int
+external define ep_cancel_epoch_bump with dummy returning Int
 
 # F4: cooperative cancellation registry. A Stop button / `AI CANCEL` IPC sets a
 # per-session flag on a SEPARATE connection while react_run_loop is blocked on the
@@ -59,8 +67,16 @@ define react_request_cancel with session_id as Str returning Int:
         set ok to sql_execute(db and f"INSERT OR REPLACE INTO trace_cancellations (session_id) VALUES ('{es}');")
     return 0
 
-# Check and CONSUME a pending cancellation (called by the loop each turn).
-define react_check_cancel with session_id as Str returning Int:
+# Check a pending cancellation (called by every run at its turn boundaries).
+# run_epoch is the cancel epoch the RUN captured at its start: any bump since then
+# halts this run — compared, never consumed, so all concurrent runs see one Stop.
+# Targeted cancels (per-session map/SQLite rows) are consumed as before, but ALSO bump
+# the epoch: a Stop from any surface halts the whole system and every sub-agent.
+define react_check_cancel with session_id as Str and run_epoch as Int returning Int:
+    # 1. Epoch latch — cheapest check first; catches a Stop from ANY surface.
+    if ep_cancel_epoch_get(0) > run_epoch:
+        return 1
+
     set key to react_cancel_key(session_id)
     set ok to lock_mutex(RUN_CANCEL_LOCK)
     set hit to map_contains(RUN_CANCEL_MAP and key)
@@ -68,18 +84,18 @@ define react_check_cancel with session_id as Str returning Int:
         set ok to map_delete(RUN_CANCEL_MAP and key)
     set ok to unlock_mutex(RUN_CANCEL_LOCK)
     if hit == 1:
+        set ok to ep_cancel_epoch_bump(0)
         return 1
 
-    # Global cancel-all flag: the /api/cancel Stop path. Checked before any SQLite so a
-    # Stop is seen at the very next turn boundary regardless of how DB-busy the turn was.
+    # Legacy consume-once flag (older callers of ep_cancel_set) — translate to a bump.
     if ep_cancel_get(0) == 1:
         set ok to ep_cancel_set(0)
+        set ok to ep_cancel_epoch_bump(0)
         return 1
 
-    # Check SQLite DB. Also honor the global '__CANCEL_ALL__' sentinel, which the web
-    # server's /api/cancel writes directly (in-process) to halt whatever run is active —
-    # this is the Stop path that does NOT depend on the (single-threaded, busy) IPC
-    # daemon accepting an 'AI CANCEL' connection mid-run.
+    # SQLite rows: the per-session 'AI CANCEL' path and the '__CANCEL_ALL__' sentinel
+    # the bridge writes directly when the (single-threaded, busy) IPC daemon cannot be
+    # reached mid-run. Consumed here, then broadcast via the epoch.
     set db to storage_get_db()
     if db != 0:
         set es to string_replace(key and "'" and "''")
@@ -88,8 +104,8 @@ define react_check_cancel with session_id as Str returning Int:
             set first_row to get_list(rows and 0)
             set count_str to get_list(first_row and 0)
             if string_to_int(count_str) > 0:
-                # Consume it (both the per-session row and the global sentinel).
                 set ok to sql_execute(db and f"DELETE FROM trace_cancellations WHERE session_id='{es}' OR session_id='__CANCEL_ALL__';")
+                set ok to ep_cancel_epoch_bump(0)
                 return 1
     return 0
 
@@ -506,6 +522,10 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
     set finished to 0
     set reply_blocks to 0
     set override_output to ""
+    # SAFETY: capture the cancel epoch at RUN start. Any Stop after this point (from any
+    # surface, for any session) makes ep_cancel_epoch_get exceed this and halts the run
+    # at its next boundary — while in-flight LLM reads abort within ~1s on their own.
+    set run_epoch to ep_cancel_epoch_get(0)
     
     # Check if we are running under automated test suite
     set is_test to 0
@@ -537,7 +557,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         if map_contains(ctx and "session_id") == 1:
             set f4_sess to map_get_val(ctx and "session_id")
         set ok to tools_set_active_session(f4_sess)
-        if react_check_cancel(f4_sess) == 1:
+        if react_check_cancel(f4_sess and run_epoch) == 1:
             display "[ReAct] Run halted by user (cancel)."
             set ok to map_insert(ctx and "was_cancelled" and 1)
             set final_answer to "Run halted at your request."
@@ -594,6 +614,13 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set raw_output to react_simulate_inference(query_prompt and loop_idx)
                 else if use_simulation == 0:
                     set raw_output to inference_run(model and query_prompt and 0 and 200)
+                else if ep_cancel_epoch_get(0) > run_epoch:
+                    # The empty response came from a Stop-aborted read, not a dead
+                    # server — report the halt, not a fake model failure.
+                    display "[ReAct] Run halted by user (Stop aborted the in-flight inference)."
+                    set ok to map_insert(ctx and "was_cancelled" and 1)
+                    set final_answer to "Run halted at your request."
+                    set finished to 1
                 else:
                     # No LLM available — tell user instead of faking it with hardcoded heuristics
                     display "[ReAct] No LLM response and no local model loaded. Returning error."
@@ -828,7 +855,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set cxl_sess to ""
                     if map_contains(ctx and "session_id") == 1:
                         set cxl_sess to map_get_val(ctx and "session_id")
-                    if react_check_cancel(cxl_sess) == 1:
+                    if react_check_cancel(cxl_sess and run_epoch) == 1:
                         display "[ReAct] Run halted by user (cancel) instead of pausing for approval."
                         set ok to map_insert(ctx and "was_cancelled" and 1)
                         free_list(args_list)
@@ -1273,8 +1300,14 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set cancel_db to storage_get_db()
     if cancel_db != 0:
         set ok to sql_execute(cancel_db and "DELETE FROM trace_cancellations WHERE session_id='__CANCEL_ALL__';")
-    # Clear the C-level cancel-all flag too, so a Stop meant for a prior run cannot halt
-    # this fresh one on turn 1. A Stop during THIS run is set after this point and honored.
+        # Also clear a stale PER-SESSION row for this session: react_check_cancel now
+        # BROADCASTS consumed cancels via the epoch, so a leftover row from a prior run
+        # would otherwise halt not just this fresh run but every concurrent one.
+        set stale_es to string_replace(react_cancel_key(stale_sid) and "'" and "''")
+        set ok to sql_execute(cancel_db and f"DELETE FROM trace_cancellations WHERE session_id='{stale_es}';")
+    # Clear the C-level legacy cancel-all flag too, so a Stop meant for a prior run
+    # cannot halt this fresh one on turn 1 (the EPOCH needs no clearing — runs capture
+    # the current value at start, so old bumps are already behind them).
     set ok to ep_cancel_set(0)
     set sanitized_user_prompt to prompt_sanitize_input(user_prompt)
     # Trigger Hebbian learning on prompt concepts
