@@ -24,6 +24,7 @@ import "../decent_name/registry"
 import "./turing_grid"
 import "./synaptic_tool"
 import "./prompt"
+import "./trace"
 import "./scheduler_tool"
 import "./compiler_tool"
 import "./web_search"
@@ -42,6 +43,13 @@ import "../decent_store/rag"
 import "./orchestrator"
 
 external define tools_set_active_session with sid as Str returning Int
+# P11 (test_all_systems): async-yielding sleep between sub-agent polls, the global
+# cancel flag (honor a user Stop between blocks), and the ms clock for wall time.
+# All are C helpers injected by build.sh; also declared where llm/react_loop use them.
+external define ep_async_sleep_ms with ms returning Int
+external define ep_cancel_get with dummy returning Int
+external define ep_cancel_set with v returning Int
+external define ep_time_now_ms returning Int
 
 define append_string_to_char_list with char_list as List and s as Str returning Int:
     set len to string_length(s)
@@ -313,6 +321,10 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "- persona_register([name: Str, text: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Register (or overwrite) a persona prompt under a name — does NOT activate it; follow with persona_set. Names: lowercase/digits/_/-.\n")
         set schemas to concat(schemas and "  Example: Action: persona_register([\"scholar\", \"Your name is Scholar. ...\"])\n\n")
+
+        set schemas to concat(schemas and "- test_all_systems([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Run the FULL system validation (master_prompt.md, 13 blocks) via sequential sub-agents and write a per-block scorecard report into the workspace (auto-attached). SLOW (many minutes). Approval-gated blocks run only when session auto-approve is ON; the Discord block auto-skips off-platform. Destructive/never-run tools stay excluded.\n")
+        set schemas to concat(schemas and "  Example: Action: test_all_systems([])\n\n")
 
         set schemas to concat(schemas and "- dht_store([key: Str, val: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Store public metadata/records in DHT. APPROVAL REQUIRED. WARNING: Public network store; never put keys, user data, or personal details here.\n")
@@ -2064,6 +2076,124 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         return rag_search_paged(storage_get_db() and rr_query and rr_sess and 10 and rr_offset)
 
     # ---- Orchestration tools ----
+    if action_name equals "test_all_systems":
+        # P11: autonomous full validation — the 13 master_prompt.md blocks run as
+        # SEQUENTIAL sub-agents (they share one LLM and one async loop; parallel blocks
+        # would contend and interleave their tool state), each result collected into a
+        # workspace report that is auto-attached. Owner/admin by the default deny gate.
+        set ta_orch to map_get_val(ctx and "orchestrator")
+        if ta_orch == 0:
+            return "Error: Orchestrator not initialized."
+        set ta_mp to ""
+        if file_exists("master_prompt.md") == 1:
+            set ta_mp to read_file("master_prompt.md")
+        if string_length(ta_mp) == 0:
+            return "Error: master_prompt.md not found in the project root."
+        set ta_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set ta_sid to map_get_val(ctx and "session_id")
+        set ta_platform to ""
+        if map_contains(ctx and "platform") == 1:
+            set ta_platform to map_get_val(ctx and "platform")
+        # Session auto-approve state (P4) — approval-gated blocks (8: run_command/
+        # codebase_write, 9: download_tool) run ONLY under the operator's session grant;
+        # a sub-agent must never self-approve.
+        set ta_aa to 0
+        if map_contains(ctx and "session_auto_approve") == 1:
+            set ta_aa_map to map_get_val(ctx and "session_auto_approve")
+            if map_contains(ta_aa_map and ta_sid) == 1:
+                set ta_aa to 1
+        if ta_aa == 1:
+            set ok to map_insert(ctx and "child_auto_approve" and 1)
+        set ta_db to storage_get_db()
+        set ta_model to map_get_val(ctx and "model")
+        set ta_memory to map_get_val(ctx and "memory_mgr")
+        set ta_tools to map_get_val(ctx and "tools_mgr")
+        set ta_started to ep_time_now_ms()
+        set ta_report to "# Full System Validation Report\n\n"
+        set ta_pass_blocks to 0
+        set ta_skip_blocks to 0
+        set ta_fail_blocks to 0
+        set ta_sections to string_split(ta_mp and "\n## ")
+        set ta_nsec to length_list(ta_sections)
+        set ta_bn to 0
+        set ta_si to 1
+        set ta_halted to 0
+        repeat while ta_si < ta_nsec and also ta_halted == 0:
+            set ta_sec to get_list(ta_sections and ta_si)
+            # Fenced block content between ``` markers; sections without a fence are prose.
+            set ta_f1 to string_index_of(ta_sec and "```")
+            if ta_f1 >= 0:
+                set ta_bn to ta_bn + 1
+                set ta_title to ta_sec
+                set ta_nl to string_index_of(ta_sec and "\n")
+                if ta_nl >= 0:
+                    set ta_title to string_trim(substring(ta_sec and 0 and ta_nl))
+                set ta_body_start to ta_f1 + 4
+                set ta_rest to substring(ta_sec and ta_body_start and string_length(ta_sec) - ta_body_start)
+                set ta_f2 to string_index_of(ta_rest and "```")
+                set ta_block to ""
+                if ta_f2 > 0:
+                    set ta_block to string_trim(substring(ta_rest and 0 and ta_f2))
+                if string_length(ta_block) > 0:
+                    # Honor a user Stop between blocks (consume it and report partial).
+                    if ep_cancel_get(0) == 1:
+                        set ok to ep_cancel_set(0)
+                        set ta_report to concat(ta_report and "\n**HALTED by user Stop — remaining blocks not run.**\n")
+                        set ta_halted to 1
+                    else:
+                        set ta_skip_reason to ""
+                        if ta_bn == 8 or else ta_bn == 9:
+                            if ta_aa == 0:
+                                set ta_skip_reason to "approval-gated — enable session auto-approve (/autoapprove on) to include it"
+                        if ta_bn == 11:
+                            if ta_platform equals "discord":
+                                set ta_skip_reason to ta_skip_reason
+                            else:
+                                set ta_skip_reason to "Discord-surface block — this run did not originate on Discord"
+                        if string_length(ta_skip_reason) > 0:
+                            set ta_skip_blocks to ta_skip_blocks + 1
+                            set ta_report to concat(ta_report and f"## Block {ta_bn} — {ta_title}\n⏭️ SKIPPED: {ta_skip_reason}\n\n")
+                            set ok to trace_emit(ta_db and ta_sid and "mid_message" and f"🧪 test_all_systems: block {ta_bn} ({ta_title}) skipped — {ta_skip_reason}")
+                        else:
+                            set ok to trace_emit(ta_db and ta_sid and "mid_message" and f"🧪 test_all_systems: running block {ta_bn} — {ta_title}")
+                            set ta_instr to concat("[AUTOMATED VALIDATION SUB-AGENT] You are executing ONE block of the full-system validation. Execute it exactly, no questions, and END with reply_request containing the scorecard table.\n\n" and ta_block)
+                            set ta_tid to orchestrator_spawn(ta_orch and ta_instr and f"validator-block-{ta_bn}" and ta_model and ta_memory and ta_tools and cast_map_to_int(ctx))
+                            set ta_waited to 0
+                            set ta_done to 0
+                            set ta_result to ""
+                            repeat while ta_waited < 900000 and also ta_done == 0:
+                                set ta_st to orchestrator_check(ta_orch and ta_tid)
+                                if string_index_of(ta_st and "completed:") == 0:
+                                    set ta_result to substring(ta_st and 10 and string_length(ta_st) - 10)
+                                    set ta_done to 1
+                                else if ta_st equals "cancelled" or else ta_st equals "not_found":
+                                    set ta_result to concat("(sub-agent " and concat(ta_st and ")"))
+                                    set ta_done to 1
+                                else:
+                                    set ok to await ep_async_sleep_ms(2000)
+                                    set ta_waited to ta_waited + 2000
+                            if ta_done == 0:
+                                set ta_result to "⏰ TIMEOUT: block did not complete within 15 minutes."
+                                set ta_fail_blocks to ta_fail_blocks + 1
+                            else:
+                                if string_contains(ta_result and "PENDING_APPROVAL") == 1 or else string_contains(string_upper(ta_result) and "FAIL") == 1 or else string_contains(ta_result and "❌") == 1:
+                                    set ta_fail_blocks to ta_fail_blocks + 1
+                                else:
+                                    set ta_pass_blocks to ta_pass_blocks + 1
+                            set ta_report to concat(ta_report and f"## Block {ta_bn} — {ta_title}\n{ta_result}\n\n")
+            set ta_si to ta_si + 1
+        if ta_aa == 1:
+            set ok to map_delete(ctx and "child_auto_approve")
+        set ta_wall to (ep_time_now_ms() - ta_started) / 1000
+        set ta_report to concat(ta_report and f"---\n**Blocks: {ta_bn} total — {ta_pass_blocks} clean, {ta_fail_blocks} with failures/timeouts, {ta_skip_blocks} skipped. Wall time: {ta_wall}s.** Per-call prefill/decode timings are in the node log ([LLM TTFT]).\n")
+        set ta_fname to concat("validation_report_" and concat(int_to_string(ta_started) and ".md"))
+        set ta_path to workspace_write_file(ta_fname and ta_report)
+        set ta_note to ""
+        if tools_emit_attachment(ta_sid and ta_path) == 0:
+            set ta_note to " (Attached to the chat.)"
+        return f"Full validation finished: {ta_bn} blocks — {ta_pass_blocks} clean, {ta_fail_blocks} with failures/timeouts, {ta_skip_blocks} skipped, {ta_wall}s. Report: {ta_path}{ta_note}"
+
     if action_name equals "delegate_task":
         if length_list(args_list) < 2:
             return "Error: delegate_task requires 2 arguments: instruction (Str) and role (Str)."
