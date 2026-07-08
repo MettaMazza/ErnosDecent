@@ -231,6 +231,70 @@ async def autoapprove_cmd(interaction: discord.Interaction, state: discord.app_c
     else:
         await interaction.followup.send(f"⚠️ Could not toggle auto-approve: {resp}")
 
+class FactoryConfirmView(discord.ui.View):
+    """Two-step confirmation for /factory — destructive, so a misclick must not fire it."""
+    def __init__(self, author):
+        super().__init__(timeout=60)
+        self.author = author
+        self.value = None
+
+    @discord.ui.button(label="Yes, wipe the agent's mind", emoji="🧨", style=discord.ButtonStyle.red)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.author:
+            await interaction.response.send_message("❌ Only the requester can confirm this.", ephemeral=True)
+            return
+        self.value = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=interaction.message.content, view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", emoji="↩️", style=discord.ButtonStyle.gray)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.author:
+            await interaction.response.send_message("❌ Only the requester can cancel this.", ephemeral=True)
+            return
+        self.value = False
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=interaction.message.content, view=self)
+        self.stop()
+
+FACTORY_WARNING = (
+    "🧨 **Factory reset** — this permanently WIPES the agent's mind:\n"
+    "sessions & transcripts, workspaces & generated files, all memory tiers "
+    "(scratchpad/lessons/timeline/synaptic graph), learning buffers, RAG index, "
+    "user & self knowledge, self-prompt sections, traces, project links.\n"
+    "**Kept:** all prompting (kernel, personas, identity files), node keys/wallet/"
+    "ledger/DHT/name registry, and configuration.\n\nAre you sure?"
+)
+
+async def run_factory_reset(send_reply):
+    resp = await send_daemon_ipc("AI FACTORY")
+    if resp and resp.startswith("factory:ok"):
+        await send_reply("🏭 **Factory reset complete.** The agent is a blank slate — prompting and node identity intact. A fresh `default` session is active.")
+    else:
+        await send_reply(f"⚠️ Factory reset failed: {resp}")
+
+@tree.command(name="factory", description="FACTORY RESET — wipe all agent data/memory (keeps prompting + node identity)")
+async def factory_cmd(interaction: discord.Interaction):
+    if not _interaction_in_channel(interaction):
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+    if not is_admin_author(interaction.user):
+        await interaction.response.send_message("❌ Only the operator can factory-reset the agent.", ephemeral=True)
+        return
+    view = FactoryConfirmView(author=interaction.user)
+    await interaction.response.send_message(FACTORY_WARNING, view=view)
+    timed_out = await view.wait()
+    if timed_out or view.value is not True:
+        try:
+            await interaction.edit_original_response(content="↩️ Factory reset cancelled.", view=None)
+        except Exception:
+            pass
+        return
+    await run_factory_reset(lambda text: interaction.followup.send(text))
+
 # Approval timeout in seconds
 # No timeout — user said "WAIT" (indefinite)
 APPROVAL_TIMEOUT = None
@@ -1498,6 +1562,18 @@ async def on_message(message):
                     pass
             return
         
+        # /factory — text fallback requires the literal word CONFIRM (destructive).
+        if message.content.strip().lower().startswith("/factory"):
+            if not is_admin_author(message.author):
+                await message.reply("❌ Only the operator can factory-reset the agent.")
+                return
+            parts = message.content.strip().split(maxsplit=1)
+            if len(parts) < 2 or parts[1].strip() != "CONFIRM":
+                await message.reply(FACTORY_WARNING + "\n\nType `/factory CONFIRM` (exact) or use the /factory slash command's buttons.")
+                return
+            await run_factory_reset(lambda text: message.reply(text))
+            return
+
         # P9: /persona <name> | /persona list — activate or list registered personas.
         # (Text fallback; the registered slash command is the primary surface.)
         if message.content.strip().lower().startswith("/persona"):
