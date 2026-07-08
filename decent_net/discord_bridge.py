@@ -345,11 +345,14 @@ async def _delayed_delete(msg, delay_seconds):
     except Exception:
         pass
 
-async def send_discord_reply(message, text, speakable=False, edit_msg=None):
+async def send_discord_reply(message, text, speakable=False, edit_msg=None, files=None):
     """Send a reply, splitting into chunks if it exceeds Discord's 2000-char limit.
     When speakable=True, a 🔊 button is attached to the final chunk that plays the
     full message audio (the whole text, not just that chunk).
-    If edit_msg is provided, it edits that message first instead of creating a new one."""
+    If edit_msg is provided, it edits that message first instead of creating a new one.
+    `files` (discord.File list) ride WITH the reply — attached to the final message so a
+    generated image / created file arrives clean on the response, not as a separate message."""
+    files = files or []
     try:
         if not text or not text.strip():
             text = "..."
@@ -371,17 +374,20 @@ async def send_discord_reply(message, text, speakable=False, edit_msg=None):
             else:
                 for idx, chunk in enumerate(chunks):
                     is_last = (idx == len(chunks) - 1)
-                    await message.reply(chunk, view=(view if is_last else None))
+                    await message.reply(chunk, view=(view if is_last else None), files=(files if is_last else []))
         else:
             if edit_msg:
                 try:
                     await edit_msg.edit(content=text, view=view)
                     print(f"[DELIVERY] edit_msg.edit() succeeded, msg_id={edit_msg.id}", flush=True)
+                    # Edits can't add attachments — send the files as a follow-up on the same reply.
+                    if files:
+                        await message.reply(content=None, files=files)
                 except Exception as edit_err:
                     print(f"[DELIVERY] edit_msg.edit() FAILED: {type(edit_err).__name__}: {edit_err} — falling back to reply", flush=True)
-                    await message.reply(text, view=view)
+                    await message.reply(text, view=view, files=files)
             else:
-                await message.reply(text, view=view)
+                await message.reply(text, view=view, files=files)
     except Exception as e:
         print(f"[DELIVERY] send_discord_reply OUTER EXCEPTION: {type(e).__name__}: {e}", flush=True)
 
@@ -538,7 +544,7 @@ def db_poll_traces(session_id):
         conn = sqlite3.connect(get_db_path())
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND session_id=? ORDER BY id LIMIT 50",
+            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type != 'attachment' AND session_id=? ORDER BY id LIMIT 50",
             (session_id,)
         )
         rows = cursor.fetchall()
@@ -555,6 +561,42 @@ def db_poll_traces(session_id):
     except Exception as e:
         print(f"[Discord Bridge] Failed to query trace_events: {e}", flush=True)
     return events
+
+def db_collect_attachments(session_id):
+    """Collect this turn's file attachments (paths) and mark them sent. These are NOT posted
+    as separate messages (db_poll_traces excludes them) — they ride WITH the final reply so the
+    image/file arrives attached to the response, cleanly, instead of mid-generation."""
+    paths = []
+    try:
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, content FROM trace_events WHERE sent=0 AND event_type='attachment' AND session_id=? ORDER BY id",
+            (session_id,)
+        )
+        for r in cursor.fetchall():
+            paths.append(r[1])
+            cursor.execute("UPDATE trace_events SET sent=1 WHERE id=?", (r[0],))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Discord Bridge] Failed to collect attachments: {e}", flush=True)
+    return paths
+
+def build_discord_files(paths):
+    """Build discord.File objects from attachment paths, secret-safe + size-capped."""
+    out = []
+    for p in paths or []:
+        p = (p or "").strip()
+        low = p.lower()
+        if not p or any(m in low for m in _ATTACH_DENY_MARKERS):
+            continue
+        try:
+            if os.path.isfile(p) and os.path.getsize(p) <= _ATTACH_MAX_BYTES:
+                out.append(discord.File(p, filename=os.path.basename(p)))
+        except Exception as e:
+            print(f"[Discord Bridge] build_discord_files skip {p}: {e}", flush=True)
+    return out
 
 def db_get_pending_deletes():
     pending = []
@@ -752,7 +794,8 @@ async def handle_tool_approval(message, resp, edit_msg=None):
     elif ipc_resp.startswith("ai:ok"):
         ai_resp = extract_ai_ok_response(ipc_resp)
         print(f"[DELIVERY] Approval result: ai:ok, len={len(ai_resp)}", flush=True)
-        await send_discord_reply(message, ai_resp, speakable=True, edit_msg=edit_msg)
+        _att = build_discord_files(db_collect_attachments(active_session_id or "default"))
+        await send_discord_reply(message, ai_resp, speakable=True, edit_msg=edit_msg, files=_att)
     elif ipc_resp == "error:daemon_offline" or ipc_resp == "error:daemon_rebooted":
         print(f"[DELIVERY] Approval result: {ipc_resp}", flush=True)
         await send_discord_reply(message, "🔄 Daemon went offline during processing. Please retry.", edit_msg=edit_msg)
@@ -1230,8 +1273,10 @@ async def _run_query_bg(message, reply_msg):
                     await reply_msg.delete()
                 except Exception as del_err:
                     print(f"[DELIVERY] placeholder delete failed (continuing): {type(del_err).__name__}: {del_err}", flush=True)
-            await send_discord_reply(message, ai_resp, speakable=True, edit_msg=None)
-            print("[DELIVERY] send_discord_reply returned OK", flush=True)
+            # Files the agent produced this turn (generated image / created file) ride WITH the reply.
+            _att = build_discord_files(db_collect_attachments(active_session_id or "default"))
+            await send_discord_reply(message, ai_resp, speakable=True, edit_msg=None, files=_att)
+            print(f"[DELIVERY] send_discord_reply returned OK (files={len(_att)})", flush=True)
     except Exception as e:
         print(f"[DELIVERY] EXCEPTION in response path: {type(e).__name__}: {e}", flush=True)
         try:
