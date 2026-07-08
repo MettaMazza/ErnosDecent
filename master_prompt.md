@@ -1,5 +1,18 @@
 # ErnOS Full-System Diagnostic — Master Prompt
 
+## One-message version (fits one Discord message, <2000 chars) — copy this:
+
+```
+SELF-TEST, ONE turn, no questions. Log ✅/❌/⏭️+reason, reuse ids. End: reply_request table |#|tool|result|detail|+totals.
+wallet_balance([]) workspace_current([]) workspace_list([]) workspace_list_links([]) list_sessions([]) list_lessons([]) get_lesson([1]) autonomy_history([]) performance_review([]) self_prompt_get(["behavior"]) session_prompt_get([]) changelog([5]) operate_scheduler(["list"]) moderation_tool(["ok"]) name_resolve(["x.ernos"]) dht_get(["network:host_nodes"]) git_tool(["status",""]) turing_grid_op(["read",""]) file_info(["node.ep"]) codebase_read(["config/edition.json"]) codebase_read_range(["node.ep",1,10]) timeline_tool(["recent","5"]) kg_tool(["query","Maria","",""]) index_ernos_reference([]) lookup_ernos(["builtins"]) rag_retrieve(["arch"])
+Round-trip: scratchpad_tool write/read/forget; memory_tool store/get/forget; workspace_write(["d.txt","a\nb"])+read+read_range([1,2])+attach_file(["config/workspaces/active/d.txt"]); lessons_tool add/get; reasoning_tool note/read/clear; timeline_tool(["add","ev"]); operate_synaptic_graph stats/store/search/relate; kg_tool add_entity/add_relation; procedure_tool list/store/get; manage_reading_progress bookmark/get_bookmark/note/get_notes; session_prompt_set/get; consolidate_tool([""]); self_prompt(["skills"]) save->set MARK->restore; workspace_link(["/tmp","dt"])->list_links->set_active->unlink; run_ep(["display \"ok\""]); run_command(["echo ok"]); codebase_write config/workspaces/active/cw.txt+read; web_search(["ernos"]); web_visit(["https://example.com"]); search_sessions(["Maria"]); read_transcripts([id]); delegate_task(["Reply only DONE","tester"])->check->wait; discord_list_channels([])->discord_read_channel([id]); react(["✅"]); operate_scheduler(["create","dj","tick","interval","3600"])->list->delete; generate_image(["red cube on white"])
+SKIP(⏭️): system_recompile money_transfer dht_store name_register submit_issue delegate_swarm consolidate-force seed_curriculum request_clarification.
+```
+
+---
+
+## Full version (detailed, numbered)
+
 Copy-paste the block below to Echo (as admin/owner) any time to stress-test **every tool and
 subsystem in one ReAct turn** and get a pass/fail report card. It exercises tools in dependency
 order (reads first, then setup→use→cleanup, then network/heavy), uses correct arguments, and
