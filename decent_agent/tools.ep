@@ -322,6 +322,14 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: Register (or overwrite) a persona prompt under a name — does NOT activate it; follow with persona_set. Names: lowercase/digits/_/-.\n")
         set schemas to concat(schemas and "  Example: Action: persona_register([\"scholar\", \"Your name is Scholar. ...\"])\n\n")
 
+        set schemas to concat(schemas and "- user_knowledge_get([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Read your rolling USER KNOWLEDGE file (also injected into every prompt as [[USER KNOWLEDGE]]). Use it to check what you already know about the user before asking them again.\n")
+        set schemas to concat(schemas and "  Example: Action: user_knowledge_get([])\n\n")
+
+        set schemas to concat(schemas and "- user_knowledge_update([full_text: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: REWRITE your USER KNOWLEDGE file — your durable model of the user (preferences, corrections, lessons, patterns). Pass the COMPLETE new document (read it first, consolidate, keep it compact and factual; 8000-char cap). Update it whenever the user states a durable preference or corrects you.\n")
+        set schemas to concat(schemas and "  Example: Action: user_knowledge_update([\"## Preferences\\n- Prefers concise tables...\\n## Corrections\\n- ...\"])\n\n")
+
         set schemas to concat(schemas and "- test_all_systems([]) -> Str\n")
         set schemas to concat(schemas and "  Description: Run the FULL system validation (master_prompt.md, 13 blocks) via sequential sub-agents and write a per-block scorecard report into the workspace (auto-attached). SLOW (many minutes). Approval-gated blocks run only when session auto-approve is ON; the Discord block auto-skips off-platform. Destructive/never-run tools stay excluded.\n")
         set schemas to concat(schemas and "  Example: Action: test_all_systems([])\n\n")
@@ -1342,6 +1350,26 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if sec equals "behavior" or else sec equals "skills":
             return concat(concat("[[" and concat(string_upper(sec) and "]] = ")) and tools_self_read_section(sec))
         return "Error: unknown section. Editable sections are 'behavior' and 'skills'."
+
+    if action_name equals "user_knowledge_get":
+        set uk_path to storage_user_knowledge_path()
+        if file_exists(uk_path) == 0:
+            return "(empty — nothing recorded about this user yet. Use user_knowledge_update to start the file.)"
+        set uk_body to string_trim(read_file(uk_path))
+        if string_length(uk_body) == 0:
+            return "(empty — nothing recorded about this user yet. Use user_knowledge_update to start the file.)"
+        return uk_body
+
+    if action_name equals "user_knowledge_update":
+        if length_list(args_list) < 1:
+            return "Error: user_knowledge_update requires 1 argument (the complete new document)."
+        set uk_text to ptr_to_str(get_list(args_list and 0))
+        if string_length(string_trim(uk_text)) == 0:
+            return "Error: refusing to blank the user-knowledge file — pass the full consolidated document."
+        if string_length(uk_text) > 8000:
+            return "Error: document exceeds the 8000-char cap — consolidate (merge duplicates, drop stale entries) and retry."
+        set ok to write_file(storage_user_knowledge_path() and uk_text)
+        return "User knowledge updated. It is injected into every prompt from your next turn."
 
     if action_name equals "persona_set":
         if length_list(args_list) < 1:
