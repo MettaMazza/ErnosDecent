@@ -1652,7 +1652,15 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: moderation_tool requires 1 argument (text)."
         # ALL audit decisions via LLM — no hardcoded heuristics.
         set mod_text to get_list(args_list and 0)
-        set mod_result to observer_audit(ctx and "" and mod_text)
+        # KV-CACHE: pass the turn's real prompt as the audit's system context (the react
+        # loop stores it in ctx before tools_execute). A bare "" context made this audit a
+        # DIFFERENT ~7KB prefix on the same model slot, evicting the main prompt's KV cache
+        # — the next main call then re-prefilled the entire prompt from zero (~turn-1 TTFT,
+        # observed mid-batch). With the shared prefix the audit costs only its own suffix.
+        set mod_ctx_prompt to ""
+        if map_contains(ctx and "current_prompt") == 1:
+            set mod_ctx_prompt to map_get_val(ctx and "current_prompt")
+        set mod_result to observer_audit(ctx and mod_ctx_prompt and mod_text)
         set mod_verdict to map_get_val(mod_result and "verdict")
         set mod_reason to map_get_val(mod_result and "reason")
         free_map(mod_result)
