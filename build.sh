@@ -6,6 +6,124 @@
 
 set -e
 
+# ── Shared C-runtime injector (single source of truth) ───────────────────────
+# The ErnosPlain compiler emits forward declarations for a set of runtime helpers
+# but not their bodies; build.sh injects the bodies. The NODE build and the TEST
+# build used to each carry a hand-copied subset of these injections, which drifted:
+# the test build never injected ep_cancel_*, ep_json_escape, or async_wait_readable_
+# timeout, so the whole cognitive-agent test suite failed to LINK (undefined symbols)
+# and could never run — masking every regression. This one function is now the ONLY
+# place the additive helpers are defined, and BOTH builds call it, so they cannot
+# diverge again. Injected before the 2nd ep_net_send (a point where the runtime
+# types EpFuture/EpReadReadyArgs/EpTask are already defined). Idempotent.
+inject_additive_helpers() {
+    local CFILE="$1"
+    if grep -aq "long long cast_borrow_to_map(long long b) {" "$CFILE"; then
+        echo "[*] additive helpers already present in $CFILE."
+        return 0
+    fi
+    CFILE="$CFILE" python3 -c "
+import os
+cfile = os.environ['CFILE']
+with open(cfile, 'r') as f:
+    content = f.read()
+inject = '''
+long long cast_borrow_to_map(long long b) {
+    return b;
+}
+
+long long cast_map_to_int(long long m) {
+    return m;
+}
+
+/* Global cancel-all flag (see node build notes). */
+volatile long long ep_cancel_all_flag = 0;
+long long ep_cancel_set(long long v) {
+    ep_cancel_all_flag = v;
+    return 0;
+}
+long long ep_cancel_get(long long dummy) {
+    return ep_cancel_all_flag;
+}
+
+/* One-pass O(n) JSON string escaper (replaces the O(n^2) pure-.ep version). */
+long long ep_json_escape(long long s_ptr) {
+    const char* s = (const char*)s_ptr;
+    if (!s) return (long long)strdup(\"\");
+    size_t len = strlen(s);
+    char* out = (char*)malloc(len * 6 + 1);
+    if (!out) return (long long)strdup(\"\");
+    static const char hexd[] = \"0123456789abcdef\";
+    size_t j = 0;
+    size_t i;
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 34)      { out[j++]=92; out[j++]=34;  }
+        else if (c == 92) { out[j++]=92; out[j++]=92;  }
+        else if (c == 10) { out[j++]=92; out[j++]=110; }
+        else if (c == 13) { out[j++]=92; out[j++]=114; }
+        else if (c == 9)  { out[j++]=92; out[j++]=116; }
+        else if (c < 32)  { out[j++]=92; out[j++]=117; out[j++]=48; out[j++]=48; out[j++]=hexd[(c>>4)&15]; out[j++]=hexd[c&15]; }
+        else              { out[j++]=(char)c; }
+    }
+    out[j] = 0;
+    long long r = (long long)strdup(out);
+    free(out);
+    return r;
+}
+
+/* Awaitable readable-OR-timeout future. */
+static long long ep_readto_read_step(void* r) {
+    EpReadReadyArgs* a = (EpReadReadyArgs*)r;
+    if (a && a->fut && !a->fut->completed) {
+        a->fut->completed = 1; a->fut->value = 1;
+        if (a->fut->waiting_task) { ep_task_enqueue(a->fut->waiting_task); a->fut->waiting_task = NULL; }
+    }
+    return 0;
+}
+static long long ep_readto_timer_step(void* r) {
+    EpReadReadyArgs* a = (EpReadReadyArgs*)r;
+    if (a && a->fut && !a->fut->completed) {
+        a->fut->completed = 1; a->fut->value = 0;
+        if (a->fut->waiting_task) { ep_task_enqueue(a->fut->waiting_task); a->fut->waiting_task = NULL; }
+    }
+    return 0;
+}
+long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
+    EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
+    fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;
+    { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
+    EpReadReadyArgs* rargs = (EpReadReadyArgs*)malloc(sizeof(EpReadReadyArgs));
+    rargs->fut = fut;
+    EpTask* rtask = (EpTask*)malloc(sizeof(EpTask));
+    rtask->step = ep_readto_read_step; rtask->args = rargs;
+    rtask->args_size_bytes = sizeof(EpReadReadyArgs);
+    rtask->fut = NULL; rtask->state = 0; rtask->is_cancelled = 0; rtask->parent = ep_current_task;
+    ep_async_register_read((int)fd, rtask);
+    EpReadReadyArgs* targs = (EpReadReadyArgs*)malloc(sizeof(EpReadReadyArgs));
+    targs->fut = fut;
+    EpTask* ttask = (EpTask*)malloc(sizeof(EpTask));
+    ttask->step = ep_readto_timer_step; ttask->args = targs;
+    ttask->args_size_bytes = sizeof(EpReadReadyArgs);
+    ttask->fut = NULL; ttask->state = 0; ttask->is_cancelled = 0; ttask->parent = ep_current_task;
+    ep_async_register_timer(timeout_ms, ttask);
+    return (long long)fut;
+}
+
+'''
+pat = 'long long ep_net_send(long long fd, const char* data) {'
+first = content.find(pat)
+second = content.find(pat, first + 1)
+if second > 0:
+    content = content[:second] + inject + content[second:]
+    with open(cfile, 'w') as f:
+        f.write(content)
+    print('Injected additive runtime helpers (cast/cancel/json/async) into ' + cfile)
+else:
+    print('WARNING: could not find second ep_net_send in ' + cfile + ' — additive helpers NOT injected')
+"
+}
+
 if [ "$1" = "test" ] || [ "$1" = "--test" ]; then
     echo "[*] Building Cognitive Agent Test Suite..."
     
@@ -31,15 +149,9 @@ with open('decent_agent/test_agent_compiled.c', 'r') as f:
     content = f.read()
 content = content.replace('long long ep_mutex_lock(long long);', '')
 content = content.replace('long long ep_mutex_unlock(long long);', '')
+# NOTE: cast_borrow_to_map/cast_map_to_int (and cancel/json/async) are injected by the
+# SHARED inject_additive_helpers() below, so they are NOT defined here (would double-define).
 inject = '''
-long long cast_borrow_to_map(long long b) {
-    return b;
-}
-
-long long cast_map_to_int(long long m) {
-    return m;
-}
-
 long long ep_net_send_raw(long long fd, long long buf, long long count) {
     if (count <= 0 || buf == 0) return 0;
     const char* p = (const char*)buf;
@@ -142,7 +254,12 @@ with open('decent_agent/test_agent_compiled.c', 'w') as f:
 print('Patched conflicting mutex declarations, test blocking barriers, and SQLite thread-safety in test_agent_compiled.c')
 "
 
-    
+    # Additive runtime helpers (cast/cancel/json/async) via the SHARED injector — the root
+    # fix for the cognitive-agent test suite failing to LINK: it never injected ep_cancel_*,
+    # ep_json_escape, or async_wait_readable_timeout, so it never built and every regression
+    # went unseen. Same function the node build uses; the two can no longer drift.
+    inject_additive_helpers decent_agent/test_agent_compiled.c
+
     # Setup library paths
     CFLAGS="-O2 -lpthread -DEP_HAS_SQLITE -lsqlite3 -Wno-int-conversion -Wno-parentheses-equality"
     OS="$(uname -s)"
@@ -394,8 +511,12 @@ else:
     echo "[*] Injected ep_net_send_raw (binary-safe send)."
 fi
 
-# Step 2c: Inject cast_borrow_to_map & cast_map_to_int
-if grep -q "long long cast_borrow_to_map(long long b) {" node_compiled.c; then
+# Step 2c: Inject additive runtime helpers via the SHARED injector (single source of
+# truth, also used by the test build so they cannot drift). The inline block below is
+# kept only as a fallback and is now skipped by its own guard once the shared injector
+# has run (grep finds cast_borrow_to_map already present).
+inject_additive_helpers node_compiled.c
+if grep -aq "long long cast_borrow_to_map(long long b) {" node_compiled.c; then
     echo "[*] cast_borrow_to_map already present."
 else
     python3 -c "
