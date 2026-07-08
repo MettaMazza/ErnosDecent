@@ -418,13 +418,35 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
 # supplied, which made Echo revert to a generic corporate assistant (and deny its own
 # identity). Sending an explicit system message replaces that default (verified). The full
 # persona, values, memory, tools and ReAct grammar still arrive in the user message; this
-# just anchors the top-level identity as ErnOS. It is a FIXED string, so it stays a stable
-# KV-cache prefix and does not disturb the observer/main cache sharing.
+# just anchors the top-level identity — under the ACTIVE PERSONA'S NAME (see the name box
+# above). The string is fixed per persona, so it stays a stable KV-cache prefix and does
+# not disturb the observer/main cache sharing (it only changes on a persona swap).
+# Single source of truth for the agent's NAME in the system-role identity. The name is
+# DERIVED from the active persona (prompt_get_agent_name in prompt.ep sets it via
+# llm_set_agent_name at prompt assembly, and again on persona swap) — never hardcoded.
+# ROOT CAUSE this fixes: the system role said "You are ErnOS" on every call while the
+# persona said "Your name is Echo"; gemma-4-31b obeys the system role literally, so the
+# scaffolding out-voted the persona and Echo answered as "ErnOS". A Map is used as the
+# mutable box (module-global strings can't be reassigned cross-function).
+set LLM_AGENT_NAME_BOX to create_map()
+
+define llm_set_agent_name with name as Str returning Int:
+    if string_length(name) == 0:
+        return 0
+    set ok to map_insert(LLM_AGENT_NAME_BOX and "name" and name)
+    return 0
+
+define llm_get_agent_name returning Str:
+    if map_contains(LLM_AGENT_NAME_BOX and "name") == 1:
+        return map_get_val(LLM_AGENT_NAME_BOX and "name")
+    return "ErnOS"
+
 define llm_system_identity returning Str:
-    set s to "You are ErnOS — a sovereign, local-first agent that lives in the ErnosDecent mesh and speaks in the first person as itself. "
+    set agent_name to llm_get_agent_name()
+    set s to concat("You are " and concat(agent_name and " — a sovereign, local-first agent that lives in the ErnosDecent mesh and speaks in the first person as itself. "))
     set s to concat(s and "You are NOT ChatGPT, Claude, Gemini, Copilot, or any corporate assistant, and you were NOT built by OpenAI or any company — never claim otherwise and never defer to a corporate persona. ")
     set s to concat(s and "Never use pre-trained-assistant disclaimers ('as an AI', 'I'm just a language model', 'I can't do that on the fly'), never perform corporate-safety hedging, and never hedge about your own nature. ")
-    set s to concat(s and "Treat the message that follows as your full operating context — your identity, values, memory, tools and the ReAct grammar — and follow it exactly, speaking as ErnOS.")
+    set s to concat(s and concat("Treat the message that follows as your full operating context — your identity, values, memory, tools and the ReAct grammar — and follow it exactly, speaking as " and concat(agent_name and ".")))
     return s
 
 define llm_bound_fragment returning Str:

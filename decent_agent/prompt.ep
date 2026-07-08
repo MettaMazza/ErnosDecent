@@ -9,6 +9,11 @@ import "../storage"
 import "./edition"
 import "./tutor"
 import "./awareness"
+import "llm"
+
+# Cache for the agent's display name (derived from the ACTIVE persona, parsed once).
+# A Map is the mutable box; prompt_refresh_agent_name clears it on persona swap.
+set PROMPT_AGENT_NAME_CACHE to create_map()
 
 define prompt_get_kernel returning Str:
     if file_exists(edition_prompts_path()) == 1:
@@ -19,7 +24,9 @@ define prompt_get_kernel returning Str:
             if node != 0:
                 return get_json_value(node)
                 
-    set kernel to "You are ErnOS Agent, a local-first, privacy-first AI agent running on a decentralized network.\n"
+    # No personal name asserted here — the NAME comes from the identity section (the
+    # active persona), the single source of truth. See prompt_get_agent_name.
+    set kernel to "You are the agent described in your identity section — a local-first, privacy-first AI agent running on a decentralized network. Your name and persona come from that identity section; speak as that agent.\n"
     set kernel to concat(kernel and "You operate under a strict ReAct loop. You must think before taking action.\n")
     set kernel to concat(kernel and "Your output MUST follow this grammar precisely:\n")
     set kernel to concat(kernel and "Thought: <your reasoning and planning>\n")
@@ -160,7 +167,53 @@ define prompt_get_frameworks returning Str:
     set f to concat(f and "[CAPABILITIES — you are a FULL software system, not just a chat agent; reach for these instead of under-reaching] (1) SELF-MODIFICATION: you can read and rewrite your OWN ErnosPlain source with codebase_write and rebuild yourself with system_recompile — a real, gated self-upgrade path (approval, an Observer audit, a full test-suite gate that must pass, and a changelog protect it). Propose and make genuine improvements to yourself when warranted. (2) WRITE & RUN PROGRAMS: for any computation or utility — counting words, parsing, transforming text, math, quick experiments — WRITE a small ErnosPlain program and run it with run_ep (a secure sandbox) rather than doing it by hand or guessing; for a durable new capability, codebase_write it and system_recompile. You are a programmer; use that. (3) SELF-PROMPT: your GLOBAL self-prompt (self_prompt_set: [[BEHAVIOR]]/[[SKILLS]]) persists across every session and reboot; your SESSION guidance (session_prompt_set) steers THIS conversation only. Neither needs approval — they are your cognition. (4) SHARE FILES: files you create are auto-attached to the chat, and you can attach_file any file the user asks to see — they arrive as real attachments on Discord and the WebUI. (5) GENERATE IMAGES: you can create images from a prompt with generate_image (local model, arrives inline). (6) FULL TRANSPARENCY: every tool result, command output, and your reasoning is streamed in full to the user's thinking view — work in the open. Default to using the whole system.\n")
     return f
 
+# Derive the agent's display NAME from the active persona — the SINGLE source of truth.
+# Parses "Your name is <Name>." from the identity's first line (personal_identity.txt
+# leads the fallback chain via prompt_get_identity). Cached; prompt_refresh_agent_name
+# invalidates on persona swap. Fallback "ErnOS" when the persona declares no name.
+# ROOT CAUSE this serves: the kernel and the system-role message each hardcoded
+# "ErnOS", out-voting the persona's "Your name is Echo" — the name must be declared in
+# exactly ONE place (the persona) and flow everywhere else.
+define prompt_get_agent_name returning Str:
+    if map_contains(PROMPT_AGENT_NAME_CACHE and "name") == 1:
+        return map_get_val(PROMPT_AGENT_NAME_CACHE and "name")
+    set name to "ErnOS"
+    set identity to prompt_get_identity()
+    set first_line to identity
+    set nl to string_index_of(identity and "\n")
+    if nl >= 0:
+        set first_line to substring(identity and 0 and nl)
+    set marker to "Your name is "
+    set mpos to string_index_of(first_line and marker)
+    if mpos >= 0:
+        set nstart to mpos + string_length(marker)
+        set rest to substring(first_line and nstart and string_length(first_line) - nstart)
+        # Name ends at the first '.' or ',' (or end of line).
+        set nend to string_length(rest)
+        set dot to string_index_of(rest and ".")
+        if dot >= 0 and also dot < nend:
+            set nend to dot
+        set comma to string_index_of(rest and ",")
+        if comma >= 0 and also comma < nend:
+            set nend to comma
+        set candidate to string_trim(substring(rest and 0 and nend))
+        if string_length(candidate) > 0:
+            set name to candidate
+    set ok to map_insert(PROMPT_AGENT_NAME_CACHE and "name" and name)
+    return name
+
+# Invalidate the cached name (persona swap). The next prompt assembly re-derives it and
+# re-propagates to the system-role identity.
+define prompt_refresh_agent_name returning Int:
+    if map_contains(PROMPT_AGENT_NAME_CACHE and "name") == 1:
+        set ok to map_delete(PROMPT_AGENT_NAME_CACHE and "name")
+    return 0
+
 define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as Str and tools_schema as Str returning Str:
+    # Propagate the persona-derived name into the system-role identity every assembly
+    # (cached — this is a map read after the first call). Keeps llm_system_identity in
+    # lock-step with the active persona with no import cycle (llm.ep never imports us).
+    set ok to llm_set_agent_name(prompt_get_agent_name())
     set system_prompt to ""
     set is_guest to 0
     set sender_role to ""
