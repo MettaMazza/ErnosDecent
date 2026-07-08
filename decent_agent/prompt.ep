@@ -335,13 +335,34 @@ define prompt_refresh_agent_name returning Int:
         set ok to map_delete(PROMPT_AGENT_NAME_CACHE and "name")
     return 0
 
-# The rolling USER KNOWLEDGE block: the agent's durable, self-maintained model of the
-# operator — preferences, corrections, distilled lessons, working patterns. Lives in
-# the DATA DIR (git-immune, survives reboots and sessions). Injected every turn with a
-# standing maintenance instruction so the file actually gets used AND kept current.
-# Capped at 8000 chars in the prompt (the tool enforces the same cap on write).
+# The current persona's registry NAME — used to scope the knowledge files. Active
+# pointer when set; otherwise mirrors prompt_get_identity's resolution (the personal
+# Echo file when present, else the base ErnOS persona).
+define prompt_persona_current_name returning Str:
+    set n to prompt_persona_active()
+    if string_length(n) > 0:
+        return n
+    if file_exists("config/personal_identity.txt") == 1:
+        return "echo"
+    return "ernos"
+
+# The rolling USER KNOWLEDGE block: this persona's durable, self-maintained model of
+# the operator — preferences, corrections, distilled lessons, working patterns.
+# PER PERSONA: Echo and Ernos each keep their own view of the user. Lives in the DATA
+# DIR (git-immune, survives reboots and sessions). Injected every turn with a standing
+# maintenance instruction so the file actually gets used AND kept current. Capped at
+# 8000 chars in the prompt (the tool enforces the same cap on write).
 define prompt_get_user_knowledge returning Str:
-    set kp to storage_user_knowledge_path()
+    set persona to prompt_persona_current_name()
+    set kp to storage_user_knowledge_path_for(persona)
+    # One-time migration: content written to the pre-persona-scoping single file moves
+    # into the current persona's file on first read.
+    if file_exists(kp) == 0:
+        set legacy_path to storage_user_knowledge_path()
+        if file_exists(legacy_path) == 1:
+            set legacy to string_trim(read_file(legacy_path))
+            if string_length(legacy) > 0:
+                set ok to write_file(kp and legacy)
     set body to ""
     if file_exists(kp) == 1:
         set body to string_trim(read_file(kp))
@@ -349,9 +370,28 @@ define prompt_get_user_knowledge returning Str:
         set body to "(empty — you have not recorded anything about this user yet)"
     if string_length(body) > 8000:
         set body to substring(body and 0 and 8000)
-    set out to "[[USER KNOWLEDGE — your rolling model of this user: their preferences, corrections they have given you, lessons learned working with them, and patterns you have observed. REFER to it when deciding how to respond. MAINTAIN it: whenever the user states a durable preference, corrects you, or you notice a real pattern, update this file with user_knowledge_update — rewrite it as a compact, current document (do not just append forever; consolidate). Keep it factual and grounded in things that actually happened.]]\n"
+    set out to "[[USER KNOWLEDGE — your rolling model of this user: their preferences, corrections they have given you, lessons learned working with them, and patterns you have observed. This file is YOURS (per persona). REFER to it when deciding how to respond. MAINTAIN it: whenever the user states a durable preference, corrects you, or you notice a real pattern, update it with user_knowledge_update — rewrite it as a compact, current document (do not just append forever; consolidate). Keep it factual and grounded in things that actually happened.]]\n"
     set out to concat(out and body)
     set out to concat(out and "\n[[/USER KNOWLEDGE]]\n")
+    return out
+
+# The rolling SELF KNOWLEDGE block: this persona's notebook about ITSELF — tendencies
+# it has noticed in its own processing, strengths, recurring mistakes and what fixed
+# them, preferences of its own, how it has changed over time. Same mechanics as the
+# user-knowledge file: per persona, data-dir, injected every turn, 8000-char cap.
+define prompt_get_self_knowledge returning Str:
+    set persona to prompt_persona_current_name()
+    set kp to storage_self_knowledge_path_for(persona)
+    set body to ""
+    if file_exists(kp) == 1:
+        set body to string_trim(read_file(kp))
+    if string_length(body) == 0:
+        set body to "(empty — you have not recorded anything about yourself yet)"
+    if string_length(body) > 8000:
+        set body to substring(body and 0 and 8000)
+    set out to "[[SELF KNOWLEDGE — your rolling notebook about YOURSELF: tendencies you have noticed in your own processing, strengths, recurring mistakes and what fixed them, preferences of your own, and how you have changed over time. This is observation, not aspiration — record what you actually are and do, grounded in real turns. REFER to it. MAINTAIN it with self_knowledge_update — rewrite as a compact, current document; consolidate rather than append.]]\n"
+    set out to concat(out and body)
+    set out to concat(out and "\n[[/SELF KNOWLEDGE]]\n")
     return out
 
 define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as Str and tools_schema as Str returning Str:
@@ -420,10 +460,12 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
     set system_prompt to concat(system_prompt and "\n")
     # F6: agent-managed behavior/skills sections (editable via the self_prompt tools).
     set system_prompt to concat(system_prompt and prompt_get_self_sections())
-    # Rolling USER KNOWLEDGE — the agent's own durable model of the operator
-    # (preferences, corrections, lessons, patterns), maintained via the
-    # user_knowledge tools and injected every turn so it is actually referred to.
+    # Rolling USER + SELF KNOWLEDGE — this persona's durable model of the operator and
+    # its own notebook about itself, maintained via the *_knowledge tools and injected
+    # every turn so they are actually referred to. Per persona: Echo and Ernos each
+    # keep their own files.
     set system_prompt to concat(system_prompt and prompt_get_user_knowledge())
+    set system_prompt to concat(system_prompt and prompt_get_self_knowledge())
 
     set sessions_mgr to map_get_val(ctx and "sessions")
     if sessions_mgr != 0:
