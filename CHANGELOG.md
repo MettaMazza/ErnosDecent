@@ -3,6 +3,49 @@
 All notable changes to ErnosDecent. Dates are absolute. The engine ships on
 `agent-parity` and is merged to `main` and the public `business` overlay.
 
+## 2026-07-08 (evening) — Eleven root fixes & features from live diagnostics
+
+### Fixed (every root cause proven from logs/probes before the fix)
+- **"No LLM model responded" (final cause)**: Ollama returns thinking models' output in
+  TWO channels (`message.content` + `message.reasoning`); turns landing entirely in
+  reasoning looked empty. Both channels are now read; all-reasoning turns are salvaged;
+  native reasoning feeds the transparency view; double-empty logs the raw body head.
+- **Discord tools returned "queued" / late reactions**: bridge commands rode IPC, which
+  the agent turn holds — structurally impossible mid-turn. The bridge now polls
+  `bridge_commands` directly from SQLite (500ms, like traces) and writes results back;
+  waits are async-yielding (new injected `ep_async_sleep_ms`); `react` is claim-honest
+  (`discord:reacted` only on confirmation).
+- **Echo's name overridden ("Where did echo go?")**: the kernel and the system-role
+  message both hardcoded "ErnOS", out-voting the persona. The NAME now derives from the
+  active persona (single source of truth) and flows into the system identity; the
+  Ernos name-origin story (ancient Greek "young shoot / olive sprout") was added to
+  Echo's identity.
+- **Batch slicer silently dropped `tool([...])` continuations** lacking `Action:`
+  markers (the scheduler "no observation" failure) — orphaned calls are now detected
+  against the registered schema and named in a format nudge.
+- **Decode latency**: gemma-4-31b num_ctx right-sized 131072 → 65536 (memory-bound
+  attention over the huge KV allocation measured ~18 tok/s); kernel gained a LATENCY
+  compactness rule; opt-in `GEMMA4_MAIN_LLAMACPP=1` llama-server block in run_node.sh.
+- **Silent "Image generation failed"**: `[ImageGen]` stage logging, pre-flight of ALL
+  four Flux files (naming the missing one — external-drive hint), distinct shim return
+  codes surfaced verbatim, ctx cache hit/miss logged.
+
+### Added
+- **Persistent per-session auto-approve**: `AI AUTOAPPROVE ON|OFF`, 🔓 button on the
+  Discord approval card, `/autoapprove`, WebUI toggle + `/api/autoapprove`. Default
+  OFF, resets on restart, observer audits unchanged.
+- **Platform awareness**: `[PLATFORM:discord|webui]` tag → `agent_ctx` → an awareness
+  line stating which surface tools apply this turn.
+- **Session rename + name-addressable sessions**: `session_rename` tool, `/rename`,
+  and title lookup (exact → unique substring) in `read_transcripts` and `SESSION SET`.
+- **Persona registry + swapping**: `config/personas/<name>.txt` (echo auto-migrates),
+  data-dir active pointer, `persona_set`/`persona_register` tools (observer-audited),
+  `AI PERSONA`, Discord `/persona`, `/api/persona`.
+- **`test_all_systems`**: runs the full 13-block master_prompt validation via
+  sequential sub-agents, mid_message progress, per-block scorecards written to a
+  workspace report and attached; approval blocks only under the session auto-approve
+  grant; Discord block auto-skips off-platform.
+
 ## 2026-07-08 — Multi-tool batching, image generation + vision, self-prompt persistence, full transparency
 
 ### Added — the agent generates and SEES images (all ErnosPlain, all local)

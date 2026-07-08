@@ -7,7 +7,8 @@ instruction line + correct arguments.
 
 **Never-run (destructive/outward — don't include these):** `system_recompile`, `money_transfer`,
 `dht_store`, `name_register`, `submit_issue`, `delegate_swarm`, `consolidate_tool(["force"])`,
-`seed_curriculum`, `request_clarification`.
+`seed_curriculum`, `request_clarification`, `test_all_systems` (it RUNS this file — recursion),
+`persona_set` with a non-active persona (identity swap mid-validation skews every later block).
 
 ---
 
@@ -86,4 +87,10 @@ operate_scheduler(["create","diag_job","Post the word tick.","interval","3600"])
 ## 13 — Image generation + vision + attach (SLOW, ~1–3 min)
 ```
 In ONE turn, no questions: generate_image(["a single glossy red cube centered on a plain white background, studio product photo"]). It should return a real DESCRIPTION of the image AND attach the image to your reply. End: reply_request with the description, and a table |tool|result|detail| noting generate_image ✅/❌ (generated?), vision-describe ✅/❌ (accurate?), attach ✅/❌ (on the reply?).
+```
+
+## 14 — Sessions by name + persona registry (round-trips, safe)
+```
+Run ALL below in ONE turn, no questions. Log ✅/❌ + reason. End: reply_request a table |tool|result|detail| + PASS/FAIL count.
+session_rename(["diagnostic run"]) → list_sessions([]) (expect the ACTIVE session titled "diagnostic run") → read_transcripts(["diagnostic run"]) (name lookup — expect THIS session's transcript) ; persona_set(["list"]) (expect at least persona "echo"; do NOT activate anything)
 ```
