@@ -1414,10 +1414,21 @@ async def on_ready():
         create_tracked_task(pending_deletes_cleanup_loop())
         print("[Discord Bridge] Pending trace thread cleanup loop started.", flush=True)
 
-    # Sync slash commands globally
+    # Sync slash commands. GLOBAL sync alone can take up to an HOUR to propagate and
+    # clients cache it (why newly added commands 'never showed up'). Guild-scoped sync
+    # is INSTANT — copy the global set onto the configured channel's guild and sync
+    # there first, then still sync globally for any other guilds.
     try:
+        guild_obj = None
+        ch = client.get_channel(channel_id)
+        if ch is not None and getattr(ch, "guild", None) is not None:
+            guild_obj = discord.Object(id=ch.guild.id)
+        if guild_obj is not None:
+            tree.copy_global_to(guild=guild_obj)
+            gsynced = await tree.sync(guild=guild_obj)
+            print(f"[Discord Bridge] Synced {len(gsynced)} command(s) to guild {ch.guild.id} (instant).", flush=True)
         synced = await tree.sync()
-        print(f"[Discord Bridge] Synced {len(synced)} command(s) with Discord API.", flush=True)
+        print(f"[Discord Bridge] Synced {len(synced)} global command(s) with Discord API.", flush=True)
     except Exception as e:
         print(f"[Discord Bridge] Failed to sync command tree: {e}", flush=True)
 

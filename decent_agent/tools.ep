@@ -1586,7 +1586,35 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         # HIGH QUALITY (M3 Ultra 512GB): 1024x1024 native Flux resolution, 28 steps. CFG is
         # overridden to 1 for Flux inside image_gen_run (guidance-distilled). For single-file
         # SD models the 7 is used. Resolution + steps are the real quality levers.
-        set gi_res to image_gen_run(gi_prompt and gi_name and 1024 and 1024 and 28 and 7 and gi_stamp)
+        # ASYNC: the render runs on its OWN OS thread (image_gen_thread_worker) and the
+        # result comes back through a SQLite job row. This poll yields the event loop
+        # every second (tools_sleep_yield — plain-fn await, see the compiler-bug note),
+        # so Stop, whispers, other sessions and sub-agents all keep working while the
+        # GPU renders. A Stop returns immediately; the render itself is a parked C call
+        # that cannot be interrupted — it finishes in the background and its PNG lands
+        # in the workspace.
+        set gi_db to storage_get_db()
+        set gi_job to image_gen_job_create(gi_db)
+        set gi_res to ""
+        if gi_job == 0:
+            # No DB (unit-test context) — synchronous fallback, exact old behavior.
+            set gi_res to image_gen_run(gi_prompt and gi_name and 1024 and 1024 and 28 and 7 and gi_stamp)
+        else:
+            spawn image_gen_thread_worker(gi_job and gi_prompt and gi_name and 1024 and 1024 and 28 and 7 and gi_stamp)
+            display f"[ImageGen] job {gi_job} dispatched to render thread — event loop stays live."
+            set gi_epoch to ep_cancel_epoch_get(0)
+            set gi_waited to 0
+            repeat while string_length(gi_res) == 0 and also gi_waited < 1200000:
+                set gi_st to image_gen_job_result(gi_db and gi_job)
+                if string_index_of(gi_st and "pending:") == 0:
+                    if ep_cancel_epoch_get(0) > gi_epoch:
+                        return "Halted by Stop. The render already in progress cannot be interrupted mid-flight — it continues in the background, and if it completes its PNG lands in config/workspaces/active/."
+                    set ok to tools_sleep_yield(1000)
+                    set gi_waited to gi_waited + 1000
+                else:
+                    set gi_res to gi_st
+            if string_length(gi_res) == 0:
+                return "ERROR: image generation timed out after 20 minutes (the render thread may still finish in the background — check config/workspaces/active/)."
         if string_contains(gi_res and "ERROR:") == 1:
             return gi_res
         # Auto-attach the generated PNG to the chat (reuses the secret-safe attachment path).

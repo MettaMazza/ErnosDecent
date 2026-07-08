@@ -11,6 +11,7 @@
 import "string"
 import "fs"
 import "collections"
+import "sql"
 import "../storage"
 
 # FFI declaration — resolved from the shim object linked into the node by build.sh.
@@ -46,6 +47,52 @@ define image_gen_out_path with name as Str returning Str:
 
 # Millisecond clock for stage timing (same injected helper llm.ep uses).
 external define ep_time_now_ms returning Int
+
+# ── ASYNC generation: OS-thread worker + SQLite job row ───────────────────────
+# sd_ep_generate is a PARKED C call that takes minutes at 1024/28 — run inline it froze
+# the whole single agent thread (no Stop, no whispers, no sibling agents until done).
+# The render now runs on its own EP thread (`spawn`), and completion travels through a
+# SQLite row — the same thread-safe pattern as bridge_commands (SQLite is serialized by
+# the global mutex; cross-thread EP map mutation is the documented hazard, so no maps
+# cross the thread boundary). The agent-side tool polls the row with an async-yielding
+# sleep, so the event loop keeps serving everything while the GPU works.
+
+define image_gen_jobs_ensure with db as Int returning Int:
+    if db == 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS image_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL DEFAULT 'running', result TEXT NOT NULL DEFAULT '');")
+    return 0
+
+# Create a job row; returns its id (0 when no DB — caller falls back to synchronous).
+define image_gen_job_create with db as Int returning Int:
+    if db == 0:
+        return 0
+    set ok to image_gen_jobs_ensure(db)
+    set ok to sql_execute(db and "INSERT INTO image_jobs (status, result) VALUES ('running', '');")
+    set rows to sql_query(db and "SELECT id FROM image_jobs ORDER BY id DESC LIMIT 1;")
+    if length_list(rows) > 0:
+        return string_to_int(get_list(get_list(rows and 0) and 0))
+    return 0
+
+# The job's result when done ("<png path>" or "ERROR: ..."), else "pending:running".
+define image_gen_job_result with db as Int and job_id as Int returning Str:
+    set rows to sql_query(db and f"SELECT status, result FROM image_jobs WHERE id={job_id};")
+    if length_list(rows) == 0:
+        return "ERROR: image job row vanished"
+    set r to get_list(rows and 0)
+    if get_list(r and 0) equals "done":
+        return get_list(r and 1)
+    return "pending:running"
+
+# OS-thread worker — the ONLY place the minutes-long FFI call runs. Only plain
+# Str/Int params cross the thread boundary; the result goes back via SQLite.
+define image_gen_thread_worker with job_id as Int and prompt as Str and out_name as Str and width as Int and height as Int and steps as Int and cfg as Int and seed as Int:
+    set res to image_gen_run(prompt and out_name and width and height and steps and cfg and seed)
+    set db to storage_get_db()
+    if db != 0:
+        set es to string_replace(res and "'" and "''")
+        set ok to sql_execute(db and f"UPDATE image_jobs SET status='done', result='{es}' WHERE id={job_id};")
+    return 0
 
 # Pre-flight one configured weight file. Returns "" when present (or not configured),
 # else a NAMED error — the real reason reaches the user verbatim instead of a bare
