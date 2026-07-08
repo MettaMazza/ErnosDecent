@@ -171,13 +171,17 @@ define observer_lookback with context_prompt as Str and agent_output as Str retu
         return result
     set parsed to observer_parse_verdict(lb_raw)
     set verdict to map_get_val(parsed and "verdict")
-    set reason to map_get_val(parsed and "reason")
-    # FAIL-OPEN (the contract): only a GENUINE, parseable BLOCKED raises a nudge. The parser
-    # fails CLOSED (BLOCKED + the "Audit unavailable" sentinel) on an unreadable response —
-    # correct for the dangerous-tool audit, but the OPPOSITE of what a self-accountability
-    # look-back wants. Treat that sentinel as no-drift so a parse miss can never inject a
-    # phantom self-check note into the next turn.
-    if verdict equals "BLOCKED" and also string_contains(reason and "Audit unavailable") == 0:
+    set was_parsed to map_get_val(parsed and "parsed")
+    # Two different failure disciplines, both preserved:
+    # - The dangerous-tool/reply AUDIT (observer_audit) reads only "verdict" and therefore
+    #   stays FAIL-CLOSED: unreadable audit => BLOCKED => the action is denied. Untouched.
+    # - The look-back's documented contract (header above) is FAIL-OPEN: it gates nothing;
+    #   its only power is injecting a drift note into the agent's OWN next prompt. Acting on
+    #   the parser's fail-closed DEFAULT here meant an unreadable response fabricated a
+    #   "you drifted" accusation — false input to cognition, which the model then parroted
+    #   verbatim as its turn output. Drift therefore requires an EXPLICITLY STATED verdict
+    #   (parsed==1), not the parser's default.
+    if was_parsed == 1 and also verdict equals "BLOCKED":
         set ok to map_insert(result and "drift" and 1)
-        set ok to map_insert(result and "note" and reason)
+        set ok to map_insert(result and "note" and map_get_val(parsed and "reason"))
     return result
