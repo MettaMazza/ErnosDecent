@@ -81,9 +81,13 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: List ALL prior sessions (newest first) with their id, title, model, message count and start time. Call this FIRST when you need a session id — you do not need to know any id in advance.\n")
         set schemas to concat(schemas and "  Example: Action: list_sessions([])\n\n")
 
-        set schemas to concat(schemas and "- read_transcripts([session_id: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Read all historical message transcripts for a given session. Get the session_id from list_sessions first.\n")
-        set schemas to concat(schemas and "  Example: Action: read_transcripts([\"session_1782564644774\"])\n\n")
+        set schemas to concat(schemas and "- read_transcripts([session_id_or_name: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Read all historical message transcripts for a given session. Accepts a session id OR a session NAME/title (exact, or a unique part of it). Get either from list_sessions.\n")
+        set schemas to concat(schemas and "  Example: Action: read_transcripts([\"flux debugging\"])\n\n")
+
+        set schemas to concat(schemas and "- session_rename([new_name: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Rename the CURRENT session so it can be referenced by name later (read_transcripts and SESSION SET accept names). Use when the user names the conversation or asks you to.\n")
+        set schemas to concat(schemas and "  Example: Action: session_rename([\"flux debugging\"])\n\n")
 
         set schemas to concat(schemas and "- search_sessions([query: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Keyword-search the CONTENT of ALL prior sessions at once; returns which sessions mention the term, each with a snippet. Use this to find where something was discussed instead of guessing session ids, THEN read_transcripts([id]) for the full thread.\n")
@@ -862,7 +866,7 @@ define tools_list_sessions returning Str:
         set out to concat(out and get_list(lines and j))
         set out to concat(out and "\n")
         set j to j + 1
-    set out to concat(out and "\nUse read_transcripts([\"<id>\"]) to read a session's full transcript.")
+    set out to concat(out and "\nUse read_transcripts([\"<id or name>\"]) to read a session's full transcript (titles work — exact or a unique part). session_rename([\"<name>\"]) names the CURRENT session.")
     return out
 
 # Keyword-search the CONTENT of every prior session so the agent finds where something
@@ -1098,10 +1102,31 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: search_sessions requires 1 argument (keyword/phrase). Example: Action: search_sessions([\"kokoro voice\"])"
         return tools_search_sessions(get_list(args_list and 0))
 
+    if action_name equals "session_rename":
+        if length_list(args_list) < 1:
+            return "Error: session_rename requires 1 argument (the new name)."
+        set sr_name to string_trim(ptr_to_str(get_list(args_list and 0)))
+        if string_length(sr_name) == 0:
+            return "Error: the new session name is empty."
+        set sr_mgr to map_get_val(ctx and "sessions")
+        if sr_mgr == 0:
+            return "Error: session manager unavailable."
+        set sr_id to session_manager_rename_active(sr_mgr and sr_name)
+        if string_length(sr_id) > 0:
+            return f"session:renamed,id:{sr_id},title:{sr_name} — this session can now be referenced by that name in read_transcripts and session switching."
+        return "Error: could not rename the active session."
+
     if action_name equals "read_transcripts":
         if length_list(args_list) < 1:
             return "Error: read_transcripts requires 1 argument (session_id)."
         set session_id to ptr_to_str(get_list(args_list and 0))
+        # P8: accept a session NAME/title (exact or unique substring) wherever an id is
+        # accepted — resolve BEFORE the id-safety check so names with spaces work.
+        if map_contains(ctx and "sessions") == 1:
+            set rt_mgr to map_get_val(ctx and "sessions")
+            set rt_resolved to session_manager_resolve_id(rt_mgr and session_id)
+            if string_length(rt_resolved) > 0:
+                set session_id to rt_resolved
         if tools_session_id_safe(session_id) == 0:
             return "Error: invalid session_id."
         set path to path_join("config/sessions" and concat(session_id and ".json"))

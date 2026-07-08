@@ -1433,6 +1433,22 @@ async def on_message(message):
                     pass
             return
         
+        # P8: /rename <name> — name the ACTIVE session so it can be referenced by name
+        # later (read_transcripts / SESSION SET accept titles).
+        if message.content.strip().lower().startswith("/rename"):
+            parts = message.content.strip().split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                await message.reply("Usage: `/rename <new session name>`")
+                return
+            new_name = parts[1].strip()
+            payload = json.dumps({"id": active_session_id or "", "title": new_name})
+            resp = await send_daemon_ipc(f"SESSION RENAME {payload}")
+            if resp and "rename_ok" in resp:
+                await message.reply(f"📝 Session renamed to **{new_name}** — you can reference it by that name from any session.")
+            else:
+                await message.reply(f"⚠️ Could not rename session: {resp}")
+            return
+
         # P4: /autoapprove on|off — persistent per-session auto-approve toggle.
         if message.content.strip().lower().startswith("/autoapprove"):
             parts = message.content.strip().split(maxsplit=1)
