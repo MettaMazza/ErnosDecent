@@ -492,6 +492,36 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
     display f"[LLM DEBUG] after retry content length={string_length(content_str)}"
     return content_str
 
+# Binary-safe file→base64 (C helper injected by build.sh). A PNG has NUL bytes that a
+# normal string read would truncate, so images must go through this.
+external define ep_file_to_base64 with path returning Str
+
+# Multimodal VISION query: send an image + a prompt to a vision-capable local model (gemma4
+# is multimodal) and return its description. Uses the OpenAI /v1/chat/completions content-array
+# format Ollama accepts for multimodal models, with the image embedded as a base64 data URI.
+# This is what lets the agent actually SEE an image it just generated and describe it.
+define query_vision with prompt as Str and image_path as Str and model_name as Str returning Str:
+    set b64 to ep_file_to_base64(image_path)
+    if string_length(b64) == 0:
+        return ""
+    set mdl to model_name
+    if string_length(mdl) == 0:
+        set mdl to "gemma-4-31b"
+    set body to "{\"model\": \""
+    set body to concat(body and mdl)
+    set body to concat(body and "\", \"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"")
+    set body to concat(body and llm_json_escape(prompt))
+    set body to concat(body and "\"}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,")
+    set body to concat(body and b64)
+    set body to concat(body and "\"}}]}]}")
+    set url to "http://127.0.0.1:11434/v1/chat/completions"
+    set headers to "Content-Type: application/json"
+    display f"[Vision] POST {url} model={mdl} img={image_path} body_len={string_length(body)}"
+    set response to await http_post_async(url and headers and body)
+    if string_length(response) == 0:
+        return ""
+    return extract_content_from_response(response)
+
 define agent_list_models returning Str:
     set models_list to create_list()
     set headers to "Accept: application/json"

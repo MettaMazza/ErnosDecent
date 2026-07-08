@@ -110,6 +110,42 @@ long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
     return (long long)fut;
 }
 
+/* Read a file binary-safe (length-aware) and return base64 — for embedding a generated
+   image into a multimodal LLM request. ep_base64_encode is strlen-based (truncates at NULs). */
+long long ep_file_to_base64(long long path_ptr) {
+    const char* path = (const char*)path_ptr;
+    if (!path) return (long long)strdup(\"\");
+    FILE* f = fopen(path, \"rb\");
+    if (!f) return (long long)strdup(\"\");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return (long long)strdup(\"\"); }
+    unsigned char* buf = (unsigned char*)malloc((size_t)sz);
+    if (!buf) { fclose(f); return (long long)strdup(\"\"); }
+    size_t rd = fread(buf, 1, (size_t)sz, f); fclose(f);
+    static const char b64[] = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\";
+    size_t olen = 4 * ((rd + 2) / 3);
+    char* out = (char*)malloc(olen + 1);
+    if (!out) { free(buf); return (long long)strdup(\"\"); }
+    size_t i, j;
+    for (i = 0, j = 0; i < rd; ) {
+        unsigned int oa = i < rd ? buf[i++] : 0;
+        unsigned int ob = i < rd ? buf[i++] : 0;
+        unsigned int oc = i < rd ? buf[i++] : 0;
+        unsigned int tr = (oa << 16) + (ob << 8) + oc;
+        out[j++] = b64[(tr >> 18) & 0x3F];
+        out[j++] = b64[(tr >> 12) & 0x3F];
+        out[j++] = b64[(tr >> 6) & 0x3F];
+        out[j++] = b64[tr & 0x3F];
+    }
+    int mod = (int)(rd % 3);
+    if (mod == 1) { out[olen-1] = 61; out[olen-2] = 61; }
+    else if (mod == 2) { out[olen-1] = 61; }
+    out[olen] = 0;
+    free(buf);
+    long long r = (long long)strdup(out); free(out);
+    return r;
+}
+
 '''
 pat = 'long long ep_net_send(long long fd, const char* data) {'
 first = content.find(pat)
