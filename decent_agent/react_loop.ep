@@ -343,12 +343,37 @@ define react_parse_action with raw as Str returning Map:
     set ok to map_insert(result and "found" and 1)
     set ok to map_insert(result and "tool_name" and tool_name_trimmed)
     set ok to map_insert(result and "args_str" and args_str)
-    
+    # Span of THIS action within `raw` (marker start .. just past the closing paren). Used by
+    # the batching queue to slice off any FURTHER actions in the same response without
+    # re-matching inside this action's own arguments.
+    set ok to map_insert(result and "start_pos" and pos)
+    set ok to map_insert(result and "end_pos" and end_args + 1)
+
     set values_list to create_list()
     set ok to map_insert(result and "values_list" and values_list)
     set ok to append_list(values_list and tool_name_trimmed)
     set ok to append_list(values_list and args_str)
     return result
+
+
+# Return the substring of `raw` starting at the NEXT "Action:" (or "call:") marker at or
+# after `from_pos`, or "" if there is none. `from_pos` is the position just past the FIRST
+# action's closing paren, so a spurious "action:" inside the first action's arguments is
+# never matched. This is what lets the model batch many tools into ONE response: the loop
+# runs the first, then feeds this slice back as the next turn's raw_output with NO new
+# inference call, and so on until the batch is drained.
+define react_slice_from_next_action with raw as Str and from_pos as Int returning Str:
+    set raw_len to string_length(raw)
+    if from_pos < 0 or else from_pos >= raw_len:
+        return ""
+    set tail to substring(raw and from_pos and raw_len - from_pos)
+    set tail_lower to string_lower(tail)
+    set off to string_index_of(tail_lower and "action:")
+    if off < 0:
+        set off to string_index_of(tail_lower and "call:")
+    if off < 0:
+        return ""
+    return substring(tail and off and string_length(tail) - off)
 
 
 define react_hebbian_trigger with memory_mgr as Map and text as Str returning Int:
@@ -501,10 +526,15 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set query_prompt to concat(query_prompt and concat("\n[SUB-AGENT RESULTS — background agents you dispatched have finished. The following are THEIR outputs (not user input). Use them and report to the user as appropriate.]\n" and concat(sub_done and "[/SUB-AGENT RESULTS]\n")))
 
         set raw_output to ""
+        # A batched turn re-uses a queued action from THIS response (override_output) with no
+        # new inference. It must NOT count against max_iters, which guards LLM ROUND-TRIPS, not
+        # tool executions — otherwise a legitimate 20-tool batch could trip the runaway cap.
+        set is_batched_turn to 0
         if string_length(override_output) > 0:
             set raw_output to override_output
             set override_output to ""
-            display f"[ReAct] Skipping LLM call, using overridden raw_output."
+            set is_batched_turn to 1
+            display f"[ReAct] Batched action — running queued tool from the same response, no new inference call."
         else:
             if is_test == 0:
                 set selected_model to ""
@@ -574,6 +604,24 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         if found_action == 1:
             set tool_name to map_get_val(action_map and "tool_name")
             set args_str to map_get_val(action_map and "args_str")
+            # BATCHING: if the model emitted MORE than one Action: in this single response,
+            # queue everything from the 2nd action onward to run on the next loop iterations
+            # with NO new inference call. This collapses N independent tool calls from N LLM
+            # round-trips (each 20–80s) into ONE. Every queued action still passes through the
+            # full approval/audit/observation path below. Pause/finish paths (approval,
+            # clarification, reply_request) drop the queue; the model re-emits any remaining
+            # steps after the pause, which is self-healing. `assistant_text` records ONLY this
+            # action in the transcript when more follow, so chained iterations don't restate the
+            # whole remainder each time.
+            set batch_rest to react_slice_from_next_action(raw_output and map_get_val(action_map and "end_pos"))
+            set assistant_text to raw_output
+            if string_length(batch_rest) > 0:
+                set override_output to batch_rest
+                # Record the transcript from the start (keeps any Thought:) THROUGH this action,
+                # dropping only the trailing actions that haven't run yet — they get recorded as
+                # each one executes on its own chained iteration.
+                set a_end to map_get_val(action_map and "end_pos")
+                set assistant_text to substring(raw_output and 0 and a_end)
             display f"Parsed action: '{tool_name}' with args: '{args_str}'"
             set ok to trace_emit(trace_db and trace_sid and "action" and f"{tool_name}({args_str})")
             set ok to append_list(values_list and action_map)
@@ -636,7 +684,8 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set current_prompt to concat(current_prompt and raw_output)
                     set current_prompt to concat(current_prompt and "\nObservation: You have used your clarification budget. Proceed now with your best understanding; do not ask the user again.\n")
                     free_list(args_list)
-                    set loop_idx to loop_idx + 1
+                    if is_batched_turn == 0:
+                        set loop_idx to loop_idx + 1
                     continue
                 set ok to map_insert(ctx and "clarify_rounds" and clarify_rounds + 1)
                 set pendingc to create_map()
@@ -665,44 +714,17 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set mid_sess to map_get_val(ctx and "session_id")
                 set ok to react_write_mid_message(mid_sess and mid_content)
                 display f"[ReAct] Mid-message sent to user: {substring(mid_content and 0 and 100)}"
-                # Note: react_write_mid_message already writes to trace_events.
-                # Do NOT also call trace_emit here — that creates a duplicate row.
-                # Check if the same LLM output contains a SECOND Action: after mid_message.
-                # Without this, actions like request_clarification bundled with mid_message
-                # are silently dropped (the parser only catches the first Action:).
-                set raw_lower to string_lower(raw_output)
-                set first_action_pos to string_index_of(raw_lower and "action:")
-                set after_action to ""
-                if first_action_pos >= 0:
-                    set search_start to first_action_pos + 7
-                    if search_start < string_length(raw_output):
-                        set remainder to substring(raw_lower and search_start and string_length(raw_lower) - search_start)
-                        set second_offset to string_index_of(remainder and "action:")
-                        if second_offset >= 0:
-                            set abs_pos to search_start + second_offset
-                            set after_action to substring(raw_output and abs_pos and string_length(raw_output) - abs_pos)
-                if string_length(after_action) > 0:
-                    set second_action to react_parse_action(after_action)
-                    set second_found to map_get_val(second_action and "found")
-                    if second_found == 1:
-                        set second_name to map_get_val(second_action and "tool_name")
-                        set second_args to map_get_val(second_action and "args_str")
-                        display f"[ReAct] Found second action after mid_message: {second_name}"
-                        # Inject the second action as if the LLM just emitted it on the next turn.
-                        set override_output to f"Thought: (continued from mid_message)\nAction: {second_name}({second_args})"
-                        set current_prompt to concat(current_prompt and "\nObservation: Mid-message delivered to the user.\n")
-                        set current_prompt to concat(current_prompt and override_output)
-                        free_map(second_action)
-                        free_list(args_list)
-                        # Do NOT increment loop_idx — re-parse on the same iteration budget.
-                        continue
-                    free_map(second_action)
-                # No second action — continue the loop with a fresh LLM call.
+                # Note: react_write_mid_message already writes to trace_events; do NOT also
+                # trace_emit here (duplicate row). A SECOND action batched in the same response
+                # is handled by the general batching queue (override_output set above) — no
+                # mid_message-specific detection needed. If more actions follow, the next
+                # iteration runs them with no new inference call.
                 set current_prompt to concat(current_prompt and "\n")
-                set current_prompt to concat(current_prompt and raw_output)
+                set current_prompt to concat(current_prompt and assistant_text)
                 set current_prompt to concat(current_prompt and "\nObservation: Mid-message delivered to the user. Continue your current task.\n")
                 free_list(args_list)
-                set loop_idx to loop_idx + 1
+                if is_batched_turn == 0:
+                    set loop_idx to loop_idx + 1
                 continue
 
             # --- Tool Approval Gate ---
@@ -910,7 +932,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set obs_model to "gemma-4-31b"
                 set obs_budget to react_observation_budget(obs_model and string_length(current_prompt))
                 set current_prompt to concat(current_prompt and "\n")
-                set current_prompt to concat(current_prompt and raw_output)
+                set current_prompt to concat(current_prompt and assistant_text)
                 # Guard: empty tool results cause the LLM to continuation-complete the
                 # Observation line instead of starting a new Thought/Action block.
                 set obs_text to tool_result
@@ -938,8 +960,11 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set current_prompt to concat(current_prompt and "\n")
             set current_prompt to concat(current_prompt and raw_output)
             set current_prompt to concat(current_prompt and "\n[FORMAT VIOLATION — YOUR OUTPUT ABOVE WAS INVALID]\nYour last output did NOT contain a valid Action call. What went wrong:\n1. You may have output raw data or continued from a previous Observation — stop. The Observation is COMPLETE. Move on.\n2. You may have written prose without calling any tool.\n\nYou MUST now output EXACTLY this format:\nThought: <your reasoning about what to do next>\nAction: <tool_name>([\"<arg1>\"])\n\nTo reply to the user: Action: reply_request([\"your response\"])\nTo call a tool: Action: <tool_name>([\"arg\"])\n\nDo NOT continue or amend the previous Observation. It is finished. Output your next Thought and Action now.\n")
-            
-        set loop_idx to loop_idx + 1
+
+        # Batched actions (queued from a single response) do NOT count against the LLM-turn cap;
+        # only a turn that made a fresh inference call advances loop_idx.
+        if is_batched_turn == 0:
+            set loop_idx to loop_idx + 1
 
     # E3: if the loop exited on the iteration cap (not a natural reply_request), abort
     # instead of spinning — a model that never replies would otherwise run forever with
