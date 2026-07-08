@@ -63,38 +63,26 @@ set TEST_ALL_RUNNING to create_map()
 define tools_sleep_yield with ms as Int returning Int:
     return await ep_async_sleep_ms(ms)
 
-# P11 coordinator — runs as a BACKGROUND async task (called WITHOUT await, the
-# orchestrator_spawn pattern), so test_all_systems returns instantly and the agent can
-# answer the user while validation proceeds. Spawns the 13 master_prompt.md blocks as
-# SEQUENTIAL sub-agents (shared LLM — parallel blocks would contend), reports progress
-# per block via mid_message, honors a user Stop between blocks, and finishes by writing
-# + attaching the scorecard report and announcing completion.
-async define tools_test_all_worker with ctx as Map and orch as Int and model as Int and memory as Int and tools as Int and sid as Str and platform as Str and aa_on as Int and db as Int returning Int:
-    set started to ep_time_now_ms()
-    # SAFETY: capture the cancel epoch — a Stop halts this coordinator (checked between
-    # blocks AND every 2s inside the poll) alongside every sub-agent, no consumption.
-    set worker_epoch to ep_cancel_epoch_get(0)
-    set mp to read_file("master_prompt.md")
-    if string_length(mp) == 0:
-        set ok to trace_emit(db and sid and "mid_message" and "🧪 test_all_systems: master_prompt.md unreadable — validation aborted.")
-        set ok to map_delete(TEST_ALL_RUNNING and "run")
-        return 1
-    if aa_on == 1:
-        # Propagate the operator's session auto-approve grant to the sub-agents
-        # (orchestrator_spawn consumes this explicit key; see P11 note there).
-        set ok to map_insert(ctx and "child_auto_approve" and 1)
-    set report to "# Full System Validation Report\n\n"
-    set pass_blocks to 0
-    set skip_blocks to 0
-    set fail_blocks to 0
+# ── P11 validation coordinator — a CHAIN of async tasks, one per block ─────────
+# COMPILER BUG constraint (see llm_read_response in llm.ep): inside an async define,
+# an await — or a call to ANY awaiting function — inside a LOOP is mis-lowered (the
+# first live run spawned all 13 blocks instantly and stamped every one TIMEOUT: the
+# poll's sleep call was emitted as a stale-future read, no call at all). Async
+# coordinators therefore must not loop-wait. This design gives each block its own
+# async task containing exactly ONE top-level await (the sub-agent's completion
+# future — the proven-safe single-await shape); sequencing comes from each task
+# enqueueing the NEXT block's task as it finishes. All bookkeeping (skips, scoring,
+# report) lives in PLAIN functions, where awaits and loops are safe.
+
+# Parse master_prompt.md's fenced blocks into a List of {bn, title, block} maps.
+define tools_validation_parse_blocks with mp as Str returning List:
+    set blocks to create_list()
     set sections to string_split(mp and "\n## ")
     set nsec to length_list(sections)
     set bn to 0
     set si to 1
-    set halted to 0
-    repeat while si < nsec and also halted == 0:
+    repeat while si < nsec:
         set sec to get_list(sections and si)
-        # Fenced block content between ``` markers; sections without a fence are prose.
         set f1 to string_index_of(sec and "```")
         if f1 >= 0:
             set bn to bn + 1
@@ -105,76 +93,121 @@ async define tools_test_all_worker with ctx as Map and orch as Int and model as 
             set body_start to f1 + 4
             set rest to substring(sec and body_start and string_length(sec) - body_start)
             set f2 to string_index_of(rest and "```")
-            set block to ""
             if f2 > 0:
-                set block to string_trim(substring(rest and 0 and f2))
-            if string_length(block) > 0:
-                # Honor a user Stop between blocks (epoch latch — no consumption, so the
-                # same Stop also halts every other run).
-                if ep_cancel_epoch_get(0) > worker_epoch:
-                    set report to concat(report and "\n**HALTED by user Stop — remaining blocks not run.**\n")
-                    set halted to 1
-                else:
-                    set skip_reason to ""
-                    if bn == 8 or else bn == 9:
-                        if aa_on == 0:
-                            set skip_reason to "approval-gated — enable session auto-approve (/autoapprove on) to include it"
-                    if bn == 11:
-                        if platform equals "discord":
-                            set skip_reason to skip_reason
-                        else:
-                            set skip_reason to "Discord-surface block — this run did not originate on Discord"
-                    if string_length(skip_reason) > 0:
-                        set skip_blocks to skip_blocks + 1
-                        set report to concat(report and f"## Block {bn} — {title}\n⏭️ SKIPPED: {skip_reason}\n\n")
-                        set ok to trace_emit(db and sid and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) skipped — {skip_reason}")
-                    else:
-                        set ok to trace_emit(db and sid and "mid_message" and f"🧪 test_all_systems: running block {bn} — {title}")
-                        set instr to concat("[AUTOMATED VALIDATION SUB-AGENT] You are executing ONE block of the full-system validation. Execute it exactly, no questions, and END with reply_request containing the scorecard table.\n\n" and block)
-                        set tid to orchestrator_spawn(orch and instr and f"validator-block-{bn}" and model and memory and tools and cast_map_to_int(ctx))
-                        set waited to 0
-                        set done to 0
-                        set result to ""
-                        repeat while waited < 900000 and also done == 0:
-                            # SAFETY: a Stop mid-block halts the coordinator within 2s
-                            # (the sub-agent halts itself via the same epoch).
-                            if ep_cancel_epoch_get(0) > worker_epoch:
-                                set result to "🛑 HALTED by user Stop mid-block."
-                                set done to 1
-                                set halted to 1
-                            else:
-                                set st to orchestrator_check(orch and tid)
-                                if string_index_of(st and "completed:") == 0:
-                                    set result to substring(st and 10 and string_length(st) - 10)
-                                    set done to 1
-                                else if st equals "cancelled" or else st equals "not_found":
-                                    set result to concat("(sub-agent " and concat(st and ")"))
-                                    set done to 1
-                                else:
-                                    # tools_sleep_yield, NOT a direct await — async+loop mis-lowering.
-                                    set ok to tools_sleep_yield(2000)
-                                    set waited to waited + 2000
-                        if done == 0:
-                            set result to "⏰ TIMEOUT: block did not complete within 15 minutes."
-                            set fail_blocks to fail_blocks + 1
-                        else:
-                            if string_contains(result and "PENDING_APPROVAL") == 1 or else string_contains(string_upper(result) and "FAIL") == 1 or else string_contains(result and "❌") == 1:
-                                set fail_blocks to fail_blocks + 1
-                            else:
-                                set pass_blocks to pass_blocks + 1
-                        set report to concat(report and f"## Block {bn} — {title}\n{result}\n\n")
+                set btext to string_trim(substring(rest and 0 and f2))
+                if string_length(btext) > 0:
+                    set bmap to create_map()
+                    set ok to map_insert(bmap and "bn" and bn)
+                    set ok to map_insert(bmap and "title" and title)
+                    set ok to map_insert(bmap and "block" and btext)
+                    set ok to append_list(blocks and bmap)
         set si to si + 1
-    if aa_on == 1:
-        set ok to map_delete(ctx and "child_auto_approve")
-    set wall to (ep_time_now_ms() - started) / 1000
-    set report to concat(report and f"---\n**Blocks: {bn} total — {pass_blocks} clean, {fail_blocks} with failures/timeouts, {skip_blocks} skipped. Wall time: {wall}s.** Per-call prefill/decode timings are in the node log ([LLM TTFT]).\n")
-    set fname to concat("validation_report_" and concat(int_to_string(started) and ".md"))
+    return blocks
+
+# Advance through skips/halt WITHOUT awaiting; spawn the next runnable block's
+# sub-agent and return its completion FUTURE (0 = nothing left to run → finalize).
+define tools_validation_next with state as Map returning Int:
+    set blocks to map_get_val(state and "blocks")
+    set n to length_list(blocks)
+    set going to 1
+    repeat while going == 1:
+        set idx to map_get_val(state and "idx")
+        if idx >= n:
+            return 0
+        if ep_cancel_epoch_get(0) > map_get_val(state and "epoch"):
+            set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and "\n**HALTED by user Stop — remaining blocks not run.**\n"))
+            return 0
+        set bmap to get_list(blocks and idx)
+        set bn to map_get_val(bmap and "bn")
+        set title to map_get_val(bmap and "title")
+        set skip_reason to ""
+        if bn == 8 or else bn == 9:
+            if map_get_val(state and "aa_on") == 0:
+                set skip_reason to "approval-gated — enable session auto-approve (/autoapprove on) to include it"
+        if bn == 11:
+            if map_get_val(state and "platform") equals "discord":
+                set skip_reason to skip_reason
+            else:
+                set skip_reason to "Discord-surface block — this run did not originate on Discord"
+        if bn == 14:
+            # Session tools are PARENT-scoped: orchestrator clones deliberately drop
+            # the session manager (sharing it raced the main agent), so session_rename
+            # can never work inside a sub-agent (live finding: the first validation run
+            # scored block 14 FAIL on 'session manager unavailable'). Main-chat only.
+            set skip_reason to "session tools are parent-scoped — run block 14 manually in the main chat"
+        if string_length(skip_reason) > 0:
+            set ok to map_insert(state and "skip_blocks" and map_get_val(state and "skip_blocks") + 1)
+            set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n⏭️ SKIPPED: {skip_reason}\n\n"))
+            set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) skipped — {skip_reason}")
+            set ok to map_insert(state and "idx" and idx + 1)
+        else:
+            set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: running block {bn} — {title}")
+            set instr to concat("[AUTOMATED VALIDATION SUB-AGENT] You are executing ONE block of the full-system validation. Execute it exactly, no questions, and END with reply_request containing the scorecard table.\n\n" and map_get_val(bmap and "block"))
+            set tid to orchestrator_spawn(map_get_val(state and "orch") and instr and f"validator-block-{bn}" and map_get_val(state and "model") and map_get_val(state and "memory") and map_get_val(state and "tools") and map_get_val(state and "ctx_int"))
+            set ok to map_insert(state and "tid" and tid)
+            set fut to orchestrator_task_future(map_get_val(state and "orch") and tid)
+            if fut == 0:
+                set ok to map_insert(state and "fail_blocks" and map_get_val(state and "fail_blocks") + 1)
+                set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n(sub-agent dispatch failed — no completion future)\n\n"))
+                set ok to map_insert(state and "idx" and idx + 1)
+            else:
+                # Signal the chain to await this block (the async caller re-fetches the
+                # future via orchestrator_task_future — awaits must be CALL expressions).
+                return 1
+    return 0
+
+# Record the just-finished block's result (runs right after the chain's await).
+define tools_validation_record with state as Map returning Int:
+    set blocks to map_get_val(state and "blocks")
+    set idx to map_get_val(state and "idx")
+    set bmap to get_list(blocks and idx)
+    set bn to map_get_val(bmap and "bn")
+    set title to map_get_val(bmap and "title")
+    set st to orchestrator_check(map_get_val(state and "orch") and map_get_val(state and "tid"))
+    set result to st
+    if string_index_of(st and "completed:") == 0:
+        set result to substring(st and 10 and string_length(st) - 10)
+    if string_contains(result and "PENDING_APPROVAL") == 1 or else string_contains(string_upper(result) and "FAIL") == 1 or else string_contains(result and "❌") == 1:
+        set ok to map_insert(state and "fail_blocks" and map_get_val(state and "fail_blocks") + 1)
+    else:
+        set ok to map_insert(state and "pass_blocks" and map_get_val(state and "pass_blocks") + 1)
+    set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n{result}\n\n"))
+    set ok to map_insert(state and "idx" and idx + 1)
+    return 0
+
+# Finish: totals, write + attach the report, announce, release the single-flight guard.
+define tools_validation_finalize with state as Map returning Int:
+    if map_get_val(state and "aa_on") == 1:
+        set ok to map_delete(cast_borrow_to_map(map_get_val(state and "ctx_int")) and "child_auto_approve")
+    set wall to (ep_time_now_ms() - map_get_val(state and "started")) / 1000
+    set total to length_list(map_get_val(state and "blocks"))
+    set pass_blocks to map_get_val(state and "pass_blocks")
+    set fail_blocks to map_get_val(state and "fail_blocks")
+    set skip_blocks to map_get_val(state and "skip_blocks")
+    set report to concat(map_get_val(state and "report") and f"---\n**Blocks: {total} total — {pass_blocks} clean, {fail_blocks} with failures, {skip_blocks} skipped. Wall time: {wall}s.** Per-call prefill/decode timings are in the node log ([LLM TTFT]).\n")
+    set fname to concat("validation_report_" and concat(int_to_string(map_get_val(state and "started")) and ".md"))
     set rpath to workspace_write_file(fname and report)
     set attach_note to ""
-    if tools_emit_attachment(sid and rpath) == 0:
+    if tools_emit_attachment(map_get_val(state and "sid") and rpath) == 0:
         set attach_note to " Report attached."
-    set ok to trace_emit(db and sid and "mid_message" and f"🧪 test_all_systems COMPLETE: {bn} blocks — {pass_blocks} clean, {fail_blocks} with failures/timeouts, {skip_blocks} skipped, {wall}s. Report: {rpath}.{attach_note}")
+    set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems COMPLETE: {total} blocks — {pass_blocks} clean, {fail_blocks} with failures, {skip_blocks} skipped, {wall}s. Report: {rpath}.{attach_note}")
     set ok to map_delete(TEST_ALL_RUNNING and "run")
+    return 0
+
+# One chain link: exactly ONE top-level await, then enqueue the next link (an
+# un-awaited call to an async define enqueues it — the orchestrator_spawn pattern).
+# EMISSION CONSTRAINTS (both bit during bring-up): locals in an async define must not
+# be named `state`/`fut` (they collide with the generated state-machine struct
+# members), and the awaited expression must be a CALL (a plain variable skips the
+# EpFuture* cast) — hence awaiting the future GETTER rather than a stored value.
+async define tools_validation_block with vstate as Map returning Int:
+    set has_block to tools_validation_next(vstate)
+    if has_block == 0:
+        set vok to tools_validation_finalize(vstate)
+        return 0
+    set vres to await orchestrator_task_future(map_get_val(vstate and "orch") and map_get_val(vstate and "tid"))
+    set vok to tools_validation_record(vstate)
+    set vnxt to tools_validation_block(vstate)
     return 0
 
 define append_string_to_char_list with char_list as List and s as Str returning Int:
@@ -2318,15 +2351,36 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set ta_aa_map to map_get_val(ctx and "session_auto_approve")
             if map_contains(ta_aa_map and ta_sid) == 1:
                 set ta_aa to 1
-        set ta_db to storage_get_db()
-        set ta_model to map_get_val(ctx and "model")
-        set ta_memory to map_get_val(ctx and "memory_mgr")
-        set ta_tools to map_get_val(ctx and "tools_mgr")
-        # Fire-and-forget: calling the async worker WITHOUT await enqueues it on the
-        # event loop (exact orchestrator_spawn pattern) — it interleaves with this and
-        # later turns at await points.
-        set ta_fut to tools_test_all_worker(ctx and ta_orch and ta_model and ta_memory and ta_tools and ta_sid and ta_platform and ta_aa and ta_db)
-        return "Validation dispatched — the 13 blocks are running SEQUENTIALLY in the background (this takes many minutes). Progress arrives as live updates and the scorecard report will be attached when it completes. Do NOT wait for it: finish your turn and tell the user it is underway."
+        set ta_blocks to tools_validation_parse_blocks(read_file("master_prompt.md"))
+        if length_list(ta_blocks) == 0:
+            set ok to map_delete(TEST_ALL_RUNNING and "run")
+            return "Error: no fenced validation blocks found in master_prompt.md."
+        if ta_aa == 1:
+            set ok to map_insert(ctx and "child_auto_approve" and 1)
+        # Chain state — everything the per-block tasks need, as plain values (ctx as an
+        # Int handle so orchestrator_spawn takes it directly).
+        set ta_state to create_map()
+        set ok to map_insert(ta_state and "blocks" and ta_blocks)
+        set ok to map_insert(ta_state and "idx" and 0)
+        set ok to map_insert(ta_state and "orch" and ta_orch)
+        set ok to map_insert(ta_state and "model" and map_get_val(ctx and "model"))
+        set ok to map_insert(ta_state and "memory" and map_get_val(ctx and "memory_mgr"))
+        set ok to map_insert(ta_state and "tools" and map_get_val(ctx and "tools_mgr"))
+        set ok to map_insert(ta_state and "ctx_int" and cast_map_to_int(ctx))
+        set ok to map_insert(ta_state and "sid" and ta_sid)
+        set ok to map_insert(ta_state and "platform" and ta_platform)
+        set ok to map_insert(ta_state and "aa_on" and ta_aa)
+        set ok to map_insert(ta_state and "db" and storage_get_db())
+        set ok to map_insert(ta_state and "started" and ep_time_now_ms())
+        set ok to map_insert(ta_state and "epoch" and ep_cancel_epoch_get(0))
+        set ok to map_insert(ta_state and "report" and "# Full System Validation Report\n\n")
+        set ok to map_insert(ta_state and "pass_blocks" and 0)
+        set ok to map_insert(ta_state and "fail_blocks" and 0)
+        set ok to map_insert(ta_state and "skip_blocks" and 0)
+        set ok to map_insert(ta_state and "tid" and "")
+        # Enqueue the first chain link (un-awaited async call = fire-and-forget).
+        set ta_fut to tools_validation_block(ta_state)
+        return "Validation dispatched — the blocks run SEQUENTIALLY in the background (this takes many minutes). Progress arrives as live updates and the scorecard report will be attached when it completes. Do NOT wait for it: finish your turn and tell the user it is underway."
 
     if action_name equals "delegate_task":
         if length_list(args_list) < 2:

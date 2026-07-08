@@ -319,6 +319,13 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
     # future; completion is recorded on the task map and drained on a later turn.
     display concat("[DELEGATE] dispatching async sub-agent task=" and concat(task_id and concat(" role=" and concat(role and concat(" parent_sid=" and parent_sid)))))
     set subfut to orchestrator_spawn_worker(task_id and instruction and role and model and child_memory and child_tools and child_ctx and ch and orch and parent_sid)
+    # Store the worker's completion future so an ASYNC caller can `await` the whole
+    # sub-agent with a SINGLE await (the compiler mis-lowers awaits in loops inside
+    # async defines — see tools_validation_block — so await-once-then-check is the
+    # only safe sequencing primitive for async coordinators).
+    set ok to lock_mutex(mtx)
+    set ok to map_insert(task_map and "future" and subfut)
+    set ok to unlock_mutex(mtx)
     return task_id
 
 
@@ -330,6 +337,23 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
 # result, and returns it.
 # Returns "error:task_not_found" if task_id is invalid.
 # ─────────────────────────────────────────────────────
+# The completion FUTURE of a task's worker (0 when unknown). For async callers that
+# need to sequence on a sub-agent with one await; the result text still comes from
+# orchestrator_check afterwards ("completed:<response>").
+define orchestrator_task_future with orch as Int and task_id as Str returning Int:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    if map_contains(tasks and task_id) == 0:
+        set ok to unlock_mutex(mtx)
+        return 0
+    set task_map to map_get_val(tasks and task_id)
+    set fut to 0
+    if map_contains(task_map and "future") == 1:
+        set fut to map_get_val(task_map and "future")
+    set ok to unlock_mutex(mtx)
+    return fut
+
 define orchestrator_wait with orch as Int and task_id as Str returning Str:
     set mtx to map_get_val(orch and "mutex")
     set ok to lock_mutex(mtx)
