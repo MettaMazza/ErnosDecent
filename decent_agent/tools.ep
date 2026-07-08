@@ -200,7 +200,11 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "- workspace_write([filename: Str, content: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Write or overwrite a file in the active session workspace.\n")
         set schemas to concat(schemas and "  Example: Action: workspace_write([\"notes.txt\", \"these are my notes\"])\n\n")
-        
+
+        set schemas to concat(schemas and "- attach_file([path: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Send an existing file to the user AS A REAL ATTACHMENT in the chat (Discord/WebUI), so they don't have to go find it. Use it to share a file you were asked to produce or a file inside a linked project. Files you create with codebase_write/workspace_write are auto-attached already — use this for files that already exist. Secret/credential paths are refused; 24MB max.\n")
+        set schemas to concat(schemas and "  Example: Action: attach_file([\"config/workspaces/active/report.md\"])\n\n")
+
         set schemas to concat(schemas and "- workspace_read([filename: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Read a file from workspace. Small files return in full. LARGE files return only the first chunk plus a header '[Lines X-Y of N total]' and a continuation hint. To read a large file IN FULL you MUST keep calling workspace_read_range for each next chunk shown in the hint until you reach line N — do not assume the first chunk is the whole file.\n")
         set schemas to concat(schemas and "  Example: Action: workspace_read([\"uploads/file.md\"])\n\n")
@@ -689,6 +693,56 @@ define tools_self_write_section with section as Str and text as Str returning In
     set ok to write_file("config/agent_self_sections.json" and out)
     return 0
 
+# ── Outbound file attachment ────────────────────────────────────────────────
+# Queue a file the agent produced (or was asked to share) for delivery AS A REAL
+# ATTACHMENT in the user's chat. Mirrors react_write_mid_message: it inserts a
+# trace_events row of type 'attachment' whose content is the file path; the Discord
+# bridge's trace_poll_loop picks it up and posts discord.File(path) to the main
+# channel (the WebUI renders a 📎 download link). This is the collaboration feature:
+# a file Ernos makes arrives in the message, so the user never has to go find it.
+#
+# SAFETY (hard, non-negotiable): a path that access_path_secret flags (private keys,
+# tokens, .env, .ssh, the ipc-token) is NEVER queued — secrets do not leave the box,
+# defence-in-depth on top of the observer already blocking secret writes. Missing
+# files and over-cap files (>24 MB, above Discord's limit) are dropped silently here;
+# the caller's own return string tells the user what happened. Returns 1 on refuse/skip,
+# 0 on queued.
+define tools_emit_attachment with session_id as Str and path as Str returning Int:
+    if string_length(path) == 0:
+        return 1
+    if file_exists(path) == 0:
+        return 1
+    # Never send secrets off-box. This is a hard block, not a warn-and-ask.
+    if access_path_secret(path) == 1:
+        display f"[Attachment] REFUSED (secret path never sent off-box): {path}"
+        return 1
+    if file_size(path) > 24000000:
+        display f"[Attachment] SKIPPED (over 24MB Discord cap): {path}"
+        return 1
+    set db to storage_get_db()
+    if db == 0:
+        return 1
+    set key to session_id
+    if string_length(key) == 0:
+        set key to "default"
+    set es to string_replace(key and "'" and "''")
+    set ep to string_replace(path and "'" and "''")
+    set ok to sql_execute(db and f"INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('{es}', 'attachment', '{ep}', strftime('%s','now'), 0);")
+    display f"[Attachment] queued for delivery: {path}"
+    return 0
+
+# Resolve a user/agent-supplied path to something on disk for attachment: try it
+# verbatim (absolute or project-relative), then against the active linked project.
+# Returns "" if nothing resolves.
+define tools_resolve_attach_path with raw as Str returning Str:
+    if file_exists(raw) == 1:
+        return raw
+    set resolved to links_resolve(raw)
+    if string_length(resolved) > 0:
+        if file_exists(resolved) == 1:
+            return resolved
+    return ""
+
 # Enumerate every prior session on disk (config/sessions/*.json, excluding the
 # _transcript_ archive shards) and render a compact, newest-first index the agent can
 # read WITHOUT already knowing any session id — the fix for "blind without the ids".
@@ -1098,7 +1152,10 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if map_contains(ctx and "session_id") == 1:
             set cl_sess to map_get_val(ctx and "session_id")
         set ok to changelog_log_change(cl_sess and "codebase_write" and path and "write" and cl_hash_before and cl_hash_after and cl_size_before and cl_size_after and f"File '{path}' written.")
-        return f"File '{path}' written successfully."
+        # Auto-attach the file the agent just made to the user's chat (Discord/WebUI),
+        # so they don't have to go find it. Approved-write-only, secret-safe (see helper).
+        set ok to tools_emit_attachment(cl_sess and path)
+        return f"File '{path}' written successfully. (Attached to the chat.)"
         
     if action_name equals "run_ep":
         if length_list(args_list) < 1:
@@ -1703,7 +1760,30 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: workspace_write requires 2 arguments: filename (Str) and content (Str). Example: Action: workspace_write([\"notes.txt\", \"content\"])"
         set ws_filename to get_list(args_list and 0)
         set ws_content to get_list(args_list and 1)
-        return workspace_write_file(ws_filename and ws_content)
+        set ws_path to workspace_write_file(ws_filename and ws_content)
+        # Auto-attach the newly written workspace file to the chat.
+        set ws_sess to ""
+        if map_contains(ctx and "session_id") == 1:
+            set ws_sess to map_get_val(ctx and "session_id")
+        set ok to tools_emit_attachment(ws_sess and ws_path)
+        return concat(ws_path and " (Attached to the chat.)")
+
+    if action_name equals "attach_file":
+        if length_list(args_list) < 1:
+            return "Error: attach_file requires 1 argument (path). Example: Action: attach_file([\"config/workspaces/active/report.md\"])"
+        set af_raw to get_list(args_list and 0)
+        set af_path to tools_resolve_attach_path(af_raw)
+        if string_length(af_path) == 0:
+            return f"Error: attach_file could not find '{af_raw}'. Give a path that exists (project-relative, absolute, or inside the active linked project)."
+        if access_path_secret(af_path) == 1:
+            return f"Refused: '{af_path}' is a secret/credential path and can never be sent off this machine."
+        if file_size(af_path) > 24000000:
+            return f"Refused: '{af_path}' exceeds the 24MB attachment limit."
+        set af_sess to ""
+        if map_contains(ctx and "session_id") == 1:
+            set af_sess to map_get_val(ctx and "session_id")
+        set ok to tools_emit_attachment(af_sess and af_path)
+        return f"Attached '{af_path}' — it will appear as a file in the chat."
 
     if action_name equals "workspace_read":
         if length_list(args_list) < 1:

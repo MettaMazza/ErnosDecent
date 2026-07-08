@@ -393,6 +393,41 @@ async def post_mid_message(channel, content):
             print(f"[Discord Bridge] mid_message chunk send error: {e}", flush=True)
 
 
+# Defence-in-depth: even though the node refuses secret paths before queueing an
+# attachment, the bridge independently refuses these markers so a file can never
+# be exfiltrated to Discord by a malformed/forged trace row.
+_ATTACH_DENY_MARKERS = (
+    "/.ssh/", "/.gnupg/", "id_rsa", "id_ed25519", ".env", "ipc-token",
+    "/.ernosdecent/", "private_key", ".pem", ".key",
+)
+_ATTACH_MAX_BYTES = 24 * 1024 * 1024  # 24 MB — under Discord's non-nitro upload cap
+
+async def post_attachment(channel, path):
+    """Deliver a file the agent produced/shared as a REAL Discord attachment in the
+    main channel. Node-side queued via a trace_events row of type 'attachment'."""
+    p = (path or "").strip()
+    low = p.lower()
+    if not p:
+        return
+    if any(m in low for m in _ATTACH_DENY_MARKERS):
+        print(f"[Discord Bridge] attachment REFUSED (sensitive path): {p}", flush=True)
+        return
+    if not os.path.exists(p) or not os.path.isfile(p):
+        await channel.send(f"📎 (couldn't attach `{os.path.basename(p)}` — file not found at delivery time)")
+        return
+    try:
+        if os.path.getsize(p) > _ATTACH_MAX_BYTES:
+            await channel.send(f"📎 `{os.path.basename(p)}` is too large to attach (>24MB). It's saved at `{p}`.")
+            return
+        await channel.send(content=f"📎 `{os.path.basename(p)}`", file=discord.File(p))
+    except Exception as e:
+        print(f"[Discord Bridge] attachment send error for {p}: {e}", flush=True)
+        try:
+            await channel.send(f"📎 (failed to attach `{os.path.basename(p)}`: {e})")
+        except Exception:
+            pass
+
+
 def parse_pending_approval(resp):
     """Parse 'ai:pending_approval,tool:<name>,summary:<args>' into (tool, summary)."""
     tool_name = "unknown"
@@ -936,6 +971,10 @@ async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
                 # mid_message: post to main channel as a visible agent reply (chunked, not truncated)
                 if etype == "mid_message" and main_channel:
                     await post_mid_message(main_channel, content)
+                    continue
+                # attachment: deliver the file the agent produced/shared to the main channel
+                if etype == "attachment" and main_channel:
+                    await post_attachment(main_channel, content)
                     continue
                 # All other events: post to trace thread
                 msg = f"{emoji} **{etype}**\n```\n{content[:1800]}\n```"
