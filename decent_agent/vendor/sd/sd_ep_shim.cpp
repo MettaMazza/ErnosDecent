@@ -76,20 +76,41 @@ static sd_ctx_t* sd_ep_ctx_for(const char* model_path, const char* diffusion_mod
 
 /* Flat entry point EP calls over FFI. extern "C" keeps the symbol unmangled — this file
  * compiles as C++ (sd.cpp's stb_image_write.h uses C++ default args), but EP links the
- * plain C name `sd_ep_generate`. */
-extern "C" int sd_ep_generate(const char* model_path,
-                   const char* diffusion_model,  /* Flux: transformer gguf ("" = single-file mode) */
-                   const char* clip_l,           /* Flux: CLIP-L path ("" if unused) */
-                   const char* t5xxl,            /* Flux: T5-XXL path ("" if unused) */
-                   const char* vae,              /* Flux: VAE path ("" if unused) */
-                   const char* prompt,
-                   const char* negative,
-                   int width,
-                   int height,
-                   int steps,
-                   int cfg,        /* integer CFG scale (EP FFI passes ints/pointers, not doubles) */
+ * plain C name `sd_ep_generate`.
+ *
+ * ABI: ALL parameters are long long — this MUST match the all-long-long prototype the
+ * ErnosPlain compiler emits for `external define` (node_compiled.c). The previous mixed
+ * int/int64 signature corrupted every STACK-passed argument (args 9+; Apple ARM64 packs
+ * stack args at natural size, so the callee read 4-byte slots against the caller's
+ * 8-byte writes): steps arrived as 0, cfg as the steps value, seed as the cfg value,
+ * and out_png_path as the SEED reinterpreted as a pointer -> stbi_write_png failed ->
+ * the live 'shim code 5' with 'generating ... steps=0 cfg=28 seed=1' in the log.
+ * Pointers/ints are cast from the long longs inside. */
+extern "C" long long sd_ep_generate(long long model_path_ll,
+                   long long diffusion_model_ll,  /* Flux: transformer gguf ("" = single-file mode) */
+                   long long clip_l_ll,           /* Flux: CLIP-L path ("" if unused) */
+                   long long t5xxl_ll,            /* Flux: T5-XXL path ("" if unused) */
+                   long long vae_ll,              /* Flux: VAE path ("" if unused) */
+                   long long prompt_ll,
+                   long long negative_ll,
+                   long long width_ll,
+                   long long height_ll,
+                   long long steps_ll,
+                   long long cfg_ll,        /* integer CFG scale (EP FFI passes ints/pointers, not doubles) */
                    long long seed,
-                   const char* out_png_path) {
+                   long long out_png_path_ll) {
+    const char* model_path      = (const char*)model_path_ll;
+    const char* diffusion_model = (const char*)diffusion_model_ll;
+    const char* clip_l          = (const char*)clip_l_ll;
+    const char* t5xxl           = (const char*)t5xxl_ll;
+    const char* vae             = (const char*)vae_ll;
+    const char* prompt          = (const char*)prompt_ll;
+    const char* negative        = (const char*)negative_ll;
+    const char* out_png_path    = (const char*)out_png_path_ll;
+    int width  = (int)width_ll;
+    int height = (int)height_ll;
+    int steps  = (int)steps_ll;
+    int cfg    = (int)cfg_ll;
     if (!model_path || !prompt || !out_png_path) return 2;
     pthread_mutex_lock(&g_sd_mutex);
 
@@ -144,11 +165,11 @@ extern "C" int sd_ep_generate(const char* model_path,
 
 #else  /* !SD_EP_HAVE_LIB — stub so the build always links */
 
-extern "C" int sd_ep_generate(const char* model_path, const char* diffusion_model,
-                   const char* clip_l, const char* t5xxl, const char* vae,
-                   const char* prompt, const char* negative,
-                   int width, int height, int steps, int cfg, long long seed,
-                   const char* out_png_path) {
+extern "C" long long sd_ep_generate(long long model_path, long long diffusion_model,
+                   long long clip_l, long long t5xxl, long long vae,
+                   long long prompt, long long negative,
+                   long long width, long long height, long long steps, long long cfg,
+                   long long seed, long long out_png_path) {
     (void)model_path; (void)diffusion_model; (void)clip_l; (void)t5xxl; (void)vae;
     (void)prompt; (void)negative; (void)width; (void)height;
     (void)steps; (void)cfg; (void)seed; (void)out_png_path;
