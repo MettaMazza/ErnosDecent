@@ -166,6 +166,71 @@ async def stop_cmd(interaction: discord.Interaction):
     else:
         await interaction.followup.send(f"⚠️ Could not reach the agent to halt it. Daemon response: {resp}", ephemeral=True)
 
+def _interaction_in_channel(interaction) -> bool:
+    """Shared channel guard for slash commands (configured channel or its threads)."""
+    is_target = interaction.channel.id == channel_id
+    is_thread = getattr(interaction.channel, 'parent_id', None) == channel_id
+    return is_target or is_thread
+
+@tree.command(name="persona", description="List registered personas or activate one (echo, ernos, ...)")
+@discord.app_commands.describe(name="Persona name to activate, or 'list' (default) to see what is registered")
+async def persona_cmd(interaction: discord.Interaction, name: str = "list"):
+    if not _interaction_in_channel(interaction):
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+    # Identity control is operator-only — a guest must not be able to swap who the agent is.
+    if not is_admin_author(interaction.user):
+        await interaction.response.send_message("❌ Only the operator can manage personas.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    resp = await send_daemon_ipc(f"AI PERSONA {name.strip()}")
+    if resp and resp.startswith("persona:active,"):
+        await interaction.followup.send(f"🎭 Persona **{resp.split(',', 1)[1]}** is now active — the agent speaks as it from the next message.")
+    elif resp:
+        await interaction.followup.send(resp[:1900])
+    else:
+        await interaction.followup.send("⚠️ No response from the node.")
+
+@tree.command(name="rename", description="Rename the current session so it can be referenced by name later")
+@discord.app_commands.describe(name="The new session name")
+async def rename_cmd(interaction: discord.Interaction, name: str):
+    if not _interaction_in_channel(interaction):
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+    if not is_admin_author(interaction.user):
+        await interaction.response.send_message("❌ Only the operator can rename sessions.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    payload = json.dumps({"id": active_session_id or "", "title": name.strip()})
+    resp = await send_daemon_ipc(f"SESSION RENAME {payload}")
+    if resp and "rename_ok" in resp:
+        await interaction.followup.send(f"📝 Session renamed to **{name.strip()}** — you can reference it by that name from any session.")
+    else:
+        await interaction.followup.send(f"⚠️ Could not rename session: {resp}")
+
+@tree.command(name="autoapprove", description="Toggle session auto-approve — tools run without approval prompts")
+@discord.app_commands.describe(state="on or off")
+@discord.app_commands.choices(state=[
+    discord.app_commands.Choice(name="on", value="on"),
+    discord.app_commands.Choice(name="off", value="off"),
+])
+async def autoapprove_cmd(interaction: discord.Interaction, state: discord.app_commands.Choice[str]):
+    if not _interaction_in_channel(interaction):
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+    # Approval bypass is operator-only — this disables the human gate for the session.
+    if not is_admin_author(interaction.user):
+        await interaction.response.send_message("❌ Only the operator can toggle auto-approve.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    resp = await send_daemon_ipc(f"AI AUTOAPPROVE {state.value.upper()}")
+    if resp and resp.startswith("ai:autoapprove"):
+        icon = "🔓" if state.value == "on" else "🔒"
+        detail = "tools run without approval prompts this session" if state.value == "on" else "approval prompts restored"
+        await interaction.followup.send(f"{icon} Session auto-approve **{state.value.upper()}** — {detail}.")
+    else:
+        await interaction.followup.send(f"⚠️ Could not toggle auto-approve: {resp}")
+
 # Approval timeout in seconds
 # No timeout — user said "WAIT" (indefinite)
 APPROVAL_TIMEOUT = None
@@ -1434,7 +1499,11 @@ async def on_message(message):
             return
         
         # P9: /persona <name> | /persona list — activate or list registered personas.
+        # (Text fallback; the registered slash command is the primary surface.)
         if message.content.strip().lower().startswith("/persona"):
+            if not is_admin_author(message.author):
+                await message.reply("❌ Only the operator can manage personas.")
+                return
             parts = message.content.strip().split(maxsplit=1)
             arg = (parts[1].strip() if len(parts) > 1 else "list")
             resp = await send_daemon_ipc(f"AI PERSONA {arg}")
@@ -1451,6 +1520,9 @@ async def on_message(message):
         # P8: /rename <name> — name the ACTIVE session so it can be referenced by name
         # later (read_transcripts / SESSION SET accept titles).
         if message.content.strip().lower().startswith("/rename"):
+            if not is_admin_author(message.author):
+                await message.reply("❌ Only the operator can rename sessions.")
+                return
             parts = message.content.strip().split(maxsplit=1)
             if len(parts) < 2 or not parts[1].strip():
                 await message.reply("Usage: `/rename <new session name>`")
@@ -1465,7 +1537,11 @@ async def on_message(message):
             return
 
         # P4: /autoapprove on|off — persistent per-session auto-approve toggle.
+        # (Text fallback; the registered slash command is the primary surface.)
         if message.content.strip().lower().startswith("/autoapprove"):
+            if not is_admin_author(message.author):
+                await message.reply("❌ Only the operator can toggle auto-approve.")
+                return
             parts = message.content.strip().split(maxsplit=1)
             state = (parts[1].strip().lower() if len(parts) > 1 else "on")
             if state not in ("on", "off"):
