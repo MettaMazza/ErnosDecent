@@ -1789,6 +1789,27 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         set ok to send_response(client_fd and 200 and "application/json" and "{\"status\":\"ok\",\"cancelled\":true}")
         return 0
 
+    if raw_path equals "/api/autoapprove":
+        # P4: persistent per-session auto-approve toggle. Routed over IPC (NOT a direct
+        # agent_ctx write — the web server is a separate THREAD, and mutating a
+        # GC-managed map cross-thread is the exact unsynchronized-shared-Map hazard the
+        # /api/cancel comment above documents). If the daemon is mid-run the toggle
+        # queues behind the turn and applies at the next IPC accept — fine for a
+        # between-runs settings flip.
+        if method equals "POST":
+            set aa_body to extract_request_body(req)
+            set aa_state to "OFF"
+            if string_contains(aa_body and "\"on\":true") == 1 or else string_contains(aa_body and "\"state\":\"on\"") == 1:
+                set aa_state to "ON"
+            set aa_resp to query_daemon_ipc(concat("AI AUTOAPPROVE " and aa_state))
+            if string_contains(aa_resp and "ai:autoapprove") == 1:
+                set ok to send_response(client_fd and 200 and "application/json" and concat("{\"status\":\"ok\",\"autoapprove\":\"" and concat(string_lower(aa_state) and "\"}")))
+            else:
+                set ok to send_response(client_fd and 500 and "application/json" and "{\"status\":\"error\",\"message\":\"toggle failed\"}")
+            return 0
+        set ok to send_response(client_fd and 405 and "application/json" and "{\"status\":\"error\",\"message\":\"POST only\"}")
+        return 0
+
     if raw_path equals "/api/upload":
         if method equals "POST":
             set body to extract_request_body(req)

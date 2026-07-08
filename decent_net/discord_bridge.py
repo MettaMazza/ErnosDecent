@@ -511,6 +511,20 @@ class ApprovalView(discord.ui.View):
         await interaction.response.edit_message(content=interaction.message.content, view=self)
         self.stop()
 
+    @discord.ui.button(label="Auto-approve session", emoji="🔓", style=discord.ButtonStyle.gray)
+    async def auto_approve_session(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """P4: PERSISTENT auto-approve for this SESSION (survives across requests until
+        toggled off or the node restarts) — unlike Approve All, which only covers the
+        current request. Approves the pending action too."""
+        if interaction.user != self.author:
+            await interaction.response.send_message("❌ Only the original sender can approve/deny this request.", ephemeral=True)
+            return
+        self.value = "session"
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=interaction.message.content, view=self)
+        self.stop()
+
     @discord.ui.button(label="Deny", emoji="❌", style=discord.ButtonStyle.red)
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.author:
@@ -773,6 +787,12 @@ async def handle_tool_approval(message, resp, edit_msg=None):
     elif view.value == "all":
         await approval_msg.edit(content=f"⚡ **Approved All** `{tool_name}` — executing subsequent actions automatically...", view=view)
         ipc_resp = await send_daemon_ipc("AI APPROVE_ALL")
+    elif view.value == "session":
+        # Enable the persistent per-session toggle FIRST, then approve the pending
+        # action — every later gate in this session auto-approves until /autoapprove off.
+        await approval_msg.edit(content=f"🔓 **Session auto-approve ON** — `{tool_name}` approved; no more prompts this session (`/autoapprove off` to re-enable).", view=view)
+        await send_daemon_ipc("AI AUTOAPPROVE ON")
+        ipc_resp = await send_daemon_ipc("AI APPROVE")
     else:
         await approval_msg.edit(content=f"❌ **Denied** `{tool_name}` — cancelled.", view=view)
         ipc_resp = await send_daemon_ipc("AI DENY")
@@ -1410,6 +1430,21 @@ async def on_message(message):
                     pass
             return
         
+        # P4: /autoapprove on|off — persistent per-session auto-approve toggle.
+        if message.content.strip().lower().startswith("/autoapprove"):
+            parts = message.content.strip().split(maxsplit=1)
+            state = (parts[1].strip().lower() if len(parts) > 1 else "on")
+            if state not in ("on", "off"):
+                await message.reply("Usage: `/autoapprove on` or `/autoapprove off`")
+                return
+            resp = await send_daemon_ipc(f"AI AUTOAPPROVE {state.upper()}")
+            if resp and resp.startswith("ai:autoapprove"):
+                icon = "🔓" if state == "on" else "🔒"
+                await message.reply(f"{icon} Session auto-approve **{state.upper()}** — {'tools run without approval prompts this session' if state == 'on' else 'approval prompts restored'}.")
+            else:
+                await message.reply(f"⚠️ Could not toggle auto-approve: {resp}")
+            return
+
         # Check if the message is the /new command
         if message.content.strip().startswith("/new"):
             parts = message.content.strip().split(maxsplit=1)

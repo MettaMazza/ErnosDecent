@@ -916,6 +916,30 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
                                                 set resp to "ai:error,reason:agent_not_initialized"
+                                        else if string_contains(cmd_upper and "AI AUTOAPPROVE ") == 1:
+                                            # P4: PERSISTENT per-session auto-approve toggle. Unlike AI APPROVE_ALL
+                                            # (request-scoped; cleared after the run), this flag lives for the
+                                            # session: every approval gate in react_run_loop consults it, so tools
+                                            # run without pausing until toggled OFF. Deliberately NOT persisted to
+                                            # disk — a node restart resets to the safe default (OFF). Observer
+                                            # audits stay fully active (approval only downgrades BLOCKED to
+                                            # advisory, exactly as with a manual approve).
+                                            if agent_ctx != 0:
+                                                set aa_arg to string_upper(string_trim(substring(cmd and 15 and string_length(cmd) - 15)))
+                                                if map_contains(agent_ctx and "session_auto_approve") == 0:
+                                                    set ok to map_insert(agent_ctx and "session_auto_approve" and create_map())
+                                                set aa_map to map_get_val(agent_ctx and "session_auto_approve")
+                                                set aa_sessions to map_get_val(agent_ctx and "sessions")
+                                                set aa_sid to map_get_val(aa_sessions and "active_session_id")
+                                                if aa_arg equals "ON":
+                                                    set ok to map_insert(aa_map and aa_sid and 1)
+                                                    set resp to f"ai:autoapprove,session:{aa_sid},state:on"
+                                                else:
+                                                    if map_contains(aa_map and aa_sid) == 1:
+                                                        set ok to map_delete(aa_map and aa_sid)
+                                                    set resp to f"ai:autoapprove,session:{aa_sid},state:off"
+                                            else:
+                                                set resp to "ai:error,reason:agent_not_initialized"
                                         else if cmd_upper equals "AI APPROVE_ALL":
                                             if agent_ctx != 0:
                                                 if map_contains(agent_ctx and "pending_action") == 1:
