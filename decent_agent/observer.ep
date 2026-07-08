@@ -47,9 +47,13 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
     # Build the audit instruction (the user-role message). The conversation
     # context (current_prompt) is sent separately as the system-role message
     # so the model can distinguish reference material from its current task.
-    set tools_schema to ""
-    if map_contains(ctx and "tools_schema") == 1:
-        set tools_schema to map_get_val(ctx and "tools_schema")
+    # KV-CACHE/PREFILL: do NOT re-embed the full tools schema (~24KB) in the audit
+    # instruction — it is already present inside current_prompt, which is sent as the
+    # system context and shared with the main call's KV prefix. Re-embedding it made the
+    # audit's UNSHARED suffix ~6-7k tokens that re-prefilled on every audit (measured:
+    # split body 62KB vs main 38KB; 43s audits under GPU load). A one-line pointer keeps
+    # the audit able to reference the schema without paying for a duplicate copy.
+    set tools_schema to "(see the full tool schema in the conversation context above)"
     # In tutor mode, the audit also enforces the answer-leak gate (no solution hand-outs).
     set tutor_on to tutor_is_active(ctx)
     set audit_instruction to observer_get_audit_instruction(agent_response and tools_schema and tutor_on)
