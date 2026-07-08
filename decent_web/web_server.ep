@@ -54,6 +54,84 @@ define query_daemon_ipc with command as Str returning Str:
 # Translate a daemon AI response (ai:ok / ai:pending_approval / ai:clarify / cancelled
 # / error) into the appropriate WS message(s) for the browser. Shared by the prompt,
 # approval, and clarification paths so all of them handle every outcome consistently.
+# Digits-only check for the /files/<rowid> route — the rowid goes into a SQL query, so it
+# must be a bare integer (no injection, no traversal). Empty string returns 0 (invalid).
+define web_is_all_digits with s as Str returning Int:
+    set n to string_length(s)
+    if n == 0:
+        return 0
+    set i to 0
+    repeat while i < n:
+        set c to get_character(s and i)
+        if c < 48 or else c > 57:
+            return 0
+        set i to i + 1
+    return 1
+
+# Last path component (for the download filename).
+define web_basename with path as Str returning Str:
+    set n to string_length(path)
+    set i to n - 1
+    repeat while i >= 0:
+        if get_character(path and i) == 47:
+            return substring(path and i + 1 and n - i - 1)
+        set i to i - 1
+    return path
+
+# Content-Type from extension so the browser renders images inline and downloads the rest.
+define web_content_type_for with path as Str returning Str:
+    set p to string_to_lower(path)
+    if ends_with(p and ".png") == 1:
+        return "image/png"
+    if ends_with(p and ".jpg") == 1 or else ends_with(p and ".jpeg") == 1:
+        return "image/jpeg"
+    if ends_with(p and ".gif") == 1:
+        return "image/gif"
+    if ends_with(p and ".webp") == 1:
+        return "image/webp"
+    if ends_with(p and ".svg") == 1:
+        return "image/svg+xml"
+    if ends_with(p and ".pdf") == 1:
+        return "application/pdf"
+    if ends_with(p and ".json") == 1:
+        return "application/json"
+    if ends_with(p and ".txt") == 1 or else ends_with(p and ".md") == 1:
+        return "text/plain; charset=utf-8"
+    return "application/octet-stream"
+
+# After a WebUI AI response, deliver the session's queued attachment + mid_message trace
+# rows to the browser — WebUI parity with Discord (which streams these via its trace poll).
+# Attachments become a file_attached message pointing at the jailed /files/<rowid> route so
+# the browser can show/download them; mid_messages become visible agent notes. Rows are
+# marked sent so they are delivered once. (The WebUI is synchronous, so these arrive right
+# after the reply rather than live-streamed mid-run — content parity, not yet live parity.)
+define ws_drain_side_channel with client_fd as Int and session_id as Str returning Int:
+    set db to storage_get_db()
+    if db == 0:
+        return 1
+    set es to string_replace(session_id and "'" and "''")
+    set q to concat("SELECT id, event_type, content FROM trace_events WHERE sent=0 AND event_type IN ('attachment','mid_message') AND session_id='" and concat(es and "' ORDER BY id;"))
+    set rows to sql_query(db and q)
+    set n to length_list(rows)
+    set i to 0
+    repeat while i < n:
+        set row to get_list(rows and i)
+        set rid to ptr_to_str(get_list(row and 0))
+        set etype to ptr_to_str(get_list(row and 1))
+        set content to ptr_to_str(get_list(row and 2))
+        if etype equals "attachment":
+            set is_img to 0
+            if starts_with(web_content_type_for(content) and "image/") == 1:
+                set is_img to 1
+            set amsg to concat("{\"type\":\"file_attached\",\"url\":\"/files/" and concat(rid and concat("\",\"name\":\"" and concat(escape_json_string(web_basename(content)) and concat("\",\"is_image\":" and concat(int_to_string(is_img) and "}"))))))
+            set ok to ws_send_text(client_fd and amsg)
+        else:
+            set mmsg to concat("{\"type\":\"mid_message\",\"text\":\"" and concat(escape_json_string(content) and "\"}"))
+            set ok to ws_send_text(client_fd and mmsg)
+        set ok to sql_execute(db and concat("UPDATE trace_events SET sent=1 WHERE id=" and concat(rid and ";")))
+        set i to i + 1
+    return 0
+
 define ws_dispatch_ai_response with client_fd as Int and ai_resp as Str returning Int:
     if string_contains(ai_resp and "error:") == 1:
         # Surface the ACTUAL error rather than the old misleading "AI subsystem not yet
@@ -480,6 +558,8 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set ai_resp to query_daemon_ipc(ai_cmd)
                     display f"[ws] IPC AI -> {ai_resp}"
                     set ok to ws_dispatch_ai_response(client_fd and ai_resp)
+                    # WebUI parity: deliver any files the agent attached + mid_messages.
+                    set ok to ws_drain_side_channel(client_fd and ws_active_sess)
                 else if msg_type equals "run_ep":
                     # Learning playground: compile + run the learner's snippet in the
                     # OS sandbox (no network, scratch-only FS, time/CPU caps) and return
@@ -1827,6 +1907,39 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                 set ok to free_bytes(wav_ptr)
                 set ok to net_close(client_fd)
                 return 0
+        set ok to send_response(client_fd and 404 and "text/plain" and "404 Not Found")
+        return 0
+
+    # Attachment download route: GET /files/<trace_rowid>. The URL carries the trace_events
+    # ROW ID (digits only), never a path — so there is zero path-traversal surface. The row
+    # must be an 'attachment' event, and those paths already passed access_path_secret when
+    # the node queued them (tools_emit_attachment), so only agent-produced/shared files are
+    # reachable. This is the WebUI half of the attachment feature (parity with Discord).
+    if starts_with(raw_path and "/files/") == 1:
+        set fid to substring(raw_path and 7 and string_length(raw_path) - 7)
+        if web_is_all_digits(fid) == 0:
+            set ok to send_response(client_fd and 400 and "text/plain" and "400 Bad Request")
+            return 0
+        set frows to sql_query(storage_get_db() and concat("SELECT content FROM trace_events WHERE event_type='attachment' AND id=" and concat(fid and " LIMIT 1;")))
+        if length_list(frows) > 0:
+            set frow to get_list(frows and 0)
+            set fpath to ptr_to_str(get_list(frow and 0))
+            if file_exists(fpath) == 1:
+                set fbytes to tts_read_file_bytes(fpath)
+                set fptr to map_get_val(fbytes and "ptr")
+                set flen to map_get_val(fbytes and "len")
+                if fptr != 0 and also flen > 0:
+                    set fhdr to "HTTP/1.1 200 OK\r\nContent-Type: "
+                    set fhdr to concat(fhdr and web_content_type_for(fpath))
+                    set fhdr to concat(fhdr and "\r\nContent-Length: ")
+                    set fhdr to concat(fhdr and int_to_string(flen))
+                    set fhdr to concat(fhdr and "\r\nContent-Disposition: inline; filename=\"")
+                    set fhdr to concat(fhdr and web_basename(fpath))
+                    set fhdr to concat(fhdr and "\"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+                    set ok to tts_http_send_binary(client_fd and fhdr and fptr and flen)
+                    set ok to free_bytes(fptr)
+                    set ok to net_close(client_fd)
+                    return 0
         set ok to send_response(client_fd and 404 and "text/plain" and "404 Not Found")
         return 0
 
