@@ -2,7 +2,11 @@
 # node); this gives the node an outbound command channel so agent tools can drive the
 # bridge (read a channel, list channels, add a reaction, send). Backed by a SQLite
 # queue (persists, survives restart) so the whole protocol is deterministic + testable.
-# The bridge polls DISCORD POLL, executes, and returns via DISCORD RESULT.
+# PRIMARY transport: the bridge polls the bridge_commands TABLE directly from SQLite
+# (500ms, same cross-process pattern as trace_events) and writes results directly —
+# this works MID-TURN, when the single-threaded IPC daemon is held by the agent turn.
+# FALLBACK: the bridge polls DISCORD POLL over IPC and returns via DISCORD RESULT
+# (remote bridges without DB-file access); it cannot serve mid-turn commands.
 # Component: decent_net/bridge_rpc.ep
 
 import "string"
@@ -106,8 +110,15 @@ define bridge_get_result with db as Int and id as Int returning Str:
         return concat("pending:" and status)
     return "error:not_found"
 
-# Poll for a result up to max_tries (50ms apart). Returns the data when ready, or
-# "discord:queued,id:<id>" if the bridge hasn't answered yet (non-blocking-ish).
+# Awaitable pure sleep (C helper injected by build.sh). Unlike ep_sleep_ms — which
+# blocks the WHOLE single-threaded async loop — awaiting this yields, so sibling agent
+# tasks keep running while we wait for the bridge process to answer via SQLite.
+external define ep_async_sleep_ms with ms returning Int
+
+# Poll for a result up to max_tries (50ms apart, async-yielding). Returns the data when
+# ready, or "discord:queued,id:<id>" if the bridge hasn't answered in time. With the
+# bridge's direct-SQLite command loop (500ms cadence) a live bridge answers well inside
+# 200 tries (10s); only a down/disconnected bridge times out.
 define bridge_wait_result with db as Int and id as Int and max_tries as Int returning Str:
     set i to 0
     repeat while i < max_tries:
@@ -118,6 +129,6 @@ define bridge_wait_result with db as Int and id as Int and max_tries as Int retu
                 set is_pending to 1
         if is_pending == 0:
             return res
-        set ok to sleep_ms(50)
+        set ok to await ep_async_sleep_ms(50)
         set i to i + 1
     return concat("discord:queued,id:" and int_to_string(id))

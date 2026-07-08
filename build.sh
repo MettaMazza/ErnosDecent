@@ -110,6 +110,25 @@ long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
     return (long long)fut;
 }
 
+/* Awaitable pure sleep: a future completed by a timer task after ms. Lets EP code wait
+   without blocking the single-threaded async loop — ep_sleep_ms stalls EVERY task for
+   the duration; awaiting this yields, so sibling agent tasks (and their LLM reads)
+   keep running. Reuses the readable-timeout plumbing's timer half. Used by
+   bridge_wait_result so a Discord RPC wait cannot freeze the node. */
+long long ep_async_sleep_ms(long long ms) {
+    EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
+    fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;
+    { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
+    EpReadReadyArgs* targs = (EpReadReadyArgs*)malloc(sizeof(EpReadReadyArgs));
+    targs->fut = fut;
+    EpTask* ttask = (EpTask*)malloc(sizeof(EpTask));
+    ttask->step = ep_readto_timer_step; ttask->args = targs;
+    ttask->args_size_bytes = sizeof(EpReadReadyArgs);
+    ttask->fut = NULL; ttask->state = 0; ttask->is_cancelled = 0; ttask->parent = ep_current_task;
+    ep_async_register_timer(ms, ttask);
+    return (long long)fut;
+}
+
 /* Read a file binary-safe (length-aware) and return base64 — for embedding a generated
    image into a multimodal LLM request. ep_base64_encode is strlen-based (truncates at NULs). */
 long long ep_file_to_base64(long long path_ptr) {

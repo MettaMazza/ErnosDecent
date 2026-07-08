@@ -1001,9 +1001,63 @@ async def _exec_bridge_command(action, args):
     except Exception as e:
         return f"error: {e}"
 
+async def bridge_commands_db_loop():
+    """Poll bridge_commands DIRECTLY from SQLite and answer directly — the PRIMARY RPC
+    path. The IPC path below (bridge_poll_loop) cannot fetch commands while the
+    single-threaded daemon is busy running an agent turn, which is exactly when tools
+    like react/discord_list_channels enqueue them — so mid-turn commands could never
+    complete mid-turn and always timed out as 'discord:queued'. Direct DB polling
+    mirrors trace_poll_loop's proven cross-process pattern: 500ms cadence, atomic
+    pending->sent claim (no double-execution with the IPC fallback), result written
+    straight back as status='done' for the node's bridge_wait_result to pick up."""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            conn = sqlite3.connect(get_db_path())
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, action, args FROM bridge_commands WHERE status='pending' ORDER BY id LIMIT 20"
+            )
+            rows = cursor.fetchall()
+            claimed = []
+            for cid, action, args in rows:
+                # Atomic claim: whoever flips pending->sent first (this loop or the IPC
+                # fallback's bridge_poll) owns the command; the other sees nothing.
+                cursor.execute(
+                    "UPDATE bridge_commands SET status='sent' WHERE id=? AND status='pending'",
+                    (cid,),
+                )
+                if cursor.rowcount == 1:
+                    claimed.append((cid, action, args))
+            conn.commit()
+            conn.close()
+            for cid, action, args in claimed:
+                result = await _exec_bridge_command(action, args)
+                try:
+                    conn = sqlite3.connect(get_db_path())
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE bridge_commands SET status='done', result=? WHERE id=?",
+                        (result, cid),
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"[Discord Bridge] bridge_commands result write error: {e}", flush=True)
+        except sqlite3.OperationalError:
+            # Table not created yet (node makes it lazily) or DB momentarily locked —
+            # both normal; next tick retries.
+            pass
+        except Exception as e:
+            print(f"[Discord Bridge] bridge_commands db loop error: {e}", flush=True)
+        await asyncio.sleep(0.5)
+
 async def bridge_poll_loop():
-    """Poll the daemon for queued agent->bridge commands, execute them, and return
-    results — making the otherwise one-way bridge bidirectional (node<->bridge RPC).
+    """FALLBACK RPC path: poll the daemon over IPC for queued agent->bridge commands.
+    Only useful when the bridge cannot reach the SQLite file directly (remote bridge);
+    bridge_commands_db_loop above normally claims commands first. NOTE: this path
+    cannot serve commands enqueued MID-TURN (the single-threaded IPC daemon is held by
+    the agent turn) — that is why the DB loop is primary.
     The daemon side is decent_net/bridge_rpc.ep (DISCORD POLL / DISCORD RESULT)."""
     await client.wait_until_ready()
     while not client.is_closed():
@@ -1194,11 +1248,13 @@ async def on_ready():
     print(f"[Discord Bridge] Active session ID is: {active_session_id}", flush=True)
     update_status("ONLINE")
 
-    # Start the node<->bridge RPC poll loop (idempotent — guard against double-start).
+    # Start the node<->bridge RPC loops (idempotent — guard against double-start).
+    # DB loop is PRIMARY (works mid-turn); IPC loop is the fallback.
     if not getattr(client, "_bridge_poll_started", False):
         client._bridge_poll_started = True
+        create_tracked_task(bridge_commands_db_loop())
         create_tracked_task(bridge_poll_loop())
-        print("[Discord Bridge] node<->bridge RPC poll loop started.", flush=True)
+        print("[Discord Bridge] node<->bridge RPC loops started (DB primary + IPC fallback).", flush=True)
     
     # Start the pending-deletes cleanup loop (crash resilience for trace threads)
     if not getattr(client, "_cleanup_started", False):

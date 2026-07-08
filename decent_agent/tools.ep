@@ -1817,11 +1817,13 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: discord_read_channel requires 1 argument (channel_id)."
         set ddb to storage_get_db()
         set did to bridge_enqueue(ddb and "discord" and "read_channel" and get_list(args_list and 0))
-        return bridge_wait_result(ddb and did and 30)
+        # 200 tries x 50ms = 10s (async-yielding): the bridge's direct-SQLite loop
+        # answers in ~0.5-1s when live; only a down bridge times out to queued.
+        return bridge_wait_result(ddb and did and 200)
     if action_name equals "discord_list_channels":
         set ddb to storage_get_db()
         set did to bridge_enqueue(ddb and "discord" and "list_channels" and "")
-        return bridge_wait_result(ddb and did and 30)
+        return bridge_wait_result(ddb and did and 200)
     if action_name equals "react":
         # React to the CURRENT message with just an emoji — the message + channel are taken
         # from this turn's context (threaded from the Discord bridge). No ids for the agent.
@@ -1839,7 +1841,14 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set rx_args to concat(rx_chan and concat("|" and concat(rx_msg and concat("|" and rx_emoji))))
         set ddb to storage_get_db()
         set did to bridge_enqueue(ddb and "discord" and "add_reaction" and rx_args)
-        return bridge_wait_result(ddb and did and 30)
+        # CLAIM HONESTY: only say "reacted" when the bridge CONFIRMED it (60x50ms = 3s
+        # async wait). A queued-but-unconfirmed reaction is reported as exactly that.
+        set rx_res to bridge_wait_result(ddb and did and 60)
+        if string_contains(rx_res and "reaction added") == 1:
+            return "discord:reacted"
+        if string_contains(rx_res and "discord:queued") == 1:
+            return concat(rx_res and " (bridge has not confirmed yet — delivery continues in the background)")
+        return rx_res
 
     if action_name equals "discord_add_reaction":
         if length_list(args_list) < 3:
@@ -1847,7 +1856,10 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set dargs to concat(get_list(args_list and 0) and concat("|" and concat(get_list(args_list and 1) and concat("|" and get_list(args_list and 2)))))
         set ddb to storage_get_db()
         set did to bridge_enqueue(ddb and "discord" and "add_reaction" and dargs)
-        return bridge_wait_result(ddb and did and 30)
+        set dr_res to bridge_wait_result(ddb and did and 60)
+        if string_contains(dr_res and "reaction added") == 1:
+            return "discord:reacted"
+        return dr_res
 
     if action_name equals "submit_issue":
         if length_list(args_list) < 3:
