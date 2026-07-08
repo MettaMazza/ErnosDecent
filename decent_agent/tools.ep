@@ -51,6 +51,112 @@ external define ep_cancel_get with dummy returning Int
 external define ep_cancel_set with v returning Int
 external define ep_time_now_ms returning Int
 
+# Single-flight guard for the background validation coordinator — one run at a time.
+set TEST_ALL_RUNNING to create_map()
+
+# P11 coordinator — runs as a BACKGROUND async task (called WITHOUT await, the
+# orchestrator_spawn pattern), so test_all_systems returns instantly and the agent can
+# answer the user while validation proceeds. Spawns the 13 master_prompt.md blocks as
+# SEQUENTIAL sub-agents (shared LLM — parallel blocks would contend), reports progress
+# per block via mid_message, honors a user Stop between blocks, and finishes by writing
+# + attaching the scorecard report and announcing completion.
+async define tools_test_all_worker with ctx as Map and orch as Int and model as Int and memory as Int and tools as Int and sid as Str and platform as Str and aa_on as Int and db as Int returning Int:
+    set started to ep_time_now_ms()
+    set mp to read_file("master_prompt.md")
+    if string_length(mp) == 0:
+        set ok to trace_emit(db and sid and "mid_message" and "🧪 test_all_systems: master_prompt.md unreadable — validation aborted.")
+        set ok to map_delete(TEST_ALL_RUNNING and "run")
+        return 1
+    if aa_on == 1:
+        # Propagate the operator's session auto-approve grant to the sub-agents
+        # (orchestrator_spawn consumes this explicit key; see P11 note there).
+        set ok to map_insert(ctx and "child_auto_approve" and 1)
+    set report to "# Full System Validation Report\n\n"
+    set pass_blocks to 0
+    set skip_blocks to 0
+    set fail_blocks to 0
+    set sections to string_split(mp and "\n## ")
+    set nsec to length_list(sections)
+    set bn to 0
+    set si to 1
+    set halted to 0
+    repeat while si < nsec and also halted == 0:
+        set sec to get_list(sections and si)
+        # Fenced block content between ``` markers; sections without a fence are prose.
+        set f1 to string_index_of(sec and "```")
+        if f1 >= 0:
+            set bn to bn + 1
+            set title to sec
+            set nl to string_index_of(sec and "\n")
+            if nl >= 0:
+                set title to string_trim(substring(sec and 0 and nl))
+            set body_start to f1 + 4
+            set rest to substring(sec and body_start and string_length(sec) - body_start)
+            set f2 to string_index_of(rest and "```")
+            set block to ""
+            if f2 > 0:
+                set block to string_trim(substring(rest and 0 and f2))
+            if string_length(block) > 0:
+                # Honor a user Stop between blocks (consume it and report partial).
+                if ep_cancel_get(0) == 1:
+                    set ok to ep_cancel_set(0)
+                    set report to concat(report and "\n**HALTED by user Stop — remaining blocks not run.**\n")
+                    set halted to 1
+                else:
+                    set skip_reason to ""
+                    if bn == 8 or else bn == 9:
+                        if aa_on == 0:
+                            set skip_reason to "approval-gated — enable session auto-approve (/autoapprove on) to include it"
+                    if bn == 11:
+                        if platform equals "discord":
+                            set skip_reason to skip_reason
+                        else:
+                            set skip_reason to "Discord-surface block — this run did not originate on Discord"
+                    if string_length(skip_reason) > 0:
+                        set skip_blocks to skip_blocks + 1
+                        set report to concat(report and f"## Block {bn} — {title}\n⏭️ SKIPPED: {skip_reason}\n\n")
+                        set ok to trace_emit(db and sid and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) skipped — {skip_reason}")
+                    else:
+                        set ok to trace_emit(db and sid and "mid_message" and f"🧪 test_all_systems: running block {bn} — {title}")
+                        set instr to concat("[AUTOMATED VALIDATION SUB-AGENT] You are executing ONE block of the full-system validation. Execute it exactly, no questions, and END with reply_request containing the scorecard table.\n\n" and block)
+                        set tid to orchestrator_spawn(orch and instr and f"validator-block-{bn}" and model and memory and tools and cast_map_to_int(ctx))
+                        set waited to 0
+                        set done to 0
+                        set result to ""
+                        repeat while waited < 900000 and also done == 0:
+                            set st to orchestrator_check(orch and tid)
+                            if string_index_of(st and "completed:") == 0:
+                                set result to substring(st and 10 and string_length(st) - 10)
+                                set done to 1
+                            else if st equals "cancelled" or else st equals "not_found":
+                                set result to concat("(sub-agent " and concat(st and ")"))
+                                set done to 1
+                            else:
+                                set ok to await ep_async_sleep_ms(2000)
+                                set waited to waited + 2000
+                        if done == 0:
+                            set result to "⏰ TIMEOUT: block did not complete within 15 minutes."
+                            set fail_blocks to fail_blocks + 1
+                        else:
+                            if string_contains(result and "PENDING_APPROVAL") == 1 or else string_contains(string_upper(result) and "FAIL") == 1 or else string_contains(result and "❌") == 1:
+                                set fail_blocks to fail_blocks + 1
+                            else:
+                                set pass_blocks to pass_blocks + 1
+                        set report to concat(report and f"## Block {bn} — {title}\n{result}\n\n")
+        set si to si + 1
+    if aa_on == 1:
+        set ok to map_delete(ctx and "child_auto_approve")
+    set wall to (ep_time_now_ms() - started) / 1000
+    set report to concat(report and f"---\n**Blocks: {bn} total — {pass_blocks} clean, {fail_blocks} with failures/timeouts, {skip_blocks} skipped. Wall time: {wall}s.** Per-call prefill/decode timings are in the node log ([LLM TTFT]).\n")
+    set fname to concat("validation_report_" and concat(int_to_string(started) and ".md"))
+    set rpath to workspace_write_file(fname and report)
+    set attach_note to ""
+    if tools_emit_attachment(sid and rpath) == 0:
+        set attach_note to " Report attached."
+    set ok to trace_emit(db and sid and "mid_message" and f"🧪 test_all_systems COMPLETE: {bn} blocks — {pass_blocks} clean, {fail_blocks} with failures/timeouts, {skip_blocks} skipped, {wall}s. Report: {rpath}.{attach_note}")
+    set ok to map_delete(TEST_ALL_RUNNING and "run")
+    return 0
+
 define append_string_to_char_list with char_list as List and s as Str returning Int:
     set len to string_length(s)
     set i to 0
@@ -2133,18 +2239,21 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
 
     # ---- Orchestration tools ----
     if action_name equals "test_all_systems":
-        # P11: autonomous full validation — the 13 master_prompt.md blocks run as
-        # SEQUENTIAL sub-agents (they share one LLM and one async loop; parallel blocks
-        # would contend and interleave their tool state), each result collected into a
-        # workspace report that is auto-attached. Owner/admin by the default deny gate.
+        # P11: autonomous full validation — ASYNC DISPATCH (delegate_task pattern).
+        # The tool returns IMMEDIATELY so the agent can answer the user in the same
+        # turn; the coordinator below runs as a background async task, spawning the 13
+        # master_prompt.md blocks as SEQUENTIAL sub-agents (they share one LLM; parallel
+        # blocks would contend) and reporting progress via mid_message. The first
+        # version ran the loop INSIDE this tool call, which held the parent's turn —
+        # and its queued reply — hostage for the entire validation.
         set ta_orch to map_get_val(ctx and "orchestrator")
         if ta_orch == 0:
             return "Error: Orchestrator not initialized."
-        set ta_mp to ""
-        if file_exists("master_prompt.md") == 1:
-            set ta_mp to read_file("master_prompt.md")
-        if string_length(ta_mp) == 0:
+        if file_exists("master_prompt.md") == 0:
             return "Error: master_prompt.md not found in the project root."
+        if map_contains(TEST_ALL_RUNNING and "run") == 1:
+            return "A full validation is ALREADY running — progress arrives as live updates; the report attaches when it finishes. Not starting a second one."
+        set ok to map_insert(TEST_ALL_RUNNING and "run" and 1)
         set ta_sid to ""
         if map_contains(ctx and "session_id") == 1:
             set ta_sid to map_get_val(ctx and "session_id")
@@ -2159,96 +2268,15 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set ta_aa_map to map_get_val(ctx and "session_auto_approve")
             if map_contains(ta_aa_map and ta_sid) == 1:
                 set ta_aa to 1
-        if ta_aa == 1:
-            set ok to map_insert(ctx and "child_auto_approve" and 1)
         set ta_db to storage_get_db()
         set ta_model to map_get_val(ctx and "model")
         set ta_memory to map_get_val(ctx and "memory_mgr")
         set ta_tools to map_get_val(ctx and "tools_mgr")
-        set ta_started to ep_time_now_ms()
-        set ta_report to "# Full System Validation Report\n\n"
-        set ta_pass_blocks to 0
-        set ta_skip_blocks to 0
-        set ta_fail_blocks to 0
-        set ta_sections to string_split(ta_mp and "\n## ")
-        set ta_nsec to length_list(ta_sections)
-        set ta_bn to 0
-        set ta_si to 1
-        set ta_halted to 0
-        repeat while ta_si < ta_nsec and also ta_halted == 0:
-            set ta_sec to get_list(ta_sections and ta_si)
-            # Fenced block content between ``` markers; sections without a fence are prose.
-            set ta_f1 to string_index_of(ta_sec and "```")
-            if ta_f1 >= 0:
-                set ta_bn to ta_bn + 1
-                set ta_title to ta_sec
-                set ta_nl to string_index_of(ta_sec and "\n")
-                if ta_nl >= 0:
-                    set ta_title to string_trim(substring(ta_sec and 0 and ta_nl))
-                set ta_body_start to ta_f1 + 4
-                set ta_rest to substring(ta_sec and ta_body_start and string_length(ta_sec) - ta_body_start)
-                set ta_f2 to string_index_of(ta_rest and "```")
-                set ta_block to ""
-                if ta_f2 > 0:
-                    set ta_block to string_trim(substring(ta_rest and 0 and ta_f2))
-                if string_length(ta_block) > 0:
-                    # Honor a user Stop between blocks (consume it and report partial).
-                    if ep_cancel_get(0) == 1:
-                        set ok to ep_cancel_set(0)
-                        set ta_report to concat(ta_report and "\n**HALTED by user Stop — remaining blocks not run.**\n")
-                        set ta_halted to 1
-                    else:
-                        set ta_skip_reason to ""
-                        if ta_bn == 8 or else ta_bn == 9:
-                            if ta_aa == 0:
-                                set ta_skip_reason to "approval-gated — enable session auto-approve (/autoapprove on) to include it"
-                        if ta_bn == 11:
-                            if ta_platform equals "discord":
-                                set ta_skip_reason to ta_skip_reason
-                            else:
-                                set ta_skip_reason to "Discord-surface block — this run did not originate on Discord"
-                        if string_length(ta_skip_reason) > 0:
-                            set ta_skip_blocks to ta_skip_blocks + 1
-                            set ta_report to concat(ta_report and f"## Block {ta_bn} — {ta_title}\n⏭️ SKIPPED: {ta_skip_reason}\n\n")
-                            set ok to trace_emit(ta_db and ta_sid and "mid_message" and f"🧪 test_all_systems: block {ta_bn} ({ta_title}) skipped — {ta_skip_reason}")
-                        else:
-                            set ok to trace_emit(ta_db and ta_sid and "mid_message" and f"🧪 test_all_systems: running block {ta_bn} — {ta_title}")
-                            set ta_instr to concat("[AUTOMATED VALIDATION SUB-AGENT] You are executing ONE block of the full-system validation. Execute it exactly, no questions, and END with reply_request containing the scorecard table.\n\n" and ta_block)
-                            set ta_tid to orchestrator_spawn(ta_orch and ta_instr and f"validator-block-{ta_bn}" and ta_model and ta_memory and ta_tools and cast_map_to_int(ctx))
-                            set ta_waited to 0
-                            set ta_done to 0
-                            set ta_result to ""
-                            repeat while ta_waited < 900000 and also ta_done == 0:
-                                set ta_st to orchestrator_check(ta_orch and ta_tid)
-                                if string_index_of(ta_st and "completed:") == 0:
-                                    set ta_result to substring(ta_st and 10 and string_length(ta_st) - 10)
-                                    set ta_done to 1
-                                else if ta_st equals "cancelled" or else ta_st equals "not_found":
-                                    set ta_result to concat("(sub-agent " and concat(ta_st and ")"))
-                                    set ta_done to 1
-                                else:
-                                    set ok to await ep_async_sleep_ms(2000)
-                                    set ta_waited to ta_waited + 2000
-                            if ta_done == 0:
-                                set ta_result to "⏰ TIMEOUT: block did not complete within 15 minutes."
-                                set ta_fail_blocks to ta_fail_blocks + 1
-                            else:
-                                if string_contains(ta_result and "PENDING_APPROVAL") == 1 or else string_contains(string_upper(ta_result) and "FAIL") == 1 or else string_contains(ta_result and "❌") == 1:
-                                    set ta_fail_blocks to ta_fail_blocks + 1
-                                else:
-                                    set ta_pass_blocks to ta_pass_blocks + 1
-                            set ta_report to concat(ta_report and f"## Block {ta_bn} — {ta_title}\n{ta_result}\n\n")
-            set ta_si to ta_si + 1
-        if ta_aa == 1:
-            set ok to map_delete(ctx and "child_auto_approve")
-        set ta_wall to (ep_time_now_ms() - ta_started) / 1000
-        set ta_report to concat(ta_report and f"---\n**Blocks: {ta_bn} total — {ta_pass_blocks} clean, {ta_fail_blocks} with failures/timeouts, {ta_skip_blocks} skipped. Wall time: {ta_wall}s.** Per-call prefill/decode timings are in the node log ([LLM TTFT]).\n")
-        set ta_fname to concat("validation_report_" and concat(int_to_string(ta_started) and ".md"))
-        set ta_path to workspace_write_file(ta_fname and ta_report)
-        set ta_note to ""
-        if tools_emit_attachment(ta_sid and ta_path) == 0:
-            set ta_note to " (Attached to the chat.)"
-        return f"Full validation finished: {ta_bn} blocks — {ta_pass_blocks} clean, {ta_fail_blocks} with failures/timeouts, {ta_skip_blocks} skipped, {ta_wall}s. Report: {ta_path}{ta_note}"
+        # Fire-and-forget: calling the async worker WITHOUT await enqueues it on the
+        # event loop (exact orchestrator_spawn pattern) — it interleaves with this and
+        # later turns at await points.
+        set ta_fut to tools_test_all_worker(ctx and ta_orch and ta_model and ta_memory and ta_tools and ta_sid and ta_platform and ta_aa and ta_db)
+        return "Validation dispatched — the 13 blocks are running SEQUENTIALLY in the background (this takes many minutes). Progress arrives as live updates and the scorecard report will be attached when it completes. Do NOT wait for it: finish your turn and tell the user it is underway."
 
     if action_name equals "delegate_task":
         if length_list(args_list) < 2:
