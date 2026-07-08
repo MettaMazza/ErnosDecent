@@ -1,5 +1,10 @@
 # Decentralised Education — Implementation Plan
 
+> **STATUS (2026-07-08): Phases 0–2 IMPLEMENTED, live-tested.** Socratic tutor mode +
+> Learning web tab + `run_ep` sandbox landed 2026-06-30 (commits `b2e424d`, `524a7ae`,
+> `5c43ca8`); tutor mode is per-request and generalised to all subjects. The P2P
+> lesson-sharing phases beyond that are not yet built. Kept as the design record.
+
 **Goal:** Turn ErnosDecent into a node for *independent, decentralised learning and skill-sharing* — an AI that teaches you **how to learn**, not what to answer, starting from zero (e.g. ErnosPlain coding, never-coder → expert), with lessons and proven skills shared peer-to-peer over the mesh rather than held by any central authority.
 
 **Design influence:** Tsinghua's open-source **OpenMAIC** (Open Multi-Agent Interactive Classroom, MIT-licensed — [github.com/THU-MAIC/OpenMAIC](https://github.com/THU-MAIC/OpenMAIC)) demonstrated a multi-agent classroom (AI teacher + TA + AI classmates) validated on 700+ students. We adopt its *pattern*, not its code: a class is a small society of agents, not a chatbot. China's national **AI+Education plan** (preschool→lifelong by 2030) is the policy backdrop; this plan is the decentralised, individual-sovereign counterpart to that centralised curriculum.

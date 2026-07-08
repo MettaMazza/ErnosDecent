@@ -220,9 +220,18 @@ Provides distributed domain name mapping for `.decent` TLD domains to DIDs. Name
 ## 7. decent_agent (AI Coordinator & Hebbian Memory)
 
 ### Core Purpose & Operational Flow
-Runs an AI agent execution coordinator loop implementing the **ReAct (Reasoning and Acting)** framework. Memory is split into tiers: scratchpad (short-term), lessons (long-term semantic), timeline (episodic log), and a Hebbian knowledge graph; a consolidation/"sleep" sweep synthesises and prunes. Synaptic connections between core conceptual namespaces are updated dynamically via Hebbian learning. It also features a 3D Turing Grid tape for system actions.
+Runs an AI agent execution coordinator loop implementing the **ReAct (Reasoning and Acting)** framework. The loop supports **multi-tool batching**: the model may emit many `Action:` calls in a single response, and the coordinator executes each through the full approval/audit/observation path with no inference call between them (an N-tool independent batch costs ~1 model round-trip instead of N). Memory is split into tiers: scratchpad (short-term), lessons (long-term semantic), timeline (episodic log), and a Hebbian knowledge graph; a consolidation/"sleep" sweep synthesises and prunes. Synaptic connections between core conceptual namespaces are updated dynamically via Hebbian learning. It also features a 3D Turing Grid tape for system actions.
 
-Agent-parity (Phases 1–6, gated) adds: a **9-tool** surface with a guarded executor; **procedural memory** (an adapter version manifest with promote/rollback); an **observer split** — `observer_rules.ep` / `observer_parser.ep` / `observer_audit.ep`, a fail-closed LLM audit gate (default verdict BLOCKED) for dangerous tools, plus a deterministic moderation classifier; **providers + a model registry/router** (OpenAI-compatible and Hugging Face adapters with pure, deterministic selection); and **platform bridges** (Discord; Telegram/WhatsApp registry) over a node↔bridge RPC channel (`bridge_poll` / `bridge_submit_result`). The full recursive self-improvement loop (SAE interpretability, steering vectors, LoRA training-and-promotion) is **partial** — Phase 6 proves the fixed-point training math, but parity with the original ErnosAgent is not reached.
+The current agent surface (agent-parity branch, 2026-07-08):
+
+*   **71 registered tools** (`tools.ep`): wallet/DHT/name, codebase + workspace file I/O with read pagination, **project linking** (`workspace_links.ep` — register external project dirs, one active per session; the active marker is cleared on new-session creation), **sessions** (`session.ep` — persistent transcripts, keyword search, per-session guidance prompt), memory/cognition tools (scratchpad, lessons, timeline, knowledge graph, procedures, synaptic graph, reasoning notes, reading progress), RAG retrieval, web search/visit/download, `run_command` + `run_ep` sandbox, **`generate_image`** (local FLUX/SD via libstable-diffusion FFI, then a vision self-describe pass), Discord surface tools (`discord_list_channels` / `discord_read_channel` / `react`), sub-agent delegation (`orchestrator.ep`: task + swarm with concat/best/vote merge), scheduler, and the self-owned prompt (`self_prompt_get`/`set`, `session_prompt_get`/`set`).
+*   **Observer** — `observer.ep` / `observer_rules.ep` / `observer_parser.ep`: fail-closed LLM audit gate for dangerous tools (human approval downgrades a BLOCKED verdict to advisory), fail-open reply audit, a mid_message-scoped self-accountability look-back, explicit parsed-vs-default verdicts, and a deterministic moderation classifier.
+*   **Access & awareness** — `access.ep` (tiered Full-PC access; sensitive paths warn/re-ask, secrets hard-block) and `awareness.ep` (situational block, tool-routing map, act-vs-ask decision policy) assembled into every prompt alongside the `[CAPABILITIES]` framing, self-sections, and session guidance.
+*   **Model client/router** (`llm.ep`): auto-discovers llama.cpp (8080/8081), Ollama (11434), LM Studio (1234); default **gemma-4-31b**; async-timeout-bounded reads; `query_vision` routes multimodal calls to the :8091 vision server (same gemma weights served with their mmproj by `run_node.sh`). Providers + model registry (OpenAI-compatible, Hugging Face) offer pure deterministic selection.
+*   **Education** (`tutor.ep` / `sandbox_ep.ep`): Socratic tutor mode and a sandboxed ErnosPlain playground behind the Learning web tab.
+*   **Transparency**: every action, command result, and reasoning token streams untruncated into the SQLite `trace_events` table (`trace.ep`), rendered live in the web thinking panel and the Discord trace thread; **platform bridges** (Discord via `decent_net/discord_bridge.py` with reply-attached files/images, Stop/approval/clarification buttons; Telegram/WhatsApp registry) ride a node↔bridge RPC channel.
+
+The full recursive self-improvement loop (SAE interpretability, steering vectors, LoRA training-and-promotion) is **planned, not built** — Phase 6 proves the fixed-point training math only.
 
 ```mermaid
 graph TD
@@ -248,6 +257,8 @@ Persists weights and text logs to a JSON memory file:
 *   `timeline`: List of event strings `[timestamp/action] description`.
 *   `edges`: Synapse weights map (`"concept1-concept2" -> weight_int`).
 *   `permanent_edges`: Permanent synapses map (`"concept1-concept2" -> 1`).
+
+Additional persistence: sessions/transcripts under `config/sessions/` (gitignored), the live trace stream in SQLite (`trace_events`, `trace_whispers`, `trace_cancellations`), self-prompt sections in the data dir (`agent_self_sections.json`, git-immune), workspace project links in `config/linked_projects.txt` (machine-local, gitignored), and image-generation model paths in `config/image.json`.
 
 ### Key APIs & Protocol Commands
 *   `react_run(model, memory, tools, ctx, prompt)`: Coordinates prompt assembly, LLM inference, tool execution, and security audit loops.

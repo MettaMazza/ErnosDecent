@@ -1,6 +1,11 @@
 # Context & Access Implementation Plan
 ### So the ErnOS agent always knows what it can do, what it's looking at, and when to act vs. ask — with a tiered, admin-controlled access model.
 
+> **STATUS (2026-07-08): IMPLEMENTED.** Landed 2026-06-30 → 07-01 as
+> `decent_agent/awareness.ep` (situational block + tool-routing map + decision policy)
+> and `decent_agent/access.ep` (tiered Full-PC access + unsafe-action gate) — commits
+> `fa11c06`, `1e3c5dd`, `1c198ed`, plus fix `893d049`. Kept as the design record.
+
 ## 0. Governing law — AGENT.md
 - **No stubs.** Every piece is wired end to end and actually runs.
 - **Fix the root cause**, not the symptom.

@@ -1,6 +1,8 @@
-# Changelog
+# Changelog (historical — superseded)
 
-All notable changes to the ErnosDecent project are documented in this file.
+> **This file is a historical record and stopped being updated on 2026-06-29.**
+> The maintained changelog is [`CHANGELOG.md` at the repository root](../CHANGELOG.md).
+> Entries below are kept for the detail they carry about that period.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
