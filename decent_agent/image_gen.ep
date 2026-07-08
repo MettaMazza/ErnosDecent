@@ -1,0 +1,52 @@
+# image_gen.ep — ErnosPlain image generation over the libstable-diffusion FFI.
+#
+# The heavy diffusion runtime is a linked C library (libstable-diffusion, ggml/Metal) —
+# the same FFI pattern the node already uses for libsodium/libsqlite. ALL orchestration
+# lives here in ErnosPlain: choosing the model, sizing, the output path, and returning
+# the result for the tool layer to auto-attach. No Python; nothing shells out to a binary.
+#
+# The C shim (decent_agent/vendor/sd/sd_ep_shim.c) exposes one flat entry point that
+# builds sd.cpp's param structs, runs the pipeline, and PNG-encodes the first image.
+
+import "string"
+import "fs"
+import "collections"
+import "../storage"
+
+# FFI declaration — resolved from the shim object linked into the node by build.sh.
+external define sd_ep_generate with model_path and prompt and negative and width and height and steps and cfg and seed and out_png_path returning Int
+
+# Default image model: SD1.5 single-file checkpoint. It is self-contained (CLIP + VAE
+# baked in), so sd.cpp loads it from one path with no companion encoder files — unlike
+# Flux, which needs separate T5-XXL/CLIP-L/VAE. Path is configurable via config/image.json.
+define image_gen_default_model returning Str:
+    set cfg_path to "config/image.json"
+    if file_exists(cfg_path) == 1:
+        set content to read_file(cfg_path)
+        set root to json_parse(content)
+        if root != 0:
+            set mnode to get_json_object_value(root and "model_path")
+            if mnode != 0:
+                set mval to get_json_value(mnode)
+                if string_length(mval) > 0:
+                    return mval
+    return "/Volumes/One Touch/models library/Creative_Models/v1-5-pruned-emaonly.safetensors"
+
+# Where generated images land: the active workspace, so the tool layer auto-attaches them.
+define image_gen_out_path with name as Str returning Str:
+    set ok to create_directory("config/workspaces/active")
+    return concat("config/workspaces/active/" and name)
+
+# Generate an image from a prompt. Returns the PNG path on success, or "ERROR: <reason>".
+# seed >= 0 is deterministic; pass -1 for a fixed default here (EP has no RNG in this path).
+define image_gen_run with prompt as Str and out_name as Str and width as Int and height as Int and steps as Int and cfg as Int and seed as Int returning Str:
+    if string_length(prompt) == 0:
+        return "ERROR: empty prompt"
+    set model to image_gen_default_model()
+    if file_exists(model) == 0:
+        return concat("ERROR: image model not found on disk at: " and model)
+    set out_path to image_gen_out_path(out_name)
+    set rc to sd_ep_generate(model and prompt and "" and width and height and steps and cfg and seed and out_path)
+    if rc == 0:
+        return out_path
+    return concat("ERROR: image generation failed (shim code " and concat(int_to_string(rc) and ")"))

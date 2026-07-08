@@ -124,6 +124,22 @@ else:
 "
 }
 
+# ── Shared: local image-generation FFI (libstable-diffusion, ggml/Metal) ─────────────
+# The shim (decent_agent/vendor/sd/sd_ep_shim.c) is compiled into BOTH the node and the
+# test build so image_gen.ep's `external define sd_ep_generate` always resolves — and the
+# two never drift (the exact failure mode that had killed the test suite). The 55MB dylib
+# lives OUTSIDE the git tree in ~/.ernosdecent/lib; when present we link it and define
+# SD_EP_HAVE_LIB, otherwise the shim compiles as a stub so the build still links cleanly.
+SD_SHIM_SRC="decent_agent/vendor/sd/sd_ep_shim.cpp"
+SD_LIB_DIR="$HOME/.ernosdecent/lib"
+SD_CFLAGS=""
+if [ "$(uname -s)" = "Darwin" ] && [ -f "$SD_LIB_DIR/libstable-diffusion.dylib" ]; then
+    SD_CFLAGS="-DSD_EP_HAVE_LIB -Idecent_agent/vendor/sd -L$SD_LIB_DIR -lstable-diffusion -Wl,-rpath,$SD_LIB_DIR -lc++"
+    echo "[*] Image FFI: linking libstable-diffusion from $SD_LIB_DIR"
+else
+    echo "[*] Image FFI: libstable-diffusion.dylib absent — compiling stub (generate_image reports unavailable)."
+fi
+
 if [ "$1" = "test" ] || [ "$1" = "--test" ]; then
     echo "[*] Building Cognitive Agent Test Suite..."
     
@@ -278,7 +294,7 @@ print('Patched conflicting mutex declarations, test blocking barriers, and SQLit
             ;;
     esac
     
-    clang decent_agent/test_agent_compiled.c -o ./decent_agent/test_agent $CFLAGS 2>&1
+    clang decent_agent/test_agent_compiled.c $SD_SHIM_SRC -o ./decent_agent/test_agent $CFLAGS $SD_CFLAGS 2>&1
     if [ "$OS" = "Darwin" ]; then
         codesign --force -s - ./decent_agent/test_agent 2>/dev/null || true
     fi
@@ -1073,8 +1089,8 @@ case "$OS" in
         ;;
 esac
 
-echo "[*] Compiling with: clang node_compiled.c -o ./node $CFLAGS"
-clang node_compiled.c -o ./node $CFLAGS 2>&1
+echo "[*] Compiling with: clang node_compiled.c $SD_SHIM_SRC -o ./node $CFLAGS $SD_CFLAGS"
+clang node_compiled.c $SD_SHIM_SRC -o ./node $CFLAGS $SD_CFLAGS 2>&1
 
 # Step 4: Sign the binary (macOS requirement for notarization)
 if [ "$OS" = "Darwin" ]; then

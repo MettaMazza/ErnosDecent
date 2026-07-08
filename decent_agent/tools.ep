@@ -12,6 +12,7 @@ import "./tutor"
 import "./tutor_content"
 import "./access"
 import "./workspace_links"
+import "./image_gen"
 import "../storage"
 
 # Subsystem modules to call
@@ -208,6 +209,10 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "- attach_file([path: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Send an existing file to the user AS A REAL ATTACHMENT in the chat (Discord/WebUI), so they don't have to go find it. Use it to share a file you were asked to produce or a file inside a linked project. Files you create with codebase_write/workspace_write are auto-attached already — use this for files that already exist. Secret/credential paths are refused; 24MB max.\n")
         set schemas to concat(schemas and "  Example: Action: attach_file([\"config/workspaces/active/report.md\"])\n\n")
+
+        set schemas to concat(schemas and "- generate_image([prompt: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Generate an image locally from a text prompt (runs on this machine via the ErnosPlain image pipeline; nothing leaves the box) and auto-attach it to the chat. Be vivid and specific in the prompt. First generation loads the model and is slower; later ones are fast.\n")
+        set schemas to concat(schemas and "  Example: Action: generate_image([\"a lone lighthouse on a cliff at dawn, cinematic, volumetric light\"])\n\n")
 
         set schemas to concat(schemas and "- workspace_read([filename: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Read a file from workspace. Small files return in full. LARGE files return only the first chunk plus a header '[Lines X-Y of N total]' and a continuation hint. To read a large file IN FULL you MUST keep calling workspace_read_range for each next chunk shown in the hint until you reach line N — do not assume the first chunk is the whole file.\n")
@@ -1313,6 +1318,24 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: no active session manager available."
         set ok to session_manager_set_guidance(map_get_val(ctx and "sessions") and sg_txt)
         return "Updated your session guidance for THIS conversation. It takes effect on your next turn and clears in a new session."
+
+    if action_name equals "generate_image":
+        if length_list(args_list) < 1:
+            return "Error: generate_image requires 1 argument (prompt). Example: Action: generate_image([\"a red fox in snow\"])"
+        set gi_prompt to ptr_to_str(get_list(args_list and 0))
+        # Time-based seed → each generation differs; doubles as a unique output filename.
+        set gi_stamp to ep_time_now_ms()
+        set gi_name to concat("generated_" and concat(int_to_string(gi_stamp) and ".png"))
+        # SD1.5 sane defaults: 512x512 native, 20 steps, CFG 7.
+        set gi_res to image_gen_run(gi_prompt and gi_name and 512 and 512 and 20 and 7 and gi_stamp)
+        if string_contains(gi_res and "ERROR:") == 1:
+            return gi_res
+        # Auto-attach the generated PNG to the chat (reuses the secret-safe attachment path).
+        set gi_sess to ""
+        if map_contains(ctx and "session_id") == 1:
+            set gi_sess to map_get_val(ctx and "session_id")
+        set ok to tools_emit_attachment(gi_sess and gi_res)
+        return concat("Generated and attached your image: " and gi_res)
 
     if action_name equals "dht_store":
         if length_list(args_list) < 2:
