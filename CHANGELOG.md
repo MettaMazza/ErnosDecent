@@ -3,6 +3,147 @@
 All notable changes to ErnosDecent. Dates are absolute. The engine ships on
 `agent-parity` and is merged to `main` and the public `business` overlay.
 
+## 2026-07-08 — Multi-tool batching, image generation + vision, self-prompt persistence, full transparency
+
+### Added — the agent generates and SEES images (all ErnosPlain, all local)
+- **Local image generation** (`generate_image`): `decent_agent/image_gen.ep` drives
+  libstable-diffusion (sd.cpp, Metal) through the ErnosPlain C FFI via a flat shim
+  (`decent_agent/vendor/sd/sd_ep_shim.cpp`, compiled into the node by `build.sh`).
+  Default model is **FLUX.1-dev** loaded in 4-input mode directly from the operator's
+  existing files (gguf transformer + diffusers-format CLIP/VAE single-files + gguf T5) —
+  no re-download, no Python sidecar. Flux is guidance-distilled so CFG is forced to 1;
+  output is 1024×1024 at 28 steps. Config: `config/image.json` (single-file SD/SDXL mode
+  also supported). Verified end-to-end: real images rendered on-box.
+- **Vision loop**: after generating, the agent LOOKS at its own image (`query_vision` in
+  `decent_agent/llm.ep`, multimodal OpenAI content-array) and returns a genuine
+  description. Ollama's gemma-4-31b tag ships without its vision projector, so
+  `run_node.sh` serves the SAME weights WITH their mmproj via llama-server on **:8091**
+  — no extra model. The image is attached to the final reply, not dumped mid-run.
+- **`react([emoji])`**: the agent reacts to the message it is currently answering —
+  message/channel ids are threaded through the bridge (`[MSGID]`/`[CHANID]` tags), the
+  agent never has to know them.
+- **Attachments ride the reply**: `attach_file` + generated images are collected by the
+  Discord bridge and attached to the reply message itself (both reply sites), with
+  claim-honesty — the agent only says "attached" when the emit actually queued.
+- **WebUI ↔ Discord 1-1 parity (W4)**: attachments and `mid_message` progress updates
+  render in the web chat exactly as they do on Discord.
+
+### Added — prompt & self-model
+- **Self-prompt persistence (W1)**: `[[BEHAVIOR]]`/`[[SKILLS]]` self-sections now live in
+  the data dir (`storage_self_sections_path()`), immune to git operations in the repo;
+  the tracked `config/agent_self_sections.json` is the template fallback. The
+  self-prompt-edit approval gate is removed (observer audit retained) — the agent owns
+  its own prompt.
+- **Session guidance (W1)**: a second, session-scoped self-prompt
+  (`session_prompt_get`/`set`) serialized with the session — global identity vs
+  per-session working style are now separate layers.
+- **`[CAPABILITIES]` prompt block (W2)**: the system prompt now frames the entire tool
+  surface and system so the agent stops under-reaching ("I can't do that" for things it
+  demonstrably can).
+- **Full transparency**: untruncated action/command/tool results are piped into the
+  thinking stream (trace) — `trace_emit` and the loop no longer clip content at 1800
+  chars; observation size is governed only by the model-context budget.
+
+### Added — performance
+- **Multi-tool batching (one LLM call, N tools)**: the model may emit many `Action:`
+  lines in a single response; the loop peels them off and executes each through the full
+  approval/audit/observation path with NO inference call between them. A 20-tool
+  independent diagnostic collapses from ~20 model round-trips (20–80 s each) to ~1.
+  Batched steps don't consume the LLM-turn cap. Kernel prompt teaches the batching rule
+  (`config/prompts.json` + fallback).
+- **Default model: gemma-4-31b** (standard attention = KV-cache reuse across turns;
+  the recurrent-MoE and gpt-oss experiments were reverted). Observer audits and the
+  look-back route to the same backend and share the main prompt prefix so the KV cache
+  is never evicted between the main call and the audit.
+- **Look-back scoped to mid_message turns**: reply text is already covered by the reply
+  audit and pure tool turns have no user-facing text — the per-step look-back cost
+  ~11–31 s per turn for zero added coverage. Root-fixed the look-back itself too: it
+  now uses the JSON-forcing LLM path and an explicit parsed-vs-default flag, so only a
+  genuine parseable BLOCKED flags drift (it had been failing 100% and poisoning turns).
+
+### Fixed
+- **Workspace links no longer bleed across sessions**: the `@active` project marker is
+  global on disk; `session_manager_new_session` now clears it, so a new session starts
+  with no active project (registered links remain available).
+- **Dead test harness fixed at root**: `build.sh` gained one shared
+  `inject_additive_helpers()` used by BOTH the node and test builds — the two injector
+  paths can no longer drift (this was the root cause, not "pre-existing/unrelated").
+  13/13 cognitive agent tests pass.
+- **"No LLM model responded" (both causes)**: (1) our own `\nThought:` stop sequence was
+  clobbering gemma4's content channel to empty — removed (proven 2/15 → 0/15 failures);
+  (2) Ollama idle-unload caused ~15 s cold reloads — the model is pinned resident
+  (`OLLAMA_KEEP_ALIVE=-1` + native-endpoint warmup in `run_node.sh`).
+- **Retrieved transcripts prompt-injecting the agent** (`read_transcripts` content is
+  fenced as data), **auto-attach claim honesty**, **subjecthood prompt neutrality**
+  (no injected uncertainty AND no prescription — free honest report).
+
+### Docs
+- `master_prompt.md`: a full-system diagnostic exercising every tool over ReAct, split
+  into 13 paste-one-at-a-time prompts, each with its own pass/fail scorecard.
+
+## 2026-07-05 — Agent tooling overhaul & IPC routing
+
+### Added
+- **Tooling overhaul** (`179c456`): read pagination (`codebase_read_range`, `file_info`
+  on any path, `run_command` result annotation, RAG offsets), a **project-linking
+  subsystem** (`decent_agent/workspace_links.ep` + `config/linked_projects.txt`:
+  register/list/activate external project dirs; bare relative paths resolve against the
+  active project), `list_sessions`, `search_sessions` (keyword-grep across all prior
+  session transcripts instead of guessing ids), un-gated synaptic-graph cognition tools,
+  and a `run_command` working-dir.
+- The agent tool surface now stands at **71 registered tools**.
+
+### Fixed
+- **IPC command routing prefix-match** (`b9eafe8`): the node dispatcher matched command
+  verbs as substrings — a chat message merely CONTAINING "RAG search"/"SESSION DELETE"
+  could hijack routing into the wrong handler. Verbs now match as prefixes.
+- **LLM read bounded by an async timeout** — a dead/hung inference server can no longer
+  hang the daemon; **O(n) JSON escape** (the stdlib-colliding O(n²) escape corrupted
+  control bytes and prompts); scheduler heap race; two local RCE/path-traversal gaps;
+  ledger broadcast heap race; web status polls no longer pile up during a turn;
+  **Stop button** made instant and turns finite.
+
+## 2026-06-30 → 07-01 — Context & access system, education, GC/SQLite stability
+
+### Added
+- **Situational awareness + decision policy** (`decent_agent/awareness.ep`): a
+  situational block and tool-routing map in the prompt (codebase_read FIRST), plus an
+  act-vs-ask / inline-vs-delegate / stop decision policy — ends the "I can't see that
+  file" flailing.
+- **Tiered Full-PC access** (`decent_agent/access.ep`): operator-controlled access
+  toggle (default ON) with an unsafe-action gate — sensitive paths warn/re-ask,
+  secrets are hard-blocked.
+- **Decentralised education phases 0–2**: Socratic tutor mode (scaffolds, never
+  answer-vends — live-tested), a **Learning** web tab, and a `run_ep` sandboxed
+  ErnosPlain playground. Fixed the playground Run hang, a numeric-arg segfault in
+  `react`, and tutor-mode bleed between requests (per-request mode).
+
+### Fixed
+- **GC blocking barrier + SQLite global mutex** restored/formalized: `sqlite3_exec`
+  runs inside the GC blocking region (fixes a SQLite use-after-free crash);
+  `ep_run_command` wrapped; rate limiters made GC-rooted globals (startup segfault);
+  sub-agent thread concurrency crashes resolved.
+- Observer boolean/number audit verdicts segfaulted the daemon; `config_load` TOML
+  parse on the JSON access file hung every turn.
+
+## 2026-06-27 → 06-29 — Orchestrator, sessions, Discord control surface
+
+### Added
+- **Agent orchestrator + swarm** (`decent_agent/orchestrator.ep`): sub-agents as
+  cooperative tasks with `delegate_task/wait/check/cancel/list/swarm` (fan-out with
+  concat/best/vote merge), admin-gated.
+- **Per-session workspaces**, live Discord trace threads, an interactive Discord
+  **Stop** button attached to the thinking message, SQLite-backed trace polling, and
+  active-session persistence across restarts.
+- Recursive workspace navigation with metadata (`filename (N lines, M bytes)`) — ends
+  file-listing blindness.
+
+### Fixed
+- Observer audit contamination + hardcoded heuristics removed; observer KV cache
+  aligned 1-1 with the agent prompt prefix; resume-approved observer-audit bypass;
+  range-reading tools; task GC protection; use-after-free in
+  `broadcast_block_to_peers`; Discord bridge delivery hardened against daemon reboots.
+
 ## 2026-06-26 — Reliability, agent capabilities, and cognitive frameworks
 
 ### Fixed
