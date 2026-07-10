@@ -21,6 +21,10 @@ mkdir -p "$(dirname "$LOG")"
 #  2. Pin the currently-loaded model NOW via the NATIVE /api/chat endpoint — the OpenAI
 #     /v1 endpoint the node uses IGNORES keep_alive, so we pin it here directly.
 launchctl setenv OLLAMA_KEEP_ALIVE -1 2>/dev/null || true
+# PARALLELISM: Ollama serves requests SERIALLY unless told otherwise — that is why a
+# reply queued behind a sub-agent's inference. Let the fallback Ollama path serve
+# concurrent requests too (applies on Ollama's next start).
+launchctl setenv OLLAMA_NUM_PARALLEL 4 2>/dev/null || true
 curl -s http://127.0.0.1:11434/api/chat \
   -d '{"model":"gemma4:26b","messages":[{"role":"user","content":"warmup"}],"keep_alive":-1,"stream":false}' \
   >/dev/null 2>&1 &
@@ -44,17 +48,28 @@ fi
 # OPT-IN (P5 latency proposal — adopt only after [LLM TTFT] confirms it wins): serve
 # gemma-4-31b's MAIN inference via llama-server instead of Ollama — exact prefill/decode
 # timings in every [LLM TTFT] line, faster prefill (-b/-ub 2048), and slot-cache control.
-# Off by default; enable with: GEMMA4_MAIN_LLAMACPP=1 ./run_node.sh
-# No node config change needed — the discovery cascade tries llama.cpp :8080 before Ollama.
-if [ "${GEMMA4_MAIN_LLAMACPP:-0}" = "1" ]; then
+# PARALLEL MAIN MODEL (default ON — Maria's M3 Ultra 512GB has ample headroom):
+# serve gemma-4-31b via llama-server on :8080 with -np 4 PARALLEL SLOTS + continuous
+# batching, so the main agent's reply, sub-agents, and background coordinators run
+# CONCURRENTLY on one model instead of queueing serially (the real "async replies" fix —
+# the EP loop was already non-blocking; the model server was the bottleneck). -c 131072
+# across 4 slots = 32k tokens/slot, comfortably above the agent's ~15k prompts. The
+# node's discovery cascade tries :8080 before Ollama, and falls back to Ollama :11434 if
+# this server isn't up yet — so a slow load or OOM degrades to serial, never to broken.
+# Opt out with GEMMA4_MAIN_LLAMACPP=0 ./run_node.sh (uses Ollama, serial unless
+# OLLAMA_NUM_PARALLEL took effect).
+if [ "${GEMMA4_MAIN_LLAMACPP:-1}" = "1" ]; then
   GEMMA4_MAIN_BLOB=$(ollama show gemma-4-31b --modelfile 2>/dev/null | awk '/^FROM/{print $2; exit}')
   if [ -n "$GEMMA4_MAIN_BLOB" ] && [ -f "$GEMMA4_MAIN_BLOB" ] && [ -x "$LLS" ]; then
     if ! curl -s -m 2 http://127.0.0.1:8080/health 2>/dev/null | grep -q '"status":"ok"'; then
-      echo "[run_node] starting gemma-4-31b MAIN server on :8080 (llama.cpp, -b/-ub 2048, fa on)"
+      echo "[run_node] starting gemma-4-31b MAIN server on :8080 (llama.cpp, -np 4 PARALLEL, -b/-ub 2048, fa on)"
       "$LLS" --model "$GEMMA4_MAIN_BLOB" --host 127.0.0.1 --port 8080 \
-        --alias gemma-4-31b -c 65536 -b 2048 -ub 2048 -ngl 999 -fa on -np 1 \
+        --alias gemma-4-31b -c 131072 -np 4 -b 2048 -ub 2048 -ngl 999 -fa on \
         > "${HOME}/.ernosdecent/gemma4main.log" 2>&1 &
+      echo "[run_node] (gemma :8080 loading in background; agent uses Ollama until it is ready)"
     fi
+  else
+    echo "[run_node] gemma-4-31b llama.cpp blob or llama-server not found — falling back to Ollama (set OLLAMA_NUM_PARALLEL for concurrency)."
   fi
 fi
 
