@@ -55,6 +55,40 @@ define query_daemon_ipc with command as Str returning Str:
     set ok to ep_net_close(fd)
     return resp
 
+# Phase A3: detached turns answer via a `final_reply` trace row instead of the socket.
+# Poll that row here — the web server is its OWN OS thread, so a blocking sleep only
+# stalls this connection, never the agent loop — and hand back the EXACT legacy payload
+# string every parser below already understands. 30-min cap.
+define web_wait_final_reply with sid as Str returning Str:
+    set waited to 0
+    repeat while waited < 1800000:
+        set db to storage_get_db()
+        if db != 0:
+            set es to string_replace(sid and "'" and "''")
+            set rows to sql_query(db and f"SELECT id, content FROM trace_events WHERE session_id='{es}' AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1;")
+            if length_list(rows) > 0:
+                set r to get_list(rows and 0)
+                set rid to get_list(r and 0)
+                set content to get_list(r and 1)
+                set ok to sql_execute(db and f"UPDATE trace_events SET sent=1 WHERE id={rid};")
+                return content
+        set ok to sleep_ms(250)
+        set waited to waited + 250
+    return "error:turn_timeout"
+
+# Normalize a daemon AI ack into the final legacy payload: detached acks are resolved by
+# waiting on the session's final_reply row; busy acks become a friendly guidance note;
+# anything else (old-style full payloads, errors) passes through untouched.
+define web_resolve_ai_response with resp as Str returning Str:
+    if string_index_of(resp and "ai:accepted") == 0:
+        set sid to extract_ipc_field(resp and "session")
+        if string_length(sid) > 0:
+            return web_wait_final_reply(sid)
+        return resp
+    if string_index_of(resp and "ai:busy_whispered") == 0:
+        return "ai:ok|||RESPONSE|||Your message reached the agent as mid-turn guidance — it is already working and will fold this in."
+    return resp
+
 # Translate a daemon AI response (ai:ok / ai:pending_approval / ai:clarify / cancelled
 # / error) into the appropriate WS message(s) for the browser. Shared by the prompt,
 # approval, and clarification paths so all of them handle every outcome consistently.
@@ -114,7 +148,7 @@ define ws_drain_side_channel with client_fd as Int and session_id as Str returni
     if db == 0:
         return 1
     set es to string_replace(session_id and "'" and "''")
-    set q to concat("SELECT id, event_type, content FROM trace_events WHERE sent=0 AND event_type IN ('attachment','mid_message') AND session_id='" and concat(es and "' ORDER BY id;"))
+    set q to concat("SELECT id, event_type, content FROM trace_events WHERE sent=0 AND event_type IN ('attachment','mid_message','image_progress','subagent_spawn','subagent_complete','subagent_approval') AND session_id='" and concat(es and "' ORDER BY id;"))
     set rows to sql_query(db and q)
     set n to length_list(rows)
     set i to 0
@@ -129,6 +163,22 @@ define ws_drain_side_channel with client_fd as Int and session_id as Str returni
                 set is_img to 1
             set amsg to concat("{\"type\":\"file_attached\",\"url\":\"/files/" and concat(rid and concat("\",\"name\":\"" and concat(escape_json_string(web_basename(content)) and concat("\",\"is_image\":" and concat(int_to_string(is_img) and "}"))))))
             set ok to ws_send_text(client_fd and amsg)
+        else if etype equals "image_progress":
+            # Image generation progress — content is raw JSON: {"status":"...", ...}
+            set ip_msg to concat("{\"type\":\"image_progress\",\"data\":" and concat(content and "}"))
+            set ok to ws_send_text(client_fd and ip_msg)
+        else if etype equals "subagent_spawn":
+            # Sub-agent spawned — content is JSON: {"task_id":"...","role":"...","instruction":"..."}
+            set ss_msg to concat("{\"type\":\"subagent_spawn\",\"data\":" and concat(content and "}"))
+            set ok to ws_send_text(client_fd and ss_msg)
+        else if etype equals "subagent_complete":
+            # Sub-agent completed — content is JSON: {"task_id":"...","status":"...","result_summary":"..."}
+            set sc_msg to concat("{\"type\":\"subagent_complete\",\"data\":" and concat(content and "}"))
+            set ok to ws_send_text(client_fd and sc_msg)
+        else if etype equals "subagent_approval":
+            # Sub-agent needs approval — content is JSON: {"task_id":"...","tool":"...","args":"...","description":"..."}
+            set sa_msg to concat("{\"type\":\"subagent_approval\",\"data\":" and concat(content and "}"))
+            set ok to ws_send_text(client_fd and sa_msg)
         else:
             set mmsg to concat("{\"type\":\"mid_message\",\"text\":\"" and concat(escape_json_string(content) and "\"}"))
             set ok to ws_send_text(client_fd and mmsg)
@@ -561,7 +611,7 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set rag_ctx to string_replace(rag_ctx and "]" and ")")
                         set ai_cmd to concat(ai_cmd and concat("[IN_MEMORY_CONTEXT:" and concat(rag_ctx and "] ")))
                     set ai_cmd to concat(ai_cmd and prompt)
-                    set ai_resp to query_daemon_ipc(ai_cmd)
+                    set ai_resp to web_resolve_ai_response(query_daemon_ipc(ai_cmd))
                     display f"[ws] IPC AI -> {ai_resp}"
                     set ok to ws_dispatch_ai_response(client_fd and ai_resp)
                     # WebUI parity: deliver any files the agent attached + mid_messages.
@@ -600,12 +650,12 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     # F3: the user answered the agent's clarifying question(s) (or chose
                     # "work with what we have" -> answers == "__USE_CURRENT__"). Resume.
                     set answers to json_get_string(payload and "answers")
-                    set clarify_resp to query_daemon_ipc(concat("AI CLARIFY " and answers))
+                    set clarify_resp to web_resolve_ai_response(query_daemon_ipc(concat("AI CLARIFY " and answers)))
                     display f"[ws] IPC AI CLARIFY -> {clarify_resp}"
                     set ok to ws_dispatch_ai_response(client_fd and clarify_resp)
                 else if msg_type equals "tool_approve":
                     # User approved a pending tool — relay to daemon
-                    set approve_resp to query_daemon_ipc("AI APPROVE")
+                    set approve_resp to web_resolve_ai_response(query_daemon_ipc("AI APPROVE"))
                     display f"[ws] IPC AI APPROVE -> {approve_resp}"
                     if string_contains(approve_resp and "ai:pending_approval") == 1:
                         # Another tool in the chain also needs approval
@@ -636,7 +686,7 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
                 else if msg_type equals "tool_approve_all":
                     # User approved all pending tools — relay to daemon
-                    set approve_resp to query_daemon_ipc("AI APPROVE_ALL")
+                    set approve_resp to web_resolve_ai_response(query_daemon_ipc("AI APPROVE_ALL"))
                     display f"[ws] IPC AI APPROVE_ALL -> {approve_resp}"
                     if string_contains(approve_resp and "ai:pending_approval") == 1:
                         set p_tool to extract_ipc_field(approve_resp and "tool")
@@ -666,7 +716,7 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
                 else if msg_type equals "tool_deny":
                     # User denied a pending tool — relay to daemon
-                    set deny_resp to query_daemon_ipc("AI DENY")
+                    set deny_resp to web_resolve_ai_response(query_daemon_ipc("AI DENY"))
                     display f"[ws] IPC AI DENY -> {deny_resp}"
                     if string_contains(deny_resp and "ai:pending_approval") == 1:
                         set p_tool to extract_ipc_field(deny_resp and "tool")
@@ -718,12 +768,38 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         if file_exists(tts_path) == 0:
                             set tts_rc to tts_speak(tts_text and tts_path)
                         if tts_rc == 0 and also file_exists(tts_path) == 1:
-                            set tts_msg to "{\"type\":\"tts_ready\",\"url\":\""
-                            set tts_msg to concat(tts_msg and tts_url)
-                            set tts_msg to concat(tts_msg and "\"}")
-                            ws_send_text(client_fd and tts_msg)
+                            ws_send_text(client_fd and concat("{\"type\":\"tts_ready\",\"url\":\"" and concat(escape_json_string(tts_url) and "\"}")))
                         else:
-                            ws_send_text(client_fd and "{\"type\":\"tts_error\",\"error\":\"synthesis failed\"}")
+                            ws_send_text(client_fd and concat("{\"type\":\"tts_error\",\"error\":\"" and concat(escape_json_string(concat("TTS failed (rc=" and concat(int_to_string(tts_rc) and ")"))) and "\"}")))
+                else if msg_type equals "subagent_whisper":
+                    # Send mid-turn guidance to a running sub-agent via trace_whispers.
+                    # The sub-agent's react_drain_whispers picks it up on its next turn.
+                    set sw_tid to json_get_string(payload and "task_id")
+                    set sw_msg to json_get_string(payload and "message")
+                    if string_length(sw_tid) > 0 and also string_length(sw_msg) > 0:
+                        set sw_db to storage_get_db()
+                        if sw_db > 0:
+                            set sw_es to string_replace(sw_tid and "'" and "''")
+                            set sw_ec to string_replace(sw_msg and "'" and "''")
+                            set sw_now to ep_time_now_sec()
+                            set ok to sql_execute(sw_db and f"INSERT INTO trace_whispers (session_id, content, created_at) VALUES ('{sw_es}', '{sw_ec}', {sw_now});")
+                            ws_send_text(client_fd and concat("{\"type\":\"whisper_ack\",\"task_id\":\"" and concat(escape_json_string(sw_tid) and "\"}")))
+                        else:
+                            ws_send_text(client_fd and "{\"type\":\"whisper_ack\",\"error\":\"db_unavailable\"}")
+                    else:
+                        ws_send_text(client_fd and "{\"type\":\"whisper_ack\",\"error\":\"missing_task_id_or_message\"}")
+                else if msg_type equals "subagent_approve":
+                    # Approve/deny a sub-agent's pending tool call.
+                    # Routes to AI APPROVE [AGENT:<task_id>] [DECISION:<yes|no>] IPC.
+                    set sa_tid to json_get_string(payload and "task_id")
+                    set sa_dec to json_get_string(payload and "decision")
+                    if string_length(sa_tid) > 0:
+                        set sa_cmd to concat("AI APPROVE [AGENT:" and concat(sa_tid and concat("] [DECISION:" and concat(sa_dec and "]"))))
+                        set sa_resp to query_daemon_ipc(sa_cmd)
+                        display f"[ws] IPC AI APPROVE sub-agent -> {sa_resp}"
+                        ws_send_text(client_fd and concat("{\"type\":\"approve_ack\",\"task_id\":\"" and concat(escape_json_string(sa_tid) and concat("\",\"decision\":\"" and concat(escape_json_string(sa_dec) and "\"}")))))                        
+                    else:
+                        ws_send_text(client_fd and "{\"type\":\"approve_ack\",\"error\":\"missing_task_id\"}")
                 else if msg_type equals "transfer":
                     set amount to json_get_string(payload and "amount")
                     set to_addr to json_get_string(payload and "to")

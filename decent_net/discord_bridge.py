@@ -50,6 +50,13 @@ signal.signal(signal.SIGINT, sig_handler)
 
 _active_tasks = set()
 
+# Image generation progress tracking
+_image_gen_msg = None
+_image_gen_last_edit = 0.0
+# Sub-agent thread tracking
+_subagent_threads = {}  # task_id -> discord.Thread
+_subagent_poll_tasks = {}  # task_id -> asyncio.Task
+
 def create_tracked_task(coro):
     """Create a task and keep a strong reference to it in _active_tasks
     to prevent the garbage collector from destroying it mid-flight."""
@@ -309,7 +316,7 @@ _ai_busy_channel_id = None  # channel where the active query originated
 def db_write_whisper(session_id, content):
     """Write a mid-turn whisper to SQLite for the react loop to pick up."""
     try:
-        conn = sqlite3.connect(get_db_path())
+        conn = connect_db()
         cursor = conn.cursor()
         now = int(time.time())
         cursor.execute(
@@ -462,10 +469,58 @@ async def query_daemon_ipc(prompt, author=None, message=None):
             tags += f"[IN_MEMORY_CONTEXT:{context_str}] "
         
         cmd = f"AI INFER {tags}{clean_prompt}"
-        return await send_daemon_ipc(cmd)
+        resp = await send_daemon_ipc(cmd)
+        # Phase A3: detached turns ack instantly; the real answer arrives as a
+        # `final_reply` trace row. Resolve it here so every caller keeps seeing the
+        # exact legacy payload it already parses.
+        return await resolve_ai_response(resp, active_session_id or "")
     except Exception as e:
         print(f"[Discord Bridge] IPC query failed: {e}", flush=True)
         return "error:daemon_offline"
+
+
+async def wait_final_reply(session_id, timeout_s=1800):
+    """Phase A3: poll the session's `final_reply` trace row (direct SQLite — the same
+    proven cross-process pattern as the trace/commands pollers). Returns the legacy
+    payload string; marks the row sent so it is delivered exactly once."""
+    import time as _t
+    start = _t.time()
+    while _t.time() - start < timeout_s:
+        try:
+            conn = sqlite3.connect(get_db_path())
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute("UPDATE trace_events SET sent=1 WHERE id=?", (row[0],))
+                conn.commit()
+                conn.close()
+                return row[1]
+            conn.close()
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return "error:turn_timeout"
+
+
+async def resolve_ai_response(resp, session_id):
+    """Normalize a daemon AI ack: ai:accepted/ai:accepted_resume → wait for the
+    session's final_reply row; ai:busy_whispered → friendly guidance note; anything
+    else (old-style full payload, errors) passes through untouched."""
+    if resp and resp.startswith("ai:accepted"):
+        sid = session_id
+        for part in resp.split(","):
+            if part.startswith("session:"):
+                sid = part.split(":", 1)[1].strip()
+        if sid:
+            return await wait_final_reply(sid)
+        return resp
+    if resp and resp.startswith("ai:busy_whispered"):
+        return "ai:ok|||RESPONSE|||🫧 Delivered as mid-turn guidance — I'm already working and will fold it in."
+    return resp
 
 import re
 
@@ -672,9 +727,14 @@ class ApprovalView(discord.ui.View):
 def get_db_path():
     return os.path.expanduser("~/.ernosdecent/node.db")
 
+def connect_db():
+    conn = sqlite3.connect(get_db_path())
+    conn.text_factory = lambda x: x.decode("utf-8", "replace")
+    return conn
+
 def db_request_cancel(session_id):
     try:
-        conn = sqlite3.connect(get_db_path())
+        conn = connect_db()
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO trace_cancellations (session_id) VALUES (?)", (session_id,))
         conn.commit()
@@ -687,7 +747,7 @@ def db_request_cancel(session_id):
 def db_poll_traces(session_id):
     events = []
     try:
-        conn = sqlite3.connect(get_db_path())
+        conn = connect_db()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type != 'attachment' AND session_id=? ORDER BY id LIMIT 50",
@@ -714,7 +774,7 @@ def db_collect_attachments(session_id):
     image/file arrives attached to the response, cleanly, instead of mid-generation."""
     paths = []
     try:
-        conn = sqlite3.connect(get_db_path())
+        conn = connect_db()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, content FROM trace_events WHERE sent=0 AND event_type='attachment' AND session_id=? ORDER BY id",
@@ -747,7 +807,7 @@ def build_discord_files(paths):
 def db_get_pending_deletes():
     pending = []
     try:
-        conn = sqlite3.connect(get_db_path())
+        conn = connect_db()
         cursor = conn.cursor()
         now = int(time.time())
         cursor.execute(
@@ -767,7 +827,7 @@ def db_get_pending_deletes():
 
 def db_complete_delete(pid):
     try:
-        conn = sqlite3.connect(get_db_path())
+        conn = connect_db()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM trace_pending_deletes WHERE id=?", (pid,))
         conn.commit()
@@ -777,7 +837,7 @@ def db_complete_delete(pid):
 
 def db_schedule_delete(thread_id, delay_secs):
     try:
-        conn = sqlite3.connect(get_db_path())
+        conn = connect_db()
         cursor = conn.cursor()
         now = int(time.time())
         delete_after = now + delay_secs
@@ -818,6 +878,16 @@ class StopView(discord.ui.View):
         sess = self.session_id or "default"
         resp = db_request_cancel(sess)
         print(f"[Discord Bridge] Stop button clicked for session {sess}, SQLite write ack: {resp}", flush=True)
+
+        # Epoch bump via HTTP — same instant abort as WebUI stop button.
+        # The SQLite cancel is read at the next turn boundary; /api/cancel
+        # bumps the C epoch latch, aborting in-flight HTTP within ~50ms.
+        try:
+            import aiohttp as _aiohttp
+            async with _aiohttp.ClientSession() as _s:
+                await _s.post("http://127.0.0.1:8088/api/cancel", timeout=_aiohttp.ClientTimeout(total=2))
+        except Exception:
+            pass  # SQLite cancel is primary; HTTP is fast-path bonus
 
 class SpeakView(discord.ui.View):
     """A 🔊 button attached to AI replies. On click, asks the node to synthesise
@@ -915,19 +985,19 @@ async def handle_tool_approval(message, resp, edit_msg=None):
         
     if view.value is True:
         await approval_msg.edit(content=f"✅ **Approved** `{tool_name}` — executing...", view=view)
-        ipc_resp = await send_daemon_ipc("AI APPROVE")
+        ipc_resp = await resolve_ai_response(await send_daemon_ipc("AI APPROVE"), active_session_id or "")
     elif view.value == "all":
         await approval_msg.edit(content=f"⚡ **Approved All** `{tool_name}` — executing subsequent actions automatically...", view=view)
-        ipc_resp = await send_daemon_ipc("AI APPROVE_ALL")
+        ipc_resp = await resolve_ai_response(await send_daemon_ipc("AI APPROVE_ALL"), active_session_id or "")
     elif view.value == "session":
         # Enable the persistent per-session toggle FIRST, then approve the pending
         # action — every later gate in this session auto-approves until /autoapprove off.
         await approval_msg.edit(content=f"🔓 **Session auto-approve ON** — `{tool_name}` approved; no more prompts this session (`/autoapprove off` to re-enable).", view=view)
         await send_daemon_ipc("AI AUTOAPPROVE ON")
-        ipc_resp = await send_daemon_ipc("AI APPROVE")
+        ipc_resp = await resolve_ai_response(await send_daemon_ipc("AI APPROVE"), active_session_id or "")
     else:
         await approval_msg.edit(content=f"❌ **Denied** `{tool_name}` — cancelled.", view=view)
-        ipc_resp = await send_daemon_ipc("AI DENY")
+        ipc_resp = await resolve_ai_response(await send_daemon_ipc("AI DENY"), active_session_id or "")
         
     try: await approval_msg.delete()
     except Exception: pass
@@ -1091,14 +1161,14 @@ async def handle_clarification(message, resp, edit_msg=None):
         for item in view.children:
             item.disabled = True
         await clar_msg.edit(content="⏰ No answer — proceeding with what we have.", view=view)
-        ipc_resp = await send_daemon_ipc("AI CLARIFY __USE_CURRENT__")
+        ipc_resp = await resolve_ai_response(await send_daemon_ipc("AI CLARIFY __USE_CURRENT__"), active_session_id or "")
     else:
         answer = view.value
         if answer == "__USE_CURRENT__":
             await clar_msg.edit(content="✅ Proceeding with current understanding.", view=view)
         else:
             await clar_msg.edit(content=f"✅ Got it: `{answer}`", view=view)
-        ipc_resp = await send_daemon_ipc(f"AI CLARIFY {answer}")
+        ipc_resp = await resolve_ai_response(await send_daemon_ipc(f"AI CLARIFY {answer}"), active_session_id or "")
 
     # Clean up the clarification card — it served its purpose
     try:
@@ -1165,7 +1235,7 @@ async def bridge_commands_db_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         try:
-            conn = sqlite3.connect(get_db_path())
+            conn = connect_db()
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT id, action, args FROM bridge_commands WHERE status='pending' ORDER BY id LIMIT 20"
@@ -1186,7 +1256,7 @@ async def bridge_commands_db_loop():
             for cid, action, args in claimed:
                 result = await _exec_bridge_command(action, args)
                 try:
-                    conn = sqlite3.connect(get_db_path())
+                    conn = connect_db()
                     cursor = conn.cursor()
                     cursor.execute(
                         "UPDATE bridge_commands SET status='done', result=? WHERE id=?",
@@ -1253,6 +1323,167 @@ async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
                 if etype == "attachment" and main_channel:
                     await post_attachment(main_channel, content)
                     continue
+
+                # --- Image generation progress embed ---
+                if etype == 'image_progress' and main_channel:
+                    global _image_gen_msg, _image_gen_last_edit
+                    import json as _json
+                    try:
+                        data = _json.loads(content)
+                    except Exception:
+                        await post_trace_event(thread, etype, content, emoji)
+                        continue
+                    status = data.get('status', '')
+                    if status == 'started':
+                        embed = discord.Embed(
+                            title='\U0001f3a8 Generating Image...',
+                            description=data.get('prompt', ''),
+                            color=0xFFB300
+                        )
+                        embed.set_footer(text='Elapsed: 0s')
+                        _image_gen_msg = await main_channel.send(embed=embed)
+                        _image_gen_last_edit = time.time()
+                    elif status == 'rendering' and _image_gen_msg:
+                        if time.time() - _image_gen_last_edit >= 5.0:
+                            elapsed = data.get('elapsed_s', 0)
+                            embed = _image_gen_msg.embeds[0] if _image_gen_msg.embeds else discord.Embed(title='\U0001f3a8 Generating Image...', color=0xFFB300)
+                            embed.set_footer(text=f'Elapsed: {elapsed}s')
+                            try:
+                                await _image_gen_msg.edit(embed=embed)
+                                _image_gen_last_edit = time.time()
+                            except Exception:
+                                pass
+                    elif status == 'complete' and _image_gen_msg:
+                        try:
+                            await _image_gen_msg.delete()
+                        except Exception:
+                            pass
+                        _image_gen_msg = None
+                    elif status == 'failed' and _image_gen_msg:
+                        embed = discord.Embed(title='\u274c Image Generation Failed', description=data.get('error', 'Unknown error'), color=0xFF0000)
+                        try:
+                            await _image_gen_msg.edit(embed=embed)
+                            msg_ref = _image_gen_msg
+                            asyncio.get_event_loop().call_later(30, lambda: asyncio.ensure_future(msg_ref.delete()))
+                        except Exception:
+                            pass
+                        _image_gen_msg = None
+                    elif status == 'cancelled' and _image_gen_msg:
+                        try:
+                            await _image_gen_msg.delete()
+                        except Exception:
+                            pass
+                        _image_gen_msg = None
+                    continue
+
+                # --- Sub-agent thread handling ---
+                if etype == 'subagent_spawn' and main_channel:
+                    global _subagent_threads, _subagent_poll_tasks
+                    import json as _json
+                    try:
+                        data = _json.loads(content)
+                    except Exception:
+                        await post_trace_event(thread, etype, content, emoji)
+                        continue
+                    task_id = data.get('task_id', '')
+                    role = data.get('role', 'Sub-Agent')
+                    instruction = data.get('instruction', '')
+                    try:
+                        sa_thread = await main_channel.create_thread(
+                            name=f'\U0001f916 {role} \u2014 {task_id}',
+                            type=discord.ChannelType.public_thread
+                        )
+                        _subagent_threads[task_id] = sa_thread
+                        embed = discord.Embed(title=f'\U0001f916 {role}', description=instruction, color=0x50c878)
+                        embed.set_footer(text=f'{task_id} \u2022 \U0001f7e2 Running')
+                        await sa_thread.send(embed=embed)
+                    except Exception as e:
+                        print(f'[discord] Failed to create sub-agent thread: {e}', flush=True)
+                    continue
+
+                if etype == 'subagent_complete' and main_channel:
+                    import json as _json
+                    try:
+                        data = _json.loads(content)
+                    except Exception:
+                        await post_trace_event(thread, etype, content, emoji)
+                        continue
+                    task_id = data.get('task_id', '')
+                    summary = data.get('result_summary', '')
+                    sa_thread = _subagent_threads.get(task_id)
+                    if sa_thread:
+                        embed = discord.Embed(title='\u2705 Complete', description=summary[:2000], color=0x34d399)
+                        try:
+                            await sa_thread.send(embed=embed)
+                        except Exception:
+                            pass
+                        # Clean up poll task
+                        poll_task = _subagent_poll_tasks.pop(task_id, None)
+                        if poll_task:
+                            poll_task.cancel()
+                        del _subagent_threads[task_id]
+                    continue
+
+                if etype == 'subagent_approval' and main_channel:
+                    import json as _json
+                    try:
+                        data = _json.loads(content)
+                    except Exception:
+                        await post_trace_event(thread, etype, content, emoji)
+                        continue
+                    task_id = data.get('task_id', '')
+                    tool = data.get('tool', '')
+                    args = data.get('args', '')
+                    desc = data.get('description', '')
+                    sa_thread = _subagent_threads.get(task_id)
+                    embed = discord.Embed(
+                        title='\u26a0\ufe0f Permission Required',
+                        description=f'**{tool}**({args})\n\n{desc}',
+                        color=0xFFB300
+                    )
+                    # Create approval buttons view
+                    class SubAgentApprovalView(discord.ui.View):
+                        def __init__(self, tid, bridge_ipc_send):
+                            super().__init__(timeout=3600)
+                            self.tid = tid
+                            self.bridge_ipc_send = bridge_ipc_send
+                        @discord.ui.button(label='\u2705 Approve', style=discord.ButtonStyle.green)
+                        async def approve(self, interaction, button):
+                            await interaction.response.defer()
+                            try:
+                                resp = await self.bridge_ipc_send(f'AI APPROVE [AGENT:{self.tid}] [DECISION:yes]')
+                            except Exception:
+                                pass
+                            for child in self.children:
+                                child.disabled = True
+                            button.label = 'Approved \u2705'
+                            await interaction.message.edit(view=self)
+                            self.stop()
+                        @discord.ui.button(label='\u274c Deny', style=discord.ButtonStyle.red)
+                        async def deny(self, interaction, button):
+                            await interaction.response.defer()
+                            try:
+                                resp = await self.bridge_ipc_send(f'AI APPROVE [AGENT:{self.tid}] [DECISION:no]')
+                            except Exception:
+                                pass
+                            for child in self.children:
+                                child.disabled = True
+                            button.label = 'Denied \u274c'
+                            await interaction.message.edit(view=self)
+                            self.stop()
+                    view = SubAgentApprovalView(task_id, send_daemon_ipc)
+                    if sa_thread:
+                        try:
+                            await sa_thread.send(embed=embed, view=view)
+                        except Exception:
+                            pass
+                    # Also notify main channel
+                    try:
+                        await main_channel.send(f'\u26a0\ufe0f Sub-agent **{task_id}** needs approval for `{tool}` \u2014 see thread', view=view)
+                    except Exception:
+                        pass
+                    continue
+
                 # All other events: post to trace thread IN FULL (chunked, never truncated)
                 await post_trace_event(thread, etype, content, emoji)
         except Exception as e:

@@ -13,6 +13,11 @@ import "http"
 
 external define cast_borrow_to_map with b returning Map
 external define async_wait_readable_timeout with fd as Int and timeout_ms as Int returning Int
+# Phase A: listen socket non-blocking; accepted sockets forced back to blocking
+# (Darwin inherits O_NONBLOCK on accept — without this every IPC read came back empty
+# and all commands failed auth). Both injected by build.sh's shared injector.
+external define ep_net_set_nonblocking with fd as Int returning Int
+external define ep_net_set_blocking with fd as Int returning Int
 
 
 define cast_borrow_to_list with b as List returning List:
@@ -113,6 +118,124 @@ external define ep_cancel_epoch_bump with dummy returning Int
 # async invariant (one react_run at a time on the heap) while allowing cancel,
 # status, and trace polling to proceed during long inference runs.
 set AGENT_RUN_LOCK to create_mutex()
+
+# ── Phase A2/A3: detached, parallel-per-session turns ───────────────────────────
+# Turn-tracking maps live INSIDE agent_ctx (created in main AFTER runtime init):
+#   agent_ctx["active_turns"] : session_id → 1 while a turn (or its pending
+#     approval/clarification) is in flight — per-session serialization: a second
+#     message to a BUSY session becomes a whisper; different sessions run genuinely
+#     concurrent turns.
+#   agent_ctx["turn_ctxs"]    : session_id → that turn's PRIVATE cloned ctx
+#     (pending_action/clarification live there; approve/deny/clarify resume against it).
+# NOT module globals: main-module map globals abort at boot (GC registration order),
+# and EP module globals are unreliable from functions anyway. The shallow turn clone
+# SHARES these two submaps, so the finish path reads them from its own tctx. Only ever
+# touched from the single event-loop thread (mutations between awaits) — no mutex.
+
+# Finish a detached turn: persist the conversation, build the EXACT legacy IPC payload
+# string the bridge/web already parse (ai:ok|||RESPONSE|||…, ai:clarify, ai:pending_
+# approval, ai:cancelled), and deliver it as a `final_reply` trace row keyed by the
+# session — A3's decoupled delivery. Returns 1 when the turn stays OPEN (pending
+# approval/clarification keeps the session busy and its ctx alive for the resume).
+define node_finish_turn with tctx as Map and sessions_mgr as Map and memory as Map and sid as Str and agent_resp as Str returning Int:
+    set tdb to storage_get_db()
+    set stays_open to 0
+    set resp to ""
+    if map_contains(tctx and "was_cancelled") == 1:
+        set ok to map_delete(tctx and "was_cancelled")
+        set resp to f"ai:cancelled,response:{agent_resp}"
+    else if agent_resp equals "PENDING_CLARIFICATION":
+        set pendingc to map_get_val(tctx and "pending_clarification")
+        set c_questions to map_get_val(pendingc and "questions")
+        set resp to f"ai:clarify,questions:{c_questions}"
+        set stays_open to 1
+    else if agent_resp equals "PENDING_APPROVAL":
+        set pending to map_get_val(tctx and "pending_action")
+        set p_tool to map_get_val(pending and "tool_name")
+        set p_summary to map_get_val(pending and "summary")
+        set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
+        set stays_open to 1
+    else:
+        # Persist to THIS turn's session (never "the active one" — another session's
+        # turn may have switched the global pointer while we ran).
+        set sess_map to map_get_val(sessions_mgr and "sessions")
+        if map_contains(sess_map and sid) == 1:
+            set tsess to map_get_val(sess_map and sid)
+            set ok to session_add_message(tsess and "assistant" and agent_resp)
+            set dir to map_get_val(sessions_mgr and "sessions_dir")
+            set filepath to path_join(dir and concat(sid and ".json"))
+            set ok to session_serialize(tsess and filepath)
+        set ser_err to memory_serialize(memory and "config/agent_memory.json")
+        set last_reason to ""
+        if map_contains(tctx and "last_reasoning") == 1:
+            set last_reason to map_get_val(tctx and "last_reasoning")
+            set ok to map_delete(tctx and "last_reasoning")
+        if string_length(last_reason) > 0:
+            set resp to f"ai:ok,reasoning:{base64_encode(last_reason)}|||RESPONSE|||{agent_resp}"
+        else:
+            set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
+    set ok to trace_emit(tdb and sid and "final_reply" and resp)
+    if stays_open == 0:
+        # The shallow clone shares the shared turn-tracking maps — clear our flags.
+        if map_contains(tctx and "active_turns") == 1:
+            set fin_active to map_get_val(tctx and "active_turns")
+            if map_contains(fin_active and sid) == 1:
+                set ok to map_delete(fin_active and sid)
+        if map_contains(tctx and "turn_ctxs") == 1:
+            set fin_tcs to map_get_val(tctx and "turn_ctxs")
+            if map_contains(fin_tcs and sid) == 1:
+                set ok to map_delete(fin_tcs and sid)
+    return stays_open
+
+# A detached foreground turn. Straight-line call to react_run (an awaiting PLAIN
+# function) from an async define is the proven-safe shape (orchestrator_spawn_worker
+# does exactly this); no awaits in loops here.
+async define node_run_turn with model as Map and memory as Map and tools as Map and tctx as Map and sessions_mgr as Map and sid as Str and prompt as Str returning Int:
+    set agent_resp to react_run(model and memory and tools and tctx and prompt)
+    set ok to node_finish_turn(tctx and sessions_mgr and memory and sid and agent_resp)
+    return 0
+
+# A detached resume after approve/deny (kind 0) or clarification answers (kind 1).
+async define node_resume_turn with model as Map and memory as Map and tools as Map and tctx as Map and sessions_mgr as Map and sid as Str and kind as Int and approved as Int and autoall as Int and answers as Str returning Int:
+    set agent_resp to ""
+    if kind == 1:
+        set agent_resp to react_resume_clarify(model and memory and tools and tctx and answers and autoall)
+    else:
+        set agent_resp to react_resume_approved(model and memory and tools and tctx and approved and autoall)
+    set ok to node_finish_turn(tctx and sessions_mgr and memory and sid and agent_resp)
+    return 0
+
+# ── Phase A2: the IPC ACCEPT is itself a TASK CHAIN ─────────────────────────────
+# Why a chain and not a loop in main: a task's step is ATOMIC on the single scheduler
+# thread, and a detached turn's step runs its whole plain call chain — its LLM waits
+# pump the queue NESTED (ep_await_future) instead of yielding. If accept lived in
+# main's frame, main could not resume while any turn step was on the stack, and a
+# second connection starved (observed live in the A2 smoke test). As a TASK, the
+# accept's next step fires from WITHIN any nested pump: connections are served, new
+# turns dispatch, whispers/Stop/status stay live even while a turn is mid-inference.
+# One top-level await per instance + self re-enqueue = the compiler-safe chain shape
+# (see tools_validation_block). Shared structures ride as Int handles; the Maps are
+# re-materialized per call with INLINE cast_borrow_to_map (never assigned to locals —
+# the documented borrow-view free hazard).
+async define node_accept_chain with listen_fd as Int and raft_i as Int and ident_i as Int and dht_node as Int and relay_node as Int and msg_store as Int and ledger_i as Int and name_reg as Int and seed_addr as Str and seed_port as Int and mem_i as Int and tools_i as Int and ctx_i as Int and model_i as Int and static_secret as Int and static_public as Int and bft_i as Int returning Int:
+    set ready to await async_wait_readable_timeout(listen_fd and 250)
+    if ready == 1:
+        set client_fd to ep_net_accept(listen_fd)
+        if client_fd >= 0:
+            # Accepted sockets inherit O_NONBLOCK on Darwin — force blocking so the
+            # AUTH command read cannot come back empty (the fixed A1 regression).
+            set ok to ep_net_set_blocking(client_fd)
+            handle_ipc_client(client_fd and borrow cast_borrow_to_map(raft_i) and borrow cast_borrow_to_map(ident_i) and dht_node and relay_node and msg_store and borrow cast_borrow_to_map(ledger_i) and name_reg and seed_addr and seed_port and borrow cast_borrow_to_map(mem_i) and borrow cast_borrow_to_map(tools_i) and borrow cast_borrow_to_map(ctx_i) and borrow cast_borrow_to_map(model_i) and static_secret and static_public and borrow cast_borrow_to_map(bft_i))
+    set nxt to node_accept_chain(listen_fd and raft_i and ident_i and dht_node and relay_node and msg_store and ledger_i and name_reg and seed_addr and seed_port and mem_i and tools_i and ctx_i and model_i and static_secret and static_public and bft_i)
+    return 0
+
+# Main's eternal pump: a PLAIN loop whose await lowers to ep_await_future each tick —
+# it drives the scheduler (tasks, timers, IO) forever. All real work happens in tasks.
+external define ep_async_sleep_ms with ms returning Int
+define node_main_pump returning Int:
+    repeat while 1 == 1:
+        set ok to await ep_async_sleep_ms(60000)
+    return 0
 
 # /factory support: recursive tree delete in pure ErnosPlain (no shell). Depth-capped
 # as a runaway guard; only ever called on the FIXED agent-state paths listed in the
@@ -793,83 +916,69 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set ok to map_insert(active_sess and "mode" and selected_mode)
                                                 set ok to session_add_message(active_sess and "user" and ai_prompt)
 
-                                            set ok to map_insert(agent_ctx and "sender_username" and sender_username)
-                                            set ok to map_insert(agent_ctx and "sender_role" and sender_role)
-                                            set ok to map_insert(agent_ctx and "in_memory_context" and in_memory_context)
-                                            # Current Discord message coordinates (for react([emoji]) auto-targeting).
-                                            set ok to map_insert(agent_ctx and "discord_msg_id" and discord_msg_id)
-                                            set ok to map_insert(agent_ctx and "discord_chan_id" and discord_chan_id)
-                                            set ok to map_insert(agent_ctx and "platform" and msg_platform)
-                                            set ok to map_insert(agent_ctx and "selected_model" and selected_model)
-                                            set ok to map_insert(agent_ctx and "mode" and selected_mode)
-                                            # F4: thread the session id so AI CANCEL can target this run.
-                                            set ok to map_insert(agent_ctx and "session_id" and selected_session_id)
-                                            # ── Per-query state reset ──────────────────────────────
-                                            # Every transient key that belongs to a SINGLE query must
-                                            # be cleared before the new run starts, otherwise stale
-                                            # approvals, clarifications, denial counters, or reasoning
-                                            # from a previous interaction bleed into the next one.
-                                            set ok to map_delete(agent_ctx and "was_cancelled")
-                                            set ok to map_delete(agent_ctx and "clarify_rounds")
-                                            set ok to map_delete(agent_ctx and "clarify_done")
-                                            set ok to map_delete(agent_ctx and "pending_action")
-                                            set ok to map_delete(agent_ctx and "pending_clarification")
-                                            set ok to map_delete(agent_ctx and "auto_approve")
-                                            set ok to map_delete(agent_ctx and "tool_approved")
-                                            set ok to map_delete(agent_ctx and "consecutive_denials")
-                                            set ok to map_delete(agent_ctx and "last_reasoning")
-                                            # Store refs for orchestrator sub-agent delegation
-                                            set ok to map_insert(agent_ctx and "model" and cast_borrow_to_map(agent_model))
-                                            set ok to map_insert(agent_ctx and "memory_mgr" and cast_borrow_to_map(agent_memory))
-                                            set ok to map_insert(agent_ctx and "tools_mgr" and cast_borrow_to_map(agent_tools))
-                                            # AGENT_RUN_LOCK: serialize react_run so
-                                            # only one agent turn runs at a time
-                                            # (cooperative async invariant). Lock is
-                                            # AFTER all option parsing so setup work
-                                            # runs concurrently on spawned IPC threads.
-                                            set ok to lock_mutex(AGENT_RUN_LOCK)
-                                            set agent_resp to react_run(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and ai_prompt)
-                                            set ok to unlock_mutex(AGENT_RUN_LOCK)
-
-                                            set ok to map_delete(agent_ctx and "sender_username")
-                                            set ok to map_delete(agent_ctx and "sender_role")
-                                            set ok to map_delete(agent_ctx and "mode")
-                                            set ok to map_delete(agent_ctx and "in_memory_context")
-
-                                            if map_contains(agent_ctx and "was_cancelled") == 1:
-                                                # F4: run was halted by the user — report distinctly, do not persist.
-                                                set ok to map_delete(agent_ctx and "was_cancelled")
-                                                set resp to f"ai:cancelled,response:{agent_resp}"
-                                            else if agent_resp equals "PENDING_CLARIFICATION":
-                                                # F3: agent is asking the user — hand the questions to the client.
-                                                set pendingc to map_get_val(agent_ctx and "pending_clarification")
-                                                set c_questions to map_get_val(pendingc and "questions")
-                                                set resp to f"ai:clarify,questions:{c_questions}"
-                                            else if agent_resp equals "PENDING_APPROVAL":
-                                                # Tool requires user approval — extract pending action details
-                                                set pending to map_get_val(agent_ctx and "pending_action")
-                                                set p_tool to map_get_val(pending and "tool_name")
-                                                set p_summary to map_get_val(pending and "summary")
-                                                set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
+                                            # ── Phase A2: detached, per-session-parallel turn dispatch ──
+                                            # Resolve THIS turn's real session id (tags may omit it).
+                                            set turn_sid to selected_session_id
+                                            if string_length(turn_sid) == 0:
+                                                set turn_sid to map_get_val(sessions_mgr and "active_session_id")
+                                            # Lazily seed the shared turn-tracking maps on agent_ctx.
+                                            if map_contains(agent_ctx and "active_turns") == 0:
+                                                set ok to map_insert(agent_ctx and "active_turns" and create_map())
+                                            if map_contains(agent_ctx and "turn_ctxs") == 0:
+                                                set ok to map_insert(agent_ctx and "turn_ctxs" and create_map())
+                                            set at_map to map_get_val(agent_ctx and "active_turns")
+                                            set tc_map to map_get_val(agent_ctx and "turn_ctxs")
+                                            if map_contains(at_map and turn_sid) == 1:
+                                                # Per-session serialization: this session already has a turn
+                                                # (or a pending approval/clarification) in flight — the new
+                                                # message becomes MID-TURN GUIDANCE via the whisper queue,
+                                                # never a clobber of the running turn's state.
+                                                set wdb to storage_get_db()
+                                                if wdb != 0:
+                                                    set wes to string_replace(turn_sid and "'" and "''")
+                                                    set wec to string_replace(ai_prompt and "'" and "''")
+                                                    set ok to sql_execute(wdb and f"INSERT INTO trace_whispers (session_id, content, created_at) VALUES ('{wes}', '{wec}', strftime('%s','now'));")
+                                                set resp to f"ai:busy_whispered,session:{turn_sid}"
                                             else:
-                                                set active_sess to session_manager_get_active(sessions_mgr)
-                                                set ok to session_add_message(active_sess and "assistant" and agent_resp)
-                                                set dir to map_get_val(sessions_mgr and "sessions_dir")
-                                                set active_id to map_get_val(sessions_mgr and "active_session_id")
-                                                set filepath to path_join(dir and concat(active_id and ".json"))
-                                                set ok to session_serialize(active_sess and filepath)
-
-                                                set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                # F1: surface the final turn's reasoning (if any) to the client,
-                                                # base64-encoded so its newlines/commas can't break the IPC line.
-                                                set last_reason to ""
-                                                if map_contains(agent_ctx and "last_reasoning") == 1:
-                                                    set last_reason to map_get_val(agent_ctx and "last_reasoning")
-                                                set ok to map_delete(agent_ctx and "last_reasoning")
-                                                if string_length(last_reason) > 0:
-                                                    set resp to f"ai:ok,reasoning:{base64_encode(last_reason)}|||RESPONSE|||{agent_resp}"
-                                                else:
-                                                    set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
+                                                # Shared refs sub-agent delegation needs, kept on the SHARED ctx
+                                                # (clone below copies them). Also ensure session_auto_approve
+                                                # exists so all turn clones share ONE toggle map.
+                                                set ok to map_insert(agent_ctx and "model" and cast_borrow_to_map(agent_model))
+                                                set ok to map_insert(agent_ctx and "memory_mgr" and cast_borrow_to_map(agent_memory))
+                                                set ok to map_insert(agent_ctx and "tools_mgr" and cast_borrow_to_map(agent_tools))
+                                                if map_contains(agent_ctx and "session_auto_approve") == 0:
+                                                    set ok to map_insert(agent_ctx and "session_auto_approve" and create_map())
+                                                # PRIVATE turn ctx: shallow clone shares the sessions manager,
+                                                # orchestrator, memory/tools handles and the auto-approve map,
+                                                # while per-turn state (pending_*, reasoning, ids, role, mode)
+                                                # stays isolated so parallel turns cannot clobber each other.
+                                                set tctx to _orch_clone_map(cast_borrow_to_map(agent_ctx))
+                                                set ok to map_delete(tctx and "was_cancelled")
+                                                set ok to map_delete(tctx and "clarify_rounds")
+                                                set ok to map_delete(tctx and "clarify_done")
+                                                set ok to map_delete(tctx and "pending_action")
+                                                set ok to map_delete(tctx and "pending_clarification")
+                                                set ok to map_delete(tctx and "auto_approve")
+                                                set ok to map_delete(tctx and "tool_approved")
+                                                set ok to map_delete(tctx and "consecutive_denials")
+                                                set ok to map_delete(tctx and "last_reasoning")
+                                                set ok to map_insert(tctx and "sender_username" and sender_username)
+                                                set ok to map_insert(tctx and "sender_role" and sender_role)
+                                                set ok to map_insert(tctx and "in_memory_context" and in_memory_context)
+                                                set ok to map_insert(tctx and "discord_msg_id" and discord_msg_id)
+                                                set ok to map_insert(tctx and "discord_chan_id" and discord_chan_id)
+                                                set ok to map_insert(tctx and "platform" and msg_platform)
+                                                set ok to map_insert(tctx and "selected_model" and selected_model)
+                                                set ok to map_insert(tctx and "mode" and selected_mode)
+                                                set ok to map_insert(tctx and "session_id" and turn_sid)
+                                                set ok to map_insert(at_map and turn_sid and 1)
+                                                set ok to map_insert(tc_map and turn_sid and tctx)
+                                                # Fire-and-forget: the turn runs as a background async task and
+                                                # delivers its answer as a `final_reply` trace row (A3). The
+                                                # socket acks immediately — the daemon is free for parallel
+                                                # sessions, Stop, and background work.
+                                                set turn_fut to node_run_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and tctx and sessions_mgr and turn_sid and ai_prompt)
+                                                set resp to f"ai:accepted,session:{turn_sid}"
                                         else if cmd_upper equals "BFT STATUS":
                                             set bview to map_get_val(bft_node and "view")
                                             set bseq to map_get_val(bft_node and "seq")
@@ -983,35 +1092,23 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 else:
                                                     set resp to "ai:error,reason:db_not_available"
                                             else:
-                                                # Main agent approval (original behavior)
-                                                if agent_ctx != 0:
-                                                    if map_contains(agent_ctx and "pending_action") == 1:
-                                                        set ok to lock_mutex(AGENT_RUN_LOCK)
-                                                        set agent_resp to react_resume_approved(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and 1 and 0)
-                                                        set ok to unlock_mutex(AGENT_RUN_LOCK)
-                                                        if agent_resp equals "PENDING_APPROVAL":
-                                                            set pending to map_get_val(agent_ctx and "pending_action")
-                                                            set p_tool to map_get_val(pending and "tool_name")
-                                                            set p_summary to map_get_val(pending and "summary")
-                                                            set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
-                                                        else if agent_resp equals "PENDING_CLARIFICATION":
-                                                            set pendingc to map_get_val(agent_ctx and "pending_clarification")
-                                                            set c_questions to map_get_val(pendingc and "questions")
-                                                            set resp to f"ai:clarify,questions:{c_questions}"
-                                                        else:
-                                                            set sessions_mgr to map_get_val(agent_ctx and "sessions")
-                                                            set active_sess to session_manager_get_active(sessions_mgr)
-                                                            set ok to session_add_message(active_sess and "assistant" and agent_resp)
-                                                            set dir to map_get_val(sessions_mgr and "sessions_dir")
-                                                            set active_id to map_get_val(sessions_mgr and "active_session_id")
-                                                            set filepath to path_join(dir and concat(active_id and ".json"))
-                                                            set ok to session_serialize(active_sess and filepath)
-                                                            set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                            set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
+                                                # Main agent approval — Phase A2: resume the DETACHED turn's
+                                                # private ctx as a background task; the outcome arrives as the
+                                                # session's next `final_reply` trace row.
+                                                set r_smgr to map_get_val(agent_ctx and "sessions")
+                                                set r_sid to map_get_val(r_smgr and "active_session_id")
+                                                set r_tcs to 0
+                                                if map_contains(agent_ctx and "turn_ctxs") == 1:
+                                                    set r_tcs to map_get_val(agent_ctx and "turn_ctxs")
+                                                if r_tcs != 0 and also map_contains(r_tcs and r_sid) == 1:
+                                                    set r_tctx to map_get_val(r_tcs and r_sid)
+                                                    if map_contains(r_tctx and "pending_action") == 1:
+                                                        set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 0 and 1 and 0 and "")
+                                                        set resp to f"ai:accepted_resume,session:{r_sid}"
                                                     else:
                                                         set resp to "ai:error,reason:no_pending_action"
                                                 else:
-                                                    set resp to "ai:error,reason:agent_not_initialized"
+                                                    set resp to "ai:error,reason:no_pending_action"
                                         else if cmd_upper equals "AI FACTORY":
                                             # FACTORY RESET — wipe every piece of agent DATA/MEMORY while keeping
                                             # all PROMPTING (kernel, personas, identity files, frameworks) and all
@@ -1115,60 +1212,38 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             else:
                                                 set resp to "ai:error,reason:agent_not_initialized"
                                         else if cmd_upper equals "AI APPROVE_ALL":
-                                            if agent_ctx != 0:
-                                                if map_contains(agent_ctx and "pending_action") == 1:
-                                                    set ok to map_insert(agent_ctx and "auto_approve" and 1)
-                                                    set agent_resp to react_resume_approved(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and 1 and 1)
-                                                    if agent_resp equals "PENDING_APPROVAL":
-                                                        set pending to map_get_val(agent_ctx and "pending_action")
-                                                        set p_tool to map_get_val(pending and "tool_name")
-                                                        set p_summary to map_get_val(pending and "summary")
-                                                        set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
-                                                    else if agent_resp equals "PENDING_CLARIFICATION":
-                                                        set pendingc to map_get_val(agent_ctx and "pending_clarification")
-                                                        set c_questions to map_get_val(pendingc and "questions")
-                                                        set resp to f"ai:clarify,questions:{c_questions}"
-                                                    else:
-                                                        set sessions_mgr to map_get_val(agent_ctx and "sessions")
-                                                        set active_sess to session_manager_get_active(sessions_mgr)
-                                                        set ok to session_add_message(active_sess and "assistant" and agent_resp)
-                                                        set dir to map_get_val(sessions_mgr and "sessions_dir")
-                                                        set active_id to map_get_val(sessions_mgr and "active_session_id")
-                                                        set filepath to path_join(dir and concat(active_id and ".json"))
-                                                        set ok to session_serialize(active_sess and filepath)
-                                                        set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                        set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
+                                            # Phase A2: detached resume with request-scoped auto-approve.
+                                            set r_smgr to map_get_val(agent_ctx and "sessions")
+                                            set r_sid to map_get_val(r_smgr and "active_session_id")
+                                            set r_tcs to 0
+                                            if map_contains(agent_ctx and "turn_ctxs") == 1:
+                                                set r_tcs to map_get_val(agent_ctx and "turn_ctxs")
+                                            if r_tcs != 0 and also map_contains(r_tcs and r_sid) == 1:
+                                                set r_tctx to map_get_val(r_tcs and r_sid)
+                                                if map_contains(r_tctx and "pending_action") == 1:
+                                                    set ok to map_insert(r_tctx and "auto_approve" and 1)
+                                                    set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 0 and 1 and 1 and "")
+                                                    set resp to f"ai:accepted_resume,session:{r_sid}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
-                                                set resp to "ai:error,reason:agent_not_initialized"
+                                                set resp to "ai:error,reason:no_pending_action"
                                         else if cmd_upper equals "AI DENY":
-                                            if agent_ctx != 0:
-                                                if map_contains(agent_ctx and "pending_action") == 1:
-                                                    set agent_resp to react_resume_approved(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and 0 and 0)
-                                                    if agent_resp equals "PENDING_APPROVAL":
-                                                        set pending to map_get_val(agent_ctx and "pending_action")
-                                                        set p_tool to map_get_val(pending and "tool_name")
-                                                        set p_summary to map_get_val(pending and "summary")
-                                                        set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
-                                                    else if agent_resp equals "PENDING_CLARIFICATION":
-                                                        set pendingc to map_get_val(agent_ctx and "pending_clarification")
-                                                        set c_questions to map_get_val(pendingc and "questions")
-                                                        set resp to f"ai:clarify,questions:{c_questions}"
-                                                    else:
-                                                        set sessions_mgr to map_get_val(agent_ctx and "sessions")
-                                                        set active_sess to session_manager_get_active(sessions_mgr)
-                                                        set ok to session_add_message(active_sess and "assistant" and agent_resp)
-                                                        set dir to map_get_val(sessions_mgr and "sessions_dir")
-                                                        set active_id to map_get_val(sessions_mgr and "active_session_id")
-                                                        set filepath to path_join(dir and concat(active_id and ".json"))
-                                                        set ok to session_serialize(active_sess and filepath)
-                                                        set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                        set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
+                                            # Phase A2: detached denied-resume.
+                                            set r_smgr to map_get_val(agent_ctx and "sessions")
+                                            set r_sid to map_get_val(r_smgr and "active_session_id")
+                                            set r_tcs to 0
+                                            if map_contains(agent_ctx and "turn_ctxs") == 1:
+                                                set r_tcs to map_get_val(agent_ctx and "turn_ctxs")
+                                            if r_tcs != 0 and also map_contains(r_tcs and r_sid) == 1:
+                                                set r_tctx to map_get_val(r_tcs and r_sid)
+                                                if map_contains(r_tctx and "pending_action") == 1:
+                                                    set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 0 and 0 and 0 and "")
+                                                    set resp to f"ai:accepted_resume,session:{r_sid}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
-                                                set resp to "ai:error,reason:agent_not_initialized"
+                                                set resp to "ai:error,reason:no_pending_action"
                                         else if string_contains(cmd_upper and "AI CANCEL") == 1:
                                             # F4: stop/halt. Arrives on its own connection while the run is
                                             # blocked on another; sets the per-session cancel flag the loop
@@ -1195,32 +1270,21 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             set clarify_answers to ""
                                             if string_length(cmd) > 11:
                                                 set clarify_answers to substring(cmd and 11 and string_length(cmd) - 11)
-                                            if agent_ctx != 0:
-                                                if map_contains(agent_ctx and "pending_clarification") == 1:
-                                                    set agent_resp to react_resume_clarify(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and clarify_answers and 0)
-                                                    if agent_resp equals "PENDING_CLARIFICATION":
-                                                        set pendingc to map_get_val(agent_ctx and "pending_clarification")
-                                                        set c_questions to map_get_val(pendingc and "questions")
-                                                        set resp to f"ai:clarify,questions:{c_questions}"
-                                                    else if agent_resp equals "PENDING_APPROVAL":
-                                                        set pending to map_get_val(agent_ctx and "pending_action")
-                                                        set p_tool to map_get_val(pending and "tool_name")
-                                                        set p_summary to map_get_val(pending and "summary")
-                                                        set resp to f"ai:pending_approval,tool:{p_tool},summary:{p_summary}"
-                                                    else:
-                                                        set sessions_mgr to map_get_val(agent_ctx and "sessions")
-                                                        set active_sess to session_manager_get_active(sessions_mgr)
-                                                        set ok to session_add_message(active_sess and "assistant" and agent_resp)
-                                                        set dir to map_get_val(sessions_mgr and "sessions_dir")
-                                                        set active_id to map_get_val(sessions_mgr and "active_session_id")
-                                                        set filepath to path_join(dir and concat(active_id and ".json"))
-                                                        set ok to session_serialize(active_sess and filepath)
-                                                        set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                        set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
+                                            # Phase A2: detached clarify-resume against the turn's private ctx.
+                                            set r_smgr to map_get_val(agent_ctx and "sessions")
+                                            set r_sid to map_get_val(r_smgr and "active_session_id")
+                                            set r_tcs to 0
+                                            if map_contains(agent_ctx and "turn_ctxs") == 1:
+                                                set r_tcs to map_get_val(agent_ctx and "turn_ctxs")
+                                            if r_tcs != 0 and also map_contains(r_tcs and r_sid) == 1:
+                                                set r_tctx to map_get_val(r_tcs and r_sid)
+                                                if map_contains(r_tctx and "pending_clarification") == 1:
+                                                    set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 1 and 0 and 0 and clarify_answers)
+                                                    set resp to f"ai:accepted_resume,session:{r_sid}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_clarification"
                                             else:
-                                                set resp to "ai:error,reason:agent_not_initialized"
+                                                set resp to "ai:error,reason:no_pending_clarification"
                                         else if cmd_upper equals "AI MODELS":
                                             set resp to agent_list_models()
                                         else if string_contains(cmd_upper and "AI TRANSCRIBE ") == 1:
@@ -2091,14 +2155,9 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
     return 0
 
 
-define ipc_server_loop with listen_fd as Int and borrow raft_node as Map and borrow identity as Map and dht_node as Int and relay_node as Int and msg_store as Int and ledger as Map and name_reg as Int and seed_addr as Str and seed_port as Int and borrow agent_memory as Map and borrow agent_tools as Map and borrow agent_ctx as Map and borrow agent_model as Map and static_secret as Int and static_public as Int and bft_node as Map:
-    repeat while 1 == 1:
-        set ready to await async_wait_readable_timeout(listen_fd and 50)
-        if ready == 1:
-            set client_fd to ep_net_accept(listen_fd)
-            if client_fd >= 0:
-                handle_ipc_client(client_fd and raft_node and identity and dht_node and relay_node and msg_store and borrow ledger and name_reg and seed_addr and seed_port and agent_memory and agent_tools and agent_ctx and agent_model and static_secret and static_public and borrow bft_node)
-    return 0
+# (Phase A2) ipc_server_loop retired: the accept now lives in the node_accept_chain
+# TASK (see its comment for why a main-frame loop starved concurrent connections);
+# main seeds the chain and parks in node_main_pump.
 
 # ================================================================
 # Bootstrap -- distributed, no single point of failure
@@ -2728,6 +2787,11 @@ define main:
     display "==================================================="
 
     # Start the daemon loop (blocks forever)
-    ipc_server_loop(listen_fd and borrow raft_node and borrow identity and dht_node and relay_node and msg_store and ledger and name_reg and seed_addr and seed_port and borrow agent_memory and borrow agent_tools and borrow agent_ctx and borrow agent_model and static_secret and static_public and bft_node)
+    # Phase A2: non-blocking listen + accept-as-a-task-chain + eternal scheduler pump.
+    # Connections are now served from within ANY nested pump (even while a detached
+    # turn is mid-inference), so sessions run in parallel and the daemon never blocks.
+    set ok to ep_net_set_nonblocking(listen_fd)
+    set accept_fut to node_accept_chain(listen_fd and cast_map_to_int(raft_node) and cast_map_to_int(identity) and dht_node and relay_node and msg_store and cast_map_to_int(ledger) and name_reg and seed_addr and seed_port and cast_map_to_int(agent_memory) and cast_map_to_int(agent_tools) and cast_map_to_int(agent_ctx) and cast_map_to_int(agent_model) and static_secret and static_public and cast_map_to_int(bft_node))
+    set ok to node_main_pump()
     
     return 0

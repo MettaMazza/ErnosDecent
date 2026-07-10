@@ -133,6 +133,23 @@ long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
    the duration; awaiting this yields, so sibling agent tasks (and their LLM reads)
    keep running. Reuses the readable-timeout plumbing's timer half. Used by
    bridge_wait_result so a Discord RPC wait cannot freeze the node. */
+/* Phase A: set a socket non-blocking (the IPC LISTEN socket, so the accept task can
+   wait via the event loop) and force one BLOCKING (each ACCEPTED client socket —
+   Darwin inherits O_NONBLOCK on accept, which made every per-connection command read
+   return empty and fail auth). Returns 0 ok, -1 on error. */
+long long ep_net_set_nonblocking(long long fd) {
+    int flags = fcntl((int)fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (fcntl((int)fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+    return 0;
+}
+long long ep_net_set_blocking(long long fd) {
+    int flags = fcntl((int)fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (fcntl((int)fd, F_SETFL, flags & ~O_NONBLOCK) < 0) return -1;
+    return 0;
+}
+
 long long ep_async_sleep_ms(long long ms) {
     EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
     fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;

@@ -602,6 +602,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set is_batched_turn to 1
             display f"[ReAct] Batched action — running queued tool from the same response, no new inference call."
         else:
+            set ok to map_delete(ctx and "subagent_turn_auto_approve")
             if is_test == 0:
                 set selected_model to ""
                 if map_contains(ctx and "selected_model") == 1:
@@ -834,6 +835,10 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set auto_approve_val to map_get_val(ctx and "auto_approve")
                 if auto_approve_flag == 1:
                     set auto_approve_val to 1
+                if auto_approve_val == 0:
+                    if map_contains(ctx and "subagent_turn_auto_approve") == 1:
+                        if map_get_val(ctx and "subagent_turn_auto_approve") == 1:
+                            set auto_approve_val to 1
                 # P4: persistent per-session auto-approve toggle (AI AUTOAPPROVE ON via
                 # Discord button//autoapprove/WebUI). Session-scoped and in-memory only —
                 # a node restart resets to OFF. Checked alongside the request-scoped
@@ -912,10 +917,82 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                             set pa_idx to pa_idx + 1
                         set ok to map_insert(pending and "args_list" and pending_args)
                         
-                        free_list(args_list)
-                        free_list(values_list)
-                        set ok to tools_set_active_session("")
-                        return "PENDING_APPROVAL"
+                        # SUB-AGENT APPROVAL FORWARDING: if this is a sub-agent (has
+                        # parent_session_id), we cannot return PENDING_APPROVAL because
+                        # nobody polls sub-agent ctx. Instead: insert a pending approval
+                        # row into trace_approvals, emit a trace event to the parent
+                        # session (so Discord/WebUI show the approval card), then poll
+                        # with tools_sleep_yield until the IPC handler writes a decision.
+                        # tools_sleep_yield yields the cooperative event loop so other
+                        # async tasks (parent agent, sibling sub-agents) keep running.
+                        if map_contains(ctx and "parent_session_id") == 1:
+                            set sa_parent_sid to map_get_val(ctx and "parent_session_id")
+                            set sa_task_id to trace_sid
+                            set sa_db to storage_get_db()
+                            # Insert pending approval row
+                            set sa_tn_esc to string_replace(tool_name and "'" and "''")
+                            set sa_as_esc to string_replace(args_str and "'" and "''")
+                            set sa_sm_esc to string_replace(approval_summary and "'" and "''")
+                            set sa_sid_esc to string_replace(sa_task_id and "'" and "''")
+                            set sa_now to ep_time_now_sec()
+                            set ok to sql_execute(sa_db and f"INSERT INTO trace_approvals (session_id, tool_name, args_str, summary, decision, created_at) VALUES ('{sa_sid_esc}', '{sa_tn_esc}', '{sa_as_esc}', '{sa_sm_esc}', NULL, {sa_now});")
+                            # Notify parent session via trace event
+                            set sa_desc to concat("Sub-agent " and concat(sa_task_id and concat(" requests permission to call " and concat(tool_name and concat("(" and concat(args_str and ")"))))))
+                            set sa_desc_esc to string_replace(sa_desc and "\"" and "'")
+                            set sa_tn_esc2 to string_replace(tool_name and "\"" and "'")
+                            set sa_as_esc2 to string_replace(args_str and "\"" and "'")
+                            set ok to trace_emit(sa_db and sa_parent_sid and "subagent_approval" and concat("{\"task_id\":\"" and concat(sa_task_id and concat("\",\"tool\":\"" and concat(sa_tn_esc2 and concat("\",\"args\":\"" and concat(sa_as_esc2 and concat("\",\"description\":\"" and concat(sa_desc_esc and "\"}")))))))))
+                            display f"[APPROVAL] Sub-agent {sa_task_id} waiting for approval of {tool_name} — polling trace_approvals"
+                            # Poll for decision — yield the event loop each second
+                            set sa_decision to ""
+                            set sa_poll_count to 0
+                            repeat while string_length(sa_decision) == 0 and also sa_poll_count < 3600:
+                                # Check for cancellation
+                                if react_check_cancel(trace_sid and run_epoch) == 1:
+                                    set ok to sql_execute(sa_db and f"DELETE FROM trace_approvals WHERE session_id='{sa_sid_esc}' AND decision IS NULL;")
+                                    free_list(args_list)
+                                    free_list(values_list)
+                                    set ok to tools_set_active_session("")
+                                    return "Run halted at your request."
+                                set ok to tools_sleep_yield(1000)
+                                set sa_poll_count to sa_poll_count + 1
+                                # Query for a decision
+                                set sa_rows to sql_query(sa_db and f"SELECT decision FROM trace_approvals WHERE session_id='{sa_sid_esc}' AND decision IS NOT NULL ORDER BY id DESC LIMIT 1;")
+                                if length_list(sa_rows) > 0:
+                                    set sa_row to get_list(sa_rows and 0)
+                                    set sa_decision to get_list(sa_row and 0)
+                            # Clean up the approval row
+                            set ok to sql_execute(sa_db and f"DELETE FROM trace_approvals WHERE session_id='{sa_sid_esc}';")
+                            if sa_decision equals "yes":
+                                display f"[APPROVAL] Sub-agent {sa_task_id} APPROVED for {tool_name} — executing"
+                                set action_allowed to 1
+                                set ok to map_insert(ctx and "consecutive_denials" and 0)
+                                set ok to map_insert(ctx and "subagent_turn_auto_approve" and 1)
+                                # Fall through to tool execution below (action_allowed=1)
+                            else:
+                                display f"[APPROVAL] Sub-agent {sa_task_id} DENIED for {tool_name}"
+                                set action_allowed to 0
+                                set ok to map_insert(ctx and "consecutive_denials" and 0)
+                                if sa_decision equals "no":
+                                    set action_reason to f"Permission denied by operator for {tool_name}."
+                                else:
+                                    set action_reason to f"Approval timed out for {tool_name} after 1 hour."
+                                free_list(args_list)
+                                free_list(values_list)
+                                # Continue the ReAct loop with the denial as observation
+                                set observation to action_reason
+                                # Skip tool execution, go to next iteration
+                                set ok to tools_set_active_session("")
+                                set current_prompt to concat(current_prompt and concat("\nObservation: " and observation))
+                                set loop_idx to loop_idx + 1
+                                if loop_idx >= max_iters:
+                                    return "Max turns reached."
+                                continue
+                        else:
+                            free_list(args_list)
+                            free_list(values_list)
+                            set ok to tools_set_active_session("")
+                            return "PENDING_APPROVAL"
                 else:
                     # Approval was granted — clear the flag and proceed
                     set ok to map_insert(ctx and "tool_approved" and 0)
@@ -1313,10 +1390,21 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     # Trigger Hebbian learning on prompt concepts
     set ok to react_hebbian_trigger(memory_mgr and sanitized_user_prompt)
     
-    # Context window compression check
+    # Context window compression check — compress THIS turn's session (resolved from
+    # ctx session_id), never "the active one": with parallel per-session turns (Phase
+    # A2) another session's dispatch may have moved the global active pointer.
     set sessions_mgr to map_get_val(ctx and "sessions")
     if sessions_mgr != 0:
-        set sess to session_manager_get_active(sessions_mgr)
+        set comp_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set comp_sid to map_get_val(ctx and "session_id")
+        set sess to 0
+        if string_length(comp_sid) > 0:
+            set comp_map to map_get_val(sessions_mgr and "sessions")
+            if map_contains(comp_map and comp_sid) == 1:
+                set sess to map_get_val(comp_map and comp_sid)
+        if sess == 0:
+            set sess to session_manager_get_active(sessions_mgr)
         if sess != 0:
             set selected_model to map_get_val(ctx and "selected_model")
             set ok to session_compress_active(sessions_mgr and sess and selected_model)
