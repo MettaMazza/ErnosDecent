@@ -302,6 +302,23 @@ async def factory_cmd(interaction: discord.Interaction):
         return
     await run_factory_reset(lambda text: interaction.followup.send(text))
 
+@tree.command(name="killagent", description="Kill ONE running sub-agent by its task id (e.g. agent_3)")
+async def killagent_cmd(interaction: discord.Interaction, task_id: str):
+    if not _interaction_in_channel(interaction):
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+    if not is_admin_author(interaction.user):
+        await interaction.response.send_message("❌ Only the operator can kill sub-agents.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    resp = await send_daemon_ipc(f"AI KILL [AGENT:{task_id.strip()}]")
+    if resp and "kill_ack" in resp and "result:cancelled" in resp:
+        await interaction.followup.send(f"🛑 Killed **{task_id}**. If it was mid-LLM-call, that call finishes first and its result is discarded.")
+    elif resp and "result:not_found" in resp:
+        await interaction.followup.send(f"⚠️ No task named **{task_id}** — check the id in its thread title or ask for a delegate list.")
+    else:
+        await interaction.followup.send(f"⚠️ Kill failed: {resp}")
+
 # Approval timeout in seconds
 # No timeout — user said "WAIT" (indefinite)
 APPROVAL_TIMEOUT = None
@@ -640,7 +657,26 @@ async def handle_subagent_event(channel, etype, content):
             _subagent_threads[task_id] = sa_thread
             embed = discord.Embed(title=f'\U0001f916 {role}', description=instruction, color=0x50c878)
             embed.set_footer(text=f'{task_id} • \U0001f7e2 Running • type here to whisper to this agent')
-            await sa_thread.send(embed=embed)
+
+            class SubAgentKillView(discord.ui.View):
+                def __init__(self, tid):
+                    super().__init__(timeout=None)
+                    self.tid = tid
+                @discord.ui.button(label='🛑 Kill this agent', style=discord.ButtonStyle.red)
+                async def kill(self, interaction, button):
+                    if not is_admin_author(interaction.user):
+                        await interaction.response.send_message('❌ Only the operator can kill sub-agents.', ephemeral=True)
+                        return
+                    await interaction.response.defer()
+                    try:
+                        resp = await send_daemon_ipc(f'AI KILL [AGENT:{self.tid}]')
+                    except Exception:
+                        resp = ''
+                    button.disabled = True
+                    button.label = 'Killed 🛑' if (resp and 'kill_ack' in resp) else 'Kill failed ⚠️'
+                    await interaction.message.edit(view=self)
+                    self.stop()
+            await sa_thread.send(embed=embed, view=SubAgentKillView(task_id))
             _subagent_poll_tasks[task_id] = create_tracked_task(subagent_trace_stream(sa_thread, task_id))
         except Exception as e:
             print(f'[discord] Failed to create sub-agent thread: {e}', flush=True)

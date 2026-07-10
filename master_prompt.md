@@ -20,8 +20,8 @@ wallet_balance([]) ; workspace_current([]) ; workspace_list([]) ; workspace_list
 
 ## 2 — Reference & retrieval
 ```
-Run ALL below in ONE turn, no questions. Log ✅/❌ + reason each. If no sessions exist, mark read_transcripts ⏭️. End: reply_request a table |tool|result|detail| + PASS/FAIL count.
-index_ernos_reference([]) ; lookup_ernos(["string builtins"]) ; rag_retrieve(["ErnosDecent architecture"]) ; search_sessions(["Maria"]) ; read_transcripts(["<a session id from list_sessions/search, else SKIP>"])
+Run ALL below in ONE turn, no questions. Log ✅/❌ + reason each. If no sessions exist, mark read_transcripts ⏭️. RAG is session-scoped, so SEED it first with rag_index_text, then retrieve the seeded text — a match on the seeded content is ✅. End: reply_request a table |tool|result|detail| + PASS/FAIL count.
+index_ernos_reference([]) ; lookup_ernos(["string builtins"]) ; rag_index_text(["diag_seed.md","ErnosDecent diagnostic seed: the mesh elects a primary host node and gossips peer state."]) → rag_retrieve(["primary host node diagnostic seed"]) (expect the seeded chunk) ; search_sessions(["Maria"]) ; read_transcripts(["<a session id from list_sessions/search, else SKIP>"])
 ```
 
 ## 3 — Memory & cognition (round-trips)
@@ -33,7 +33,7 @@ scratchpad_tool(["write","diag_k","diag_v"]) → scratchpad_tool(["read","diag_k
 ## 4 — Graphs (synaptic + knowledge + procedures)
 ```
 Run ALL below in ONE turn, no questions. Log ✅/❌ + reason. End: reply_request a table |tool|result|detail| + PASS/FAIL count.
-operate_synaptic_graph(["stats","",""]) ; operate_synaptic_graph(["store","DiagConcept","a diagnostic concept"]) → operate_synaptic_graph(["search","DiagConcept",""]) → operate_synaptic_graph(["relate","DiagConcept","DiagTarget"]) ; kg_tool(["add_entity","DiagEntity","",""]) → kg_tool(["add_relation","DiagEntity","relates_to","DiagOther"]) → kg_tool(["query","DiagEntity","",""]) ; procedure_tool(["store","diag_proc","step 1; step 2"]) → procedure_tool(["get","diag_proc",""]) → procedure_tool(["list","",""])
+operate_synaptic_graph(["stats","",""]) ; operate_synaptic_graph(["store","DiagConcept","a diagnostic concept"]) → operate_synaptic_graph(["search","DiagConcept",""]) → operate_synaptic_graph(["relate","DiagConcept","relates_to","DiagTarget"]) (relate takes FOUR elements: action, from, relation, to) ; kg_tool(["add_entity","DiagEntity","",""]) → kg_tool(["add_relation","DiagEntity","relates_to","DiagOther"]) → kg_tool(["query","DiagEntity","",""]) ; procedure_tool(["store","diag_proc","step 1; step 2"]) → procedure_tool(["get","diag_proc",""]) → procedure_tool(["list","",""])
 ```
 
 ## 5 — Reading progress

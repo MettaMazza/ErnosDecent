@@ -354,9 +354,9 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: wallet_balance([])\n\n")
         
     if is_admin == 1:
-        set schemas to concat(schemas and "- operate_synaptic_graph([action: 'search'|'beliefs'|'stats'|'store'|'relate'|'link_memory', concept_or_relation: Str, data_or_target: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: CRUD over your local cognitive memory graph. Use 'store', 'relate', or 'link_memory' to write/update (requires approval for admin). Use 'search', 'beliefs', or 'stats' to query. These actions are LOCAL and PRIVATE.\n")
-        set schemas to concat(schemas and "  Example: Action: operate_synaptic_graph([\"search\", \"gardening\"])\n\n")
+        set schemas to concat(schemas and "- operate_synaptic_graph([action: 'search'|'beliefs'|'stats'|'store'|'relate'|'link_memory', ...args]) -> Str\n")
+        set schemas to concat(schemas and "  Description: CRUD over your local cognitive memory graph. Use 'store', 'relate', or 'link_memory' to write/update (requires approval for admin). Use 'search', 'beliefs', or 'stats' to query. These actions are LOCAL and PRIVATE. ARITY: store=[\"store\", concept, data]; relate=[\"relate\", from, relation, to] (FOUR elements); search=[\"search\", query].\n")
+        set schemas to concat(schemas and "  Example: Action: operate_synaptic_graph([\"relate\", \"Maria\", \"created\", \"ErnosDecent\"])\n\n")
     else:
         set schemas to concat(schemas and "- operate_synaptic_graph([action: 'search'|'beliefs'|'stats', concept_or_relation: Str, data_or_target: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Query your local cognitive memory graph. Use 'search' to find relevant memories, 'beliefs' to list stored beliefs, 'stats' for graph metrics. These read actions are LOCAL and PRIVATE.\n")
@@ -531,8 +531,12 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: changelog([10])\n\n")
         
         set schemas to concat(schemas and "- rag_retrieve([query: Str, offset?: Int]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Search indexed RAG segments from uploaded files. Returns JSON with total_matches, has_more, and up to 10 results. If has_more is true, call again with the next offset (offset += 10) to page through more matches.\n")
+        set schemas to concat(schemas and "  Description: Search THIS session's indexed RAG segments (uploaded files + rag_index_text). Returns JSON with total_matches, has_more, and up to 10 results. If has_more is true, call again with the next offset (offset += 10) to page through more matches. A session with nothing indexed returns 0 matches.\n")
         set schemas to concat(schemas and "  Example: Action: rag_retrieve([\"Claude session content\"])  (page 2: rag_retrieve([\"...\", 10]))\n\n")
+
+        set schemas to concat(schemas and "- rag_index_text([doc_name: Str, text: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Index text into THIS session's RAG store so rag_retrieve can find it later. Local and private. Re-indexing the same doc_name replaces it. 60000-char cap per call.\n")
+        set schemas to concat(schemas and "  Example: Action: rag_index_text([\"notes.md\", \"The mesh elects a primary host node...\"])\n\n")
         
         set schemas to concat(schemas and "WRITE OPERATIONS (requires user approval before execution):\n")
         
@@ -592,9 +596,9 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: Transfer coins to another DID on the mesh. APPROVAL REQUIRED.\n")
         set schemas to concat(schemas and "  Example: Action: money_transfer([100, \"did:key:z6Mku...\"])\n\n")
         
-        set schemas to concat(schemas and "- operate_synaptic_graph([action: 'store'|'relate'|'link_memory', concept_or_relation: Str, data_or_target: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Write, link, or relate facts in your cognitive synaptic memory graph. LOCAL and PRIVATE. APPROVAL REQUIRED.\n")
-        set schemas to concat(schemas and "  Example: Action: operate_synaptic_graph([\"store\", \"user_name\", \"Maria\"])\n\n")
+        set schemas to concat(schemas and "- operate_synaptic_graph([action: 'store'|'relate'|'link_memory', ...args]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Write, link, or relate facts in your cognitive synaptic memory graph. LOCAL and PRIVATE. APPROVAL REQUIRED. ARITY: store=[\"store\", concept, data]; relate=[\"relate\", from, relation, to] (FOUR elements); link_memory=[\"link_memory\", concept, memory_key].\n")
+        set schemas to concat(schemas and "  Example: Action: operate_synaptic_graph([\"relate\", \"Maria\", \"created\", \"ErnosDecent\"])\n\n")
         
         set schemas to concat(schemas and "- operate_scheduler([action: 'create'|'delete'|'toggle'|'run_now', name: Str, instruction: Str, schedule_type: Str, schedule_value: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Manage scheduled background jobs. APPROVAL REQUIRED. create takes ALL 5 args: name (id), instruction (what the job does, run as an agent prompt), schedule_type 'interval' (seconds) or 'idle' (seconds of quiet), schedule_value (the number as a string). delete/toggle/run_now take the name; pad unused args with \"\".\n")
@@ -2397,6 +2401,25 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if length_list(args_list) >= 2:
             set rr_offset to tools_safe_int(get_list(args_list and 1))
         return rag_search_paged(storage_get_db() and rr_query and rr_sess and 10 and rr_offset)
+
+    if action_name equals "rag_index_text":
+        # Write path for session RAG: ingest text so rag_retrieve can find it later.
+        # Session-scoped like rag_retrieve (a sub-agent's session is its task_id) —
+        # before this, only file uploads could seed session RAG, so rag_retrieve in a
+        # fresh session ALWAYS returned 0 matches (validation block 2's false FAIL).
+        if length_list(args_list) < 2:
+            return "Error: rag_index_text requires 2 arguments: doc_name (Str), text (Str)."
+        set ri_doc to get_list(args_list and 0)
+        set ri_text to get_list(args_list and 1)
+        if string_length(ri_text) > 60000:
+            return "Error: text exceeds the 60000-char cap — index it in parts."
+        set ri_sess to ""
+        if map_contains(ctx and "session_id") == 1:
+            set ri_sess to map_get_val(ctx and "session_id")
+        set ri_n to rag_index(storage_get_db() and ri_doc and ri_text and ri_sess)
+        if ri_n <= 0:
+            return "Error: indexing produced 0 chunks (embedding backend down or empty text)."
+        return f"rag:indexed,doc:{ri_doc},chunks:{int_to_string(ri_n)} — retrievable in THIS session via rag_retrieve. Re-indexing the same doc_name replaces it."
 
     # ---- Orchestration tools ----
     if action_name equals "test_all_systems":

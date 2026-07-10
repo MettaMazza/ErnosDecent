@@ -1063,8 +1063,14 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set resp to handle_onion_search(cast_borrow_to_map(sidx2) and query and dht_node and static_secret and static_public)
                                             else:
                                                 set resp to "search:error,reason:missing_query"
-                                        else if cmd_upper equals "AI APPROVE":
-                                            # Check for sub-agent approval: [AGENT:<task_id>] [DECISION:<yes|no>]
+                                        else if cmd_upper equals "AI APPROVE" or else string_index_of(cmd_upper and "AI APPROVE [") == 0:
+                                            # Matches the BARE "AI APPROVE" (main-agent button) AND the bracketed
+                                            # sub-agent form "AI APPROVE [AGENT:x] [DECISION:y]". The old
+                                            # `equals`-only match meant the bracketed form matched NO branch — the
+                                            # bridge's sub-agent approve click was silently dropped as
+                                            # unknown_command and the [AGENT:] parsing below was unreachable
+                                            # (agent_5/agent_7 approval hangs). "AI APPROVE [" cannot swallow
+                                            # AI APPROVE_ALL (different prefix).
                                             set approve_agent_id to ""
                                             set approve_decision to ""
                                             if string_contains(cmd and "[AGENT:") == 1:
@@ -1109,6 +1115,28 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                         set resp to "ai:error,reason:no_pending_action"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
+                                        else if string_index_of(cmd_upper and "AI KILL") == 0:
+                                            # Operator kill for ONE sub-agent: "AI KILL [AGENT:<task_id>]".
+                                            # Cancels via the orchestrator (status=cancelled + per-session
+                                            # react cancel flag). HONEST LIMIT: an LLM call already in flight
+                                            # finishes first (the flag is checked at step boundaries and in
+                                            # approval/poll loops); its result is then discarded. Also releases
+                                            # a kill-target parked at an approval poll (poll checks cancel).
+                                            set kill_agent_id to ""
+                                            if string_contains(cmd and "[AGENT:") == 1:
+                                                set ka_sp to string_index_of(cmd and "[AGENT:")
+                                                set ka_rest to substring(cmd and ka_sp + 7 and string_length(cmd) - ka_sp - 7)
+                                                set ka_ep to string_index_of(ka_rest and "]")
+                                                if ka_ep > 0:
+                                                    set kill_agent_id to substring(ka_rest and 0 and ka_ep)
+                                            if string_length(kill_agent_id) == 0:
+                                                set resp to "ai:error,reason:kill_requires_agent_id"
+                                            else if map_contains(agent_ctx and "orchestrator") == 1:
+                                                set kill_orch to map_get_val(agent_ctx and "orchestrator")
+                                                set kill_res to orchestrator_cancel(kill_orch and kill_agent_id)
+                                                set resp to f"ai:kill_ack,agent:{kill_agent_id},result:{kill_res}"
+                                            else:
+                                                set resp to "ai:error,reason:orchestrator_not_initialized"
                                         else if cmd_upper equals "AI FACTORY":
                                             # FACTORY RESET — wipe every piece of agent DATA/MEMORY while keeping
                                             # all PROMPTING (kernel, personas, identity files, frameworks) and all
