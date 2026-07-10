@@ -603,7 +603,7 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: delegate_wait([\"agent_1\"])\n\n")
         
         set schemas to concat(schemas and "- delegate_check([task_id: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Non-blocking status check on a delegated task. Returns 'running', 'completed:<response>', or 'not_found'.\n")
+        set schemas to concat(schemas and "  Description: Check a sub-agent's PROGRESS: returns 'running'/'completed:<response>'/'not_found' PLUS what it is doing right now (its latest action/tool/thought). Use this to monitor a delegated agent without waiting for it.\n")
         set schemas to concat(schemas and "  Example: Action: delegate_check([\"agent_1\"])\n\n")
         
         set schemas to concat(schemas and "- delegate_cancel([task_id: Str]) -> Str\n")
@@ -2459,7 +2459,22 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set dc_orch to map_get_val(ctx and "orchestrator")
         if dc_orch == 0:
             return "Error: Orchestrator not initialized."
-        return orchestrator_check(dc_orch and dc_task_id)
+        set dc_status to orchestrator_check(dc_orch and dc_task_id)
+        # Phase E: enrich the bare running/completed status with the sub-agent's LATEST
+        # activity (its most recent action/tool/thought), so "check progress" actually
+        # tells you what it is doing right now — not just that it is alive.
+        set dc_db to storage_get_db()
+        if dc_db != 0:
+            set dc_es to string_replace(dc_task_id and "'" and "''")
+            set dc_rows to sql_query(dc_db and f"SELECT event_type, content FROM trace_events WHERE session_id='{dc_es}' AND event_type IN ('action','tool_exec','tool_result','mid_message','thinking') ORDER BY id DESC LIMIT 1;")
+            if length_list(dc_rows) > 0:
+                set dc_r to get_list(dc_rows and 0)
+                set dc_et to get_list(dc_r and 0)
+                set dc_snip to get_list(dc_r and 1)
+                if string_length(dc_snip) > 180:
+                    set dc_snip to concat(substring(dc_snip and 0 and 180) and "…")
+                set dc_status to concat(dc_status and concat("  | doing now: [" and concat(dc_et and concat("] " and dc_snip))))
+        return dc_status
 
     if action_name equals "delegate_cancel":
         if length_list(args_list) < 1:
