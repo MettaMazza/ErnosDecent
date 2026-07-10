@@ -247,10 +247,22 @@ define tools_validation_finalize with state as Map returning Int:
 # be named `state`/`fut` (they collide with the generated state-machine struct
 # members), and the awaited expression must be a CALL (a plain variable skips the
 # EpFuture* cast).
-# Warm-up: yield ~5s before the first fan-out so the PARENT turn's reply reaches the
-# model first (its "validation underway" ack shouldn't queue behind block 1).
+# GATE: do not start the fan-out until the PARENT turn that launched test_all has
+# finished replying. One GPU falls off a cliff past ~2 concurrent 12k-token requests
+# (measured live: 4 concurrent = 181s vs 15s solo), so if the sub-agents joined the
+# parent's own reply call the user's "underway" ack got buried for 3 minutes. This
+# polls the shared active-turns map (a chain: one await + self re-enqueue = compiler-
+# safe) until the parent session is no longer active, then begins the fan-out. Capped
+# at ~60s so a stuck parent can't block validation forever.
 async define tools_validation_start with vstate as Map returning Int:
-    set ok to await ep_async_sleep_ms(5000)
+    set at to map_get_val(vstate and "active_turns")
+    set psid to map_get_val(vstate and "sid")
+    set waited to map_get_val(vstate and "gate_waited")
+    if at != 0 and also map_contains(at and psid) == 1 and also waited < 60000:
+        set ok to map_insert(vstate and "gate_waited" and waited + 1500)
+        set ok to await ep_async_sleep_ms(1500)
+        set retry to tools_validation_start(vstate)
+        return 0
     set nxt to tools_validation_tick(vstate)
     return 0
 
@@ -2426,9 +2438,17 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ok to map_insert(ta_state and "blocks" and ta_blocks)
         set ok to map_insert(ta_state and "next_idx" and 0)
         set ok to map_insert(ta_state and "inflight" and create_list())
-        # Concurrency: run up to 3 blocks at once on the 4-slot parallel server,
-        # leaving a slot for the operator's foreground chat so it is never starved.
-        set ok to map_insert(ta_state and "cap" and 3)
+        # Concurrency cap = 2: one GPU collapses past ~2 concurrent 12k-token gemma
+        # requests (measured: 4 concurrent = 181s vs 15s solo). 2 running sub-agents +
+        # the operator's occasional foreground reply = 3 at peak, the tolerable ceiling.
+        set ok to map_insert(ta_state and "cap" and 2)
+        # Gate the fan-out on the parent turn finishing (shared active-turns map) so the
+        # sub-agents never compete with the user's own reply.
+        set ok to map_insert(ta_state and "gate_waited" and 0)
+        set ta_at to 0
+        if map_contains(ctx and "active_turns") == 1:
+            set ta_at to map_get_val(ctx and "active_turns")
+        set ok to map_insert(ta_state and "active_turns" and ta_at)
         set ok to map_insert(ta_state and "orch" and ta_orch)
         set ok to map_insert(ta_state and "model" and map_get_val(ctx and "model"))
         set ok to map_insert(ta_state and "memory" and map_get_val(ctx and "memory_mgr"))
