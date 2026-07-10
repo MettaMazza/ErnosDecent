@@ -614,6 +614,95 @@ async def post_image_progress(channel, content):
         print(f"[Discord Bridge] image_progress render error: {e}", flush=True)
 
 
+async def handle_subagent_event(channel, etype, content):
+    """Sub-agent thread lifecycle (spawn → thread + live trace + whisper; approval →
+    buttons in-thread; complete → close). Owned by the PERSISTENT side-channel loop, not
+    the turn-scoped trace poller — because with yield-to-foreground the sub-agents spawn
+    AFTER the parent turn (and its poller) has ended, so these events must be handled by
+    a loop that outlives the turn or the threads/buttons/transparency never appear."""
+    global _subagent_threads, _subagent_poll_tasks
+    import json as _json
+    try:
+        data = _json.loads(content)
+    except Exception:
+        return
+    task_id = data.get('task_id', '')
+    if etype == 'subagent_spawn':
+        role = data.get('role', 'Sub-Agent')
+        instruction = data.get('instruction', '')
+        if task_id in _subagent_threads:
+            return
+        try:
+            sa_thread = await channel.create_thread(
+                name=f'\U0001f916 {role} — {task_id}',
+                type=discord.ChannelType.public_thread
+            )
+            _subagent_threads[task_id] = sa_thread
+            embed = discord.Embed(title=f'\U0001f916 {role}', description=instruction, color=0x50c878)
+            embed.set_footer(text=f'{task_id} • \U0001f7e2 Running • type here to whisper to this agent')
+            await sa_thread.send(embed=embed)
+            _subagent_poll_tasks[task_id] = create_tracked_task(subagent_trace_stream(sa_thread, task_id))
+        except Exception as e:
+            print(f'[discord] Failed to create sub-agent thread: {e}', flush=True)
+    elif etype == 'subagent_complete':
+        summary = data.get('result_summary', '')
+        sa_thread = _subagent_threads.get(task_id)
+        if sa_thread:
+            try:
+                await sa_thread.send(embed=discord.Embed(title='✅ Complete', description=summary[:2000], color=0x34d399))
+            except Exception:
+                pass
+            poll_task = _subagent_poll_tasks.pop(task_id, None)
+            if poll_task:
+                poll_task.cancel()
+            _subagent_threads.pop(task_id, None)
+    elif etype == 'subagent_approval':
+        tool = data.get('tool', '')
+        args = data.get('args', '')
+        desc = data.get('description', '')
+        sa_thread = _subagent_threads.get(task_id)
+        embed = discord.Embed(title='⚠️ Permission Required', description=f'**{tool}**({args})\n\n{desc}', color=0xFFB300)
+
+        class SubAgentApprovalView(discord.ui.View):
+            def __init__(self, tid):
+                super().__init__(timeout=3600)
+                self.tid = tid
+            @discord.ui.button(label='✅ Approve', style=discord.ButtonStyle.green)
+            async def approve(self, interaction, button):
+                await interaction.response.defer()
+                try:
+                    await send_daemon_ipc(f'AI APPROVE [AGENT:{self.tid}] [DECISION:yes]')
+                except Exception:
+                    pass
+                for child in self.children:
+                    child.disabled = True
+                button.label = 'Approved ✅'
+                await interaction.message.edit(view=self)
+                self.stop()
+            @discord.ui.button(label='❌ Deny', style=discord.ButtonStyle.red)
+            async def deny(self, interaction, button):
+                await interaction.response.defer()
+                try:
+                    await send_daemon_ipc(f'AI APPROVE [AGENT:{self.tid}] [DECISION:no]')
+                except Exception:
+                    pass
+                for child in self.children:
+                    child.disabled = True
+                button.label = 'Denied ❌'
+                await interaction.message.edit(view=self)
+                self.stop()
+        view = SubAgentApprovalView(task_id)
+        if sa_thread:
+            try:
+                await sa_thread.send(embed=embed, view=view)
+            except Exception:
+                pass
+        try:
+            await channel.send(f'⚠️ Sub-agent **{task_id}** needs approval for `{tool}` — approve here or in its thread', view=SubAgentApprovalView(task_id))
+        except Exception:
+            pass
+
+
 async def session_side_channel_loop():
     """PERSISTENT delivery of the agent's user-facing outputs — mid_message, attachment,
     image_progress — for the ACTIVE session to the main channel, INDEPENDENT of any
@@ -634,7 +723,7 @@ async def session_side_channel_loop():
                 conn = sqlite3.connect(get_db_path())
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT id, event_type, content FROM trace_events WHERE session_id=? AND sent=0 AND event_type IN ('mid_message','attachment','image_progress') ORDER BY id LIMIT 30",
+                    "SELECT id, event_type, content FROM trace_events WHERE session_id=? AND sent=0 AND event_type IN ('mid_message','attachment','image_progress','subagent_spawn','subagent_complete','subagent_approval') ORDER BY id LIMIT 30",
                     (sid,),
                 )
                 rows = cur.fetchall()
@@ -653,6 +742,8 @@ async def session_side_channel_loop():
                             await post_attachment(ch, content)
                         elif etype == 'image_progress':
                             await post_image_progress(ch, content)
+                        elif etype in ('subagent_spawn', 'subagent_complete', 'subagent_approval'):
+                            await handle_subagent_event(ch, etype, content)
                     except Exception as e:
                         print(f"[Discord Bridge] side-channel deliver error ({etype}): {e}", flush=True)
                     try:
@@ -881,7 +972,7 @@ def db_poll_traces(session_id):
         # turn, so background/sub-agent/async-image outputs are never dropped). This
         # turn-scoped thread trace only streams the thinking events.
         cursor.execute(
-            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type NOT IN ('attachment','mid_message','image_progress','final_reply') AND session_id=? ORDER BY id LIMIT 50",
+            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type NOT IN ('attachment','mid_message','image_progress','final_reply','subagent_spawn','subagent_complete','subagent_approval') AND session_id=? ORDER BY id LIMIT 50",
             (session_id,)
         )
         rows = cursor.fetchall()
@@ -1507,118 +1598,11 @@ async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
                         _image_gen_msg = None
                     continue
 
-                # --- Sub-agent thread handling ---
-                if etype == 'subagent_spawn' and main_channel:
-                    global _subagent_threads, _subagent_poll_tasks
-                    import json as _json
-                    try:
-                        data = _json.loads(content)
-                    except Exception:
-                        await post_trace_event(thread, etype, content, emoji)
-                        continue
-                    task_id = data.get('task_id', '')
-                    role = data.get('role', 'Sub-Agent')
-                    instruction = data.get('instruction', '')
-                    try:
-                        sa_thread = await main_channel.create_thread(
-                            name=f'\U0001f916 {role} \u2014 {task_id}',
-                            type=discord.ChannelType.public_thread
-                        )
-                        _subagent_threads[task_id] = sa_thread
-                        embed = discord.Embed(title=f'\U0001f916 {role}', description=instruction, color=0x50c878)
-                        embed.set_footer(text=f'{task_id} \u2022 \U0001f7e2 Running \u2022 type here to whisper to this agent')
-                        await sa_thread.send(embed=embed)
-                        # Phase D: stream this sub-agent's live trace into its thread so
-                        # the operator can monitor it (and whisper by typing in-thread).
-                        _subagent_poll_tasks[task_id] = create_tracked_task(
-                            subagent_trace_stream(sa_thread, task_id)
-                        )
-                    except Exception as e:
-                        print(f'[discord] Failed to create sub-agent thread: {e}', flush=True)
-                    continue
-
-                if etype == 'subagent_complete' and main_channel:
-                    import json as _json
-                    try:
-                        data = _json.loads(content)
-                    except Exception:
-                        await post_trace_event(thread, etype, content, emoji)
-                        continue
-                    task_id = data.get('task_id', '')
-                    summary = data.get('result_summary', '')
-                    sa_thread = _subagent_threads.get(task_id)
-                    if sa_thread:
-                        embed = discord.Embed(title='\u2705 Complete', description=summary[:2000], color=0x34d399)
-                        try:
-                            await sa_thread.send(embed=embed)
-                        except Exception:
-                            pass
-                        # Clean up poll task
-                        poll_task = _subagent_poll_tasks.pop(task_id, None)
-                        if poll_task:
-                            poll_task.cancel()
-                        del _subagent_threads[task_id]
-                    continue
-
-                if etype == 'subagent_approval' and main_channel:
-                    import json as _json
-                    try:
-                        data = _json.loads(content)
-                    except Exception:
-                        await post_trace_event(thread, etype, content, emoji)
-                        continue
-                    task_id = data.get('task_id', '')
-                    tool = data.get('tool', '')
-                    args = data.get('args', '')
-                    desc = data.get('description', '')
-                    sa_thread = _subagent_threads.get(task_id)
-                    embed = discord.Embed(
-                        title='\u26a0\ufe0f Permission Required',
-                        description=f'**{tool}**({args})\n\n{desc}',
-                        color=0xFFB300
-                    )
-                    # Create approval buttons view
-                    class SubAgentApprovalView(discord.ui.View):
-                        def __init__(self, tid, bridge_ipc_send):
-                            super().__init__(timeout=3600)
-                            self.tid = tid
-                            self.bridge_ipc_send = bridge_ipc_send
-                        @discord.ui.button(label='\u2705 Approve', style=discord.ButtonStyle.green)
-                        async def approve(self, interaction, button):
-                            await interaction.response.defer()
-                            try:
-                                resp = await self.bridge_ipc_send(f'AI APPROVE [AGENT:{self.tid}] [DECISION:yes]')
-                            except Exception:
-                                pass
-                            for child in self.children:
-                                child.disabled = True
-                            button.label = 'Approved \u2705'
-                            await interaction.message.edit(view=self)
-                            self.stop()
-                        @discord.ui.button(label='\u274c Deny', style=discord.ButtonStyle.red)
-                        async def deny(self, interaction, button):
-                            await interaction.response.defer()
-                            try:
-                                resp = await self.bridge_ipc_send(f'AI APPROVE [AGENT:{self.tid}] [DECISION:no]')
-                            except Exception:
-                                pass
-                            for child in self.children:
-                                child.disabled = True
-                            button.label = 'Denied \u274c'
-                            await interaction.message.edit(view=self)
-                            self.stop()
-                    view = SubAgentApprovalView(task_id, send_daemon_ipc)
-                    if sa_thread:
-                        try:
-                            await sa_thread.send(embed=embed, view=view)
-                        except Exception:
-                            pass
-                    # Also notify main channel
-                    try:
-                        await main_channel.send(f'\u26a0\ufe0f Sub-agent **{task_id}** needs approval for `{tool}` \u2014 see thread', view=view)
-                    except Exception:
-                        pass
-                    continue
+                # Sub-agent lifecycle events (spawn/complete/approval) are owned by the
+                # PERSISTENT session_side_channel_loop (they now arrive AFTER this
+                # turn-scoped poller has stopped, since sub-agents yield to foreground and
+                # spawn once the parent turn ends) \u2014 and are excluded from db_poll_traces
+                # so they are never consumed here. Only in-turn thinking-trace lands here.
 
                 # All other events: post to trace thread IN FULL (chunked, never truncated)
                 await post_trace_event(thread, etype, content, emoji)
