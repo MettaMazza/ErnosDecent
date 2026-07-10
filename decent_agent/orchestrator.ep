@@ -12,6 +12,7 @@ import "memory"
 
 external define cast_borrow_to_map with b returning Map
 external define cast_map_to_int with m returning Int
+external define cast_int_to_map with i returning Map
 # react_run keeps its active session id in a thread-local (ep_active_session_id is
 # __thread), so each spawned sub-agent thread has its own and no longer clobbers the
 # parent's or its siblings'.
@@ -173,6 +174,12 @@ async define orchestrator_spawn_worker with task_id as Str and instruction as St
     set ok to map_insert(wresults and task_id and result)
     set ok to unlock_mutex(wmtx)
     display concat("[DELEGATE] worker recorded completion task=" and concat(task_id and concat(" parent_sid=" and parent_sid)))
+    # TRACE: notify the parent session that this sub-agent finished so Discord/WebUI
+    # can update status and stop polling. Uses parent_sid so the parent sees it.
+    set cmp_db to storage_get_db()
+    if cmp_db > 0:
+        set cmp_summary to string_replace(substring(result and 0 and 200) and "\"" and "'")
+        set ok to trace_emit(cmp_db and parent_sid and "subagent_complete" and concat("{\"task_id\":\"" and concat(task_id and concat("\",\"status\":\"completed\",\"result_summary\":\"" and concat(cmp_summary and "\"}")))))
     # PROACTIVE PING: notify the user the moment the background sub-agent finishes by
     # pushing its result as a mid-turn message (trace 'mid_message' — the web/Discord
     # client polls it). orchestrator_claim_report atomically marks the task reported,
@@ -278,6 +285,7 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
     # and memory so any nested delegation / tool lookup uses the clones, not the
     # parent's shared maps.
     set ok to map_insert(child_ctx and "session_id" and task_id)
+    set ok to map_insert(child_ctx and "parent_session_id" and parent_sid)
     set ok to map_insert(child_ctx and "memory" and child_memory)
     set ok to map_insert(child_ctx and "memory_mgr" and child_memory)
     set ok to map_insert(child_ctx and "tools_mgr" and child_tools)
@@ -326,6 +334,14 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
     set ok to lock_mutex(mtx)
     set ok to map_insert(task_map and "future" and subfut)
     set ok to unlock_mutex(mtx)
+    # TRACE: notify the parent session so Discord/WebUI can create sub-agent
+    # threads and monitoring panels. The event is under parent_sid so the
+    # parent's trace poll picks it up.
+    set sp_db to storage_get_db()
+    if sp_db > 0:
+        set sp_inst_esc to string_replace(substring(instruction and 0 and 100) and "\"" and "'")
+        set sp_role_esc to string_replace(role and "\"" and "'")
+        set ok to trace_emit(sp_db and parent_sid and "subagent_spawn" and concat("{\"task_id\":\"" and concat(task_id and concat("\",\"role\":\"" and concat(sp_role_esc and concat("\",\"instruction\":\"" and concat(sp_inst_esc and "\"}")))))))
     return task_id
 
 
@@ -410,6 +426,25 @@ define orchestrator_check with orch as Int and task_id as Str returning Str:
     # Status is still "running"
     set ok to unlock_mutex(mtx)
     return "running"
+
+
+# ─────────────────────────────────────────────────────
+# orchestrator_get_task
+# Returns the raw task_map (Int pointer) for a given task_id, or 0 if not found.
+# Used by the approval-forwarding system (react_resume_subagent_approval) to
+# access the child's ctx and its approval_channel for channel-based suspend/resume.
+# ─────────────────────────────────────────────────────
+define orchestrator_get_task with orch as Int and task_id as Str returning Int:
+    set mtx to map_get_val(orch and "mutex")
+    set ok to lock_mutex(mtx)
+    set tasks to map_get_val(orch and "tasks")
+    set has_task to map_contains(tasks and task_id)
+    if has_task == 0:
+        set ok to unlock_mutex(mtx)
+        return 0
+    set task_map to map_get_val(tasks and task_id)
+    set ok to unlock_mutex(mtx)
+    return cast_map_to_int(task_map)
 
 
 # ─────────────────────────────────────────────────────

@@ -45,7 +45,7 @@ function string_length(str) {
 }
 
 function escapeHTML(str) {
-    let res, reLt, reGt, reQuot, reApos, reAmp, reClass;
+    let reClass, reLt, reQuot, reApos, res, reAmp, reGt;
     if (!str) {
         return "";
     }
@@ -87,7 +87,7 @@ function setControlsEnabled(enabled) {
 }
 
 function handleDisconnect() {
-    let didFull, walletVal, statusText, nodeRole, nodePeers, indicator, headerDid, nodeTerm, dhtSize, chunkCount;
+    let walletVal, nodePeers, headerDid, chunkCount, statusText, dhtSize, indicator, nodeRole, didFull, nodeTerm;
     window.isConnected = false;
     indicator = document.getElementById("connection-indicator");
     indicator.classList.remove("online");
@@ -114,7 +114,7 @@ function handleDisconnect() {
 }
 
 function connectDaemon() {
-    let wsClass, port, wsUrl, ws, hostname;
+    let wsClass, wsUrl, port, hostname, ws;
     port = (window.location.port || "8080");
     hostname = (window.location.hostname || "127.0.0.1");
     if ((hostname === "localhost")) {
@@ -214,7 +214,7 @@ function connectDaemon() {
 }
 
 function saveChatMessage(chanName, sender, text, type, timeStr) {
-    let hasChannel, channelList, historyStr, msg, historyObj;
+    let channelList, msg, hasChannel, historyStr, historyObj;
     historyStr = window.localStorage.getItem("ernode_chat_history");
     historyObj = Object();
     if (historyStr) {
@@ -235,7 +235,7 @@ function saveChatMessage(chanName, sender, text, type, timeStr) {
 }
 
 function saveAiMessage(sender, text, type, timeStr) {
-    let msg, historyList, historyStr;
+    let historyList, msg, historyStr;
     historyStr = window.localStorage.getItem("ernode_ai_history");
     historyList = [];
     if (historyStr) {
@@ -251,7 +251,7 @@ function saveAiMessage(sender, text, type, timeStr) {
 }
 
 function renderChatHistory(chanName) {
-    let historyStr, channelList, historyObj, hasChannel;
+    let channelList, hasChannel, historyObj, historyStr;
     window.chatContainer.innerHTML = "";
     historyStr = window.localStorage.getItem("ernode_chat_history");
     if (!historyStr) {
@@ -272,7 +272,7 @@ function renderChatHistory(chanName) {
 }
 
 function renderAiHistory() {
-    let historyStr, historyList;
+    let historyList, historyStr;
     window.aiContainer.innerHTML = "";
     historyStr = window.localStorage.getItem("ernode_ai_history");
     if (!historyStr) {
@@ -337,7 +337,7 @@ function attachTtsButton(bubble, text) {
 }
 
 function appendMessage(container, sender, text, type) {
-    let timeStrSec, timeStr, timeParts, dateStr, secParts;
+    let secParts, dateStr, timeStr, timeStrSec, timeParts;
     dateStr = Date();
     timeParts = dateStr.split(" ");
     timeStrSec = timeParts[4];
@@ -363,7 +363,7 @@ function activeAiMessages() {
 }
 
 function sendTutorPrompt(text) {
-    let container, loader, modelSel, msg, inp, stp, modelVal, sb;
+    let loader, inp, modelSel, container, stp, modelVal, msg, sb;
     if ((!text || !window.isConnected)) {
         return 0;
     }
@@ -463,7 +463,7 @@ function setupAccessToggle() {
 }
 
 function setupLearningTab() {
-    let seedBtn, startBtn, runBtn, lessonsList, form;
+    let runBtn, lessonsList, startBtn, seedBtn, form;
     form = document.getElementById("learning-send-form");
     if (form) {
         form.addEventListener("submit", (event) => {
@@ -542,7 +542,7 @@ function appendAiToken(token) {
 }
 
 function appendApprovalCard(toolName, summary) {
-    let bubble, approveAllBtn, escapedSummary, btnSubmit, actionsHtml, escapedTool, contentHtml, approveBtn, denyBtn;
+    let approveAllBtn, escapedTool, approveBtn, actionsHtml, btnSubmit, denyBtn, bubble, contentHtml, escapedSummary;
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
     set_prop(bubble.style, "border", "1px solid rgba(245, 158, 11, 0.3)");
@@ -629,7 +629,7 @@ function appendApprovalCard(toolName, summary) {
 }
 
 function appendClarifyCard(questionsJson) {
-    let questions, bubble, stopB, nq;
+    let bubble, stopB, nq, questions;
     questions = JSON.parse(questionsJson);
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -725,7 +725,7 @@ function appendClarifyCard(questionsJson) {
 }
 
 function appendReasoningBubble(b64) {
-    let html, decoded, bubble;
+    let bubble, html, decoded;
     decoded = decodeURIComponent(escape(atob(b64)));
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -738,7 +738,7 @@ function appendReasoningBubble(b64) {
 }
 
 function updateHostsTableUI(jsonStr) {
-    let electedHostEl, tbody, list, primary, i;
+    let i, primary, list, electedHostEl, tbody;
     tbody = document.getElementById("hosts-table-body");
     if (!tbody) {
         return 0;
@@ -782,7 +782,7 @@ function updateHostsTableUI(jsonStr) {
 }
 
 function handleDhtResult(msg) {
-    let dhtLog, entry;
+    let entry, dhtLog;
     if ((msg.key === "network:host_nodes")) {
         if (msg.found) {
             updateHostsTableUI(msg.value);
@@ -812,7 +812,7 @@ function handleDhtResult(msg) {
 }
 
 function handleNameResult(msg) {
-    let entry, nameLog, headerDid;
+    let nameLog, headerDid, entry;
     nameLog = document.getElementById("name-log");
     if (!nameLog) {
         return 0;
@@ -845,7 +845,7 @@ function handleNameResult(msg) {
 }
 
 function selectAiModel(modelName, skipSave) {
-    let btns, msg, aiModelSelect, modelText;
+    let aiModelSelect, modelText, btns, msg;
     window.selectedAiModel = modelName;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
@@ -873,7 +873,7 @@ function selectAiModel(modelName, skipSave) {
 }
 
 function updateAiModelsUI(models) {
-    let isIncluded, aiModelSelect, currentSelected, activeClass, learnModelSelect, prevLearn;
+    let isIncluded, aiModelSelect, currentSelected, prevLearn, learnModelSelect, activeClass;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
         currentSelected = window.selectedAiModel;
@@ -957,7 +957,7 @@ function deleteSession(id) {
 }
 
 function updatePlatformsUI() {
-    let tgStatus, telegramConfig, discToken, tgToggle, discordConfig, waPhoneId, tgToken, waToken, statusText, discStatus, whatsappConfig, waToggle, waStatus, discChannel, discToggle;
+    let tgStatus, waToken, tgToken, discToken, statusText, waStatus, whatsappConfig, discChannel, waToggle, waPhoneId, tgToggle, telegramConfig, discordConfig, discStatus, discToggle;
     if (!window.platforms) {
         return 0;
     }
@@ -1057,7 +1057,7 @@ function updatePlatformsUI() {
 }
 
 function updatePromptsUI() {
-    let observerArea, personaArea, kernelArea;
+    let kernelArea, observerArea, personaArea;
     if (!window.prompts) {
         return 0;
     }
@@ -1096,7 +1096,7 @@ function showPromptsStatus(text, isSuccess) {
 }
 
 function renderPluginsUI() {
-    let deleteBtns, body, toggleBtns;
+    let body, toggleBtns, deleteBtns;
     body = document.getElementById("plugins-list-body");
     if (!body) {
         return 0;
@@ -1196,7 +1196,7 @@ function savePluginsSettings() {
 }
 
 function savePromptsConfig() {
-    let payload, personaArea, observerArea, kernelArea;
+    let kernelArea, payload, personaArea, observerArea;
     if ((!window.ws || !window.isConnected)) {
         showPromptsStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1219,7 +1219,7 @@ function savePromptsConfig() {
 }
 
 function updateSystemConfigUI() {
-    let relayPort, isStaticHost, raftPort, banDur, rateLimit, dhtTtl, webPort, maxConn, seedAddr, enableHostElect, seedPort, ipcPort, logLevel, heartbeat, maxContent, electTimeout, nodeName, listenAddr, dhtPort, banThresh, dataDir, maxMsg, p2pPort;
+    let electTimeout, webPort, banDur, isStaticHost, seedPort, rateLimit, nodeName, dhtPort, relayPort, maxMsg, seedAddr, logLevel, p2pPort, ipcPort, maxContent, raftPort, dataDir, listenAddr, dhtTtl, maxConn, enableHostElect, banThresh, heartbeat;
     if (!window.systemConfig) {
         return 0;
     }
@@ -1340,7 +1340,7 @@ function showSystemConfigStatus(text, statusType) {
 }
 
 function saveSystemConfig() {
-    let isStaticHost, valStatic, payload, enableHostElect, val, valElect;
+    let valElect, val, isStaticHost, valStatic, enableHostElect, payload;
     if ((!window.ws || !window.isConnected)) {
         showSystemConfigStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1408,7 +1408,7 @@ function saveSystemConfig() {
 }
 
 function savePlatformConfig(platformId) {
-    let discConfig, tokenVal, whatsappConfig, payload, phoneVal, enabledVal, telegramConfig, chanVal;
+    let whatsappConfig, enabledVal, telegramConfig, tokenVal, discConfig, chanVal, phoneVal, payload;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1471,7 +1471,7 @@ function savePlatformConfig(platformId) {
 }
 
 function handlePlatformToggle(platformId) {
-    let discConfig, telegramConfig, whatsappConfig, payload, enabledVal;
+    let telegramConfig, payload, whatsappConfig, enabledVal, discConfig;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1518,7 +1518,7 @@ function handlePlatformToggle(platformId) {
 }
 
 function registerPlugin() {
-    let desc, name, endpoint, newPlugin;
+    let newPlugin, name, endpoint, desc;
     if (!window.plugins) {
         window.plugins = [];
     }
@@ -1628,7 +1628,7 @@ function updateSessionsUI(sessions) {
 }
 
 function initMemoryCanvas() {
-    let width, height, emptyState, canvas, oldCanvas, container;
+    let canvas, container, emptyState, oldCanvas, width, height;
     container = document.getElementById("memory-graph-viz");
     if (!container) {
         return 0;
@@ -1656,7 +1656,7 @@ function initMemoryCanvas() {
 }
 
 function updateMemoryGraphData(edges) {
-    let currentIds, width, incomingNodes, height;
+    let height, currentIds, width, incomingNodes;
     if (!window.canvasElement) {
         initMemoryCanvas();
     }
@@ -1693,7 +1693,7 @@ function updateMemoryGraphData(edges) {
 }
 
 function animateGraph() {
-    let dy, dist, dx, n2, fx, force, i, height, n1, nodeIds, j, fy, width;
+    let height, nodeIds, dx, fx, dist, n1, force, fy, dy, width, i, j, n2;
     if (!window.isConnected) {
         window.animationFrameId = requestAnimationFrame((dummy) => {
     animateGraph();
@@ -1801,7 +1801,7 @@ function animateGraph() {
 }
 
 function renderTuringGrid(data) {
-    let isHead, cellClass, turingCellsCount, html, headZ, headY, container, c, value, turingHeadPos, r, headX, cellKey;
+    let headY, headZ, turingHeadPos, value, cellKey, isHead, cellClass, html, r, c, turingCellsCount, container, headX;
     container = document.getElementById("turing-grid-viz");
     if (!container) {
         return 0;
@@ -1848,7 +1848,7 @@ function renderTuringGrid(data) {
 }
 
 function updateMemoryTables(data) {
-    let keys, lBody, sBody;
+    let sBody, keys, lBody;
     sBody = document.getElementById("scratchpad-body");
     if (sBody) {
         sBody.innerHTML = "";
@@ -1882,7 +1882,7 @@ function updateMemoryTables(data) {
 }
 
 function handleDaemonMessage(msg) {
-    let stopBtn, summaryNotice, rvRepos, noSelected, dateStr, computeSlots, sess_id, encKeyEl, isLearning, timeParts, sess, timeStr, auToggle, refresh, type, storageBody, bwUp, dhtSize, msgSessions, detailsPanel, sigKeyEl, rvFile, uiStaticHost, nameInput, lStop, btnSubmit, chunkCount, idNameEl, bwDown, natMode, faBubble, walletVal, timeStrSec, uiHostElect, headerDid, fpToggle, didFull, fpLabel, faImg, nodeRole, ttsAudio, faLink, nodePeers, gdBadge, activeCircuits, repOut, aiText, textNode, secParts, lLoader, lInput, roleUpper, lSubmit, repBtn, nodeTerm;
+    let saaBanner, fpLabel, faImg, isLearning, sess_id, igPrompt, saWInput, saaBody, saaBannerP, computeSlots, lLoader, headerDid, faLink, lStop, stopBtn, rvFile, bwUp, saaBtns, refresh, igCtx, uiHostElect, sad, ipStatus, igCanvas, saWBtn, bwDown, storageBody, btnSubmit, uiStaticHost, idNameEl, igO2c, textNode, aiText, auToggle, noSelected, saaDenyBtn, repBtn, scd, faBubble, scCard, igO2, secParts, nodePeers, saBody, sigKeyEl, ttsAudio, roleUpper, sess, fpToggle, igTimer, saCard, saHeader, nodeTerm, encKeyEl, saInstr, timeStrSec, scLog, walletVal, saad, gdBadge, detailsPanel, saLog, msgSessions, nameInput, nodeRole, igOverlay, natMode, saaCard, summaryNotice, ipd, saWRow, scStatus, didFull, igO3, ok, igTimer2, lInput, rvRepos, dhtSize, dateStr, timeStr, repOut, activeCircuits, type, lSubmit, chunkCount, timeParts, scEntry, saaApproveBtn;
     type = msg.type;
     if ((type === "status")) {
         roleUpper = msg.role.toUpperCase();
@@ -2055,6 +2055,160 @@ function handleDaemonMessage(msg) {
         activeAiMessages().appendChild(faBubble);
     } else if ((type === "mid_message")) {
         appendMessage(activeAiMessages(), "ErnOS", msg.text, "received");
+    } else if ((type === "image_progress")) {
+        ipd = msg.data;
+        if (ipd) {
+            ipStatus = ipd.status;
+            if ((ipStatus === "started")) {
+                set_prop(window.aiLoader.style, "display", "none");
+                igOverlay = document.getElementById("image-gen-overlay");
+                if (igOverlay) {
+                    set_prop(igOverlay.style, "display", "flex");
+                }
+                igPrompt = document.getElementById("image-gen-prompt");
+                if (igPrompt) {
+                    igPrompt.textContent = ipd.prompt;
+                }
+                igTimer = document.getElementById("image-gen-timer");
+                if (igTimer) {
+                    igTimer.textContent = "Elapsed: 0s";
+                }
+                igCanvas = document.getElementById("image-gen-canvas");
+                if (igCanvas) {
+                    igCtx = igCanvas.getContext("2d");
+                    window._igHue = 260;
+                    window._igAnimFrame = 0;
+                    eval("(function draw(){window._igHue=(window._igHue+0.5)%360;var c=document.getElementById('image-gen-canvas');if(!c)return;var x=c.getContext('2d');var g=x.createRadialGradient(100,100,20,100,100,100);g.addColorStop(0,'hsla('+window._igHue+',70%,60%,0.8)');g.addColorStop(1,'hsla('+((window._igHue+60)%360)+',60%,30%,0.4)');x.fillStyle=g;x.fillRect(0,0,200,200);window._igAnimFrame=requestAnimationFrame(draw)})()");
+                }
+                window._igStartMs = Date.now();
+                window._igTimerInterval = setInterval("document.getElementById('image-gen-timer').textContent='Elapsed: '+Math.floor((Date.now()-window._igStartMs)/1000)+'s'", 1000);
+            } else if ((ipStatus === "rendering")) {
+                igTimer2 = document.getElementById("image-gen-timer");
+                if (igTimer2) {
+                    igTimer2.textContent = ("Elapsed: " + (ipd.elapsed_s + "s"));
+                }
+            } else if ((ipStatus === "complete")) {
+                igO2 = document.getElementById("image-gen-overlay");
+                if (igO2) {
+                    set_prop(igO2.style, "display", "none");
+                }
+                if (window._igAnimFrame) {
+                    cancelAnimationFrame(window._igAnimFrame);
+                }
+                if (window._igTimerInterval) {
+                    clearInterval(window._igTimerInterval);
+                }
+            } else if ((ipStatus === "cancelled")) {
+                igO2c = document.getElementById("image-gen-overlay");
+                if (igO2c) {
+                    set_prop(igO2c.style, "display", "none");
+                }
+                if (window._igAnimFrame) {
+                    cancelAnimationFrame(window._igAnimFrame);
+                }
+                if (window._igTimerInterval) {
+                    clearInterval(window._igTimerInterval);
+                }
+            } else if ((ipStatus === "failed")) {
+                igO3 = document.getElementById("image-gen-overlay");
+                if (igO3) {
+                    set_prop(igO3.style, "display", "none");
+                }
+                if (window._igAnimFrame) {
+                    cancelAnimationFrame(window._igAnimFrame);
+                }
+                if (window._igTimerInterval) {
+                    clearInterval(window._igTimerInterval);
+                }
+                appendMessage(activeAiMessages(), "ErnOS", ("⚠️ Image generation failed: " + ipd.error), "received");
+            }
+        }
+    } else if ((type === "subagent_spawn")) {
+        sad = msg.data;
+        if (sad) {
+            saCard = document.createElement("div");
+            saCard.className = "subagent-card";
+            saCard.setAttribute("data-task-id", sad.task_id);
+            saHeader = document.createElement("div");
+            saHeader.className = "subagent-header";
+            saHeader.innerHTML = ("<span class='subagent-role'>🤖 " + (sad.role + (" <small style='color:rgba(255,255,255,0.3)'>" + (sad.task_id + "</small></span><span class='subagent-status'>🟢 Running</span>"))));
+            saCard.appendChild(saHeader);
+            saBody = document.createElement("div");
+            saBody.className = "subagent-body";
+            saInstr = document.createElement("div");
+            saInstr.className = "subagent-instruction";
+            saInstr.textContent = sad.instruction;
+            saBody.appendChild(saInstr);
+            saLog = document.createElement("div");
+            saLog.className = "subagent-trace-log";
+            saLog.textContent = "Waiting for activity...";
+            saBody.appendChild(saLog);
+            saWRow = document.createElement("div");
+            saWRow.className = "subagent-whisper-row";
+            saWInput = document.createElement("input");
+            saWInput.className = "subagent-whisper-input";
+            saWInput.placeholder = "Send guidance to this agent...";
+            saWInput.setAttribute("data-tid", sad.task_id);
+            saWRow.appendChild(saWInput);
+            saWBtn = document.createElement("button");
+            saWBtn.className = "subagent-whisper-btn";
+            saWBtn.textContent = "Whisper";
+            saWBtn.setAttribute("data-tid", sad.task_id);
+            saWBtn.onclick = eval(("(function(){var tid='" + (sad.task_id + "';return function(){var inp=document.querySelector('.subagent-whisper-input[data-tid=\"'+tid+'\"]');if(inp&&inp.value.trim()){window.ws.send(JSON.stringify({type:'subagent_whisper',task_id:tid,message:inp.value.trim()}));inp.value=''}}})()")));
+            saWRow.appendChild(saWBtn);
+            saBody.appendChild(saWRow);
+            saCard.appendChild(saBody);
+            saHeader.onclick = eval(("(function(){var b=document.querySelector('.subagent-card[data-task-id=\"" + (sad.task_id + "\"] .subagent-body');return function(){b.classList.toggle('collapsed')}})()")));
+            activeAiMessages().appendChild(saCard);
+        }
+    } else if ((type === "subagent_complete")) {
+        scd = msg.data;
+        if (scd) {
+            scCard = document.querySelector((".subagent-card[data-task-id='" + (scd.task_id + "']")));
+            if (scCard) {
+                scStatus = scCard.querySelector(".subagent-status");
+                if (scStatus) {
+                    scStatus.className = "subagent-status completed";
+                    scStatus.textContent = "✅ Complete";
+                }
+                scLog = scCard.querySelector(".subagent-trace-log");
+                if (scLog) {
+                    scEntry = document.createElement("div");
+                    scEntry.className = "result";
+                    scEntry.textContent = ("Result: " + scd.result_summary);
+                    scLog.appendChild(scEntry);
+                }
+            }
+        }
+    } else if ((type === "subagent_approval")) {
+        saad = msg.data;
+        if (saad) {
+            saaCard = document.querySelector((".subagent-card[data-task-id='" + (saad.task_id + "']")));
+            if (saaCard) {
+                saaBody = saaCard.querySelector(".subagent-body");
+                if (saaBody) {
+                    saaBanner = document.createElement("div");
+                    saaBanner.className = "subagent-approval-banner";
+                    saaBannerP = document.createElement("p");
+                    saaBannerP.textContent = ("⚠️ " + saad.description);
+                    saaBanner.appendChild(saaBannerP);
+                    saaBtns = document.createElement("div");
+                    saaBtns.className = "subagent-approval-btns";
+                    saaApproveBtn = document.createElement("button");
+                    saaApproveBtn.className = "subagent-approve-btn";
+                    saaApproveBtn.textContent = "✅ Approve";
+                    saaApproveBtn.onclick = eval(("(function(){var tid='" + (saad.task_id + "';return function(){window.ws.send(JSON.stringify({type:'subagent_approve',task_id:tid,decision:'yes'}));this.parentElement.parentElement.remove()}})()")));
+                    saaBtns.appendChild(saaApproveBtn);
+                    saaDenyBtn = document.createElement("button");
+                    saaDenyBtn.className = "subagent-deny-btn";
+                    saaDenyBtn.textContent = "❌ Deny";
+                    saaDenyBtn.onclick = eval(("(function(){var tid='" + (saad.task_id + "';return function(){window.ws.send(JSON.stringify({type:'subagent_approve',task_id:tid,decision:'no'}));this.parentElement.parentElement.remove()}})()")));
+                    saaBtns.appendChild(saaDenyBtn);
+                    saaBanner.appendChild(saaBtns);
+                    ok = saaBody.insertBefore(saaBanner, saaBody.firstChild);
+                }
+            }
+        }
     } else if ((type === "ai_complete")) {
         isLearning = (window.aiSurface === "learning");
         if (window.currentAiResponseBubble) {
@@ -2253,7 +2407,7 @@ function handleDaemonMessage(msg) {
 }
 
 function handleOnionResult(msg) {
-    let results, resultsBox, html;
+    let html, resultsBox, results;
     resultsBox = document.getElementById("onion-results-box");
     if (!resultsBox) {
         return 0;
@@ -2355,7 +2509,7 @@ function renderBrowserTabs() {
 }
 
 function switchBrowserTab(tabId) {
-    let loader, tab, addressInput, contentArea;
+    let addressInput, contentArea, tab, loader;
     window.activeTabId = tabId;
     renderBrowserTabs();
     tab = null;
@@ -2396,7 +2550,7 @@ function switchBrowserTab(tabId) {
 }
 
 function closeBrowserTab(tabId) {
-    let i, idx, modal, tObj;
+    let i, idx, tObj, modal;
     idx = (0 - 1);
     i = 0;
     window.browserTabs.forEach((t) => {
@@ -2428,7 +2582,7 @@ function closeBrowserTab(tabId) {
 }
 
 function navigateTab(tab, url) {
-    let isSearch, progressBar, hasProtocol, loader, contentArea, viewMsg, hasDot, addressInput, targetUrl;
+    let viewMsg, addressInput, isSearch, hasProtocol, loader, hasDot, targetUrl, contentArea, progressBar;
     targetUrl = url.trim();
     if ((targetUrl === "")) {
         return 0;
@@ -2509,7 +2663,7 @@ function updateNavButtons(tab) {
 }
 
 function updateStarButton(tab) {
-    let btnStar, isBookmarked;
+    let isBookmarked, btnStar;
     btnStar = document.getElementById("btn-browser-star");
     if (!btnStar) {
         return 0;
@@ -2536,7 +2690,7 @@ function updateStarButton(tab) {
 }
 
 function toggleBookmarkActiveTab() {
-    let existingIdx, newBookmark, i, activeTab;
+    let activeTab, i, existingIdx, newBookmark;
     activeTab = getActiveTab();
     if ((!activeTab || (activeTab.url === "ernos://newtab"))) {
         return 0;
@@ -2563,7 +2717,7 @@ function toggleBookmarkActiveTab() {
 }
 
 function renderBookmarksBar() {
-    let homeItem, bar;
+    let bar, homeItem;
     bar = document.getElementById("browser-bookmarks-bar");
     if (!bar) {
         return 0;
@@ -2594,7 +2748,7 @@ function renderBookmarksBar() {
 }
 
 function resolveRelativeUrl(baseUrl, relativeUrl) {
-    let firstSlash, protoIdx, baseFolder, domain, afterProto, lastSlash;
+    let domain, lastSlash, baseFolder, afterProto, protoIdx, firstSlash;
     if (((string_index_of(relativeUrl, "://") >= 0) || (string_index_of(relativeUrl, "data:") === 0))) {
         return relativeUrl;
     }
@@ -2623,7 +2777,7 @@ function resolveRelativeUrl(baseUrl, relativeUrl) {
 }
 
 function interceptViewportClicks() {
-    let contentArea, links;
+    let links, contentArea;
     contentArea = document.getElementById("reader-modal-content");
     if (!contentArea) {
         return 0;
@@ -2644,7 +2798,7 @@ function interceptViewportClicks() {
 }
 
 function renderNewTabPage(tab) {
-    let scTor, form, contentArea, scDdg, scGithub, newTabHtml, scWiki;
+    let scTor, scGithub, contentArea, form, scDdg, scWiki, newTabHtml;
     contentArea = document.getElementById("reader-modal-content");
     if ((tab.id !== window.activeTabId)) {
         return 0;
@@ -2686,7 +2840,7 @@ function renderNewTabPage(tab) {
 }
 
 function handleOnionViewResult(msg) {
-    let tEnd, tabId, title, urlParts, progressBar, targetTab, contentArea, tStart, htmlLower, activeTab, loader;
+    let title, tabId, htmlLower, tStart, tEnd, urlParts, progressBar, targetTab, loader, activeTab, contentArea;
     tabId = msg.tabId;
     targetTab = null;
     window.browserTabs.forEach((t) => {
@@ -2801,7 +2955,7 @@ function updateGitDecRepos(reposStr) {
 }
 
 function selectGitDecRepo(repoId) {
-    let msg2, detailsPanel, viewerContent, msg1, noSelected, activeIdEl, msgFileList, viewerName, msg3;
+    let activeIdEl, viewerName, msg1, msgFileList, noSelected, viewerContent, detailsPanel, msg3, msg2;
     window.gitdecActiveRepo = repoId;
     noSelected = document.getElementById("gitdec-no-repo-selected");
     detailsPanel = document.getElementById("gitdec-repo-details");
@@ -2840,7 +2994,7 @@ function selectGitDecRepo(repoId) {
 }
 
 function handleGitDecFile(repoId, filename, content) {
-    let listEl, prListEl, visToggle, branchSelect, titleEl, commitListEl, sRepoName, isOwner, removeBtns, auQuery, guideViewer, issueListEl, sRepoId, data, activeFileSpan, opt, manifest, branches, b_keys, visBadge, fileViewer, keys, visVal, localRole;
+    let visVal, visToggle, commitListEl, listEl, localRole, sRepoName, prListEl, issueListEl, keys, data, b_keys, guideViewer, activeFileSpan, titleEl, isOwner, manifest, visBadge, branchSelect, opt, branches, sRepoId, auQuery, removeBtns, fileViewer;
     if (((repoId === "ErnosDecent") && ((((((((((((filename === "docs/gitdec_user_guide.md") || (filename === "docs/system_guide_synthesis.md")) || (filename === "docs/ERNOS_REFERENCE.md")) || (filename === "README.md")) || (filename === "docs/settings_guide.md")) || (filename === "docs/identity_registry_guide.md")) || (filename === "docs/network_dht_guide.md")) || (filename === "docs/resource_pooling_guide.md")) || (filename === "docs/turing_hebbian_guide.md")) || (filename === "docs/messaging_social_guide.md")) || (filename === "docs/storage_crdt_guide.md")) || (filename === "docs/ledger_dex_guide.md")))) {
         guideViewer = document.getElementById("guide-text-content");
         if (guideViewer) {
@@ -3096,7 +3250,7 @@ function renderGitDecFiles(repoId, filesStr) {
 }
 
 function showGitDecIssueDetail(issue) {
-    let bodyRow, detailCard, titleEl, commentsContainer;
+    let commentsContainer, bodyRow, detailCard, titleEl;
     window.gitdecActiveIssue = issue;
     detailCard = document.getElementById("gitdec-issue-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -3122,7 +3276,7 @@ function showGitDecIssueDetail(issue) {
 }
 
 function showGitDecPrDetail(pr) {
-    let branchEl, titleEl, reviewsContainer, descRow, detailCard;
+    let branchEl, detailCard, titleEl, reviewsContainer, descRow;
     window.gitdecActivePr = pr;
     detailCard = document.getElementById("gitdec-pr-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -3156,7 +3310,7 @@ function showGitDecPrDetail(pr) {
 }
 
 function initGuide() {
-    let navList, msg, btns, file, activeBtn;
+    let navList, activeBtn, file, msg, btns;
     navList = document.getElementById("guide-nav-list");
     if (!navList) {
         return 0;
@@ -3193,7 +3347,7 @@ function initGuide() {
 }
 
 function initGitDec() {
-    let btnCloseNewIssue, prsBtn, btnCloseCloneRepo, modalNewIssue, autoUpdateToggle, modalNewRepo, modalCloneRepo, commitsBtn, formCreateIssue, modalImportRepo, formCreatePr, btnCloseIssue, filesPanel, btnCloseNewPr, btnToggleVis, repoSearch, btnMergeMain, btnCloneRepo, btnNewIssue, commitsPanel, prsPanel, formCloneRepo, btnNewPr, formImportRepo, issuesBtn, settingsPanel, filesBtn, btnImportRepo, formReviewPr, issuesPanel, settingsBtn, btnDeleteRepo, formSettingsAddCollab, formCommentIssue, formCreateRepo, modalNewPr, btnCloseImportRepo, btnNewRepo, btnCloseNewRepo;
+    let btnNewRepo, btnCloseIssue, formCreatePr, commitsBtn, btnNewIssue, repoSearch, btnCloneRepo, filesPanel, btnCloseCloneRepo, btnCloseNewPr, btnImportRepo, formSettingsAddCollab, modalNewIssue, formCloneRepo, btnToggleVis, commitsPanel, modalNewRepo, btnMergeMain, modalImportRepo, prsBtn, issuesPanel, btnCloseImportRepo, modalNewPr, btnDeleteRepo, autoUpdateToggle, prsPanel, btnCloseNewRepo, formCreateIssue, btnCloseNewIssue, formImportRepo, formCommentIssue, formCreateRepo, formReviewPr, btnNewPr, modalCloneRepo, settingsBtn, filesBtn, issuesBtn, settingsPanel;
     commitsBtn = document.getElementById("gitdec-tab-commits");
     filesBtn = document.getElementById("gitdec-tab-files");
     issuesBtn = document.getElementById("gitdec-tab-issues");
@@ -3594,7 +3748,7 @@ function initGitDec() {
 }
 
 function main() {
-    let menuReloadOption, menuNewTab, torBookmark, btnMenu, guideSections, wikiBookmark, nameForm, btnSaveWhatsapp, btnSavePrompts, savedLastName, readerModalHtml, navItems, toggleWhatsapp, turingForm, clickFn, dhtForm, btnDecayMemory, tabPanels, nameInput, toggleDiscord, btnForward, targetBtn, chatForm, channelBtns, onionForm, btnAddTab, ddgBookmark, savedTab, btnRefreshHosts, aiModelSelect, dhtCardWide, onionSearchHtml, btnTriggerAutonomy, menuBookmarkOption, btnCloseBrowser, aiForm, btnSaveTelegram, btnSwapTokens, addressInput, subTabs, menuNewIncognito, onionCard, btnReload, btnHome, readerModal, btnBack, btnNewSession, btnSaveSystemConfig, networkGrid, pageTitle, menuExitOption, btnSaveDiscord, transferForm, btnStar, toggleTelegram, btnAddPlugin, guideBtns;
+    let turingForm, dhtForm, btnSaveTelegram, btnSaveWhatsapp, ddgBookmark, wikiBookmark, chatForm, btnForward, btnAddPlugin, savedTab, btnRefreshHosts, menuNewIncognito, subTabs, btnSwapTokens, guideSections, dhtCardWide, btnSaveSystemConfig, btnMenu, aiForm, channelBtns, menuReloadOption, btnHome, onionForm, toggleDiscord, onionSearchHtml, menuBookmarkOption, readerModal, btnReload, btnAddTab, menuNewTab, menuExitOption, guideBtns, toggleTelegram, transferForm, targetBtn, nameInput, pageTitle, addressInput, btnTriggerAutonomy, savedLastName, btnStar, btnNewSession, toggleWhatsapp, nameForm, tabPanels, btnSavePrompts, readerModalHtml, torBookmark, aiModelSelect, btnBack, btnCloseBrowser, navItems, networkGrid, clickFn, btnDecayMemory, btnSaveDiscord, onionCard;
     window.ws = null;
     window.isConnected = false;
     window.uptimeSeconds = 0;

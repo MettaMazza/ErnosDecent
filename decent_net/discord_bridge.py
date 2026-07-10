@@ -601,6 +601,44 @@ _ATTACH_DENY_MARKERS = (
 )
 _ATTACH_MAX_BYTES = 24 * 1024 * 1024  # 24 MB — under Discord's non-nitro upload cap
 
+async def subagent_trace_stream(thread, task_id):
+    """Phase D: stream a sub-agent's OWN trace (keyed by its task_id session) into its
+    Discord thread so the operator can watch it think/act live. Runs until cancelled by
+    subagent_complete. Mirrors trace_poll_loop's direct-SQLite pattern; marks rows sent
+    so the same event isn't posted twice. Skips the meta events handled elsewhere."""
+    TYPE_EMOJI = {
+        "thinking": "🧠", "reasoning": "💭", "action": "⚙️", "tool_exec": "🔧",
+        "tool_result": "📊", "raw_output": "🗒️", "audit": "🛡️", "mid_message": "💬",
+        "reply_audit": "✅", "no_action": "⚠️", "lookback": "🔎",
+    }
+    SKIP = {"subagent_spawn", "subagent_complete", "subagent_approval", "final_reply"}
+    while True:
+        try:
+            conn = sqlite3.connect(get_db_path())
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, event_type, content FROM trace_events WHERE session_id=? AND sent=0 ORDER BY id LIMIT 20",
+                (task_id,),
+            )
+            rows = cur.fetchall()
+            for rid, etype, content in rows:
+                cur.execute("UPDATE trace_events SET sent=1 WHERE id=?", (rid,))
+            conn.commit()
+            conn.close()
+            for rid, etype, content in rows:
+                if etype in SKIP:
+                    continue
+                try:
+                    await post_trace_event(thread, etype, content, TYPE_EMOJI.get(etype, "•"))
+                except Exception:
+                    pass
+        except sqlite3.OperationalError:
+            pass
+        except Exception as e:
+            print(f"[discord] subagent trace stream error ({task_id}): {e}", flush=True)
+        await asyncio.sleep(0.6)
+
+
 async def post_trace_event(thread, etype, content, emoji):
     """Post a trace event to the thinking thread IN FULL, chunked across messages instead
     of truncating — full transparency: every action result, command output, reasoning and
@@ -1395,8 +1433,13 @@ async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
                         )
                         _subagent_threads[task_id] = sa_thread
                         embed = discord.Embed(title=f'\U0001f916 {role}', description=instruction, color=0x50c878)
-                        embed.set_footer(text=f'{task_id} \u2022 \U0001f7e2 Running')
+                        embed.set_footer(text=f'{task_id} \u2022 \U0001f7e2 Running \u2022 type here to whisper to this agent')
                         await sa_thread.send(embed=embed)
+                        # Phase D: stream this sub-agent's live trace into its thread so
+                        # the operator can monitor it (and whisper by typing in-thread).
+                        _subagent_poll_tasks[task_id] = create_tracked_task(
+                            subagent_trace_stream(sa_thread, task_id)
+                        )
                     except Exception as e:
                         print(f'[discord] Failed to create sub-agent thread: {e}', flush=True)
                     continue
@@ -1750,6 +1793,20 @@ async def on_message(message):
     if message.author == client.user:
         return
     
+    # Phase D: a message typed inside a SUB-AGENT thread is a direct WHISPER to that
+    # sub-agent (monitor + steer it from its own thread). The sub-agent drains its own
+    # whispers because its session_id IS the task_id, so this needs no other plumbing.
+    for _tid, _thr in list(_subagent_threads.items()):
+        if _thr is not None and message.channel.id == _thr.id:
+            if message.content.strip():
+                db_write_whisper(_tid, message.content.strip())
+                try:
+                    ack = await message.reply("🫧 Whisper delivered to this agent — it'll fold your guidance in on its next step.")
+                    create_tracked_task(_delayed_delete(ack, 6.0))
+                except Exception:
+                    pass
+            return
+
     # Listen only to the configured channel or threads within it
     is_target_channel = message.channel.id == channel_id
     is_thread_in_target_channel = getattr(message.channel, 'parent_id', None) == channel_id

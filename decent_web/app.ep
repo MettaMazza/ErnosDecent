@@ -1969,6 +1969,147 @@ define handleDaemonMessage with msg:
     else if type == "mid_message":
         appendMessage(activeAiMessages() and "ErnOS" and msg.text and "received")
 
+    else if type == "image_progress":
+        # Image generation loading screen — driven by trace events from tools.ep.
+        set ipd to msg.data
+        if ipd:
+            set ipStatus to ipd.status
+            if ipStatus == "started":
+                # Hide generic loader, show image gen overlay
+                set_prop(window.aiLoader.style and "display" and "none")
+                set igOverlay to document.getElementById("image-gen-overlay")
+                if igOverlay:
+                    set_prop(igOverlay.style and "display" and "flex")
+                set igPrompt to document.getElementById("image-gen-prompt")
+                if igPrompt:
+                    set igPrompt.textContent to ipd.prompt
+                set igTimer to document.getElementById("image-gen-timer")
+                if igTimer:
+                    set igTimer.textContent to "Elapsed: 0s"
+                # Start canvas gradient animation
+                set igCanvas to document.getElementById("image-gen-canvas")
+                if igCanvas:
+                    set igCtx to igCanvas.getContext("2d")
+                    set window._igHue to 260
+                    set window._igAnimFrame to 0
+                    # Animation via inline JS (EP can't do requestAnimationFrame directly)
+                    eval("(function draw(){window._igHue=(window._igHue+0.5)%360;var c=document.getElementById('image-gen-canvas');if(!c)return;var x=c.getContext('2d');var g=x.createRadialGradient(100,100,20,100,100,100);g.addColorStop(0,'hsla('+window._igHue+',70%,60%,0.8)');g.addColorStop(1,'hsla('+((window._igHue+60)%360)+',60%,30%,0.4)');x.fillStyle=g;x.fillRect(0,0,200,200);window._igAnimFrame=requestAnimationFrame(draw)})()")
+                # Timer interval
+                set window._igStartMs to Date.now()
+                set window._igTimerInterval to setInterval("document.getElementById('image-gen-timer').textContent='Elapsed: '+Math.floor((Date.now()-window._igStartMs)/1000)+'s'" and 1000)
+            else if ipStatus == "rendering":
+                set igTimer2 to document.getElementById("image-gen-timer")
+                if igTimer2:
+                    set igTimer2.textContent to concat("Elapsed: " and concat(ipd.elapsed_s and "s"))
+            else if ipStatus == "complete":
+                set igO2 to document.getElementById("image-gen-overlay")
+                if igO2:
+                    set_prop(igO2.style and "display" and "none")
+                if window._igAnimFrame:
+                    cancelAnimationFrame(window._igAnimFrame)
+                if window._igTimerInterval:
+                    clearInterval(window._igTimerInterval)
+            else if ipStatus == "cancelled":
+                set igO2c to document.getElementById("image-gen-overlay")
+                if igO2c:
+                    set_prop(igO2c.style and "display" and "none")
+                if window._igAnimFrame:
+                    cancelAnimationFrame(window._igAnimFrame)
+                if window._igTimerInterval:
+                    clearInterval(window._igTimerInterval)
+            else if ipStatus == "failed":
+                set igO3 to document.getElementById("image-gen-overlay")
+                if igO3:
+                    set_prop(igO3.style and "display" and "none")
+                if window._igAnimFrame:
+                    cancelAnimationFrame(window._igAnimFrame)
+                if window._igTimerInterval:
+                    clearInterval(window._igTimerInterval)
+                appendMessage(activeAiMessages() and "ErnOS" and concat("⚠️ Image generation failed: " and ipd.error) and "received")
+
+    else if type == "subagent_spawn":
+        # Create a sub-agent monitoring card in the chat
+        set sad to msg.data
+        if sad:
+            set saCard to document.createElement("div")
+            set saCard.className to "subagent-card"
+            saCard.setAttribute("data-task-id" and sad.task_id)
+            set saHeader to document.createElement("div")
+            set saHeader.className to "subagent-header"
+            set saHeader.innerHTML to concat("<span class='subagent-role'>🤖 " and concat(sad.role and concat(" <small style='color:rgba(255,255,255,0.3)'>" and concat(sad.task_id and "</small></span><span class='subagent-status'>🟢 Running</span>"))))
+            saCard.appendChild(saHeader)
+            set saBody to document.createElement("div")
+            set saBody.className to "subagent-body"
+            set saInstr to document.createElement("div")
+            set saInstr.className to "subagent-instruction"
+            set saInstr.textContent to sad.instruction
+            saBody.appendChild(saInstr)
+            set saLog to document.createElement("div")
+            set saLog.className to "subagent-trace-log"
+            set saLog.textContent to "Waiting for activity..."
+            saBody.appendChild(saLog)
+            # Whisper input row
+            set saWRow to document.createElement("div")
+            set saWRow.className to "subagent-whisper-row"
+            set saWInput to document.createElement("input")
+            set saWInput.className to "subagent-whisper-input"
+            set saWInput.placeholder to "Send guidance to this agent..."
+            saWInput.setAttribute("data-tid" and sad.task_id)
+            saWRow.appendChild(saWInput)
+            set saWBtn to document.createElement("button")
+            set saWBtn.className to "subagent-whisper-btn"
+            set saWBtn.textContent to "Whisper"
+            saWBtn.setAttribute("data-tid" and sad.task_id)
+            set saWBtn.onclick to eval(concat("(function(){var tid='" and concat(sad.task_id and "';return function(){var inp=document.querySelector('.subagent-whisper-input[data-tid=\"'+tid+'\"]');if(inp&&inp.value.trim()){window.ws.send(JSON.stringify({type:'subagent_whisper',task_id:tid,message:inp.value.trim()}));inp.value=''}}})()")))  
+            saWRow.appendChild(saWBtn)
+            saBody.appendChild(saWRow)
+            saCard.appendChild(saBody)
+            # Toggle collapse on header click
+            set saHeader.onclick to eval(concat("(function(){var b=document.querySelector('.subagent-card[data-task-id=\"" and concat(sad.task_id and "\"] .subagent-body');return function(){b.classList.toggle('collapsed')}})()")))  
+            activeAiMessages().appendChild(saCard)
+
+    else if type == "subagent_complete":
+        set scd to msg.data
+        if scd:
+            set scCard to document.querySelector(concat(".subagent-card[data-task-id='" and concat(scd.task_id and "']")))
+            if scCard:
+                set scStatus to scCard.querySelector(".subagent-status")
+                if scStatus:
+                    set scStatus.className to "subagent-status completed"
+                    set scStatus.textContent to "✅ Complete"
+                set scLog to scCard.querySelector(".subagent-trace-log")
+                if scLog:
+                    set scEntry to document.createElement("div")
+                    set scEntry.className to "result"
+                    set scEntry.textContent to concat("Result: " and scd.result_summary)
+                    scLog.appendChild(scEntry)
+
+    else if type == "subagent_approval":
+        set saad to msg.data
+        if saad:
+            set saaCard to document.querySelector(concat(".subagent-card[data-task-id='" and concat(saad.task_id and "']")))
+            if saaCard:
+                set saaBody to saaCard.querySelector(".subagent-body")
+                if saaBody:
+                    set saaBanner to document.createElement("div")
+                    set saaBanner.className to "subagent-approval-banner"
+                    set saaBannerP to document.createElement("p")
+                    set saaBannerP.textContent to concat("⚠️ " and saad.description)
+                    saaBanner.appendChild(saaBannerP)
+                    set saaBtns to document.createElement("div")
+                    set saaBtns.className to "subagent-approval-btns"
+                    set saaApproveBtn to document.createElement("button")
+                    set saaApproveBtn.className to "subagent-approve-btn"
+                    set saaApproveBtn.textContent to "✅ Approve"
+                    set saaApproveBtn.onclick to eval(concat("(function(){var tid='" and concat(saad.task_id and "';return function(){window.ws.send(JSON.stringify({type:'subagent_approve',task_id:tid,decision:'yes'}));this.parentElement.parentElement.remove()}})()")))
+                    saaBtns.appendChild(saaApproveBtn)
+                    set saaDenyBtn to document.createElement("button")
+                    set saaDenyBtn.className to "subagent-deny-btn"
+                    set saaDenyBtn.textContent to "❌ Deny"
+                    set saaDenyBtn.onclick to eval(concat("(function(){var tid='" and concat(saad.task_id and "';return function(){window.ws.send(JSON.stringify({type:'subagent_approve',task_id:tid,decision:'no'}));this.parentElement.parentElement.remove()}})()")))
+                    saaBtns.appendChild(saaDenyBtn)
+                    saaBanner.appendChild(saaBtns)
+                    set ok to saaBody.insertBefore(saaBanner and saaBody.firstChild)
     else if type == "ai_complete":
         set isLearning to (window.aiSurface == "learning")
         if window.currentAiResponseBubble:
