@@ -146,6 +146,19 @@ define tools_validation_parse_blocks with mp as Str returning List:
 # parallel model server (:8080, -np 4); cap<slots leaves headroom for the operator's
 # foreground chat so it is not starved. NO await here — safe plain loop.
 define tools_validation_fill with state as Map returning Int:
+    # YIELD TO FOREGROUND (single shared GPU): do NOT start new sub-agent inference while
+    # the operator has an active turn. active_turns holds ONLY foreground INFER turns
+    # (sub-agents are orchestrator tasks, never added), so a non-empty map = the user is
+    # mid-turn → hold off spawning. In-flight sub-agents finish; the reap below still
+    # runs; new blocks start once the foreground turn clears. Foreground stays at near-
+    # solo speed; validation progresses in the gaps.
+    set fg_at to map_get_val(state and "active_turns")
+    if fg_at != 0:
+        set fg_keys to map_keys(fg_at)
+        set fg_active to length_list(fg_keys)
+        free_list(fg_keys)
+        if fg_active > 0:
+            return 0
     set blocks to map_get_val(state and "blocks")
     set n to length_list(blocks)
     set inflight to map_get_val(state and "inflight")
@@ -247,22 +260,12 @@ define tools_validation_finalize with state as Map returning Int:
 # be named `state`/`fut` (they collide with the generated state-machine struct
 # members), and the awaited expression must be a CALL (a plain variable skips the
 # EpFuture* cast).
-# GATE: do not start the fan-out until the PARENT turn that launched test_all has
-# finished replying. One GPU falls off a cliff past ~2 concurrent 12k-token requests
-# (measured live: 4 concurrent = 181s vs 15s solo), so if the sub-agents joined the
-# parent's own reply call the user's "underway" ack got buried for 3 minutes. This
-# polls the shared active-turns map (a chain: one await + self re-enqueue = compiler-
-# safe) until the parent session is no longer active, then begins the fan-out. Capped
-# at ~60s so a stuck parent can't block validation forever.
+# Tiny warm-up, then hand to the tick. The fan-out's yield-to-foreground (in
+# tools_validation_fill) is what actually keeps sub-agents from competing with the
+# user's turns — including the parent turn that launched this — so no explicit parent
+# gate is needed here.
 async define tools_validation_start with vstate as Map returning Int:
-    set at to map_get_val(vstate and "active_turns")
-    set psid to map_get_val(vstate and "sid")
-    set waited to map_get_val(vstate and "gate_waited")
-    if at != 0 and also map_contains(at and psid) == 1 and also waited < 60000:
-        set ok to map_insert(vstate and "gate_waited" and waited + 1500)
-        set ok to await ep_async_sleep_ms(1500)
-        set retry to tools_validation_start(vstate)
-        return 0
+    set ok to await ep_async_sleep_ms(2000)
     set nxt to tools_validation_tick(vstate)
     return 0
 
