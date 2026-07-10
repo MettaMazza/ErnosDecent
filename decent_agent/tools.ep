@@ -238,6 +238,15 @@ define tools_validation_finalize with state as Map returning Int:
 # be named `state`/`fut` (they collide with the generated state-machine struct
 # members), and the awaited expression must be a CALL (a plain variable skips the
 # EpFuture* cast) — hence awaiting the future GETTER rather than a stored value.
+# Warm-up: yield ~5s before the FIRST sub-agent so the PARENT turn's reply_request LLM
+# call reaches the (serial) model server first — otherwise the agent's "validation is
+# underway" reply queues behind block 1's inference and the user waits with no ack.
+# (True concurrent inference needs OLLAMA_NUM_PARALLEL>1 — a serving config, not code.)
+async define tools_validation_start with vstate as Map returning Int:
+    set ok to await ep_async_sleep_ms(5000)
+    set nxt to tools_validation_block(vstate)
+    return 0
+
 async define tools_validation_block with vstate as Map returning Int:
     set has_block to tools_validation_next(vstate)
     if has_block == 0:
@@ -2416,7 +2425,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ok to map_insert(ta_state and "skip_blocks" and 0)
         set ok to map_insert(ta_state and "tid" and "")
         # Enqueue the first chain link (un-awaited async call = fire-and-forget).
-        set ta_fut to tools_validation_block(ta_state)
+        set ta_fut to tools_validation_start(ta_state)
         return "Validation dispatched — the blocks run SEQUENTIALLY in the background (this takes many minutes). Progress arrives as live updates and the scorecard report will be attached when it completes. Do NOT wait for it: finish your turn and tell the user it is underway."
 
     if action_name equals "delegate_task":

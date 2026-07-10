@@ -579,6 +579,95 @@ async def send_discord_reply(message, text, speakable=False, edit_msg=None, file
         print(f"[DELIVERY] send_discord_reply OUTER EXCEPTION: {type(e).__name__}: {e}", flush=True)
 
 
+async def post_image_progress(channel, content):
+    """Render an image_progress trace row (started/rendering/complete/failed/cancelled)
+    as a single editable embed. Extracted so the PERSISTENT side-channel loop owns it."""
+    global _image_gen_msg, _image_gen_last_edit
+    import json as _json
+    try:
+        data = _json.loads(content)
+    except Exception:
+        return
+    status = data.get('status', '')
+    try:
+        if status == 'started':
+            embed = discord.Embed(title='\U0001f3a8 Generating Image...', description=data.get('prompt', ''), color=0xFFB300)
+            embed.set_footer(text='rendering in the background — I’ll post it when it’s ready')
+            _image_gen_msg = await channel.send(embed=embed)
+            _image_gen_last_edit = time.time()
+        elif status == 'rendering' and _image_gen_msg:
+            if time.time() - _image_gen_last_edit >= 5.0:
+                embed = _image_gen_msg.embeds[0] if _image_gen_msg.embeds else discord.Embed(title='\U0001f3a8 Generating Image...', color=0xFFB300)
+                embed.set_footer(text=f"Elapsed: {data.get('elapsed_s', 0)}s")
+                await _image_gen_msg.edit(embed=embed)
+                _image_gen_last_edit = time.time()
+        elif status in ('complete', 'cancelled') and _image_gen_msg:
+            await _image_gen_msg.delete()
+            _image_gen_msg = None
+        elif status == 'failed':
+            if _image_gen_msg:
+                await _image_gen_msg.edit(embed=discord.Embed(title='❌ Image Generation Failed', description=data.get('error', 'Unknown error'), color=0xFF0000))
+                _image_gen_msg = None
+            else:
+                await channel.send(embed=discord.Embed(title='❌ Image Generation Failed', description=data.get('error', 'Unknown error'), color=0xFF0000))
+    except Exception as e:
+        print(f"[Discord Bridge] image_progress render error: {e}", flush=True)
+
+
+async def session_side_channel_loop():
+    """PERSISTENT delivery of the agent's user-facing outputs — mid_message, attachment,
+    image_progress — for the ACTIVE session to the main channel, INDEPENDENT of any
+    turn's lifecycle. This is the fix for background/sub-agent/async outputs being
+    dropped: the old path (trace_poll_loop) delivered these only until the foreground
+    turn's done_event fired, so test_all's progress + report, async image gen, and
+    post-turn sub-agent replies vanished. This loop runs forever (500ms), so nothing the
+    agent emits to the active session is ever lost. Sub-agent THREAD trace is delivered
+    separately by the per-task pollers (keyed by task id, not the active session)."""
+    await client.wait_until_ready()
+    ch = None
+    while not client.is_closed():
+        try:
+            if ch is None:
+                ch = client.get_channel(channel_id)
+            sid = active_session_id
+            if ch is not None and sid:
+                conn = sqlite3.connect(get_db_path())
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, event_type, content FROM trace_events WHERE session_id=? AND sent=0 AND event_type IN ('mid_message','attachment','image_progress') ORDER BY id LIMIT 30",
+                    (sid,),
+                )
+                rows = cur.fetchall()
+                conn.close()
+                for rid, etype, content in rows:
+                    # During an active turn, LEAVE attachments for db_collect_attachments
+                    # so they ride WITH the reply (cleaner). Only deliver attachments
+                    # standalone once no turn is active (e.g. async image gen finishing
+                    # after the turn). mid_message + image_progress always flow live.
+                    if etype == 'attachment' and _ai_busy:
+                        continue
+                    try:
+                        if etype == 'mid_message':
+                            await post_mid_message(ch, content)
+                        elif etype == 'attachment':
+                            await post_attachment(ch, content)
+                        elif etype == 'image_progress':
+                            await post_image_progress(ch, content)
+                    except Exception as e:
+                        print(f"[Discord Bridge] side-channel deliver error ({etype}): {e}", flush=True)
+                    try:
+                        c2 = sqlite3.connect(get_db_path())
+                        c2.execute("UPDATE trace_events SET sent=1 WHERE id=?", (rid,))
+                        c2.commit(); c2.close()
+                    except Exception:
+                        pass
+        except sqlite3.OperationalError:
+            pass
+        except Exception as e:
+            print(f"[Discord Bridge] side-channel loop error: {e}", flush=True)
+        await asyncio.sleep(0.5)
+
+
 async def post_mid_message(channel, content):
     """Post a mid-turn / sub-agent message to a channel, CHUNKED across multiple
     Discord messages (2000-char limit) instead of truncating. Sub-agent results can
@@ -787,8 +876,12 @@ def db_poll_traces(session_id):
     try:
         conn = connect_db()
         cursor = conn.cursor()
+        # mid_message / image_progress / attachment are USER-FACING outputs delivered to
+        # the MAIN CHANNEL by the PERSISTENT session_side_channel_loop (which outlives the
+        # turn, so background/sub-agent/async-image outputs are never dropped). This
+        # turn-scoped thread trace only streams the thinking events.
         cursor.execute(
-            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type != 'attachment' AND session_id=? ORDER BY id LIMIT 50",
+            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type NOT IN ('attachment','mid_message','image_progress') AND session_id=? ORDER BY id LIMIT 50",
             (session_id,)
         )
         rows = cursor.fetchall()
@@ -1680,7 +1773,8 @@ async def on_ready():
         client._bridge_poll_started = True
         create_tracked_task(bridge_commands_db_loop())
         create_tracked_task(bridge_poll_loop())
-        print("[Discord Bridge] node<->bridge RPC loops started (DB primary + IPC fallback).", flush=True)
+        create_tracked_task(session_side_channel_loop())
+        print("[Discord Bridge] node<->bridge RPC loops started (DB primary + IPC fallback + persistent side-channel).", flush=True)
     
     # Start the pending-deletes cleanup loop (crash resilience for trace threads)
     if not getattr(client, "_cleanup_started", False):
