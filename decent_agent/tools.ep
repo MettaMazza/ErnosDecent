@@ -63,6 +63,43 @@ set TEST_ALL_RUNNING to create_map()
 define tools_sleep_yield with ms as Int returning Int:
     return await ep_async_sleep_ms(ms)
 
+# ── Phase B: truly-async image generation ───────────────────────────────────────
+# generate_image dispatches the render thread + this background chain and RETURNS
+# immediately, so the agent replies "rendering…" and ends its turn. The finished image
+# (with a vision description) posts to the chat later via mid_message. Each async
+# instance has exactly ONE top-level await (the compiler-safe shape); the poll chain
+# re-enqueues itself while the render is pending and hands off to the finish task on
+# completion. ctx is carried as a task arg (GC-held; the sub-agent precedent).
+
+# One vision await, then attach + announce.
+async define image_gen_finish with ctx as Map and db as Int and sess as Str and path as Str and vmodel as Str returning Int:
+    set ok to tools_emit_attachment(sess and path and ctx)
+    set desc to query_vision("You just generated this image for the user from their prompt. Look at it and describe, in 2-3 vivid and specific sentences, what it actually shows — composition, subject, colour, mood. Speak as if presenting it to them." and path and vmodel)
+    if string_length(desc) > 0:
+        set ok to trace_emit(db and sess and "mid_message" and concat("🎨 Here's the image you asked for. Looking at it: " and desc))
+    else:
+        set ok to trace_emit(db and sess and "mid_message" and concat("🎨 Here's the image you asked for: " and path))
+    return 0
+
+# Poll the render job row; sleep+re-enqueue while pending, hand off when done.
+async define image_gen_poll with ctx as Map and db as Int and sess as Str and job as Int and vmodel as Str and epoch as Int and waited as Int returning Int:
+    set st to image_gen_job_result(db and job)
+    if string_index_of(st and "pending:") == 0:
+        if ep_cancel_epoch_get(0) > epoch:
+            set ok to trace_emit(db and sess and "mid_message" and "🎨 Image generation was stopped (the render thread may still finish and drop its PNG in the workspace).")
+            return 0
+        if waited >= 1200000:
+            set ok to trace_emit(db and sess and "mid_message" and "🎨 Image generation timed out after 20 minutes.")
+            return 0
+        set ok to await ep_async_sleep_ms(1500)
+        set nxt to image_gen_poll(ctx and db and sess and job and vmodel and epoch and waited + 1500)
+        return 0
+    if string_contains(st and "ERROR:") == 1:
+        set ok to trace_emit(db and sess and "mid_message" and concat("🎨 Image generation failed: " and st))
+        return 0
+    set fin to image_gen_finish(ctx and db and sess and st and vmodel)
+    return 0
+
 # ── P11 validation coordinator — a CHAIN of async tasks, one per block ─────────
 # COMPILER BUG constraint (see llm_read_response in llm.ep): inside an async define,
 # an await — or a call to ANY awaiting function — inside a LOOP is mis-lowered (the
@@ -188,7 +225,8 @@ define tools_validation_finalize with state as Map returning Int:
     set fname to concat("validation_report_" and concat(int_to_string(map_get_val(state and "started")) and ".md"))
     set rpath to workspace_write_file(fname and report)
     set attach_note to ""
-    if tools_emit_attachment(map_get_val(state and "sid") and rpath) == 0:
+    set _ea_ctx to create_map()
+    if tools_emit_attachment(map_get_val(state and "sid") and rpath and _ea_ctx) == 0:
         set attach_note to " Report attached."
     set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems COMPLETE: {total} blocks — {pass_blocks} clean, {fail_blocks} with failures, {skip_blocks} skipped, {wall}s. Report: {rpath}.{attach_note}")
     set ok to map_delete(TEST_ALL_RUNNING and "run")
@@ -576,6 +614,10 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: List all delegated sub-agent tasks and their statuses.\n")
         set schemas to concat(schemas and "  Example: Action: delegate_list([])\n\n")
         
+        set schemas to concat(schemas and "- delegate_whisper([task_id: Str, message: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Send mid-turn guidance to a running sub-agent. The whisper is injected before the sub-agent's next LLM call as [MID-TURN USER GUIDANCE]. Use this to steer a running sub-agent's approach without cancelling it — e.g. 'focus on error handling' or 'skip the happy path'. The sub-agent does not see it until its next ReAct turn.\n")
+        set schemas to concat(schemas and "  Example: Action: delegate_whisper([\"agent_1\", \"Focus on error handling, skip the happy path\"])\n\n")
+        
         set schemas to concat(schemas and "- delegate_swarm([instruction: Str, sub_tasks: Str, join_strategy: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Fan-out: spawn multiple sub-agents (one per sub-task, separated by '|') and merge their results. Use over delegate_task when ONE question benefits from several PERSPECTIVES or PARTITIONS of the same job. join_strategy: 'concat' = keep every result (multi-dimension review — the usual choice); 'best' = keep the strongest single answer (independent attempts at one hard problem); 'vote' = majority verdict (yes/no or classification checks). Same rules as delegate_task: self-contained sub-task text, 2-3 sub-agents (shared model), un-gated tools only.\n")
         set schemas to concat(schemas and "  Example: Action: delegate_swarm([\"Review decent_agent/session.ep\", \"Check for memory-safety issues|Check error handling on file I/O|Check the title-resolver edge cases\", \"concat\"])\n\n")
@@ -944,7 +986,7 @@ define tools_self_write_section with section as Str and text as Str returning In
 # files and over-cap files (>24 MB, above Discord's limit) are dropped silently here;
 # the caller's own return string tells the user what happened. Returns 1 on refuse/skip,
 # 0 on queued.
-define tools_emit_attachment with session_id as Str and path as Str returning Int:
+define tools_emit_attachment with session_id as Str and path as Str and ctx as Map returning Int:
     if string_length(path) == 0:
         return 1
     if file_exists(path) == 0:
@@ -966,6 +1008,15 @@ define tools_emit_attachment with session_id as Str and path as Str returning In
     set ep to string_replace(path and "'" and "''")
     set ok to sql_execute(db and f"INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('{es}', 'attachment', '{ep}', strftime('%s','now'), 0);")
     display f"[Attachment] queued for delivery: {path}"
+    # Propagate to parent session so Discord bridge / WebUI see sub-agent attachments.
+    # When a sub-agent (session_id = task_id like "agent_1") emits an attachment, the
+    # parent's trace poll would never see it. Duplicating under parent_session_id ensures
+    # the image reaches both the sub-agent's thread AND the parent's channel.
+    if map_contains(ctx and "parent_session_id") == 1:
+        set ea_psid to map_get_val(ctx and "parent_session_id")
+        set ea_pes to string_replace(ea_psid and "'" and "''")
+        set ok to sql_execute(db and f"INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('{ea_pes}', 'attachment', '{ep}', strftime('%s','now'), 0);")
+        display f"[Attachment] propagated to parent session: {ea_psid}"
     return 0
 
 # Resolve a user/agent-supplied path to something on disk for attachment: try it
@@ -1413,7 +1464,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         # Auto-attach the file the agent just made to the user's chat (Discord/WebUI),
         # so they don't have to go find it. Approved-write-only, secret-safe (see helper).
         # Only claim it was attached when the emit actually queued it (0), never on a refuse/skip.
-        if tools_emit_attachment(cl_sess and path) == 0:
+        if tools_emit_attachment(cl_sess and path and ctx) == 0:
             return f"File '{path}' written successfully. (Attached to the chat.)"
         return f"File '{path}' written successfully."
         
@@ -1626,46 +1677,32 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         # GPU renders. A Stop returns immediately; the render itself is a parked C call
         # that cannot be interrupted — it finishes in the background and its PNG lands
         # in the workspace.
-        set gi_db to storage_get_db()
-        set gi_job to image_gen_job_create(gi_db)
-        set gi_res to ""
-        if gi_job == 0:
-            # No DB (unit-test context) — synchronous fallback, exact old behavior.
-            set gi_res to image_gen_run(gi_prompt and gi_name and 1024 and 1024 and 28 and 7 and gi_stamp)
-        else:
-            spawn image_gen_thread_worker(gi_job and gi_prompt and gi_name and 1024 and 1024 and 28 and 7 and gi_stamp)
-            display f"[ImageGen] job {gi_job} dispatched to render thread — event loop stays live."
-            set gi_epoch to ep_cancel_epoch_get(0)
-            set gi_waited to 0
-            repeat while string_length(gi_res) == 0 and also gi_waited < 1200000:
-                set gi_st to image_gen_job_result(gi_db and gi_job)
-                if string_index_of(gi_st and "pending:") == 0:
-                    if ep_cancel_epoch_get(0) > gi_epoch:
-                        return "Halted by Stop. The render already in progress cannot be interrupted mid-flight — it continues in the background, and if it completes its PNG lands in config/workspaces/active/."
-                    set ok to tools_sleep_yield(1000)
-                    set gi_waited to gi_waited + 1000
-                else:
-                    set gi_res to gi_st
-            if string_length(gi_res) == 0:
-                return "ERROR: image generation timed out after 20 minutes (the render thread may still finish in the background — check config/workspaces/active/)."
-        if string_contains(gi_res and "ERROR:") == 1:
-            return gi_res
-        # Auto-attach the generated PNG to the chat (reuses the secret-safe attachment path).
+        # Extract session_id early so it's available for progress trace events.
         set gi_sess to ""
         if map_contains(ctx and "session_id") == 1:
             set gi_sess to map_get_val(ctx and "session_id")
-        set ok to tools_emit_attachment(gi_sess and gi_res)
-        # VISION LOOP: actually LOOK at the image just generated and describe it, so the reply
-        # is grounded in the real picture. Uses the AGENT'S OWN model (multimodal gemma-4) — no
-        # separate model. Requires the Ollama tag to carry its vision projector; if it doesn't,
-        # query_vision returns "" and we fall back to the plain confirmation below.
+        set gi_db to storage_get_db()
         set gi_vmodel to ""
         if map_contains(ctx and "selected_model") == 1:
             set gi_vmodel to map_get_val(ctx and "selected_model")
-        set gi_desc to query_vision("You just generated this image for the user from their prompt. Look at it and describe, in 2-3 vivid and specific sentences, what it actually shows — composition, subject, colour, mood. Speak as if presenting it to them." and gi_res and gi_vmodel)
-        if string_length(gi_desc) > 0:
-            return concat("Generated the image and attached it to the chat. Looking at it: " and gi_desc)
-        return concat("Generated and attached your image: " and gi_res)
+        set gi_job to image_gen_job_create(gi_db)
+        if gi_job == 0:
+            # No DB (unit-test context) — synchronous fallback, exact old behavior.
+            set gi_res to image_gen_run(gi_prompt and gi_name and 1024 and 1024 and 28 and 7 and gi_stamp)
+            if string_contains(gi_res and "ERROR:") == 1:
+                return gi_res
+            set ok to tools_emit_attachment(gi_sess and gi_res and ctx)
+            return concat("Generated and attached your image: " and gi_res)
+        # TRULY ASYNC (Phase B): dispatch the render thread AND a background poll chain,
+        # then RETURN NOW so the agent replies immediately and its turn ends. The image
+        # (with a vision description) posts to the chat via mid_message when the render
+        # completes — the agent does NOT sit and wait for the GPU.
+        spawn image_gen_thread_worker(gi_job and gi_prompt and gi_name and 1024 and 1024 and 28 and 7 and gi_stamp)
+        display f"[ImageGen] job {gi_job} dispatched — agent turn returns; result posts async."
+        set gi_prompt_esc to string_replace(gi_prompt and "\"" and "'")
+        set ok to trace_emit(gi_db and gi_sess and "image_progress" and concat("{\"status\":\"started\",\"prompt\":\"" and concat(gi_prompt_esc and "\"}")))
+        set gi_chain to image_gen_poll(ctx and gi_db and gi_sess and gi_job and gi_vmodel and ep_cancel_epoch_get(0) and 0)
+        return "Your image is rendering in the background — it will post to the chat with a description as soon as it's ready (usually 1–3 minutes at this quality). Tell the user it's on the way and FINISH YOUR TURN now; do not wait for it."
 
     if action_name equals "dht_store":
         if length_list(args_list) < 2:
@@ -2196,7 +2233,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ws_sess to ""
         if map_contains(ctx and "session_id") == 1:
             set ws_sess to map_get_val(ctx and "session_id")
-        if tools_emit_attachment(ws_sess and ws_path) == 0:
+        if tools_emit_attachment(ws_sess and ws_path and ctx) == 0:
             return concat(ws_path and " (Attached to the chat.)")
         return ws_path
 
@@ -2214,7 +2251,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set af_sess to ""
         if map_contains(ctx and "session_id") == 1:
             set af_sess to map_get_val(ctx and "session_id")
-        set ok to tools_emit_attachment(af_sess and af_path)
+        set ok to tools_emit_attachment(af_sess and af_path and ctx)
         return f"Attached '{af_path}' — it will appear as a file in the chat."
 
     if action_name equals "workspace_read":
@@ -2438,6 +2475,30 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if dl_orch == 0:
             return "Error: Orchestrator not initialized."
         return orchestrator_list(dl_orch)
+
+    if action_name equals "delegate_whisper":
+        if length_list(args_list) < 2:
+            return "Error: delegate_whisper requires 2 arguments: task_id (Str) and message (Str)."
+        set dw_tid to get_list(args_list and 0)
+        set dw_msg to get_list(args_list and 1)
+        set dw_orch to map_get_val(ctx and "orchestrator")
+        if dw_orch == 0:
+            return "Error: Orchestrator not initialized."
+        set dw_status to orchestrator_check(dw_orch and dw_tid)
+        if string_contains(dw_status and "not_found") == 1:
+            return f"Error: No sub-agent with task_id '{dw_tid}' found."
+        if string_contains(dw_status and "completed") == 1:
+            return f"Error: Sub-agent '{dw_tid}' has already completed — whispers only reach running agents."
+        if string_contains(dw_status and "cancelled") == 1:
+            return f"Error: Sub-agent '{dw_tid}' was cancelled."
+        set dw_db to storage_get_db()
+        if dw_db == 0:
+            return "Error: Database not available."
+        set dw_es to string_replace(dw_tid and "'" and "''")
+        set dw_ec to string_replace(dw_msg and "'" and "''")
+        set dw_now to ep_time_now_sec()
+        set ok to sql_execute(dw_db and f"INSERT INTO trace_whispers (session_id, content, created_at) VALUES ('{dw_es}', '{dw_ec}', {dw_now});")
+        return f"Whisper sent to sub-agent '{dw_tid}'. It will receive the guidance before its next LLM call."
 
     if action_name equals "delegate_swarm":
         if length_list(args_list) < 3:
