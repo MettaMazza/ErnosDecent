@@ -881,7 +881,7 @@ def db_poll_traces(session_id):
         # turn, so background/sub-agent/async-image outputs are never dropped). This
         # turn-scoped thread trace only streams the thinking events.
         cursor.execute(
-            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type NOT IN ('attachment','mid_message','image_progress') AND session_id=? ORDER BY id LIMIT 50",
+            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type NOT IN ('attachment','mid_message','image_progress','final_reply') AND session_id=? ORDER BY id LIMIT 50",
             (session_id,)
         )
         rows = cursor.fetchall()
