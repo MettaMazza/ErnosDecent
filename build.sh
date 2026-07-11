@@ -90,6 +90,34 @@ long long ep_json_escape(long long s_ptr) {
     return r;
 }
 
+/* THREAD OWNERSHIP OF THE ASYNC LOOP (root fix for the sub-agent hangs).
+   The event loop (run queue + kqueue + timers) is single-threaded state with NO locks.
+   Sub-agent WORKER THREADS used to create read/timer tasks on the shared kqueue and
+   pump the loop concurrently from ep_await_future. kqueue hands each event to WHICHEVER
+   thread is parked in kevent(), so worker A's readiness event could be consumed by
+   another thread: A's future got completed, but A stayed parked in kevent() with no
+   event of its own, holding a fully-buffered LLM response until ANY new process I/O
+   (e.g. the operator's next command — the cancel) woke it. That is the observed
+   sub-agents-hang-then-complete-instantly-on-the-next-message bug, and the
+   unsynchronized run-queue linked list was a latent corruption risk on top.
+   Invariant restored: ONLY the loop-owner thread (main — captured by the constructor,
+   which runs on the main thread at load) may create loop tasks or pump the loop.
+   Non-owner threads wait with plain poll()/nanosleep (correct in a dedicated OS thread)
+   and get a PRE-COMPLETED future, which ep_await_future returns from immediately
+   without ever touching the loop. */
+#include <poll.h>
+#include <pthread.h>
+static pthread_t ep_loop_owner_thread;
+__attribute__((constructor)) static void ep_capture_loop_owner(void) {
+    ep_loop_owner_thread = pthread_self();
+}
+static EpFuture* ep_make_completed_future(long long value) {
+    EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
+    fut->completed = 1; fut->value = value; fut->waiting_task = NULL; fut->chan = 0;
+    { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
+    return fut;
+}
+
 /* Awaitable readable-OR-timeout future. */
 static long long ep_readto_read_step(void* r) {
     EpReadReadyArgs* a = (EpReadReadyArgs*)r;
@@ -108,6 +136,12 @@ static long long ep_readto_timer_step(void* r) {
     return 0;
 }
 long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
+    if (!pthread_equal(pthread_self(), ep_loop_owner_thread)) {
+        /* Worker thread: NEVER touch the shared loop — plain poll, pre-completed future. */
+        struct pollfd p; p.fd = (int)fd; p.events = POLLIN; p.revents = 0;
+        int r = poll(&p, 1, (int)timeout_ms);
+        return (long long)ep_make_completed_future(r > 0 ? 1 : 0);
+    }
     EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
     fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;
     { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
@@ -132,7 +166,9 @@ long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
    without blocking the single-threaded async loop — ep_sleep_ms stalls EVERY task for
    the duration; awaiting this yields, so sibling agent tasks (and their LLM reads)
    keep running. Reuses the readable-timeout plumbing's timer half. Used by
-   bridge_wait_result so a Discord RPC wait cannot freeze the node. */
+   bridge_wait_result so a Discord RPC wait cannot freeze the node.
+   THREAD-AWARE like async_wait_readable_timeout: a worker thread nanosleeps and gets a
+   pre-completed future instead of registering a timer on the loop it must not touch. */
 /* Phase A: set a socket non-blocking (the IPC LISTEN socket, so the accept task can
    wait via the event loop) and force one BLOCKING (each ACCEPTED client socket —
    Darwin inherits O_NONBLOCK on accept, which made every per-connection command read
@@ -151,6 +187,12 @@ long long ep_net_set_blocking(long long fd) {
 }
 
 long long ep_async_sleep_ms(long long ms) {
+    if (!pthread_equal(pthread_self(), ep_loop_owner_thread)) {
+        /* Worker thread: NEVER touch the shared loop — plain sleep, pre-completed future. */
+        struct timespec ts; ts.tv_sec = ms / 1000; ts.tv_nsec = (ms % 1000) * 1000000L;
+        nanosleep(&ts, NULL);
+        return (long long)ep_make_completed_future(0);
+    }
     EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
     fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;
     { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
@@ -206,11 +248,67 @@ first = content.find(pat)
 second = content.find(pat, first + 1)
 if second > 0:
     content = content[:second] + inject + content[second:]
-    with open(cfile, 'w') as f:
-        f.write(content)
-    print('Injected additive runtime helpers (cast/cancel/json/async) into ' + cfile)
 else:
     print('WARNING: could not find second ep_net_send in ' + cfile + ' — additive helpers NOT injected')
+
+# THREAD-SAFE RUN QUEUE: the compiler emits an unlocked linked-list run queue, which
+# worker threads can still touch via un-awaited async dispatch (e.g. a sub-agent tool
+# calling generate_image enqueues the poll chain from its worker thread while the main
+# thread pumps). Same root hazard family as the stolen-kevent-wakeup bug — an
+# unsynchronized cross-thread mutation of loop state. Guard both queue ops with a mutex
+# (pthread.h is included well before these functions in the emitted C).
+old_q = '''static void ep_task_enqueue(EpTask* task) {
+    if (!task) return;
+    task->next = NULL;
+    if (ep_run_queue_tail) {
+        ep_run_queue_tail->next = task;
+        ep_run_queue_tail = task;
+    } else {
+        ep_run_queue_head = ep_run_queue_tail = task;
+    }
+}
+
+static EpTask* ep_task_dequeue(void) {
+    if (!ep_run_queue_head) return NULL;
+    EpTask* task = ep_run_queue_head;
+    ep_run_queue_head = ep_run_queue_head->next;
+    if (!ep_run_queue_head) ep_run_queue_tail = NULL;
+    return task;
+}'''
+new_q = '''static pthread_mutex_t ep_run_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static void ep_task_enqueue(EpTask* task) {
+    if (!task) return;
+    pthread_mutex_lock(&ep_run_queue_lock);
+    task->next = NULL;
+    if (ep_run_queue_tail) {
+        ep_run_queue_tail->next = task;
+        ep_run_queue_tail = task;
+    } else {
+        ep_run_queue_head = ep_run_queue_tail = task;
+    }
+    pthread_mutex_unlock(&ep_run_queue_lock);
+}
+
+static EpTask* ep_task_dequeue(void) {
+    pthread_mutex_lock(&ep_run_queue_lock);
+    EpTask* task = ep_run_queue_head;
+    if (task) {
+        ep_run_queue_head = task->next;
+        if (!ep_run_queue_head) ep_run_queue_tail = NULL;
+    }
+    pthread_mutex_unlock(&ep_run_queue_lock);
+    return task;
+}'''
+if old_q in content:
+    content = content.replace(old_q, new_q, 1)
+    print('Injected additive runtime helpers + THREAD-SAFE run queue into ' + cfile)
+elif new_q in content:
+    print('Injected additive runtime helpers into ' + cfile + ' (run queue already thread-safe)')
+else:
+    print('WARNING: run-queue pattern not found in ' + cfile + ' — queue left UNLOCKED (compiler output changed?)')
+
+with open(cfile, 'w') as f:
+    f.write(content)
 "
 }
 
@@ -692,6 +790,18 @@ long long ep_json_escape(long long s_ptr) {
    accepts the connection then never responds, freezing the single-threaded daemon. The
    loser step is a no-op (guards on !completed) so there is no value clobber or double
    enqueue; each task self-frees when it eventually fires. */
+#include <poll.h>
+#include <pthread.h>
+static pthread_t ep_loop_owner_thread;
+__attribute__((constructor)) static void ep_capture_loop_owner(void) {
+    ep_loop_owner_thread = pthread_self();
+}
+static EpFuture* ep_make_completed_future(long long value) {
+    EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
+    fut->completed = 1; fut->value = value; fut->waiting_task = NULL; fut->chan = 0;
+    { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
+    return fut;
+}
 static long long ep_readto_read_step(void* r) {
     EpReadReadyArgs* a = (EpReadReadyArgs*)r;
     if (a && a->fut && !a->fut->completed) {
@@ -709,6 +819,12 @@ static long long ep_readto_timer_step(void* r) {
     return 0;
 }
 long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
+    if (!pthread_equal(pthread_self(), ep_loop_owner_thread)) {
+        /* Worker thread: NEVER touch the shared loop — plain poll, pre-completed future. */
+        struct pollfd p; p.fd = (int)fd; p.events = POLLIN; p.revents = 0;
+        int r = poll(&p, 1, (int)timeout_ms);
+        return (long long)ep_make_completed_future(r > 0 ? 1 : 0);
+    }
     EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
     fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;
     { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
