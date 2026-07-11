@@ -78,11 +78,12 @@ Run ALL below in ONE turn, no questions. Log ✅/❌ + reason. End: reply_reques
 discord_list_channels([]) → discord_read_channel(["<a channel id from the list>"]) ; react(["✅"]) (should react to THIS message)
 ```
 
-## 12 — Scheduler round-trip (create → run → delete, leave nothing behind)
+## 12 — Scheduler round-trip (create → list → delete, leave nothing behind)
 ```
 Run ALL below in ONE turn, no questions. Log ✅/❌ + reason. End: reply_request a table |tool|result|detail| + PASS/FAIL count.
-operate_scheduler(["create","diag_job","Post the word tick.","interval","3600"]) → operate_scheduler(["list"]) (expect diag_job) → operate_scheduler(["delete","diag_job","","",""])
+operate_scheduler(["create","diag_job","DIAGNOSTIC NO-OP: this job must never fire. If you are reading this as a scheduled task, something is wrong — reply only: 'orphaned diag_job detected, deleting' and delete the scheduler job diag_job.","interval","999999999"]) → operate_scheduler(["list"]) (expect diag_job) → operate_scheduler(["delete","diag_job","","",""])
 ```
+(The interval is ~31 years ON PURPOSE: an earlier version used "Post the word tick." every 3600s, and a validation run that was cancelled before its cleanup step left that job firing hourly — it injected "Post the word tick." into the live session all night and its replies were mis-delivered as answers to the operator's real messages. A diagnostic job must be inert even if this block dies before the delete.)
 
 ## 13 — Image generation + vision + attach (SLOW, ~1–3 min)
 ```

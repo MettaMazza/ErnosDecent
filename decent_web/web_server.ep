@@ -59,31 +59,46 @@ define query_daemon_ipc with command as Str returning Str:
 # Poll that row here — the web server is its OWN OS thread, so a blocking sleep only
 # stalls this connection, never the agent loop — and hand back the EXACT legacy payload
 # string every parser below already understands. 30-min cap.
-define web_wait_final_reply with sid as Str returning Str:
+define web_wait_final_reply with sid as Str and turn_tag as Str returning Str:
     set waited to 0
+    # TURN CORRELATION: when the ack carried a turn id, only accept the row prefixed
+    # "turn:<tag>," (strip it before returning) — otherwise a concurrent scheduler-job
+    # turn in the same session gets delivered as this request's answer (the tick bug).
+    set want to ""
+    if string_length(turn_tag) > 0:
+        set want to f"turn:{turn_tag},"
     repeat while waited < 1800000:
         set db to storage_get_db()
         if db != 0:
             set es to string_replace(sid and "'" and "''")
-            set rows to sql_query(db and f"SELECT id, content FROM trace_events WHERE session_id='{es}' AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1;")
+            set wq to f"SELECT id, content FROM trace_events WHERE session_id='{es}' AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1;"
+            if string_length(want) > 0:
+                set ew to string_replace(want and "'" and "''")
+                set wq to f"SELECT id, content FROM trace_events WHERE session_id='{es}' AND event_type='final_reply' AND sent=0 AND content LIKE '{ew}%' ORDER BY id LIMIT 1;"
+            set rows to sql_query(db and wq)
             if length_list(rows) > 0:
                 set r to get_list(rows and 0)
                 set rid to get_list(r and 0)
                 set content to get_list(r and 1)
                 set ok to sql_execute(db and f"UPDATE trace_events SET sent=1 WHERE id={rid};")
+                if string_length(want) > 0:
+                    if string_index_of(content and want) == 0:
+                        set wlen to string_length(want)
+                        set content to substring(content and wlen and string_length(content) - wlen)
                 return content
         set ok to sleep_ms(250)
         set waited to waited + 250
     return "error:turn_timeout"
 
 # Normalize a daemon AI ack into the final legacy payload: detached acks are resolved by
-# waiting on the session's final_reply row; busy acks become a friendly guidance note;
-# anything else (old-style full payloads, errors) passes through untouched.
+# waiting on THAT TURN's final_reply row (matched by the turn id in the ack); busy acks
+# become a friendly guidance note; anything else passes through untouched.
 define web_resolve_ai_response with resp as Str returning Str:
     if string_index_of(resp and "ai:accepted") == 0:
         set sid to extract_ipc_field(resp and "session")
+        set wtag to extract_ipc_field(resp and "turn")
         if string_length(sid) > 0:
-            return web_wait_final_reply(sid)
+            return web_wait_final_reply(sid and wtag)
         return resp
     if string_index_of(resp and "ai:busy_whispered") == 0:
         return "ai:ok|||RESPONSE|||Your message reached the agent as mid-turn guidance — it is already working and will fold this in."

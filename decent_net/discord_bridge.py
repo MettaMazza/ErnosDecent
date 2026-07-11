@@ -496,26 +496,42 @@ async def query_daemon_ipc(prompt, author=None, message=None):
         return "error:daemon_offline"
 
 
-async def wait_final_reply(session_id, timeout_s=1800):
+async def wait_final_reply(session_id, timeout_s=1800, turn_tag=None):
     """Phase A3: poll the session's `final_reply` trace row (direct SQLite — the same
     proven cross-process pattern as the trace/commands pollers). Returns the legacy
-    payload string; marks the row sent so it is delivered exactly once."""
+    payload string; marks the row sent so it is delivered exactly once.
+
+    TURN CORRELATION: when the daemon's ack carried a turn id, only the row prefixed
+    'turn:<tag>,' is accepted (and the prefix is stripped). Without it, a concurrent
+    scheduler-job turn in the SAME session could land its final_reply first and be
+    delivered as the user's answer — the tick bug: Maria's 'Hello' was 'answered' by an
+    orphaned diagnostic job's reply while her real reply rotted unsent."""
     import time as _t
     start = _t.time()
+    prefix = f"turn:{turn_tag}," if turn_tag else None
     while _t.time() - start < timeout_s:
         try:
             conn = sqlite3.connect(get_db_path())
             cur = conn.cursor()
-            cur.execute(
-                "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1",
-                (session_id,),
-            )
+            if prefix:
+                cur.execute(
+                    "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 AND content LIKE ? ORDER BY id LIMIT 1",
+                    (session_id, prefix + "%"),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1",
+                    (session_id,),
+                )
             row = cur.fetchone()
             if row:
                 cur.execute("UPDATE trace_events SET sent=1 WHERE id=?", (row[0],))
                 conn.commit()
                 conn.close()
-                return row[1]
+                content = row[1]
+                if prefix and content.startswith(prefix):
+                    content = content[len(prefix):]
+                return content
             conn.close()
         except Exception:
             pass
@@ -524,16 +540,19 @@ async def wait_final_reply(session_id, timeout_s=1800):
 
 
 async def resolve_ai_response(resp, session_id):
-    """Normalize a daemon AI ack: ai:accepted/ai:accepted_resume → wait for the
-    session's final_reply row; ai:busy_whispered → friendly guidance note; anything
-    else (old-style full payload, errors) passes through untouched."""
+    """Normalize a daemon AI ack: ai:accepted/ai:accepted_resume → wait for THAT TURN's
+    final_reply row (matched by the turn id in the ack); ai:busy_whispered → friendly
+    guidance note; anything else (old-style full payload, errors) passes through."""
     if resp and resp.startswith("ai:accepted"):
         sid = session_id
+        tag = None
         for part in resp.split(","):
             if part.startswith("session:"):
                 sid = part.split(":", 1)[1].strip()
+            elif part.startswith("turn:"):
+                tag = part.split(":", 1)[1].strip() or None
         if sid:
-            return await wait_final_reply(sid)
+            return await wait_final_reply(sid, turn_tag=tag)
         return resp
     if resp and resp.startswith("ai:busy_whispered"):
         return "ai:ok|||RESPONSE|||🫧 Delivered as mid-turn guidance — I'm already working and will fold it in."

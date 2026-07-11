@@ -174,6 +174,12 @@ define node_finish_turn with tctx as Map and sessions_mgr as Map and memory as M
             set resp to f"ai:ok,reasoning:{base64_encode(last_reason)}|||RESPONSE|||{agent_resp}"
         else:
             set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
+    # TURN CORRELATION: prefix this turn's id so the bridge waiter can match the reply
+    # to ITS request instead of taking the session's next final_reply (which delivered a
+    # concurrent scheduler-job's reply as the user's answer — the tick bug).
+    if map_contains(tctx and "turn_id") == 1:
+        set ft_tag to map_get_val(tctx and "turn_id")
+        set resp to concat(f"turn:{ft_tag}," and resp)
     set ok to trace_emit(tdb and sid and "final_reply" and resp)
     if stays_open == 0:
         # The shallow clone shares the shared turn-tracking maps — clear our flags.
@@ -971,6 +977,19 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set ok to map_insert(tctx and "selected_model" and selected_model)
                                                 set ok to map_insert(tctx and "mode" and selected_mode)
                                                 set ok to map_insert(tctx and "session_id" and turn_sid)
+                                                # TURN CORRELATION: every INFER gets a unique turn id, echoed in the
+                                                # ack AND prefixed onto this turn's final_reply row. The bridge waits
+                                                # for ITS turn id — not "the session's next final_reply" — so a
+                                                # concurrent scheduler-job turn in the same session can never be
+                                                # delivered as the answer to the user's message (the tick bug: the
+                                                # waiter grabbed the scheduled job's reply and the user's real reply
+                                                # rotted unsent).
+                                                set turn_seq to 1
+                                                if map_contains(agent_ctx and "turn_seq") == 1:
+                                                    set turn_seq to map_get_val(agent_ctx and "turn_seq") + 1
+                                                set ok to map_insert(agent_ctx and "turn_seq" and turn_seq)
+                                                set turn_tag to f"t{int_to_string(turn_seq)}"
+                                                set ok to map_insert(tctx and "turn_id" and turn_tag)
                                                 set ok to map_insert(at_map and turn_sid and 1)
                                                 set ok to map_insert(tc_map and turn_sid and tctx)
                                                 # Fire-and-forget: the turn runs as a background async task and
@@ -978,7 +997,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 # socket acks immediately — the daemon is free for parallel
                                                 # sessions, Stop, and background work.
                                                 set turn_fut to node_run_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and tctx and sessions_mgr and turn_sid and ai_prompt)
-                                                set resp to f"ai:accepted,session:{turn_sid}"
+                                                set resp to f"ai:accepted,session:{turn_sid},turn:{turn_tag}"
                                         else if cmd_upper equals "BFT STATUS":
                                             set bview to map_get_val(bft_node and "view")
                                             set bseq to map_get_val(bft_node and "seq")
@@ -1110,7 +1129,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                     set r_tctx to map_get_val(r_tcs and r_sid)
                                                     if map_contains(r_tctx and "pending_action") == 1:
                                                         set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 0 and 1 and 0 and "")
-                                                        set resp to f"ai:accepted_resume,session:{r_sid}"
+                                                        set r_ttag to ""
+                                                        if map_contains(r_tctx and "turn_id") == 1:
+                                                            set r_ttag to map_get_val(r_tctx and "turn_id")
+                                                        set resp to f"ai:accepted_resume,session:{r_sid},turn:{r_ttag}"
                                                     else:
                                                         set resp to "ai:error,reason:no_pending_action"
                                                 else:
@@ -1251,7 +1273,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 if map_contains(r_tctx and "pending_action") == 1:
                                                     set ok to map_insert(r_tctx and "auto_approve" and 1)
                                                     set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 0 and 1 and 1 and "")
-                                                    set resp to f"ai:accepted_resume,session:{r_sid}"
+                                                    set r_ttag to ""
+                                                    if map_contains(r_tctx and "turn_id") == 1:
+                                                        set r_ttag to map_get_val(r_tctx and "turn_id")
+                                                    set resp to f"ai:accepted_resume,session:{r_sid},turn:{r_ttag}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
@@ -1267,7 +1292,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set r_tctx to map_get_val(r_tcs and r_sid)
                                                 if map_contains(r_tctx and "pending_action") == 1:
                                                     set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 0 and 0 and 0 and "")
-                                                    set resp to f"ai:accepted_resume,session:{r_sid}"
+                                                    set r_ttag to ""
+                                                    if map_contains(r_tctx and "turn_id") == 1:
+                                                        set r_ttag to map_get_val(r_tctx and "turn_id")
+                                                    set resp to f"ai:accepted_resume,session:{r_sid},turn:{r_ttag}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
@@ -1308,7 +1336,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set r_tctx to map_get_val(r_tcs and r_sid)
                                                 if map_contains(r_tctx and "pending_clarification") == 1:
                                                     set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 1 and 0 and 0 and clarify_answers)
-                                                    set resp to f"ai:accepted_resume,session:{r_sid}"
+                                                    set r_ttag to ""
+                                                    if map_contains(r_tctx and "turn_id") == 1:
+                                                        set r_ttag to map_get_val(r_tctx and "turn_id")
+                                                    set resp to f"ai:accepted_resume,session:{r_sid},turn:{r_ttag}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_clarification"
                                             else:
