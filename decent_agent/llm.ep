@@ -861,6 +861,44 @@ define detect_repetition_loop with s as Str returning Int:
         set L to L + 1
     return 0
 
+# ── Operator-configurable DEFAULT model ──────────────────────────────────────
+# config/default_model.txt (one line, an Ollama/LM Studio tag e.g. "gemma4:26b")
+# overrides the built-in gemma-4-31b default WITHOUT a rebuild — read per call so a
+# swap takes effect on the next message. Delete the file (or empty it) to revert.
+define llm_default_model returning Str:
+    if file_exists("config/default_model.txt") == 1:
+        set dm to string_trim(read_file("config/default_model.txt"))
+        if string_length(dm) > 0:
+            return dm
+    return "gemma-4-31b"
+
+define llm_default_configured returning Int:
+    if file_exists("config/default_model.txt") == 1:
+        if string_length(string_trim(read_file("config/default_model.txt"))) > 0:
+            return 1
+    return 0
+
+# Ordered backend ports for the DEFAULT cascade. With a configured default (an
+# Ollama/LM Studio tag), Ollama comes FIRST: llama.cpp (:8080/:8081) serves whatever
+# single model it was started with and IGNORES the model field, so routing a configured
+# tag there would silently hit the wrong weights — and contend with the operator's own
+# use of them (the "my 31b is busy" case). :8080/:8081 stay as LAST-RESORT fallbacks
+# (degraded to the loaded model, never broken). Unconfigured: original order, :8080
+# (the parallel server) first.
+define llm_default_ports returning List:
+    set ports to create_list()
+    if llm_default_configured() == 1:
+        set ok to append_list(ports and 11434)
+        set ok to append_list(ports and 1234)
+        set ok to append_list(ports and 8080)
+        set ok to append_list(ports and 8081)
+    else:
+        set ok to append_list(ports and 8080)
+        set ok to append_list(ports and 8081)
+        set ok to append_list(ports and 11434)
+        set ok to append_list(ports and 1234)
+    return ports
+
 define query_local_llm_raw with prompt as Str and selected_model as Str returning Str:
     if string_length(selected_model) > 0:
         # Structured router path first (model_registry). On any miss, fall through to
@@ -898,25 +936,20 @@ define query_local_llm_raw with prompt as Str and selected_model as Str returnin
 
         display f"[LLM] Selected model '{selected_model}' failed or offline. Falling through to cascade."
 
-    # Default cascade. llama.cpp (8080/8081) first — it serves whatever model is loaded.
-    if is_port_open("127.0.0.1" and 8080) == 1:
-        set res to try_chat_completion("http://127.0.0.1:8080/v1/chat/completions" and selected_model and prompt)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 8081) == 1:
-        set res to try_chat_completion("http://127.0.0.1:8081/v1/chat/completions" and selected_model and prompt)
-        if string_length(res) > 0:
-            return res
-
-    # Then gemma4:26b on Ollama / LM Studio.
-    if is_port_open("127.0.0.1" and 11434) == 1:
-        set res to try_chat_completion("http://127.0.0.1:11434/v1/chat/completions" and "gemma-4-31b" and prompt)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 1234) == 1:
-        set res to try_chat_completion("http://127.0.0.1:1234/v1/chat/completions" and "gemma-4-31b" and prompt)
-        if string_length(res) > 0:
-            return res
+    # Default cascade — model + backend order from the operator-configurable default
+    # (config/default_model.txt). Configured: Ollama first with that tag. Unconfigured:
+    # llama.cpp (:8080, the parallel server) first with gemma-4-31b.
+    set dp to llm_default_ports()
+    set dm to llm_default_model()
+    set dn to length_list(dp)
+    set di to 0
+    repeat while di < dn:
+        set dport to get_list(dp and di)
+        if is_port_open("127.0.0.1" and dport) == 1:
+            set res to try_chat_completion(f"http://127.0.0.1:{int_to_string(dport)}/v1/chat/completions" and dm and prompt)
+            if string_length(res) > 0:
+                return res
+        set di to di + 1
 
     return ""
 
@@ -974,22 +1007,19 @@ define query_local_llm_json with system_content as Str and user_content as Str a
             if string_length(res) > 0:
                 return res
 
-    # Default cascade with gemma4:26b — SAME order (8080 -> 8081 -> 11434 -> 1234).
-    if is_port_open("127.0.0.1" and 8080) == 1:
-        set res to try_chat_completion_split("http://127.0.0.1:8080/v1/chat/completions" and "gemma-4-31b" and system_content and user_content)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 8081) == 1:
-        set res to try_chat_completion_split("http://127.0.0.1:8081/v1/chat/completions" and "gemma-4-31b" and system_content and user_content)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 11434) == 1:
-        set res to try_chat_completion_split("http://127.0.0.1:11434/v1/chat/completions" and "gemma-4-31b" and system_content and user_content)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 1234) == 1:
-        set res to try_chat_completion_split("http://127.0.0.1:1234/v1/chat/completions" and "gemma-4-31b" and system_content and user_content)
-        if string_length(res) > 0:
-            return res
+    # Default cascade — SAME model + backend order as the main call's default
+    # (llm_default_ports/llm_default_model) so the observer lands on the SAME backend
+    # the main call just used and reuses its KV-cached prefix.
+    set dp to llm_default_ports()
+    set dm to llm_default_model()
+    set dn to length_list(dp)
+    set di to 0
+    repeat while di < dn:
+        set dport to get_list(dp and di)
+        if is_port_open("127.0.0.1" and dport) == 1:
+            set res to try_chat_completion_split(f"http://127.0.0.1:{int_to_string(dport)}/v1/chat/completions" and dm and system_content and user_content)
+            if string_length(res) > 0:
+                return res
+        set di to di + 1
 
     return ""
