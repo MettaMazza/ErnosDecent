@@ -21,10 +21,13 @@ mkdir -p "$(dirname "$LOG")"
 #  2. Pin the currently-loaded model NOW via the NATIVE /api/chat endpoint — the OpenAI
 #     /v1 endpoint the node uses IGNORES keep_alive, so we pin it here directly.
 launchctl setenv OLLAMA_KEEP_ALIVE -1 2>/dev/null || true
-# PARALLELISM: Ollama serves requests SERIALLY unless told otherwise — that is why a
-# reply queued behind a sub-agent's inference. Let the fallback Ollama path serve
-# concurrent requests too (applies on Ollama's next start).
-launchctl setenv OLLAMA_NUM_PARALLEL 4 2>/dev/null || true
+# DO NOT SET OLLAMA_NUM_PARALLEL. It was set to 4 here for parallelism; Ollama 0.30.x
+# ignored it for memory sizing (five weeks, 1963 loads, zero evictions), but the 0.31.2
+# update (2026-07-13 18:03) multiplies EVERY model's KV arena by it — gemma4:26b's
+# predicted load went 29 GiB -> 174.6 GiB, exceeding free RAM, and the scheduler began
+# evicting/reloading models on nearly every call (+25s per reply). Removed via
+# launchctl unsetenv; never re-add without checking the sched log for 'evicting'.
+launchctl unsetenv OLLAMA_NUM_PARALLEL 2>/dev/null || true
 curl -s http://127.0.0.1:11434/api/chat \
   -d '{"model":"gemma4:26b","messages":[{"role":"user","content":"warmup"}],"keep_alive":-1,"stream":false}' \
   >/dev/null 2>&1 &
