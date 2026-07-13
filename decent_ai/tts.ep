@@ -1,6 +1,6 @@
 # ErnosDecent — Kokoro TTS (EP-native).
 # Drives the raw kokoro-v1.0.onnx model via FFI: text -> (libespeak-ng) IPA phonemes
-# -> kokoro vocab tokens -> (libonnxruntime) Run(tokens, bm_fable style, speed) ->
+# -> kokoro vocab tokens -> (libonnxruntime) Run(tokens, VOICE style [tts_load_style], speed) ->
 # 24kHz float audio -> PCM16 WAV. This file implements the full pipeline: chunker +
 # vocab + tokenizer, libespeak-ng phonemize FFI, onnxruntime synthesis FFI, and WAV
 # output. Delivery is wired to the Web UI (tts_request) and Discord (🔊 button). Audio
@@ -108,9 +108,16 @@ define tts_ort_release_value with api as Int and val as Int returning Int:
     set ok to ep_dlcall1(tts_ort_fn(api and 96) and val)
     return 0
 
-# Load bm_fable's style vector for a token sequence of length `token_count`:
-# 256 float32 (1024 bytes) at absolute offset 13060938 + idx*1024 in voices-v1.0.bin
-# (verified: matches numpy bm_fable[idx]). Uses libc fopen/fseek/fread.
+# Load the VOICE's style vector for a token sequence of length `token_count`:
+# 256 float32 (1024 bytes) at absolute offset VOICE_BASE + idx*1024 in voices-v1.0.bin.
+# voices-v1.0.bin is a zip (npz): a voice's float data starts at its zip member's data
+# offset + 128 (the .npy header). Known bases in Maria's file (member offset + 128):
+#   am_michael = 8358940  + 128 = 8359068   (CURRENT — the only 'michael'; Kokoro v1.0
+#                                            has NO bm_michael. British males available:
+#                                            bm_daniel, bm_fable, bm_george, bm_lewis)
+#   bm_fable   = 13060810 + 128 = 13060938  (previous voice — verified vs numpy)
+# To swap voices: recompute the member's data offset (python zipfile: header_offset +
+# 30 + name_len + extra_len + 128) and change the constant below.
 define tts_load_style with token_count as Int returning Int:
     set idx to token_count
     if idx > 509:
@@ -120,7 +127,7 @@ define tts_load_style with token_count as Int returning Int:
     set fp to ep_dlcall2(ep_dlsym(libc and "fopen") and tts_str_to_buf("/Users/mettamazza/.ernosagent/models/voices-v1.0.bin") and tts_str_to_buf("rb"))
     if fp == 0:
         return buf
-    set ok to ep_dlcall3(ep_dlsym(libc and "fseek") and fp and (13060938 + idx * 1024) and 0)
+    set ok to ep_dlcall3(ep_dlsym(libc and "fseek") and fp and (8359068 + idx * 1024) and 0)
     set rd to ep_dlcall4(ep_dlsym(libc and "fread") and buf and 1 and 1024 and fp)
     set ok to ep_dlcall1(ep_dlsym(libc and "fclose") and fp)
     return buf
@@ -444,10 +451,16 @@ define tts_http_send_binary with client_fd as Int and header_str as Str and body
     set ok to free_bytes(buf)
     return 1
 
-# Deterministic filename for a TTS request: djb2 hash of the text.
-# Identical message text reuses the same cached WAV; distinct text gets a
-# distinct file. Shared by the Web UI server and the node's TTS SPEAK verb so
-# both resolve the same path (under decent_web/tts/, inside the web root).
+# The active voice's tag — keep in sync with the offset constant in tts_load_style
+# (both must change together on a voice swap). Baked into cached filenames so a voice
+# change never replays stale WAVs synthesized with the previous voice.
+define tts_voice_tag returning Str:
+    return "am_michael"
+
+# Deterministic filename for a TTS request: djb2 hash of the text + the voice tag.
+# Identical message text reuses the same cached WAV; distinct text (or a different
+# voice) gets a distinct file. Shared by the Web UI server and the node's TTS SPEAK
+# verb so both resolve the same path (under decent_web/tts/, inside the web root).
 define tts_filename_for with text as Str returning Str:
     set h to 5381
     set i to 0
@@ -455,7 +468,7 @@ define tts_filename_for with text as Str returning Str:
     repeat while i < n:
         set h to ((h * 33) + get_character(text and i)) modulo 1000000007
         set i to i + 1
-    return concat("tts_" and concat(int_to_string(h) and ".wav"))
+    return concat("tts_" and concat(tts_voice_tag() and concat("_" and concat(int_to_string(h) and ".wav"))))
 
 # Binary-safe read of a whole file into a fresh byte buffer.
 # Returns Map{ptr, len}; ptr==0 on failure. EP's read_file is C-string based

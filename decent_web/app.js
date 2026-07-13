@@ -7,7 +7,7 @@ function set_prop(target, key, value) {
 }
 
 function send_msg(ws, payload) {
-    let readyState, sendFn;
+    let sendFn, readyState;
     if (!ws) {
         return 0;
     }
@@ -45,7 +45,7 @@ function string_length(str) {
 }
 
 function escapeHTML(str) {
-    let res, reAmp, reQuot, reGt, reApos, reLt, reClass;
+    let reGt, reClass, reAmp, reQuot, reApos, res, reLt;
     if (!str) {
         return "";
     }
@@ -87,7 +87,7 @@ function setControlsEnabled(enabled) {
 }
 
 function handleDisconnect() {
-    let headerDid, nodeRole, nodeTerm, chunkCount, dhtSize, didFull, indicator, statusText, nodePeers, walletVal;
+    let headerDid, dhtSize, nodeRole, nodePeers, indicator, statusText, didFull, walletVal, nodeTerm, chunkCount;
     window.isConnected = false;
     indicator = document.getElementById("connection-indicator");
     indicator.classList.remove("online");
@@ -114,7 +114,7 @@ function handleDisconnect() {
 }
 
 function connectDaemon() {
-    let port, wsClass, hostname, wsUrl, ws;
+    let port, hostname, wsClass, ws, wsUrl;
     port = (window.location.port || "8080");
     hostname = (window.location.hostname || "127.0.0.1");
     if ((hostname === "localhost")) {
@@ -214,7 +214,7 @@ function connectDaemon() {
 }
 
 function saveChatMessage(chanName, sender, text, type, timeStr) {
-    let historyStr, hasChannel, historyObj, channelList, msg;
+    let historyObj, historyStr, msg, hasChannel, channelList;
     historyStr = window.localStorage.getItem("ernode_chat_history");
     historyObj = Object();
     if (historyStr) {
@@ -251,7 +251,7 @@ function saveAiMessage(sender, text, type, timeStr) {
 }
 
 function renderChatHistory(chanName) {
-    let hasChannel, historyStr, channelList, historyObj;
+    let hasChannel, channelList, historyObj, historyStr;
     window.chatContainer.innerHTML = "";
     historyStr = window.localStorage.getItem("ernode_chat_history");
     if (!historyStr) {
@@ -287,7 +287,7 @@ function renderAiHistory() {
 }
 
 function appendMessageRaw(container, sender, text, type, timeStr) {
-    let bubble, escapedText;
+    let escapedText, bubble;
     bubble = document.createElement("div");
     bubble.className = ("chat-bubble " + String(type));
     escapedText = escapeHTML(text).replace("\n", "<br>");
@@ -337,7 +337,7 @@ function attachTtsButton(bubble, text) {
 }
 
 function appendMessage(container, sender, text, type) {
-    let timeStr, dateStr, timeStrSec, timeParts, secParts;
+    let dateStr, timeStrSec, timeStr, secParts, timeParts;
     dateStr = Date();
     timeParts = dateStr.split(" ");
     timeStrSec = timeParts[4];
@@ -363,7 +363,7 @@ function activeAiMessages() {
 }
 
 function sendTutorPrompt(text) {
-    let stp, modelVal, inp, msg, loader, container, sb, modelSel;
+    let loader, sb, inp, msg, modelVal, modelSel, stp, container;
     if ((!text || !window.isConnected)) {
         return 0;
     }
@@ -404,7 +404,7 @@ function sendTutorPrompt(text) {
 }
 
 function renderLessonsList(items) {
-    let container, html;
+    let html, container;
     container = document.getElementById("learning-lessons-list");
     if (!container) {
         return 0;
@@ -463,7 +463,7 @@ function setupAccessToggle() {
 }
 
 function setupLearningTab() {
-    let seedBtn, lessonsList, runBtn, form, startBtn;
+    let form, seedBtn, lessonsList, runBtn, startBtn;
     form = document.getElementById("learning-send-form");
     if (form) {
         form.addEventListener("submit", (event) => {
@@ -528,7 +528,7 @@ function setupLearningTab() {
 }
 
 function appendAiToken(token) {
-    let textNode, bubble;
+    let bubble, textNode;
     if (!window.currentAiResponseBubble) {
         bubble = document.createElement("div");
         bubble.className = "chat-bubble received ai-bot";
@@ -542,7 +542,7 @@ function appendAiToken(token) {
 }
 
 function appendApprovalCard(toolName, summary) {
-    let denyBtn, contentHtml, actionsHtml, escapedSummary, escapedTool, approveAllBtn, approveBtn, bubble, btnSubmit;
+    let approveAllBtn, actionsHtml, escapedTool, approveBtn, bubble, denyBtn, contentHtml, btnSubmit, escapedSummary;
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
     set_prop(bubble.style, "border", "1px solid rgba(245, 158, 11, 0.3)");
@@ -629,7 +629,7 @@ function appendApprovalCard(toolName, summary) {
 }
 
 function appendClarifyCard(questionsJson) {
-    let bubble, questions, nq, stopB;
+    let questions, stopB, bubble, nq;
     questions = JSON.parse(questionsJson);
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -725,7 +725,7 @@ function appendClarifyCard(questionsJson) {
 }
 
 function appendReasoningBubble(b64) {
-    let bubble, html, decoded;
+    let html, decoded, bubble;
     decoded = decodeURIComponent(escape(atob(b64)));
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -738,7 +738,7 @@ function appendReasoningBubble(b64) {
 }
 
 function updateHostsTableUI(jsonStr) {
-    let primary, list, tbody, electedHostEl, i;
+    let list, electedHostEl, primary, tbody, i;
     tbody = document.getElementById("hosts-table-body");
     if (!tbody) {
         return 0;
@@ -812,7 +812,7 @@ function handleDhtResult(msg) {
 }
 
 function handleNameResult(msg) {
-    let headerDid, entry, nameLog;
+    let nameLog, entry, headerDid;
     nameLog = document.getElementById("name-log");
     if (!nameLog) {
         return 0;
@@ -845,7 +845,7 @@ function handleNameResult(msg) {
 }
 
 function selectAiModel(modelName, skipSave) {
-    let aiModelSelect, modelText, msg, btns;
+    let modelText, aiModelSelect, btns, msg;
     window.selectedAiModel = modelName;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
@@ -873,7 +873,7 @@ function selectAiModel(modelName, skipSave) {
 }
 
 function updateAiModelsUI(models) {
-    let prevLearn, aiModelSelect, activeClass, currentSelected, learnModelSelect, isIncluded;
+    let aiModelSelect, prevLearn, activeClass, learnModelSelect, currentSelected, isIncluded;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
         currentSelected = window.selectedAiModel;
@@ -957,7 +957,7 @@ function deleteSession(id) {
 }
 
 function updatePlatformsUI() {
-    let discordConfig, discChannel, discStatus, statusText, waToggle, tgStatus, waPhoneId, waToken, whatsappConfig, tgToken, tgToggle, telegramConfig, discToggle, discToken, waStatus;
+    let waToggle, tgToggle, tgToken, telegramConfig, whatsappConfig, waToken, discordConfig, discToken, waStatus, tgStatus, waPhoneId, discToggle, discStatus, statusText, discChannel;
     if (!window.platforms) {
         return 0;
     }
@@ -1057,7 +1057,7 @@ function updatePlatformsUI() {
 }
 
 function updatePromptsUI() {
-    let personaArea, kernelArea, observerArea;
+    let personaArea, observerArea, kernelArea;
     if (!window.prompts) {
         return 0;
     }
@@ -1096,7 +1096,7 @@ function showPromptsStatus(text, isSuccess) {
 }
 
 function renderPluginsUI() {
-    let deleteBtns, body, toggleBtns;
+    let deleteBtns, toggleBtns, body;
     body = document.getElementById("plugins-list-body");
     if (!body) {
         return 0;
@@ -1196,7 +1196,7 @@ function savePluginsSettings() {
 }
 
 function savePromptsConfig() {
-    let personaArea, observerArea, payload, kernelArea;
+    let payload, personaArea, kernelArea, observerArea;
     if ((!window.ws || !window.isConnected)) {
         showPromptsStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1219,7 +1219,7 @@ function savePromptsConfig() {
 }
 
 function updateSystemConfigUI() {
-    let dataDir, relayPort, seedPort, dhtPort, maxMsg, banDur, banThresh, maxConn, webPort, p2pPort, listenAddr, dhtTtl, maxContent, seedAddr, raftPort, electTimeout, rateLimit, enableHostElect, heartbeat, ipcPort, nodeName, isStaticHost, logLevel;
+    let webPort, nodeName, ipcPort, rateLimit, seedPort, dataDir, enableHostElect, raftPort, p2pPort, dhtTtl, dhtPort, banDur, banThresh, maxConn, maxContent, maxMsg, heartbeat, logLevel, isStaticHost, relayPort, seedAddr, electTimeout, listenAddr;
     if (!window.systemConfig) {
         return 0;
     }
@@ -1340,7 +1340,7 @@ function showSystemConfigStatus(text, statusType) {
 }
 
 function saveSystemConfig() {
-    let isStaticHost, valStatic, payload, enableHostElect, valElect, val;
+    let isStaticHost, val, valElect, payload, enableHostElect, valStatic;
     if ((!window.ws || !window.isConnected)) {
         showSystemConfigStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1408,7 +1408,7 @@ function saveSystemConfig() {
 }
 
 function savePlatformConfig(platformId) {
-    let tokenVal, whatsappConfig, payload, phoneVal, discConfig, telegramConfig, chanVal, enabledVal;
+    let telegramConfig, phoneVal, payload, enabledVal, tokenVal, discConfig, chanVal, whatsappConfig;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1471,7 +1471,7 @@ function savePlatformConfig(platformId) {
 }
 
 function handlePlatformToggle(platformId) {
-    let enabledVal, payload, telegramConfig, discConfig, whatsappConfig;
+    let payload, whatsappConfig, enabledVal, discConfig, telegramConfig;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1518,7 +1518,7 @@ function handlePlatformToggle(platformId) {
 }
 
 function registerPlugin() {
-    let name, endpoint, desc, newPlugin;
+    let newPlugin, desc, endpoint, name;
     if (!window.plugins) {
         window.plugins = [];
     }
@@ -1628,7 +1628,7 @@ function updateSessionsUI(sessions) {
 }
 
 function initMemoryCanvas() {
-    let height, canvas, emptyState, container, oldCanvas, width;
+    let height, emptyState, canvas, container, oldCanvas, width;
     container = document.getElementById("memory-graph-viz");
     if (!container) {
         return 0;
@@ -1656,7 +1656,7 @@ function initMemoryCanvas() {
 }
 
 function updateMemoryGraphData(edges) {
-    let width, height, currentIds, incomingNodes;
+    let width, incomingNodes, currentIds, height;
     if (!window.canvasElement) {
         initMemoryCanvas();
     }
@@ -1693,7 +1693,7 @@ function updateMemoryGraphData(edges) {
 }
 
 function animateGraph() {
-    let n1, fx, nodeIds, height, dx, width, fy, dist, i, n2, dy, force, j;
+    let dist, force, height, dx, n2, j, nodeIds, dy, fx, n1, width, i, fy;
     if (!window.isConnected) {
         window.animationFrameId = requestAnimationFrame((dummy) => {
     animateGraph();
@@ -1801,7 +1801,7 @@ function animateGraph() {
 }
 
 function renderTuringGrid(data) {
-    let turingHeadPos, cellKey, value, cellClass, r, headY, headX, headZ, isHead, c, turingCellsCount, html, container;
+    let container, r, cellClass, turingHeadPos, html, turingCellsCount, headX, headZ, value, headY, cellKey, c, isHead;
     container = document.getElementById("turing-grid-viz");
     if (!container) {
         return 0;
@@ -1882,7 +1882,7 @@ function updateMemoryTables(data) {
 }
 
 function handleDaemonMessage(msg) {
-    let saaBody, fpToggle, saWRow, lInput, saWBtn, nodeTerm, igPrompt, timeStrSec, lStop, btnSubmit, ttsAudio, igO2, saLog, igCtx, scd, igOverlay, nodeRole, computeSlots, saInstr, rvRepos, dhtSize, gdBadge, lLoader, refresh, igTimer2, auToggle, igO3, ok, nameInput, faImg, saBody, repBtn, saaBannerP, fpLabel, didFull, saHeader, chunkCount, encKeyEl, saaApproveBtn, igTimer, saCard, sess_id, rvFile, nodePeers, faLink, stopBtn, uiHostElect, activeCircuits, noSelected, detailsPanel, aiText, sess, summaryNotice, saaBanner, msgSessions, type, natMode, roleUpper, igCanvas, saaDenyBtn, scEntry, scStatus, dateStr, timeStr, sigKeyEl, sad, headerDid, scCard, ipStatus, timeParts, idNameEl, lSubmit, storageBody, saWInput, saaCard, isLearning, repOut, faBubble, igO2c, walletVal, bwUp, scLog, saaBtns, textNode, ipd, secParts, bwDown, saad, uiStaticHost;
+    let faLink, activeCircuits, saaBanner, lStop, ttsAudio, aiText, sess, igTimer, lLoader, saBody, igOverlay, saaApproveBtn, secParts, msgSessions, saInstr, igTimer2, saLog, scEntry, igPrompt, ok, sigKeyEl, refresh, faBubble, saWRow, nodeRole, gdBadge, lInput, btnSubmit, headerDid, type, nameInput, roleUpper, saWBtn, chunkCount, saaBtns, saaDenyBtn, igO2, lSubmit, stopBtn, uiStaticHost, textNode, ipStatus, saaCard, bwDown, timeStr, uiHostElect, detailsPanel, igCanvas, saWInput, sad, sess_id, walletVal, igCtx, saCard, timeParts, encKeyEl, faImg, summaryNotice, noSelected, scStatus, scLog, didFull, natMode, saHeader, isLearning, timeStrSec, idNameEl, rvFile, rvRepos, computeSlots, repOut, fpToggle, scCard, saaBannerP, dhtSize, scd, igO2c, fpLabel, repBtn, storageBody, nodeTerm, saaBody, ipd, bwUp, igO3, nodePeers, dateStr, auToggle, saad;
     type = msg.type;
     if ((type === "status")) {
         roleUpper = msg.role.toUpperCase();
@@ -2509,7 +2509,7 @@ function renderBrowserTabs() {
 }
 
 function switchBrowserTab(tabId) {
-    let addressInput, contentArea, loader, tab;
+    let addressInput, tab, contentArea, loader;
     window.activeTabId = tabId;
     renderBrowserTabs();
     tab = null;
@@ -2550,7 +2550,7 @@ function switchBrowserTab(tabId) {
 }
 
 function closeBrowserTab(tabId) {
-    let modal, idx, tObj, i;
+    let i, modal, tObj, idx;
     idx = (0 - 1);
     i = 0;
     window.browserTabs.forEach((t) => {
@@ -2582,7 +2582,7 @@ function closeBrowserTab(tabId) {
 }
 
 function navigateTab(tab, url) {
-    let progressBar, addressInput, hasProtocol, targetUrl, isSearch, loader, hasDot, viewMsg, contentArea;
+    let targetUrl, isSearch, loader, contentArea, progressBar, hasProtocol, hasDot, addressInput, viewMsg;
     targetUrl = url.trim();
     if ((targetUrl === "")) {
         return 0;
@@ -2650,7 +2650,7 @@ function navigateActiveTab(url, isHistoryNavigation) {
 }
 
 function updateNavButtons(tab) {
-    let btnForward, btnBack;
+    let btnBack, btnForward;
     btnBack = document.getElementById("btn-browser-back");
     if (btnBack) {
         btnBack.disabled = (tab.historyIndex <= 0);
@@ -2690,7 +2690,7 @@ function updateStarButton(tab) {
 }
 
 function toggleBookmarkActiveTab() {
-    let existingIdx, i, activeTab, newBookmark;
+    let activeTab, existingIdx, i, newBookmark;
     activeTab = getActiveTab();
     if ((!activeTab || (activeTab.url === "ernos://newtab"))) {
         return 0;
@@ -2717,7 +2717,7 @@ function toggleBookmarkActiveTab() {
 }
 
 function renderBookmarksBar() {
-    let bar, homeItem;
+    let homeItem, bar;
     bar = document.getElementById("browser-bookmarks-bar");
     if (!bar) {
         return 0;
@@ -2748,7 +2748,7 @@ function renderBookmarksBar() {
 }
 
 function resolveRelativeUrl(baseUrl, relativeUrl) {
-    let firstSlash, domain, afterProto, baseFolder, lastSlash, protoIdx;
+    let domain, protoIdx, firstSlash, afterProto, lastSlash, baseFolder;
     if (((string_index_of(relativeUrl, "://") >= 0) || (string_index_of(relativeUrl, "data:") === 0))) {
         return relativeUrl;
     }
@@ -2777,7 +2777,7 @@ function resolveRelativeUrl(baseUrl, relativeUrl) {
 }
 
 function interceptViewportClicks() {
-    let contentArea, links;
+    let links, contentArea;
     contentArea = document.getElementById("reader-modal-content");
     if (!contentArea) {
         return 0;
@@ -2798,7 +2798,7 @@ function interceptViewportClicks() {
 }
 
 function renderNewTabPage(tab) {
-    let scDdg, scWiki, scGithub, newTabHtml, scTor, contentArea, form;
+    let form, scGithub, scDdg, scWiki, scTor, newTabHtml, contentArea;
     contentArea = document.getElementById("reader-modal-content");
     if ((tab.id !== window.activeTabId)) {
         return 0;
@@ -2840,7 +2840,7 @@ function renderNewTabPage(tab) {
 }
 
 function handleOnionViewResult(msg) {
-    let targetTab, tStart, tEnd, urlParts, htmlLower, progressBar, title, loader, activeTab, tabId, contentArea;
+    let title, htmlLower, contentArea, progressBar, activeTab, tStart, urlParts, targetTab, tEnd, loader, tabId;
     tabId = msg.tabId;
     targetTab = null;
     window.browserTabs.forEach((t) => {
@@ -2955,7 +2955,7 @@ function updateGitDecRepos(reposStr) {
 }
 
 function selectGitDecRepo(repoId) {
-    let detailsPanel, msg3, activeIdEl, msgFileList, msg1, viewerName, viewerContent, noSelected, msg2;
+    let msg2, activeIdEl, msgFileList, viewerName, msg3, msg1, viewerContent, detailsPanel, noSelected;
     window.gitdecActiveRepo = repoId;
     noSelected = document.getElementById("gitdec-no-repo-selected");
     detailsPanel = document.getElementById("gitdec-repo-details");
@@ -2994,7 +2994,7 @@ function selectGitDecRepo(repoId) {
 }
 
 function handleGitDecFile(repoId, filename, content) {
-    let localRole, auQuery, keys, prListEl, activeFileSpan, removeBtns, isOwner, manifest, branchSelect, visVal, visBadge, sRepoId, guideViewer, sRepoName, issueListEl, data, opt, commitListEl, fileViewer, branches, listEl, b_keys, visToggle, titleEl;
+    let auQuery, visBadge, localRole, fileViewer, listEl, sRepoName, branches, manifest, visToggle, keys, issueListEl, data, prListEl, b_keys, branchSelect, guideViewer, removeBtns, isOwner, sRepoId, visVal, titleEl, opt, commitListEl, activeFileSpan;
     if (((repoId === "ErnosDecent") && ((((((((((((filename === "docs/gitdec_user_guide.md") || (filename === "docs/system_guide_synthesis.md")) || (filename === "docs/ERNOS_REFERENCE.md")) || (filename === "README.md")) || (filename === "docs/settings_guide.md")) || (filename === "docs/identity_registry_guide.md")) || (filename === "docs/network_dht_guide.md")) || (filename === "docs/resource_pooling_guide.md")) || (filename === "docs/turing_hebbian_guide.md")) || (filename === "docs/messaging_social_guide.md")) || (filename === "docs/storage_crdt_guide.md")) || (filename === "docs/ledger_dex_guide.md")))) {
         guideViewer = document.getElementById("guide-text-content");
         if (guideViewer) {
@@ -3250,7 +3250,7 @@ function renderGitDecFiles(repoId, filesStr) {
 }
 
 function showGitDecIssueDetail(issue) {
-    let detailCard, titleEl, bodyRow, commentsContainer;
+    let bodyRow, titleEl, detailCard, commentsContainer;
     window.gitdecActiveIssue = issue;
     detailCard = document.getElementById("gitdec-issue-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -3276,7 +3276,7 @@ function showGitDecIssueDetail(issue) {
 }
 
 function showGitDecPrDetail(pr) {
-    let reviewsContainer, titleEl, descRow, detailCard, branchEl;
+    let reviewsContainer, branchEl, detailCard, titleEl, descRow;
     window.gitdecActivePr = pr;
     detailCard = document.getElementById("gitdec-pr-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -3310,7 +3310,7 @@ function showGitDecPrDetail(pr) {
 }
 
 function initGuide() {
-    let msg, activeBtn, btns, navList, file;
+    let navList, activeBtn, file, msg, btns;
     navList = document.getElementById("guide-nav-list");
     if (!navList) {
         return 0;
@@ -3347,7 +3347,7 @@ function initGuide() {
 }
 
 function initGitDec() {
-    let modalNewPr, settingsBtn, commitsBtn, btnNewPr, btnNewRepo, autoUpdateToggle, commitsPanel, formCommentIssue, btnCloseIssue, btnDeleteRepo, btnCloseImportRepo, formCreateRepo, btnNewIssue, prsPanel, issuesPanel, filesBtn, prsBtn, settingsPanel, btnImportRepo, formImportRepo, formReviewPr, btnCloneRepo, btnCloseNewPr, repoSearch, btnCloseNewIssue, btnCloseNewRepo, btnMergeMain, formSettingsAddCollab, formCreatePr, modalImportRepo, modalNewRepo, btnCloseCloneRepo, btnToggleVis, formCreateIssue, modalCloneRepo, modalNewIssue, filesPanel, formCloneRepo, issuesBtn;
+    let commitsPanel, formCreateIssue, modalNewPr, modalNewIssue, filesBtn, prsBtn, formCreatePr, btnToggleVis, formReviewPr, btnNewIssue, btnNewRepo, autoUpdateToggle, formImportRepo, formCreateRepo, formCommentIssue, btnCloseNewPr, formSettingsAddCollab, btnImportRepo, btnCloneRepo, commitsBtn, btnDeleteRepo, issuesBtn, issuesPanel, prsPanel, settingsPanel, btnCloseImportRepo, btnCloseNewIssue, modalNewRepo, btnMergeMain, repoSearch, btnNewPr, modalImportRepo, filesPanel, btnCloseNewRepo, modalCloneRepo, formCloneRepo, btnCloseCloneRepo, settingsBtn, btnCloseIssue;
     commitsBtn = document.getElementById("gitdec-tab-commits");
     filesBtn = document.getElementById("gitdec-tab-files");
     issuesBtn = document.getElementById("gitdec-tab-issues");
@@ -3748,7 +3748,7 @@ function initGitDec() {
 }
 
 function main() {
-    let dhtForm, btnHome, menuNewIncognito, channelBtns, dhtCardWide, readerModalHtml, btnReload, btnDecayMemory, turingForm, btnNewSession, btnSaveSystemConfig, savedLastName, guideBtns, btnSavePrompts, btnBack, chatForm, toggleWhatsapp, pageTitle, nameInput, btnSaveDiscord, toggleTelegram, wikiBookmark, onionCard, ddgBookmark, btnCloseBrowser, btnSwapTokens, btnForward, btnStar, torBookmark, aiModelSelect, navItems, onionForm, aiForm, menuReloadOption, btnMenu, savedTab, nameForm, btnSaveWhatsapp, btnRefreshHosts, clickFn, readerModal, btnTriggerAutonomy, btnSaveTelegram, subTabs, onionSearchHtml, menuBookmarkOption, btnAddTab, targetBtn, transferForm, toggleDiscord, menuExitOption, networkGrid, guideSections, btnAddPlugin, addressInput, tabPanels, menuNewTab;
+    let tabPanels, torBookmark, aiForm, chatForm, btnDecayMemory, turingForm, nameForm, channelBtns, btnMenu, onionSearchHtml, readerModal, toggleWhatsapp, savedLastName, menuNewTab, btnAddTab, btnForward, btnSaveTelegram, dhtForm, btnSaveDiscord, guideBtns, savedTab, networkGrid, toggleTelegram, aiModelSelect, clickFn, menuBookmarkOption, menuNewIncognito, btnSwapTokens, btnTriggerAutonomy, btnSaveWhatsapp, onionCard, ddgBookmark, btnAddPlugin, targetBtn, btnNewSession, wikiBookmark, transferForm, dhtCardWide, btnCloseBrowser, btnBack, btnRefreshHosts, addressInput, guideSections, subTabs, pageTitle, navItems, menuReloadOption, nameInput, readerModalHtml, onionForm, toggleDiscord, btnStar, menuExitOption, btnSaveSystemConfig, btnSavePrompts, btnReload, btnHome;
     window.ws = null;
     window.isConnected = false;
     window.uptimeSeconds = 0;
