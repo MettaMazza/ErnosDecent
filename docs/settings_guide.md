@@ -1,6 +1,18 @@
 # ErnosDecent Node Settings User Guide
 
-This guide details every configuration parameter and tab within the Settings interface of your sovereign node.
+This guide describes the Settings interface as implemented in July 2026. Saving a
+system setting writes `~/.ernosdecent/config.toml`; settings marked **startup** are
+read by `node.ep` on the next daemon launch. Settings marked **stored only** currently
+round-trip through the UI and TOML but are not consumed by the runtime. They are named
+explicitly here so the interface is not represented as enforcing controls it does not.
+
+The dashboard listens on `http://127.0.0.1:8088` by default. Before that listener
+starts, the node creates a random per-installation password at
+`~/.ernosdecent/web-password`, restricts it to mode `0600`, and prints it once to the
+operator log. Read the same value later with
+`tr -d '\r\n' < ~/.ernosdecent/web-password; printf '\n'`. If the file is empty or
+its permissions cannot be secured, the Web listener fails closed and reports the
+error; there is no shared default password.
 
 ---
 
@@ -32,43 +44,36 @@ The Platform Adapters sub-tab allows you to enable or disable messaging gateways
 This tab configures the daemon's underlying P2P network, Raft consensus database, block storage, and rate-limiting firewall policies.
 
 ### Core Node Settings
-- **Node Name**: A friendly identifier for your node, visible to other peers in the network and displayed in telemetry logs.
-- **Log Level**: Adjusts verbosity of daemon output. Options include:
-  - *Debug*: Extremely verbose output including low-level network packets, memory allocations, and state transactions.
-  - *Info*: Standard operational logs such as block commits, P2P handshake events, and node state changes.
-  - *Warn*: Highlights non-fatal errors, missing optional parameters, or potential connectivity bottlenecks.
-  - *Error*: Logs fatal problems that require action (e.g. database corruption, port binding conflicts).
-- **Data Directory**: The absolute filepath on the host system where blocks, wallet credentials, DHT cache tables, and database files are persisted (defaulting to `~/.ernosdecent`).
+- **Node Name — stored only**: A local label retained in the configuration.
+- **Log Level — stored only**: Retained in configuration; the logger does not currently apply this value as a filter.
+- **Data Directory — stored only**: Retained in configuration. Runtime state currently remains under `~/.ernosdecent`.
 
 ### Storage & DHT Cache
-- **Max Content Size (Bytes)**: The maximum permissible file or payload size that the node is willing to store in its Content-Addressable Storage (CAS) engine.
-- **DHT TTL (Seconds)**: Time-To-Live for DHT key-value entries. In Kademlia, values are republished periodically; this dictates how long a cached key is considered valid.
+- **Max Content Size (Bytes) — stored only**: Retained for a future storage-policy hook; it does not currently enforce a CAS limit.
+- **DHT TTL (Seconds) — stored only**: Retained for a future expiry-policy hook; it does not currently change DHT retention.
 
 ### Network Interfaces & Ports
-- **Listen Address**: The network interface address that the node binds to. Setting this to `0.0.0.0` allows connections on all interfaces, while `127.0.0.1` restricts daemon access to the local machine.
-- **Max P2P Connections**: The maximum number of concurrent TCP sockets the node will open to negotiate peer exchanges.
-- **P2P Port**: The network port assigned for standard P2P gossip protocol communication.
-- **DHT Port**: The port used by the Kademlia DHT routing engine for peer discovery query lookups.
-- **Relay Server Port**: The port assigned for TURN/STUN relay signaling to assist in NAT traversal for firewalled nodes.
-- **IPC Port**: The Unix/TCP loopback port for node-daemon communication (typically port `5000`).
-- **Web Port**: The port hosting the web application UI and its accompanying WebSocket endpoint (typically port `8080`).
-- **Max P2P Message Size (Bytes)**: The payload size limit for standard P2P gossip message transmission.
-- **Seed Peer IP/Addr**: The IP address of a stable bootstrapper or seed node used to join the network.
-- **Seed Peer Port**: The port of the bootstrapper/seed node.
-- **Enable Dynamic Host Election & Fallback Routing**: When enabled, the node participates in consensus-based leader elections to act as a primary network relay if other nodes fail.
-- **Static Preferred Host Node**: Overrides election protocols to mark this node as a high-priority root/seed node, bypassing standard fallback mechanisms.
+- **Listen Address — stored only**: Retained in TOML. The production build binds P2P/DHT/relay/raft/compute to all IPv4 interfaces and forces IPC/Web to loopback.
+- **Max P2P Connections — stored only**: No runtime connection cap currently reads this value.
+- **P2P Port — startup**: Encrypted peer traffic; default TCP `9100`.
+- **DHT Port — startup**: Bootstrap and Kademlia RPC traffic; default TCP `9101`.
+- **Relay Server Port — startup**: ErnosDecent relay registration/forwarding; default TCP `9102`. This is not a TURN or STUN server.
+- **IPC Port — startup**: Authenticated loopback control plane; default TCP `5000`.
+- **Web Port — startup**: Loopback HTTP/WebSocket dashboard; default TCP `8088`.
+- **Max P2P Message Size — stored only**: No transport framing limit currently reads this value.
+- **Public Hostname or IP — startup**: Address advertised to peers. Empty means detect the current public IPv4 address at launch.
+- **Seed Peer Address and Port — startup**: Optional explicit DHT bootstrap endpoint. It takes priority over cached peers and operated defaults.
+- **Enable Dynamic Host Election & Fallback Routing — startup**: Starts the host-election loop when set to `1`.
+- **Static Preferred Host Node — startup**: Gives this node static-host election priority and prevents the operated root from dialing its own shipped default aliases. Explicit and verified cached peers remain eligible.
 
 ### Raft Consensus Tuning
-- **Raft Port**: The port dedicated to executing Raft heartbeat and log synchronization protocols.
-- **Election Timeout (ms)**: The duration a follower waits without receiving a heartbeat before declaring a new election cycle.
-- **Heartbeat Interval (ms)**: The rate at which the Raft leader sends heartbeats to maintain consensus.
+- **Raft Port — startup**: Raft transport listener; default TCP `9103`.
+- **Election Timeout and Heartbeat Interval — stored only**: The current Raft runtime does not consume these TOML values.
 
 ### Firewall & Security Bounds
-- **Rate Limit (req/min)**: The maximum number of requests a single IP address can make before trigger events are logged as suspicious.
-- **Violations Ban Threshold**: The number of rule violations (e.g. invalid signatures, rate-limit overflow) before the firewall temporarily blocks the offending peer IP.
-- **Ban Duration (Seconds)**: The duration an IP remains blacklisted after crossing the violations threshold.
+- **Rate Limit, Violations Ban Threshold, and Ban Duration — stored only**: The security module has enforcement routines, but these dashboard values are not currently passed into them.
 
-- **Save System Configuration Button**: Validates and writes all system configuration changes to the daemon config file. Note that port changes require a daemon restart.
+- **Save System Configuration Button**: Parses supplied fields and writes the daemon config file. Startup settings require a daemon restart. Endpoint validity is enforced during node startup; the UI is not a complete semantic validator.
 
 ---
 

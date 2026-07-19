@@ -88,7 +88,7 @@ hosts it peer-to-peer, with each change cryptographically signed.
 website that could delete it.
 
 **Hash** — A fingerprint of data: a short string that changes completely if even one byte changes.
-ErnosDecent uses *BLAKE3*. Used to name files by their contents and to detect tampering.
+ErnosDecent uses *SHA-256* to name files by their contents and detect tampering.
 
 **HD wallet** — A wallet whose every key can be regenerated from one *seed phrase* (a short list of
 ordinary words). Keep the words safe and you can rebuild the whole wallet on a new machine.

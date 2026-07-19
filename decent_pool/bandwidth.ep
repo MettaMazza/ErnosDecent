@@ -17,6 +17,14 @@ set BANDWIDTH_ERR_RATE_LIMITED to 802
 set BANDWIDTH_ERR_INVALID_DIRECTION to 803
 set BANDWIDTH_ERR_INVALID_TIER to 804
 set BANDWIDTH_ERR_UNREACHABLE to 805
+set BANDWIDTH_ERR_SEND_FAILED to 806
+set BANDWIDTH_ERR_RECV_FAILED to 807
+set BANDWIDTH_ERR_CLOSE_FAILED to 808
+set BANDWIDTH_ERR_INVALID_BYTES to 809
+set BANDWIDTH_ERR_OVERFLOW to 810
+set BANDWIDTH_ERR_INVALID_NODE to 811
+set BANDWIDTH_ERR_LOCK_FAILED to 812
+set BANDWIDTH_ERR_UNLOCK_FAILED to 813
 
 # ================================================================
 # Data Structures
@@ -47,6 +55,12 @@ define bandwidth_create_pool returning Map:
     set ok to map_insert(pool and "peers" and peers)
     set ok to map_insert(pool and "tiers" and tiers)
     set ok to map_insert(pool and "total_pooled_bandwidth_kbps" and 0)
+    set mutex to create_mutex()
+    set ok to map_insert(pool and "mutex" and mutex)
+    set ok to map_insert(pool and "error" and 0)
+    if mutex == 0:
+        display "ERROR: bandwidth pool mutex creation failed"
+        set ok to map_insert(pool and "error" and BANDWIDTH_ERR_LOCK_FAILED)
 
     # Initialize standard tiers
     # Free tier: low priority, low speed
@@ -73,9 +87,20 @@ define bandwidth_create_pool returning Map:
     return pool
 
 define bandwidth_add_peer with pool as Map and node_id as Str returning Int:
+    if string_length(node_id) == 0:
+        return BANDWIDTH_ERR_INVALID_NODE
+    set mutex to map_get_val(pool and "mutex")
+    if mutex == 0:
+        return BANDWIDTH_ERR_LOCK_FAILED
+    set lock_ok to lock_mutex(mutex)
+    if lock_ok == 0:
+        return BANDWIDTH_ERR_LOCK_FAILED
     set peers to map_get_val(pool and "peers")
     set existing to map_get_val(peers and node_id)
     if existing != 0:
+        set unlock_ok to unlock_mutex(mutex)
+        if unlock_ok == 0:
+            return BANDWIDTH_ERR_UNLOCK_FAILED
         return BANDWIDTH_ERR_NONE
 
     set peer to create_map()
@@ -85,8 +110,21 @@ define bandwidth_add_peer with pool as Map and node_id as Str returning Int:
     set ok to map_insert(peer and "contribution_score" and 0)
     set ok to map_insert(peer and "tier_name" and "free")
     set ok to map_insert(peer and "last_active" and ep_time_now_sec())
+    set ok to map_insert(peer and "window_start" and ep_time_now_sec())
+    set ok to map_insert(peer and "window_downloaded" and 0)
 
     set ok to map_insert(peers and node_id and peer)
+    set unlock_ok to unlock_mutex(mutex)
+    if unlock_ok == 0:
+        return BANDWIDTH_ERR_UNLOCK_FAILED
+    return BANDWIDTH_ERR_NONE
+
+# Reset a peer's fixed 60-second accounting window once it expires. Caller holds mutex.
+define bandwidth_refresh_window_locked with peer as Map and now_sec as Int returning Int:
+    set window_start to map_get_val(peer and "window_start")
+    if window_start <= 0 or else now_sec < window_start or else now_sec - window_start >= 60:
+        set ok to map_insert(peer and "window_start" and now_sec)
+        set ok to map_insert(peer and "window_downloaded" and 0)
     return BANDWIDTH_ERR_NONE
 
 # ================================================================
@@ -94,20 +132,52 @@ define bandwidth_add_peer with pool as Map and node_id as Str returning Int:
 # ================================================================
 
 define bandwidth_record_traffic with pool as Map and node_id as Str and bytes as Int and direction as Str returning Int:
+    if bytes < 0:
+        return BANDWIDTH_ERR_INVALID_BYTES
+    set mutex to map_get_val(pool and "mutex")
+    if mutex == 0:
+        return BANDWIDTH_ERR_LOCK_FAILED
+    set lock_ok to lock_mutex(mutex)
+    if lock_ok == 0:
+        return BANDWIDTH_ERR_LOCK_FAILED
     set peers to map_get_val(pool and "peers")
     set peer to map_get_val(peers and node_id)
     if peer == 0:
+        set unlock_ok to unlock_mutex(mutex)
+        if unlock_ok == 0:
+            return BANDWIDTH_ERR_UNLOCK_FAILED
         return BANDWIDTH_ERR_PEER_NOT_FOUND
 
     set bytes_up to map_get_val(peer and "bytes_uploaded")
     set bytes_down to map_get_val(peer and "bytes_downloaded")
 
     if direction equals "upload":
+        if bytes > 9223372036854775807 - bytes_up:
+            set unlock_ok to unlock_mutex(mutex)
+            if unlock_ok == 0:
+                return BANDWIDTH_ERR_UNLOCK_FAILED
+            return BANDWIDTH_ERR_OVERFLOW
         set ok to map_insert(peer and "bytes_uploaded" and bytes_up + bytes)
     else:
         if direction equals "download":
+            if bytes > 9223372036854775807 - bytes_down:
+                set unlock_ok to unlock_mutex(mutex)
+                if unlock_ok == 0:
+                    return BANDWIDTH_ERR_UNLOCK_FAILED
+                return BANDWIDTH_ERR_OVERFLOW
+            set refresh_err to bandwidth_refresh_window_locked(peer and ep_time_now_sec())
+            set window_downloaded to map_get_val(peer and "window_downloaded")
+            if bytes > 9223372036854775807 - window_downloaded:
+                set unlock_ok to unlock_mutex(mutex)
+                if unlock_ok == 0:
+                    return BANDWIDTH_ERR_UNLOCK_FAILED
+                return BANDWIDTH_ERR_OVERFLOW
             set ok to map_insert(peer and "bytes_downloaded" and bytes_down + bytes)
+            set ok to map_insert(peer and "window_downloaded" and window_downloaded + bytes)
         else:
+            set unlock_ok to unlock_mutex(mutex)
+            if unlock_ok == 0:
+                return BANDWIDTH_ERR_UNLOCK_FAILED
             return BANDWIDTH_ERR_INVALID_DIRECTION
 
     # Recalculate contribution score: Contribution = Upload - (Download / 2)
@@ -127,58 +197,102 @@ define bandwidth_record_traffic with pool as Map and node_id as Str and bytes as
             set ok to map_insert(peer and "tier_name" and "premium")
 
     set ok to map_insert(peer and "last_active" and ep_time_now_sec())
+    set unlock_ok to unlock_mutex(mutex)
+    if unlock_ok == 0:
+        return BANDWIDTH_ERR_UNLOCK_FAILED
     return BANDWIDTH_ERR_NONE
 
 define bandwidth_check_limit with pool as Map and node_id as Str and tier_name as Str returning Int:
+    set mutex to map_get_val(pool and "mutex")
+    if mutex == 0:
+        return BANDWIDTH_ERR_LOCK_FAILED
+    set lock_ok to lock_mutex(mutex)
+    if lock_ok == 0:
+        return BANDWIDTH_ERR_LOCK_FAILED
     set peers to map_get_val(pool and "peers")
     set peer to map_get_val(peers and node_id)
     if peer == 0:
+        set unlock_ok to unlock_mutex(mutex)
+        if unlock_ok == 0:
+            return BANDWIDTH_ERR_UNLOCK_FAILED
         return BANDWIDTH_ERR_PEER_NOT_FOUND
 
     set tiers to map_get_val(pool and "tiers")
     set tier to map_get_val(tiers and tier_name)
     if tier == 0:
+        set unlock_ok to unlock_mutex(mutex)
+        if unlock_ok == 0:
+            return BANDWIDTH_ERR_UNLOCK_FAILED
+        return BANDWIDTH_ERR_INVALID_TIER
+    set assigned_tier to map_get_val(peer and "tier_name")
+    if (assigned_tier equals tier_name) == 0:
+        set unlock_ok to unlock_mutex(mutex)
+        if unlock_ok == 0:
+            return BANDWIDTH_ERR_UNLOCK_FAILED
         return BANDWIDTH_ERR_INVALID_TIER
 
     set limit_kbps to map_get_val(tier and "rate_limit_kbps")
-    
-    # We check if a peer's recent consumption rate is within limits.
-    # In this simulated pooling model, a node's usage is evaluated against their tier threshold.
-    # If the tier is free, we impose a simulated limit check where if they have downloaded 
-    # more than 10MB in the current minute window, they get rate-limited.
-    # Emergency tier allows up to 50MB, and Premium allows 1GB.
-    set bytes_down to map_get_val(peer and "bytes_downloaded")
-    set limit_bytes to 0
-    
-    if tier_name equals "free":
-        set limit_bytes to 10485760 # 10 MB
-    else:
-        if tier_name equals "emergency":
-            set limit_bytes to 52428800 # 50 MB
-        else:
-            if tier_name equals "premium":
-                set limit_bytes to 1073741824 # 1 GB
-
-    if bytes_down > limit_bytes:
+    if limit_kbps <= 0:
+        set unlock_ok to unlock_mutex(mutex)
+        if unlock_ok == 0:
+            return BANDWIDTH_ERR_UNLOCK_FAILED
+        return BANDWIDTH_ERR_INVALID_TIER
+    set refresh_err to bandwidth_refresh_window_locked(peer and ep_time_now_sec())
+    set window_downloaded to map_get_val(peer and "window_downloaded")
+    # kbps is decimal kilobits per second: 1000 / 8 bytes each second, over 60 seconds.
+    set limit_bytes to limit_kbps * 125 * 60
+    set limit_error to BANDWIDTH_ERR_NONE
+    if window_downloaded > limit_bytes:
+        set limit_error to BANDWIDTH_ERR_RATE_LIMITED
+    set unlock_ok to unlock_mutex(mutex)
+    if unlock_ok == 0:
+        return BANDWIDTH_ERR_UNLOCK_FAILED
+    if limit_error != BANDWIDTH_ERR_NONE:
         return BANDWIDTH_ERR_RATE_LIMITED
 
     return BANDWIDTH_ERR_NONE
+
+define bandwidth_peer_tier with pool as Map and node_id as Str returning Str:
+    set mutex to map_get_val(pool and "mutex")
+    if mutex == 0:
+        display "ERROR: bandwidth peer-tier lookup has no mutex"
+        return ""
+    set lock_ok to lock_mutex(mutex)
+    if lock_ok == 0:
+        display "ERROR: bandwidth peer-tier mutex lock failed"
+        return ""
+    set peers to map_get_val(pool and "peers")
+    set peer to map_get_val(peers and node_id)
+    set tier_name to ""
+    if peer != 0:
+        set tier_name to map_get_val(peer and "tier_name")
+    set unlock_ok to unlock_mutex(mutex)
+    if unlock_ok == 0:
+        display "ERROR: bandwidth peer-tier mutex unlock failed"
+        return ""
+    return tier_name
 
 # ================================================================
 # Collaborative Routing Proxy
 # ================================================================
 
-# Forward a sender's request to a real destination over TCP on their behalf (a real
-# bandwidth-sharing relay — previously this only echoed the payload and "simulated"
-# routing). Records the actual bytes relayed in both directions for accounting and
+# Forward a sender's request to a real destination over TCP on their behalf. The former
+# implementation only echoed the payload and did not enforce routing. This implementation
+# records the actual bytes relayed in both directions for accounting and
 # returns the destination's real reply.
 define bandwidth_route_proxy with pool as Map and sender_id as Str and dest_address as Str and dest_port as Int and msg_type as Str and payload as Str returning Map:
     set result to create_map()
-    set ok to bandwidth_add_peer(pool and sender_id)
+    set add_err to bandwidth_add_peer(pool and sender_id)
+    if add_err != BANDWIDTH_ERR_NONE:
+        set ok to map_insert(result and "error" and add_err)
+        set ok to map_insert(result and "status" and "peer_registration_failed")
+        return result
 
-    set peers to map_get_val(pool and "peers")
-    set peer to map_get_val(peers and sender_id)
-    set tier_name to map_get_val(peer and "tier_name")
+    set tier_name to bandwidth_peer_tier(pool and sender_id)
+    if string_length(tier_name) == 0:
+        set ok to map_insert(result and "error" and BANDWIDTH_ERR_LOCK_FAILED)
+        set ok to map_insert(result and "status" and "tier_lookup_failed")
+        return result
 
     # Check if sender is rate-limited
     set limit_check to bandwidth_check_limit(pool and sender_id and tier_name)
@@ -196,18 +310,52 @@ define bandwidth_route_proxy with pool as Map and sender_id as Str and dest_addr
         return result
 
     set up_bytes to string_length(payload)
-    set ok to transport_send(conn and msg_type and payload)
+    set send_err to transport_send(conn and msg_type and payload)
+    if send_err != TRANSPORT_ERR_NONE:
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and BANDWIDTH_ERR_CLOSE_FAILED)
+            set ok to map_insert(result and "status" and "send_and_close_failed")
+        else:
+            set ok to map_insert(result and "error" and BANDWIDTH_ERR_SEND_FAILED)
+            set ok to map_insert(result and "status" and "send_failed")
+        return result
     # Sender's request egresses through us: that is upload bandwidth we contribute.
-    set ok to bandwidth_record_traffic(pool and sender_id and up_bytes and "upload")
+    set accounting_error to bandwidth_record_traffic(pool and sender_id and up_bytes and "upload")
+    if accounting_error != BANDWIDTH_ERR_NONE:
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and BANDWIDTH_ERR_CLOSE_FAILED)
+            set ok to map_insert(result and "status" and "accounting_and_close_failed")
+        else:
+            set ok to map_insert(result and "error" and accounting_error)
+            set ok to map_insert(result and "status" and "accounting_failed")
+        return result
 
     set reply to transport_recv(conn)
-    set ok to transport_close(conn)
+    set close_err to transport_close(conn)
+    if close_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and BANDWIDTH_ERR_CLOSE_FAILED)
+        set ok to map_insert(result and "status" and "close_failed")
+        return result
     set resp_payload to ""
-    if map_get_val(reply and "error") == 0:
-        set resp_payload to ptr_to_str(map_get_val(reply and "payload"))
+    if map_get_val(reply and "error") != 0:
+        set ok to map_insert(result and "error" and BANDWIDTH_ERR_RECV_FAILED)
+        set ok to map_insert(result and "status" and "receive_failed")
+        return result
+    set resp_payload to ptr_to_str(map_get_val(reply and "payload"))
     set down_bytes to string_length(resp_payload)
     # The reply we relay back to the sender is download bandwidth.
-    set ok to bandwidth_record_traffic(pool and sender_id and down_bytes and "download")
+    set accounting_error to bandwidth_record_traffic(pool and sender_id and down_bytes and "download")
+    if accounting_error != BANDWIDTH_ERR_NONE:
+        set ok to map_insert(result and "error" and accounting_error)
+        set ok to map_insert(result and "status" and "accounting_failed")
+        return result
+    set post_limit_check to bandwidth_check_limit(pool and sender_id and tier_name)
+    if post_limit_check != BANDWIDTH_ERR_NONE:
+        set ok to map_insert(result and "error" and post_limit_check)
+        set ok to map_insert(result and "status" and "rate_limited")
+        return result
 
     set ok to map_insert(result and "error" and BANDWIDTH_ERR_NONE)
     set ok to map_insert(result and "status" and "routed")

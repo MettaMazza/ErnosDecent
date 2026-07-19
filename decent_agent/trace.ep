@@ -58,6 +58,8 @@ define trace_init with db as Int returning Int:
         return 1
     # Whisper mid-turn user guidance — bridge INSERTs, react loop SELECTs + DELETEs
     set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS trace_whispers (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0);")
+    if ok != 0:
+        return 1
     # Sub-agent approval forwarding — sub-agent INSERTs pending, polls for decision;
     # IPC AI APPROVE handler UPDATEs the decision column. Session_id is the sub-agent's
     # task_id (e.g. "agent_1"). Cleaned up after the sub-agent resumes.
@@ -69,7 +71,11 @@ define trace_init with db as Int returning Int:
     # rows (Maria's agent_7 workspace_link hang). This table holds only in-flight
     # requests (none survive a restart), so DROP + recreate at boot is a safe migration.
     set ok to sql_execute(db and "DROP TABLE IF EXISTS trace_approvals;")
+    if ok != 0:
+        return 1
     set ok to sql_execute(db and "CREATE TABLE trace_approvals (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, tool_name TEXT NOT NULL, args_str TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', decision TEXT DEFAULT NULL, created_at INTEGER NOT NULL DEFAULT 0);")
+    if ok != 0:
+        return 1
     return 0
 
 # ================================================================
@@ -91,6 +97,8 @@ define trace_emit with db as Int and session_id as Str and event_type as Str and
     set q to concat("INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('" and es)
     set q to concat(q and concat("', '" and concat(et and concat("', '" and concat(ec and concat("', " and concat(int_to_string(now) and ", 0);")))))))
     set ok to sql_execute(db and q)
+    if ok != 0:
+        return ok
     return 0
 
 # ================================================================
@@ -117,6 +125,8 @@ define trace_poll with db as Int and session_id as Str returning Str:
         set out to concat(out and concat(",\"ts\":" and concat(get_list(r and 3) and "}")))
         # Mark as sent
         set ok to sql_execute(db and concat("UPDATE trace_events SET sent=1 WHERE id=" and concat(id_str and ";")))
+        if ok != 0:
+            return concat("{\"error\":\"trace event delivery state update failed\",\"sqlite_code\":" and concat(int_to_string(ok) and "}"))
         set i to i + 1
     set out to concat(out and "]")
     return out
@@ -130,7 +140,7 @@ define trace_cleanup with db as Int and session_id as Str returning Int:
         return 1
     set es to trace_sql_escape(session_id)
     set ok to sql_execute(db and concat("DELETE FROM trace_events WHERE session_id='" and concat(es and "';")))
-    return 0
+    return ok
 
 # ================================================================
 # Pending Thread Deletions — crash-resilient Discord thread cleanup
@@ -145,7 +155,7 @@ define trace_schedule_delete with db as Int and thread_id as Str and delay_secs 
     set q to concat("INSERT INTO trace_pending_deletes (thread_id, delete_after, created_at) VALUES ('" and et)
     set q to concat(q and concat("', " and concat(int_to_string(delete_after) and concat(", " and concat(int_to_string(now) and ");")))))
     set ok to sql_execute(db and q)
-    return 0
+    return ok
 
 define trace_get_pending_deletes with db as Int returning Str:
     if db == 0:
@@ -170,4 +180,4 @@ define trace_complete_delete with db as Int and id as Int returning Int:
     if db == 0:
         return 1
     set ok to sql_execute(db and concat("DELETE FROM trace_pending_deletes WHERE id=" and concat(int_to_string(id) and ";")))
-    return 0
+    return ok

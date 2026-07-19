@@ -22,6 +22,7 @@ set DHT_ERR_EXPIRED to 504
 set DHT_ERR_INVALID_MESSAGE to 505
 set DHT_ERR_SELF_INSERT to 506
 set DHT_ERR_STORE_REJECTED to 507
+set DHT_ERR_LOCK_FAILED to 508
 
 # Kademlia parameters
 set DHT_K to 20
@@ -167,7 +168,7 @@ define is_distance_less with dist_a as Str and dist_b as Str returning Int:
 # Stored as a map: { id, address, port, last_seen }
 # ================================================================
 
-define create_node with node_id as Str and address as Str and port as Int:
+define create_node with node_id as Str and address as Str and port as Int returning Map:
     set node to create_map()
     set ok to map_insert(node and "id" and node_id)
     set ok to map_insert(node and "address" and address)
@@ -175,10 +176,10 @@ define create_node with node_id as Str and address as Str and port as Int:
     set ok to map_insert(node and "last_seen" and ep_time_now_sec())
     return node
 
-define node_get_id with node as Int returning Str:
+define node_get_id with node as Map returning Str:
     return map_get_val(node and "id")
 
-define node_update_seen with node as Int:
+define node_update_seen with node as Map returning Int:
     set ok to map_insert(node and "last_seen" and ep_time_now_sec())
     return 0
 
@@ -187,23 +188,23 @@ define node_update_seen with node as Int:
 # Least recently seen at front, most recently seen at back
 # ================================================================
 
-define create_bucket:
+define create_bucket returning Map:
     set bucket to create_map()
     set nodes to create_list()
     set ok to map_insert(bucket and "nodes" and nodes)
     set ok to map_insert(bucket and "count" and 0)
     return bucket
 
-define bucket_count with bucket as Int returning Int:
+define bucket_count with bucket as Map returning Int:
     return map_get_val(bucket and "count")
 
-define bucket_is_full with bucket as Int returning Int:
+define bucket_is_full with bucket as Map returning Int:
     set count to map_get_val(bucket and "count")
     if count >= DHT_K:
         return 1
     return 0
 
-define bucket_contains with bucket as Int and node_id as Str returning Int:
+define bucket_contains with bucket as Map and node_id as Str returning Int:
     # Returns 1 if the bucket contains a node with the given ID
     set nodes to map_get_val(bucket and "nodes")
     set count to map_get_val(bucket and "count")
@@ -216,7 +217,7 @@ define bucket_contains with bucket as Int and node_id as Str returning Int:
         set i to i + 1
     return 0
 
-define bucket_find_index with bucket as Int and node_id as Str returning Int:
+define bucket_find_index with bucket as Map and node_id as Str returning Int:
     # Returns index of node in bucket, or -1 if not found
     set nodes to map_get_val(bucket and "nodes")
     set count to map_get_val(bucket and "count")
@@ -229,7 +230,7 @@ define bucket_find_index with bucket as Int and node_id as Str returning Int:
         set i to i + 1
     return 0 - 1
 
-define bucket_add_or_update with bucket as Int and node as Int returning Int:
+define bucket_add_or_update with bucket as Map and node as Map returning Int:
     # Add a node to the bucket, or move it to the back if already present
     # Returns: 0 = added, 1 = updated, DHT_ERR_BUCKET_FULL = full
     set node_id to map_get_val(node and "id")
@@ -262,15 +263,17 @@ define bucket_add_or_update with bucket as Int and node as Int returning Int:
     set ok to map_insert(bucket and "count" and count + 1)
     return 0
 
-define bucket_get_nodes with bucket as Int:
+define bucket_get_nodes with bucket as Map returning Int:
     # Returns the list of nodes in this bucket
     return map_get_val(bucket and "nodes")
 
-define bucket_remove with bucket as Int and node_id as Str returning Int:
+define bucket_remove with bucket as Map and node_id as Str returning Int:
     # Remove a node from the bucket by ID
     set lock to map_get_val(bucket and "lock")
     if lock != 0:
-        set ok to lock_mutex(lock)
+        set lock_ok to lock_mutex(lock)
+        if lock_ok == 0:
+            return DHT_ERR_LOCK_FAILED
     set nodes to map_get_val(bucket and "nodes")
     set count to map_get_val(bucket and "count")
 
@@ -290,14 +293,16 @@ define bucket_remove with bucket as Int and node_id as Str returning Int:
         set ok to map_insert(bucket and "nodes" and new_nodes)
         set ok to map_insert(bucket and "count" and count - 1)
     if lock != 0:
-        set ok to unlock_mutex(lock)
+        set unlock_ok to unlock_mutex(lock)
+        if unlock_ok == 0:
+            return DHT_ERR_LOCK_FAILED
     return removed
 
 # ================================================================
 # Routing Table -- 256 k-buckets indexed by leading zeros of XOR distance
 # ================================================================
 
-define create_routing_table with local_id as Str:
+define create_routing_table with local_id as Str returning Map:
     set rt to create_map()
     set ok to map_insert(rt and "local_id" and local_id)
 
@@ -313,7 +318,7 @@ define create_routing_table with local_id as Str:
     set ok to map_insert(rt and "node_count" and 0)
     return rt
 
-define routing_table_add with rt as Int and node as Int returning Int:
+define routing_table_add with rt as Map and node as Map returning Int:
     # Add a node to the routing table
     set local_id to map_get_val(rt and "local_id")
     set node_id to map_get_val(node and "id")
@@ -344,7 +349,7 @@ define routing_table_add with rt as Int and node as Int returning Int:
         set ok to map_insert(rt and "node_count" and current_count + 1)
     return result
 
-define routing_table_remove with rt as Int and node_id as Str returning Int:
+define routing_table_remove with rt as Map and node_id as Str returning Int:
     set local_id to map_get_val(rt and "local_id")
     set dist to xor_distance(local_id and node_id)
     set bucket_idx to bucket_index_for_distance(dist)
@@ -356,17 +361,23 @@ define routing_table_remove with rt as Int and node_id as Str returning Int:
     set bucket to get_list(buckets and bucket_idx)
 
     set removed to bucket_remove(bucket and node_id)
+    if removed == DHT_ERR_LOCK_FAILED:
+        return removed
     if removed == 1:
         set lock to map_get_val(rt and "lock")
         if lock != 0:
-            set ok to lock_mutex(lock)
+            set lock_ok to lock_mutex(lock)
+            if lock_ok == 0:
+                return DHT_ERR_LOCK_FAILED
         set current_count to map_get_val(rt and "node_count")
         set ok to map_insert(rt and "node_count" and current_count - 1)
         if lock != 0:
-            set ok to unlock_mutex(lock)
+            set unlock_ok to unlock_mutex(lock)
+            if unlock_ok == 0:
+                return DHT_ERR_LOCK_FAILED
     return removed
 
-define routing_table_find_closest with rt as Int and target_id as Str and count as Int:
+define routing_table_find_closest with rt as Map and target_id as Str and count as Int returning List:
     # Find the 'count' closest nodes to target_id from the routing table
     # Returns a list of nodes sorted by XOR distance to target_id
     set local_id to map_get_val(rt and "local_id")
@@ -432,7 +443,7 @@ define routing_table_find_closest with rt as Int and target_id as Str and count 
 
     return result
 
-define routing_table_contains with rt as Int and node_id as Str returning Int:
+define routing_table_contains with rt as Map and node_id as Str returning Int:
     set local_id to map_get_val(rt and "local_id")
     set dist to xor_distance(local_id and node_id)
     set bucket_idx to bucket_index_for_distance(dist)
@@ -444,20 +455,20 @@ define routing_table_contains with rt as Int and node_id as Str returning Int:
     set bucket to get_list(buckets and bucket_idx)
     return bucket_contains(bucket and node_id)
 
-define routing_table_node_count with rt as Int returning Int:
+define routing_table_node_count with rt as Map returning Int:
     return map_get_val(rt and "node_count")
 
 # ================================================================
 # Value Store -- content-addressed storage with TTL
 # ================================================================
 
-define create_value_store:
+define create_value_store returning Map:
     set store to create_map()
     set data to create_map()
     set ok to map_insert(store and "data" and data)
     return store
 
-define value_store_put with store as Int and key as Str and value as Str and publisher_id as Str:
+define value_store_put with store as Map and key as Str and value as Str and publisher_id as Str returning Int:
     # Store a value with TTL
     set data to map_get_val(store and "data")
 
@@ -484,7 +495,7 @@ define value_store_put with store as Int and key as Str and value as Str and pub
     set ok to map_insert(data and key and entry)
     return DHT_ERR_NONE
 
-define value_store_get with store as Int and key as Str:
+define value_store_get with store as Map and key as Str returning Map:
     # Retrieve a value, checking TTL
     set result to create_map()
     set data to map_get_val(store and "data")
@@ -509,7 +520,7 @@ define value_store_get with store as Int and key as Str:
     set ok to map_insert(result and "error" and DHT_ERR_NONE)
     return result
 
-define value_store_delete with store as Int and key as Str returning Int:
+define value_store_delete with store as Map and key as Str returning Int:
     set data to map_get_val(store and "data")
     return map_delete(data and key)
 
@@ -517,13 +528,16 @@ define value_store_delete with store as Int and key as Str returning Int:
 # DHT Node -- Complete Kademlia node (routing table + value store)
 # ================================================================
 
-define create_dht_node with node_id as Str and address as Str and port as Int:
+define create_dht_node with node_id as Str and address as Str and port as Int returning Map:
     set dht to create_map()
     set ok to map_insert(dht and "id" and node_id)
     set ok to map_insert(dht and "address" and address)
     set ok to map_insert(dht and "port" and port)
 
     set lock to create_mutex()
+    if lock == 0:
+        set ok to map_insert(dht and "error" and DHT_ERR_LOCK_FAILED)
+        return dht
     set ok to map_insert(dht and "lock" and lock)
 
     set rt to create_routing_table(node_id)
@@ -545,52 +559,87 @@ define create_dht_node with node_id as Str and address as Str and port as Int:
     set ok to map_insert(dht and "error" and DHT_ERR_NONE)
     return dht
 
-define dht_node_add_peer with dht as Int and peer_id as Str and peer_addr as Str and peer_port as Int returning Int:
+define dht_node_add_peer with dht as Map and peer_id as Str and peer_addr as Str and peer_port as Int returning Int:
     set lock to map_get_val(dht and "lock")
-    if lock != 0:
-        set ok to lock_mutex(lock)
+    if lock == 0:
+        return DHT_ERR_LOCK_FAILED
+    set lock_ok to lock_mutex(lock)
+    if lock_ok == 0:
+        return DHT_ERR_LOCK_FAILED
     set rt to map_get_val(dht and "routing_table")
     set peer_node to create_node(peer_id and peer_addr and peer_port)
     # Persist peer to storage
     set save_ok to storage_dht_put_peer(peer_id and peer_addr and peer_port)
+    if save_ok != STORAGE_ERR_NONE:
+        set unlock_ok to unlock_mutex(lock)
+        if unlock_ok == 0:
+            return DHT_ERR_LOCK_FAILED
+        return DHT_ERR_STORE_REJECTED
     set result to routing_table_add(rt and peer_node)
-    if lock != 0:
-        set ok to unlock_mutex(lock)
+    set unlock_ok to unlock_mutex(lock)
+    if unlock_ok == 0:
+        return DHT_ERR_LOCK_FAILED
     return result
 
-define dht_node_find_closest with dht as Int and target_id as Str and count as Int:
+define dht_node_find_closest with dht as Map and target_id as Str and count as Int returning Map:
+    set response to create_map()
     set lock to map_get_val(dht and "lock")
-    if lock != 0:
-        set ok to lock_mutex(lock)
+    if lock == 0:
+        set ok to map_insert(response and "error" and DHT_ERR_LOCK_FAILED)
+        return response
+    set lock_ok to lock_mutex(lock)
+    if lock_ok == 0:
+        set ok to map_insert(response and "error" and DHT_ERR_LOCK_FAILED)
+        return response
     set rt to map_get_val(dht and "routing_table")
     set result to routing_table_find_closest(rt and target_id and count)
-    if lock != 0:
-        set ok to unlock_mutex(lock)
-    return result
+    set unlock_ok to unlock_mutex(lock)
+    if unlock_ok == 0:
+        set ok to map_insert(response and "error" and DHT_ERR_LOCK_FAILED)
+        return response
+    set ok to map_insert(response and "nodes" and result)
+    set ok to map_insert(response and "error" and DHT_ERR_NONE)
+    return response
 
-define dht_node_store_value with dht as Int and key as Str and value as Str returning Int:
+define dht_node_store_value with dht as Map and key as Str and value as Str returning Int:
     set lock to map_get_val(dht and "lock")
-    if lock != 0:
-        set ok to lock_mutex(lock)
+    if lock == 0:
+        return DHT_ERR_LOCK_FAILED
+    set lock_ok to lock_mutex(lock)
+    if lock_ok == 0:
+        return DHT_ERR_LOCK_FAILED
     set store to map_get_val(dht and "store")
     set publisher_id to map_get_val(dht and "id")
     # Persist to SQLite alongside in-memory store
     set save_ok to storage_dht_put(key and value and publisher_id and ep_time_now_sec() and 0)
+    if save_ok != 0:
+        set unlock_ok to unlock_mutex(lock)
+        if unlock_ok == 0:
+            return DHT_ERR_LOCK_FAILED
+        return save_ok
     set result to value_store_put(store and key and value and publisher_id)
-    if lock != 0:
-        set ok to unlock_mutex(lock)
+    set unlock_ok to unlock_mutex(lock)
+    if unlock_ok == 0:
+        return DHT_ERR_LOCK_FAILED
     return result
 
-define dht_node_get_value with dht as Int and key as Str:
+define dht_node_get_value with dht as Map and key as Str returning Map:
+    set lock_error_result to create_map()
     set lock to map_get_val(dht and "lock")
-    if lock != 0:
-        set ok to lock_mutex(lock)
+    if lock == 0:
+        set ok to map_insert(lock_error_result and "error" and DHT_ERR_LOCK_FAILED)
+        return lock_error_result
+    set lock_ok to lock_mutex(lock)
+    if lock_ok == 0:
+        set ok to map_insert(lock_error_result and "error" and DHT_ERR_LOCK_FAILED)
+        return lock_error_result
     set store to map_get_val(dht and "store")
     set mem_result to value_store_get(store and key)
     set mem_err to map_get_val(mem_result and "error")
     if mem_err == DHT_ERR_NONE:
-        if lock != 0:
-            set ok to unlock_mutex(lock)
+        set unlock_ok to unlock_mutex(lock)
+        if unlock_ok == 0:
+            set ok to map_insert(mem_result and "error" and DHT_ERR_LOCK_FAILED)
         return mem_result
     # Fallback to persistent storage
     set persisted to storage_dht_get(key)
@@ -604,21 +653,27 @@ define dht_node_get_value with dht as Int and key as Str:
         set ok to map_insert(result and "stored_at" and ep_time_now_sec())
         set ok to map_insert(result and "expires_at" and ep_time_now_sec() + DHT_VALUE_TTL_SECONDS)
         set ok to map_insert(result and "error" and DHT_ERR_NONE)
-        if lock != 0:
-            set ok to unlock_mutex(lock)
+        set unlock_ok to unlock_mutex(lock)
+        if unlock_ok == 0:
+            set ok to map_insert(result and "error" and DHT_ERR_LOCK_FAILED)
         return result
-    if lock != 0:
-        set ok to unlock_mutex(lock)
+    set unlock_ok to unlock_mutex(lock)
+    if unlock_ok == 0:
+        set ok to map_insert(mem_result and "error" and DHT_ERR_LOCK_FAILED)
     return mem_result
 
-define dht_node_peer_count with dht as Int returning Int:
+define dht_node_peer_count with dht as Map returning Int:
     set lock to map_get_val(dht and "lock")
-    if lock != 0:
-        set ok to lock_mutex(lock)
+    if lock == 0:
+        return 0 - DHT_ERR_LOCK_FAILED
+    set lock_ok to lock_mutex(lock)
+    if lock_ok == 0:
+        return 0 - DHT_ERR_LOCK_FAILED
     set rt to map_get_val(dht and "routing_table")
     set result to routing_table_node_count(rt)
-    if lock != 0:
-        set ok to unlock_mutex(lock)
+    set unlock_ok to unlock_mutex(lock)
+    if unlock_ok == 0:
+        return 0 - DHT_ERR_LOCK_FAILED
     return result
 
 # ================================================================
@@ -626,21 +681,21 @@ define dht_node_peer_count with dht as Int returning Int:
 # Messages are maps that can be serialized for transmission
 # ================================================================
 
-define create_ping_message with sender_id as Str:
+define create_ping_message with sender_id as Str returning Map:
     set msg to create_map()
     set ok to map_insert(msg and "type" and DHT_MSG_PING)
     set ok to map_insert(msg and "sender" and sender_id)
     set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
     return msg
 
-define create_pong_message with sender_id as Str:
+define create_pong_message with sender_id as Str returning Map:
     set msg to create_map()
     set ok to map_insert(msg and "type" and DHT_MSG_PONG)
     set ok to map_insert(msg and "sender" and sender_id)
     set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
     return msg
 
-define create_find_node_message with sender_id as Str and target_id as Str:
+define create_find_node_message with sender_id as Str and target_id as Str returning Map:
     set msg to create_map()
     set ok to map_insert(msg and "type" and DHT_MSG_FIND_NODE)
     set ok to map_insert(msg and "sender" and sender_id)
@@ -648,7 +703,7 @@ define create_find_node_message with sender_id as Str and target_id as Str:
     set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
     return msg
 
-define create_find_node_reply with sender_id as Str and closest_nodes as Int:
+define create_find_node_reply with sender_id as Str and closest_nodes as List returning Map:
     set msg to create_map()
     set ok to map_insert(msg and "type" and DHT_MSG_FIND_NODE_REPLY)
     set ok to map_insert(msg and "sender" and sender_id)
@@ -656,7 +711,7 @@ define create_find_node_reply with sender_id as Str and closest_nodes as Int:
     set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
     return msg
 
-define create_find_value_message with sender_id as Str and key as Str:
+define create_find_value_message with sender_id as Str and key as Str returning Map:
     set msg to create_map()
     set ok to map_insert(msg and "type" and DHT_MSG_FIND_VALUE)
     set ok to map_insert(msg and "sender" and sender_id)
@@ -664,7 +719,7 @@ define create_find_value_message with sender_id as Str and key as Str:
     set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
     return msg
 
-define create_find_value_reply with sender_id as Str and value as Str and found as Int:
+define create_find_value_reply with sender_id as Str and value as Str and found as Int returning Map:
     set msg to create_map()
     set ok to map_insert(msg and "type" and DHT_MSG_FIND_VALUE_REPLY)
     set ok to map_insert(msg and "sender" and sender_id)
@@ -673,7 +728,7 @@ define create_find_value_reply with sender_id as Str and value as Str and found 
     set ok to map_insert(msg and "timestamp" and ep_time_now_sec())
     return msg
 
-define create_store_message with sender_id as Str and key as Str and value as Str:
+define create_store_message with sender_id as Str and key as Str and value as Str returning Map:
     set msg to create_map()
     set ok to map_insert(msg and "type" and DHT_MSG_STORE)
     set ok to map_insert(msg and "sender" and sender_id)
@@ -686,11 +741,16 @@ define create_store_message with sender_id as Str and key as Str and value as St
 # RPC Handler -- process incoming messages
 # ================================================================
 
-define dht_handle_message with dht as Int and msg as Int:
+define dht_handle_message with dht as Map and msg as Map returning Map:
     set lock to map_get_val(dht and "lock")
-    if lock != 0:
-        set ok to lock_mutex(lock)
     set result to create_map()
+    if lock == 0:
+        set ok to map_insert(result and "error" and DHT_ERR_LOCK_FAILED)
+        return result
+    set lock_ok to lock_mutex(lock)
+    if lock_ok == 0:
+        set ok to map_insert(result and "error" and DHT_ERR_LOCK_FAILED)
+        return result
     set msg_type to map_get_val(msg and "type")
     set sender_id to map_get_val(msg and "sender")
     set my_id to map_get_val(dht and "id")
@@ -705,8 +765,9 @@ define dht_handle_message with dht as Int and msg as Int:
         set reply to create_pong_message(my_id)
         set ok to map_insert(result and "reply" and reply)
         set ok to map_insert(result and "error" and DHT_ERR_NONE)
-        if lock != 0:
-            set ok to unlock_mutex(lock)
+        set unlock_ok to unlock_mutex(lock)
+        if unlock_ok == 0:
+            set ok to map_insert(result and "error" and DHT_ERR_LOCK_FAILED)
         return result
 
     if msg_type == DHT_MSG_FIND_NODE:
@@ -715,8 +776,9 @@ define dht_handle_message with dht as Int and msg as Int:
         set reply to create_find_node_reply(my_id and closest)
         set ok to map_insert(result and "reply" and reply)
         set ok to map_insert(result and "error" and DHT_ERR_NONE)
-        if lock != 0:
-            set ok to unlock_mutex(lock)
+        set unlock_ok to unlock_mutex(lock)
+        if unlock_ok == 0:
+            set ok to map_insert(result and "error" and DHT_ERR_LOCK_FAILED)
         return result
 
     if msg_type == DHT_MSG_FIND_VALUE:
@@ -733,8 +795,9 @@ define dht_handle_message with dht as Int and msg as Int:
             set reply to create_find_node_reply(my_id and closest)
         set ok to map_insert(result and "reply" and reply)
         set ok to map_insert(result and "error" and DHT_ERR_NONE)
-        if lock != 0:
-            set ok to unlock_mutex(lock)
+        set unlock_ok to unlock_mutex(lock)
+        if unlock_ok == 0:
+            set ok to map_insert(result and "error" and DHT_ERR_LOCK_FAILED)
         return result
 
     if msg_type == DHT_MSG_STORE:
@@ -747,13 +810,15 @@ define dht_handle_message with dht as Int and msg as Int:
         set ok to map_insert(reply and "sender" and my_id)
         set ok to map_insert(result and "reply" and reply)
         set ok to map_insert(result and "error" and DHT_ERR_NONE)
-        if lock != 0:
-            set ok to unlock_mutex(lock)
+        set unlock_ok to unlock_mutex(lock)
+        if unlock_ok == 0:
+            set ok to map_insert(result and "error" and DHT_ERR_LOCK_FAILED)
         return result
 
     set ok to map_insert(result and "error" and DHT_ERR_INVALID_MESSAGE)
-    if lock != 0:
-        set ok to unlock_mutex(lock)
+    set unlock_ok to unlock_mutex(lock)
+    if unlock_ok == 0:
+        set ok to map_insert(result and "error" and DHT_ERR_LOCK_FAILED)
     return result
 
 # ================================================================
@@ -767,14 +832,19 @@ define generate_node_id_from_key with public_key_hex as Str returning Str:
 define generate_random_node_id returning Str:
     # Generate a random 256-bit ID
     set err to init_crypto()
+    if err != 0:
+        return ""
     set buf to alloc_bytes(32)
     set fn to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    if buf == 0 or else fn == 0:
+        set ok to free_bytes(buf)
+        return ""
     set ok to ep_dlcall2(fn and buf and 32)
     set hex to raw_to_hex(buf and 32)
     set ok to free_bytes(buf)
     return hex
 
-define dht_node_get_oldest_bucket_node with dht as Int and peer_id as Str returning Map:
+define dht_node_get_oldest_bucket_node with dht as Map and peer_id as Str returning Map:
     set local_id to map_get_val(dht and "id")
     set dist to xor_distance(local_id and peer_id)
     set bucket_idx to bucket_index_for_distance(dist)

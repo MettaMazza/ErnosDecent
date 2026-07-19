@@ -28,6 +28,7 @@ set LEDGER_ERR_BLOCK_GAP to 908
 set LEDGER_ERR_BLOCK_STALE to 909
 set LEDGER_ERR_BLOCK_FORK to 910
 set LEDGER_ERR_BLOCK_EQUIVOCATION to 911
+set LEDGER_ERR_PERSIST_FAILED to 912
 set LEDGER_BLOCK_DUPLICATE to 912
 
 set TX_STANDARD to 1
@@ -513,7 +514,7 @@ define ledger_elect_validator with ledger as Map and prev_hash as Str returning 
 # Transaction Management
 # ================================================================
 
-define ledger_create_tx with inputs as Int and outputs as Int and fee as Int returning Map:
+define ledger_create_tx with inputs as List and outputs as List and fee as Int returning Map:
     set tx to create_map()
     set ok to map_insert(tx and "inputs" and inputs)
     set ok to map_insert(tx and "outputs" and outputs)
@@ -612,6 +613,7 @@ define ledger_add_block with ledger as Map and transactions as List and validato
     set blocks to map_get_val(ledger and "blocks")
     set utxos to map_get_val(ledger and "utxos")
     set values_list to map_get_val(ledger and "values_list")
+    set values_start to length_list(values_list)
     
     set prev_block to get_list(blocks and length_list(blocks) - 1)
     set prev_hash to map_get_val(prev_block and "hash")
@@ -891,6 +893,29 @@ define ledger_add_block with ledger as Map and transactions as List and validato
     # below an early `return` (dead code) — blocks were never durably persisted.
     set block_idx to map_get_val(new_block and "index")
     set persist_ok to storage_ledger_add_block(block_idx and prev_hash and block_hash and validator_did and ep_time_now_sec() and tx_len and root_hash)
+    if persist_ok != STORAGE_ERR_NONE:
+        set ok to remove_list(blocks and length_list(blocks) - 1)
+        set ok to ledger_restore_contracts(contracts_backup)
+        set utxos_keys to map_keys(utxos)
+        set uk_len to length_list(utxos_keys)
+        set u_i to 0
+        repeat while u_i < uk_len:
+            set ok to map_delete(utxos and get_list(utxos_keys and u_i))
+            set u_i to u_i + 1
+        free_list(utxos_keys)
+        set bak_keys to map_keys(utxo_backup)
+        set bk_len to length_list(bak_keys)
+        set u_i to 0
+        repeat while u_i < bk_len:
+            set bk_key to get_list(bak_keys and u_i)
+            set ok to map_insert(utxos and bk_key and map_get_val(utxo_backup and bk_key))
+            set u_i to u_i + 1
+        free_list(bak_keys)
+        repeat while length_list(values_list) > values_start:
+            set ok to remove_list(values_list and length_list(values_list) - 1)
+        free_map(contracts_backup)
+        free_map(utxo_backup)
+        return LEDGER_ERR_PERSIST_FAILED
 
     set ok to append_list(values_list and new_block)
     set ok to append_list(values_list and transactions)

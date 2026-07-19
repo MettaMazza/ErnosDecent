@@ -194,14 +194,14 @@ define noise_hkdf with chaining_key_ptr as Int and input_key_ptr as Int and inpu
 # Stored as a map: { key_ptr, nonce, has_key }
 # ================================================================
 
-define cipher_state_init:
+define cipher_state_init returning Map:
     set cs to create_map()
     set ok to map_insert(cs and "key_ptr" and 0)
     set ok to map_insert(cs and "nonce" and 0)
     set ok to map_insert(cs and "has_key" and 0)
     return cs
 
-define cipher_state_init_key with key_ptr as Int:
+define cipher_state_init_key with key_ptr as Int returning Map:
     set cs to create_map()
     # Copy the key to our own buffer
     set our_key to alloc_bytes(32)
@@ -215,7 +215,7 @@ define cipher_state_init_key with key_ptr as Int:
     set ok to map_insert(cs and "has_key" and 1)
     return cs
 
-define cipher_state_encrypt_with_ad with cs as Int and ad_ptr as Int and ad_len as Int and plaintext_ptr as Int and plain_len as Int and ciphertext_ptr as Int and cipher_len_ptr as Int returning Int:
+define cipher_state_encrypt_with_ad with cs as Map and ad_ptr as Int and ad_len as Int and plaintext_ptr as Int and plain_len as Int and ciphertext_ptr as Int and cipher_len_ptr as Int returning Int:
     set has_key to map_get_val(cs and "has_key")
     if has_key == 0:
         # No key: copy plaintext to ciphertext (unencrypted)
@@ -239,7 +239,7 @@ define cipher_state_encrypt_with_ad with cs as Int and ad_ptr as Int and ad_len 
     set ok to map_insert(cs and "nonce" and nonce + 1)
     return NOISE_ERR_NONE
 
-define cipher_state_decrypt_with_ad with cs as Int and ad_ptr as Int and ad_len as Int and ciphertext_ptr as Int and cipher_len as Int and plaintext_ptr as Int and plain_len_ptr as Int returning Int:
+define cipher_state_decrypt_with_ad with cs as Map and ad_ptr as Int and ad_len as Int and ciphertext_ptr as Int and cipher_len as Int and plaintext_ptr as Int and plain_len_ptr as Int returning Int:
     set has_key to map_get_val(cs and "has_key")
     if has_key == 0:
         # No key: copy ciphertext to plaintext
@@ -267,7 +267,7 @@ define cipher_state_decrypt_with_ad with cs as Int and ad_ptr as Int and ad_len 
 # SymmetricState -- chaining key + cipher state + hash
 # ================================================================
 
-define symmetric_state_init:
+define symmetric_state_init returning Map:
     set ss to create_map()
 
     # Initialize h = SHA-256(protocol_name) if len <= 32, else SHA-256(protocol_name)
@@ -303,7 +303,7 @@ define symmetric_state_init:
     set ok to map_insert(ss and "cs" and cs)
     return ss
 
-define symmetric_state_mix_hash with ss as Int and data_ptr as Int and data_len as Int returning Int:
+define symmetric_state_mix_hash with ss as Map and data_ptr as Int and data_len as Int returning Int:
     # h = SHA-256(h || data)
     set h_ptr to map_get_val(ss and "h_ptr")
     set combined to alloc_bytes(32 + data_len)
@@ -326,7 +326,7 @@ define symmetric_state_mix_hash with ss as Int and data_ptr as Int and data_len 
     set ok to free_bytes(combined)
     return NOISE_ERR_NONE
 
-define symmetric_state_mix_key with ss as Int and input_key_ptr as Int and input_len as Int returning Int:
+define symmetric_state_mix_key with ss as Map and input_key_ptr as Int and input_len as Int returning Int:
     # ck, temp_k = HKDF(ck, input_key_material)
     # Then re-init cipher state with temp_k
     set ck_ptr to map_get_val(ss and "ck_ptr")
@@ -357,7 +357,7 @@ define symmetric_state_mix_key with ss as Int and input_key_ptr as Int and input
 
     return NOISE_ERR_NONE
 
-define symmetric_state_encrypt_and_hash with ss as Int and plaintext_ptr as Int and plain_len as Int and ciphertext_ptr as Int and cipher_len_ptr as Int returning Int:
+define symmetric_state_encrypt_and_hash with ss as Map and plaintext_ptr as Int and plain_len as Int and ciphertext_ptr as Int and cipher_len_ptr as Int returning Int:
     # Encrypt with h as AD, then mix_hash the ciphertext
     set cs to map_get_val(ss and "cs")
     set h_ptr to map_get_val(ss and "h_ptr")
@@ -375,7 +375,7 @@ define symmetric_state_encrypt_and_hash with ss as Int and plaintext_ptr as Int 
     set ok to symmetric_state_mix_hash(ss and ciphertext_ptr and out_len)
     return NOISE_ERR_NONE
 
-define symmetric_state_decrypt_and_hash with ss as Int and ciphertext_ptr as Int and cipher_len as Int and plaintext_ptr as Int and plain_len_ptr as Int returning Int:
+define symmetric_state_decrypt_and_hash with ss as Map and ciphertext_ptr as Int and cipher_len as Int and plaintext_ptr as Int and plain_len_ptr as Int returning Int:
     # Save current h, decrypt with h as AD, then mix_hash the ciphertext
     set cs to map_get_val(ss and "cs")
     set h_ptr to map_get_val(ss and "h_ptr")
@@ -396,7 +396,7 @@ define symmetric_state_decrypt_and_hash with ss as Int and ciphertext_ptr as Int
     set ok to free_bytes(saved_h)
     return result
 
-define symmetric_state_split with ss as Int:
+define symmetric_state_split with ss as Map returning Map:
     # Split into two CipherStates for transport
     # temp_k1, temp_k2 = HKDF(ck, empty)
     set ck_ptr to map_get_val(ss and "ck_ptr")
@@ -433,7 +433,7 @@ define symmetric_state_split with ss as Int:
 # HandshakeState -- Noise_XX pattern
 # ================================================================
 
-define noise_handshake_init with role as Int and static_secret_ptr as Int and static_public_ptr as Int:
+define noise_handshake_init with role as Int and static_secret_ptr as Int and static_public_ptr as Int returning Map:
     # Initialize handshake state
     set err to init_crypto()
     if err != 0:
@@ -479,7 +479,7 @@ define noise_handshake_init with role as Int and static_secret_ptr as Int and st
 # Initiator sends: e (ephemeral public key, 32 bytes)
 # ================================================================
 
-define noise_xx_write_message1 with hs as Int:
+define noise_xx_write_message1 with hs as Map returning Map:
     set result to create_map()
     set role to map_get_val(hs and "role")
     if role != NOISE_ROLE_INITIATOR:
@@ -504,7 +504,7 @@ define noise_xx_write_message1 with hs as Int:
 # Noise_XX Message 1: Responder reads
 # ================================================================
 
-define noise_xx_read_message1 with hs as Int and msg_hex as Str:
+define noise_xx_read_message1 with hs as Map and msg_hex as Str returning Map:
     set result to create_map()
     set role to map_get_val(hs and "role")
     if role != NOISE_ROLE_RESPONDER:
@@ -536,7 +536,7 @@ define noise_xx_read_message1 with hs as Int and msg_hex as Str:
 # Output: e.public (32B) + encrypted(s.public) (32B + 16B tag)
 # ================================================================
 
-define noise_xx_write_message2 with hs as Int:
+define noise_xx_write_message2 with hs as Map returning Map:
     set result to create_map()
     set role to map_get_val(hs and "role")
     if role != NOISE_ROLE_RESPONDER:
@@ -597,7 +597,7 @@ define noise_xx_write_message2 with hs as Int:
 # Noise_XX Message 2: Initiator reads
 # ================================================================
 
-define noise_xx_read_message2 with hs as Int and msg_hex as Str:
+define noise_xx_read_message2 with hs as Map and msg_hex as Str returning Map:
     set result to create_map()
     set role to map_get_val(hs and "role")
     if role != NOISE_ROLE_INITIATOR:
@@ -677,7 +677,7 @@ define noise_xx_read_message2 with hs as Int and msg_hex as Str:
 # Output: encrypted(s.public) (48B)
 # ================================================================
 
-define noise_xx_write_message3 with hs as Int:
+define noise_xx_write_message3 with hs as Map returning Map:
     set result to create_map()
     set role to map_get_val(hs and "role")
     if role != NOISE_ROLE_INITIATOR:
@@ -742,7 +742,7 @@ define noise_xx_write_message3 with hs as Int:
 # Noise_XX Message 3: Responder reads
 # ================================================================
 
-define noise_xx_read_message3 with hs as Int and msg_hex as Str:
+define noise_xx_read_message3 with hs as Map and msg_hex as Str returning Map:
     set result to create_map()
     set role to map_get_val(hs and "role")
     if role != NOISE_ROLE_RESPONDER:
@@ -817,7 +817,7 @@ define noise_xx_read_message3 with hs as Int and msg_hex as Str:
 # Transport messages -- post-handshake encrypted communication
 # ================================================================
 
-define noise_transport_encrypt with hs as Int and plaintext as Str:
+define noise_transport_encrypt with hs as Map and plaintext as Str returning Map:
     set result to create_map()
 
     set state to map_get_val(hs and "state")
@@ -860,7 +860,7 @@ define noise_transport_encrypt with hs as Int and plaintext as Str:
     set ok to map_insert(result and "error" and NOISE_ERR_NONE)
     return result
 
-define noise_transport_decrypt with hs as Int and ciphertext_hex as Str:
+define noise_transport_decrypt with hs as Map and ciphertext_hex as Str returning Map:
     set result to create_map()
 
     set state to map_get_val(hs and "state")
@@ -912,7 +912,7 @@ define noise_transport_decrypt with hs as Int and ciphertext_hex as Str:
 # Get remote static public key (after handshake)
 # ================================================================
 
-define noise_get_remote_static with hs as Int returning Str:
+define noise_get_remote_static with hs as Map returning Str:
     set rs_pub to map_get_val(hs and "rs_pub")
     if rs_pub == 0:
         return ""

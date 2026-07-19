@@ -33,6 +33,7 @@ set DID_ERR_UNSUPPORTED_METHOD to 203
 set DID_ERR_KEY_LENGTH to 204
 set DID_ERR_DECODE_FAILED to 205
 set DID_ERR_VERIFICATION_FAILED to 206
+set DID_ERR_PERSISTENCE_FAILED to 207
 
 # Key type identifiers for DID documents
 set DID_KEY_TYPE_ED25519 to "Ed25519VerificationKey2020"
@@ -253,7 +254,7 @@ define create_did_key_from_x25519 with public_key_hex as Str returning Str:
     set did to concat(did and b58)
     return did
 
-define resolve_did_key with did as Str:
+define resolve_did_key with did as Str returning Map:
     # Parse a did:key and return the public key hex + key type
     # Returns a map with: method, multibase, public_key_hex, key_type, error
     set result to create_map()
@@ -323,7 +324,7 @@ define resolve_did_key with did as Str:
 # DID Document -- W3C DID Core v1.0 structure
 # ================================================================
 
-define create_did_document with signing_pub_hex as Str and encryption_pub_hex as Str:
+define create_did_document with signing_pub_hex as Str and encryption_pub_hex as Str returning Map:
     # Generate a full DID document from signing + encryption public keys
     set result to create_map()
 
@@ -401,7 +402,7 @@ define create_did_peer with signing_pub_hex as Str returning Str:
     set did to concat(did and b58)
     return did
 
-define resolve_did_peer with did as Str:
+define resolve_did_peer with did as Str returning Map:
     # Parse a did:peer:0z... and extract the public key
     set result to create_map()
 
@@ -461,12 +462,15 @@ define create_auth_challenge returning Str:
 
     set buf to alloc_bytes(32)
     set fn to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    if buf == 0 or else fn == 0:
+        set ok to free_bytes(buf)
+        return ""
     set ok to ep_dlcall2(fn and buf and 32)
     set challenge to raw_to_hex(buf and 32)
     set ok to free_bytes(buf)
     return challenge
 
-define respond_to_challenge with challenge as Str and secret_key_hex as Str:
+define respond_to_challenge with challenge as Str and secret_key_hex as Str returning Map:
     # Sign the challenge with the DID's secret key
     # Returns map with: response (signature hex), challenge, error
     set result to create_map()
@@ -507,7 +511,47 @@ define verify_challenge_response with challenge as Str and response as Str and p
 # Generates keypair, creates DID, builds DID document
 # ================================================================
 
-define create_identity:
+define create_ephemeral_identity returning Map:
+    # Generate a fresh identity without reading or writing the node identity.
+    # This is for transient participants (for example, remote peers represented
+    # in a simulation). The local node must use create_identity so its identity
+    # remains durable across restarts.
+    set result to create_map()
+    set identity to generate_identity_keypair()
+    set id_err to map_get_val(identity and "error")
+    if id_err != 0:
+        set ok to map_insert(result and "error" and id_err)
+        return result
+
+    set signing to map_get_val(identity and "signing")
+    set encryption to map_get_val(identity and "encryption")
+    set sign_pub to map_get_val(signing and "public_key")
+    set sign_sec to map_get_val(signing and "secret_key")
+    set enc_pub to map_get_val(encryption and "public_key")
+    set enc_sec to map_get_val(encryption and "secret_key")
+
+    set did to create_did_key_from_ed25519(sign_pub)
+    if string_length(did) == 0:
+        set ok to map_insert(result and "error" and DID_ERR_INVALID_KEY)
+        return result
+
+    set doc_result to create_did_document(sign_pub and enc_pub)
+    set doc_err to map_get_val(doc_result and "error")
+    if doc_err != 0:
+        set ok to map_insert(result and "error" and doc_err)
+        return result
+
+    set ok to map_insert(result and "did" and did)
+    set ok to map_insert(result and "document" and map_get_val(doc_result and "document"))
+    set ok to map_insert(result and "signing_public_key" and sign_pub)
+    set ok to map_insert(result and "signing_secret_key" and sign_sec)
+    set ok to map_insert(result and "encryption_public_key" and enc_pub)
+    set ok to map_insert(result and "encryption_secret_key" and enc_sec)
+    set ok to map_insert(result and "identity_hash" and map_get_val(identity and "identity_hash"))
+    set ok to map_insert(result and "error" and DID_ERR_NONE)
+    return result
+
+define create_identity returning Map:
     # Generate a full identity: keypairs + DID + DID document
     # If an identity was previously saved, load it instead of generating new keys
     set result to create_map()
@@ -543,47 +587,25 @@ define create_identity:
             set ok to map_insert(result and "error" and DID_ERR_NONE)
             return result
 
-    set identity to generate_identity_keypair()
-    set id_err to map_get_val(identity and "error")
+    set fresh_identity to create_ephemeral_identity()
+    set id_err to map_get_val(fresh_identity and "error")
     if id_err != 0:
         set ok to map_insert(result and "error" and id_err)
         return result
 
-    set signing to map_get_val(identity and "signing")
-    set encryption to map_get_val(identity and "encryption")
-    set sign_pub to map_get_val(signing and "public_key")
-    set sign_sec to map_get_val(signing and "secret_key")
-    set enc_pub to map_get_val(encryption and "public_key")
-    set enc_sec to map_get_val(encryption and "secret_key")
-
-    # Create DID from signing key
-    set did to create_did_key_from_ed25519(sign_pub)
-    if string_length(did) == 0:
-        set ok to map_insert(result and "error" and DID_ERR_INVALID_KEY)
-        return result
-
-    # Create DID document
-    set doc_result to create_did_document(sign_pub and enc_pub)
-    set doc_err to map_get_val(doc_result and "error")
-    if doc_err != 0:
-        set ok to map_insert(result and "error" and doc_err)
-        return result
-
-    set document to map_get_val(doc_result and "document")
-    set identity_hash to map_get_val(identity and "identity_hash")
+    set did to map_get_val(fresh_identity and "did")
+    set sign_pub to map_get_val(fresh_identity and "signing_public_key")
+    set sign_sec to map_get_val(fresh_identity and "signing_secret_key")
+    set enc_pub to map_get_val(fresh_identity and "encryption_public_key")
+    set enc_sec to map_get_val(fresh_identity and "encryption_secret_key")
 
     # Persist the new identity to storage
     set save_ok to storage_identity_save(did and sign_pub and sign_sec and enc_pub and enc_sec)
+    if save_ok != 0:
+        set ok to map_insert(result and "error" and DID_ERR_PERSISTENCE_FAILED)
+        return result
 
-    set ok to map_insert(result and "did" and did)
-    set ok to map_insert(result and "document" and document)
-    set ok to map_insert(result and "signing_public_key" and sign_pub)
-    set ok to map_insert(result and "signing_secret_key" and sign_sec)
-    set ok to map_insert(result and "encryption_public_key" and enc_pub)
-    set ok to map_insert(result and "encryption_secret_key" and enc_sec)
-    set ok to map_insert(result and "identity_hash" and identity_hash)
-    set ok to map_insert(result and "error" and DID_ERR_NONE)
-    return result
+    return fresh_identity
 
 define did_resolve with did as Str returning Map:
     set prefix_key to "did:key:"
@@ -616,4 +638,3 @@ define did_resolve with did as Str returning Map:
     set ok to map_insert(res and "verification_method" and vm_map)
     set ok to map_insert(res and "error" and DID_ERR_NONE)
     return res
-

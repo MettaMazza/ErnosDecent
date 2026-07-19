@@ -9,8 +9,9 @@ import "string"
 import "collections"
 import "net"
 import "../decent_id/keys"
+import "../storage"
 
-define dht_test_server with dht as Int and listen_fd as Int and msg_count as Int:
+define dht_test_server with dht as Map and listen_fd as Int and msg_count as Int returning Int:
     # Handle a fixed number of messages
     set i to 0
     repeat while i < msg_count:
@@ -19,18 +20,48 @@ define dht_test_server with dht as Int and listen_fd as Int and msg_count as Int
             set conn to create_map()
             set ok to map_insert(conn and "fd" and client_fd)
             set ok to map_insert(conn and "connected" and 1)
-            set ok to dht_handle_transport_message(dht and conn)
-            transport_close(conn)
+            set handler_err to dht_handle_transport_message(dht and conn)
+            set close_err to transport_close(conn)
             free_map(conn)
+            if handler_err != DHT_NET_ERR_NONE or else close_err != TRANSPORT_ERR_NONE:
+                display f"  FAIL: DHT handler/close failed ({handler_err}, {close_err})"
+                return 1
         set i to i + 1
     return 0
 
-define main:
+define dht_wrong_pong_server with listen_fd as Int returning Int:
+    set client_fd to ep_net_accept(listen_fd)
+    if client_fd < 0:
+        return 1
+    set conn to create_map()
+    set ok to map_insert(conn and "fd" and client_fd)
+    set ok to map_insert(conn and "connected" and 1)
+    set frame to transport_recv(conn)
+    set recv_err to map_get_val(frame and "error")
+    free_map(frame)
+    if recv_err != TRANSPORT_ERR_NONE:
+        set close_err to transport_close(conn)
+        free_map(conn)
+        return 1
+    set send_err to transport_send(conn and MSG_TYPE_DHT_FIND_NODE_RESP and "not-a-pong")
+    set close_err to transport_close(conn)
+    free_map(conn)
+    if send_err != TRANSPORT_ERR_NONE or else close_err != TRANSPORT_ERR_NONE:
+        return 1
+    return 0
+
+define main returning Int:
     display "==================================================="
     display "  ErnosDecent -- DHT-over-Transport Test Suite"
     display "  Decentralised Hash Table over TCP — Phase 2"
     display "==================================================="
     display ""
+
+    set test_storage_dir to concat("/tmp/ernos_dht_transport_test_" and int_to_string(ep_time_now_ms()))
+    set storage_err to storage_init(test_storage_dir)
+    if storage_err != STORAGE_ERR_NONE:
+        display f"FATAL: test storage initialization failed with {storage_err}"
+        return 1
 
     set tests_passed to 0
     set tests_failed to 0
@@ -43,8 +74,8 @@ define main:
     display "TEST 1: DHT Ping/Pong over TCP"
     set t1_ok to 1
 
-    set dht_client to create_dht_node("node_alpha" and "127.0.0.1" and 20001)
-    set dht_server to create_dht_node("node_beta" and "127.0.0.1" and 20002)
+    set dht_client to create_dht_node("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" and "127.0.0.1" and 20001)
+    set dht_server to create_dht_node("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2" and "127.0.0.1" and 20002)
 
     set listen_fd to ep_net_listen(20002)
     if listen_fd < 0:
@@ -76,8 +107,8 @@ define main:
     display "TEST 2: DHT Store over TCP"
     set t2_ok to 1
 
-    set dht_client2 to create_dht_node("node_store_client" and "127.0.0.1" and 20011)
-    set dht_server2 to create_dht_node("node_store_server" and "127.0.0.1" and 20012)
+    set dht_client2 to create_dht_node("ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc3" and "127.0.0.1" and 20011)
+    set dht_server2 to create_dht_node("ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd4" and "127.0.0.1" and 20012)
 
     set listen_fd2 to ep_net_listen(20012)
     if listen_fd2 < 0:
@@ -110,8 +141,8 @@ define main:
     display "TEST 3: DHT FindValue over TCP"
     set t3_ok to 1
 
-    set dht_client3 to create_dht_node("node_find_client" and "127.0.0.1" and 20021)
-    set dht_server3 to create_dht_node("node_find_server" and "127.0.0.1" and 20013)
+    set dht_client3 to create_dht_node("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee5" and "127.0.0.1" and 20021)
+    set dht_server3 to create_dht_node("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6" and "127.0.0.1" and 20013)
     # Pre-store a value on the server node
     set ok to dht_node_store_value(dht_server3 and "secret_key" and "secret_data_123")
 
@@ -202,8 +233,8 @@ define main:
     display "TEST 5: DHT FindValue non-existent key"
     set t5_ok to 1
 
-    set dht_client5 to create_dht_node("node_nf_client" and "127.0.0.1" and 20041)
-    set dht_server5 to create_dht_node("node_nf_server" and "127.0.0.1" and 20015)
+    set dht_client5 to create_dht_node("1111111111111111111111111111111111111111111111111111111111111117" and "127.0.0.1" and 20041)
+    set dht_server5 to create_dht_node("2222222222222222222222222222222222222222222222222222222222222228" and "127.0.0.1" and 20015)
 
     set listen_fd5 to ep_net_listen(20015)
     if listen_fd5 < 0:
@@ -283,6 +314,73 @@ define main:
         set tests_failed to tests_failed + 1
 
     # ===========================================================
+    # TEST 7: Invalid/wildcard endpoints fail closed
+    # ===========================================================
+    display "TEST 7: Invalid/wildcard endpoints fail closed"
+    set t7_ok to 1
+
+    if dht_endpoint_is_advertisable("0.0.0.0" and 9201) != 0:
+        display "  FAIL: wildcard IPv4 endpoint accepted"
+        set t7_ok to 0
+    if dht_endpoint_is_advertisable("::" and 9201) != 0:
+        display "  FAIL: wildcard IPv6 endpoint accepted"
+        set t7_ok to 0
+    if dht_endpoint_is_advertisable("127.0.0.1" and 65536) != 0:
+        display "  FAIL: out-of-range port accepted"
+        set t7_ok to 0
+    if dht_endpoint_is_advertisable("127.0.0.1" and 9201) != 1:
+        display "  FAIL: valid loopback endpoint rejected"
+        set t7_ok to 0
+
+    set invalid_ping to dht_rpc_ping(dht_client and "0.0.0.0" and 9201)
+    if invalid_ping != DHT_NET_ERR_INVALID_ENDPOINT:
+        display f"  FAIL: invalid ping returned {invalid_ping}"
+        set t7_ok to 0
+
+    set invalid_find to dht_rpc_find_node(dht_client and "0.0.0.0" and 9201 and "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+    if map_get_val(invalid_find and "error") != DHT_NET_ERR_INVALID_ENDPOINT:
+        display "  FAIL: invalid find-node endpoint was not rejected"
+        set t7_ok to 0
+    free_map(invalid_find)
+
+    set invalid_peer_add to dht_add_peer_with_eviction(dht_client and "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" and "0.0.0.0" and 9201)
+    if invalid_peer_add != DHT_ERR_INVALID_MESSAGE:
+        display f"  FAIL: wildcard peer add returned {invalid_peer_add}"
+        set t7_ok to 0
+
+    if t7_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 8: Ping requires an actual DHT_PONG
+    # ===========================================================
+    display "TEST 8: Ping requires an actual DHT_PONG"
+    set t8_ok to 1
+    set listen_fd8 to ep_net_listen(20016)
+    if listen_fd8 < 0:
+        display "  FAIL: could not listen on port 20016"
+        set t8_ok to 0
+    if t8_ok == 1:
+        spawn dht_wrong_pong_server(listen_fd8)
+        set ok to ep_sleep_ms(50)
+        set wrong_pong_err to dht_rpc_ping(dht_client and "127.0.0.1" and 20016)
+        if wrong_pong_err != DHT_NET_ERR_BAD_RESPONSE:
+            display f"  FAIL: wrong PONG type returned {wrong_pong_err}"
+            set t8_ok to 0
+    set ok to ep_sleep_ms(50)
+    if listen_fd8 >= 0:
+        set ok to ep_net_close(listen_fd8)
+
+    if t8_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
     # Summary
     # ===========================================================
     display ""
@@ -292,4 +390,6 @@ define main:
     if tests_failed > 0:
         display f"  {tests_failed} FAILED!"
     display "==================================================="
+    if tests_failed > 0:
+        return 1
     return 0

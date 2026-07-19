@@ -34,18 +34,33 @@ set RAG_CACHE_LOCK to create_mutex()
 set RAG_CACHE_MAX to 100000
 
 # Return the parsed embedding vector for a chunk, from cache or by parsing once.
-define rag_get_vec with id_key as Str and emb_str as Str returning List:
-    set ok to lock_mutex(RAG_CACHE_LOCK)
+define rag_get_vec with id_key as Str and emb_str as Str returning Map:
+    set result to create_map()
+    if RAG_CACHE_LOCK == 0:
+        set ok to map_insert(result and "error" and 1)
+        return result
+    set lock_ok to lock_mutex(RAG_CACHE_LOCK)
+    if lock_ok == 0:
+        set ok to map_insert(result and "error" and 1)
+        return result
     set hit to map_contains(RAG_VEC_CACHE and id_key)
     set cached to 0
     if hit == 1:
         set cached to map_get_val(RAG_VEC_CACHE and id_key)
-    set ok to unlock_mutex(RAG_CACHE_LOCK)
+    set unlock_ok to unlock_mutex(RAG_CACHE_LOCK)
+    if unlock_ok == 0:
+        set ok to map_insert(result and "error" and 2)
+        return result
     if hit == 1:
-        return cached
+        set ok to map_insert(result and "vector" and cached)
+        set ok to map_insert(result and "error" and 0)
+        return result
     # Miss: parse OUTSIDE the lock (allocation-heavy), then store.
     set vec to rag_parse_embedding(emb_str)
-    set ok to lock_mutex(RAG_CACHE_LOCK)
+    set lock_ok to lock_mutex(RAG_CACHE_LOCK)
+    if lock_ok == 0:
+        set ok to map_insert(result and "error" and 1)
+        return result
     if map_contains(RAG_VEC_CACHE and id_key) == 0:
         # Safety valve against unbounded growth (e.g. churned/re-indexed corpora):
         # drop the whole cache wholesale; live vectors still in use stay rooted on
@@ -53,8 +68,13 @@ define rag_get_vec with id_key as Str and emb_str as Str returning List:
         if map_size(RAG_VEC_CACHE) >= RAG_CACHE_MAX:
             set RAG_VEC_CACHE to create_map()
         set ok to map_insert(RAG_VEC_CACHE and id_key and vec)
-    set ok to unlock_mutex(RAG_CACHE_LOCK)
-    return vec
+    set unlock_ok to unlock_mutex(RAG_CACHE_LOCK)
+    if unlock_ok == 0:
+        set ok to map_insert(result and "error" and 2)
+        return result
+    set ok to map_insert(result and "vector" and vec)
+    set ok to map_insert(result and "error" and 0)
+    return result
 
 # --- float helpers (json.ep truncates decimals; embeddings need real floats) ---
 
@@ -327,10 +347,26 @@ define rag_chunk_text with text as Str and chunk_size as Int and overlap as Int 
     return out
 
 # Ensure the (session-scoped) schema exists; migrate older session-less tables.
-define rag_ensure_schema with db as Int:
+define rag_ensure_schema with db as Int returning Int:
+    if db == 0:
+        return 1
     set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS rag_chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, document_name TEXT NOT NULL, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, embedding TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '');")
-    # Add session_id to a pre-existing session-less table (errors harmlessly if present).
-    set ok to sql_execute(db and "ALTER TABLE rag_chunks ADD COLUMN session_id TEXT NOT NULL DEFAULT '';")
+    if ok != 0:
+        return ok
+    # Migrate only when PRAGMA confirms the column is absent. Treating every ALTER
+    # error as "already exists" used to hide genuine I/O and corruption failures.
+    set columns to sql_query(db and "PRAGMA table_info(rag_chunks);")
+    set has_session_id to 0
+    set column_index to 0
+    repeat while column_index < length_list(columns):
+        set column_row to get_list(columns and column_index)
+        if string_to_lower(get_list(column_row and 1)) equals "session_id":
+            set has_session_id to 1
+        set column_index to column_index + 1
+    if has_session_id == 0:
+        set ok to sql_execute(db and "ALTER TABLE rag_chunks ADD COLUMN session_id TEXT NOT NULL DEFAULT '';")
+        if ok != 0:
+            return ok
     return 0
 
 define rag_sql_escape with s as Str returning Str:
@@ -338,7 +374,8 @@ define rag_sql_escape with s as Str returning Str:
 
 # Index a document's text into rag_chunks, tagged with session_id.
 define rag_index with db as Int and doc_name as Str and text as Str and session_id as Str returning Int:
-    set ok to rag_ensure_schema(db)
+    if rag_ensure_schema(db) != 0:
+        return 0 - 1
     set edoc to rag_sql_escape(doc_name)
     set esession to rag_sql_escape(session_id)
     set del_sql to concat("DELETE FROM rag_chunks WHERE document_name='" and edoc)
@@ -346,6 +383,8 @@ define rag_index with db as Int and doc_name as Str and text as Str and session_
     set del_sql to concat(del_sql and esession)
     set del_sql to concat(del_sql and "';")
     set ok to sql_execute(db and del_sql)
+    if ok != 0:
+        return 0 - 1
     set chunks to rag_chunk_text(text and 1000 and 200)
     set nc to length_list(chunks)
     set indexed to 0
@@ -367,8 +406,17 @@ define rag_index with db as Int and doc_name as Str and text as Str and session_
             set ins to concat(ins and esession)
             set ins to concat(ins and "');")
             set ok to sql_execute(db and ins)
+            if ok != 0:
+                set free_error to free_list(chunks)
+                if free_error != 0:
+                    display f"[-] RAG chunk cleanup also failed: {free_error}."
+                return 0 - 1
             set indexed to indexed + 1
         set i to i + 1
+    set free_error to free_list(chunks)
+    if free_error != 0:
+        display f"[-] RAG chunk cleanup failed: {free_error}."
+        return 0 - 1
     return indexed
 
 # Search the current session's chunks for the query; returns a JSON string
@@ -398,7 +446,10 @@ define rag_search_paged with db as Int and query as Str and session_id as Str an
         set cidx to ptr_to_str(get_list(row and 2))
         set content to ptr_to_str(get_list(row and 3))
         set emb_str to ptr_to_str(get_list(row and 4))
-        set cvec to rag_get_vec(id_key and emb_str)
+        set cvec_result to rag_get_vec(id_key and emb_str)
+        if map_get_val(cvec_result and "error") != 0:
+            return "{\"status\":\"error\",\"message\":\"Embedding cache synchronization failed.\",\"results\":[]}"
+        set cvec to map_get_val(cvec_result and "vector")
         set score to rag_cosine(qvec and cvec)
         set ok to append_list(docs and dname)
         set ok to append_list(idxs and cidx)

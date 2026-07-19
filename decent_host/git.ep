@@ -18,6 +18,8 @@ set GIT_ERR_REPO_NOT_FOUND to 911
 set GIT_ERR_UNAUTHORIZED to 912
 set GIT_ERR_VERIFICATION_FAILED to 913
 set GIT_ERR_INVALID_REF to 914
+set GIT_ERR_NETWORK to 915
+set GIT_ERR_CLOSE_FAILED to 916
 
 # ================================================================
 # Data Structures
@@ -133,49 +135,86 @@ define git_remote_push with address as Str and port as Int and pusher_did as Str
     set msg to concat(msg and payload)
 
     set ok to transport_send(conn and "GIT_PUSH" and msg)
+    if ok != 0:
+        set close_error to transport_close(conn)
+        if close_error != TRANSPORT_ERR_NONE:
+            return GIT_ERR_CLOSE_FAILED
+        return GIT_ERR_NETWORK
 
     # Receive acknowledgment
     set response to transport_recv(conn)
-    set ok to transport_close(conn)
+    set close_error to transport_close(conn)
 
     set recv_err to map_get_val(response and "error")
-    if recv_err != 0:
-        return 2
+    if recv_err != 0 or else close_error != 0:
+        if close_error != TRANSPORT_ERR_NONE:
+            return GIT_ERR_CLOSE_FAILED
+        return GIT_ERR_NETWORK
     return 0
 
-define git_remote_pull with address as Str and port as Int and branch as Str returning Str:
+define git_remote_pull with address as Str and port as Int and branch as Str returning Map:
     # Pull a branch ref from a remote git server
+    set result to create_map()
     set conn to transport_connect(address and port)
     set err to map_get_val(conn and "error")
     if err != 0:
-        return ""
+        set ok to map_insert(result and "error" and GIT_ERR_NETWORK)
+        return result
 
     set ok to transport_send(conn and "GIT_PULL" and branch)
+    if ok != 0:
+        set close_error to transport_close(conn)
+        if close_error != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and GIT_ERR_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and GIT_ERR_NETWORK)
+        return result
 
     set response to transport_recv(conn)
-    set ok to transport_close(conn)
+    set close_error to transport_close(conn)
 
     set recv_err to map_get_val(response and "error")
-    if recv_err != 0:
-        return ""
-    return map_get_val(response and "payload")
+    if recv_err != 0 or else close_error != 0:
+        if close_error != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and GIT_ERR_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and GIT_ERR_NETWORK)
+        return result
+    set ok to map_insert(result and "payload" and map_get_val(response and "payload"))
+    set ok to map_insert(result and "error" and GIT_ERR_NONE)
+    return result
 
-define git_remote_fetch_object with address as Str and port as Int and object_hash as Str returning Str:
+define git_remote_fetch_object with address as Str and port as Int and object_hash as Str returning Map:
     # Fetch a git object from a remote server
+    set result to create_map()
     set conn to transport_connect(address and port)
     set err to map_get_val(conn and "error")
     if err != 0:
-        return ""
+        set ok to map_insert(result and "error" and GIT_ERR_NETWORK)
+        return result
 
     set ok to transport_send(conn and "GIT_FETCH_OBJ" and object_hash)
+    if ok != 0:
+        set close_error to transport_close(conn)
+        if close_error != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and GIT_ERR_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and GIT_ERR_NETWORK)
+        return result
 
     set response to transport_recv(conn)
-    set ok to transport_close(conn)
+    set close_error to transport_close(conn)
 
     set recv_err to map_get_val(response and "error")
-    if recv_err != 0:
-        return ""
-    return map_get_val(response and "payload")
+    if recv_err != 0 or else close_error != 0:
+        if close_error != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and GIT_ERR_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and GIT_ERR_NETWORK)
+        return result
+    set ok to map_insert(result and "payload" and map_get_val(response and "payload"))
+    set ok to map_insert(result and "error" and GIT_ERR_NONE)
+    return result
 
 # Parse a GIT_PUSH wire message and apply it. Wire format:
 #   pusher_did|branch|commit_hash|signature|payload
@@ -219,33 +258,50 @@ define git_serve with repo as Map and port as Int returning Int:
     set conn_err to map_get_val(conn and "error")
     if conn_err != 0:
         set ok to transport_close(listener)
+        if ok != 0:
+            return 4
         return 2
 
     set request to transport_recv(conn)
     set recv_err to map_get_val(request and "error")
     if recv_err != 0:
-        set ok to transport_close(conn)
-        set ok to transport_close(listener)
+        set conn_close_error to transport_close(conn)
+        set listener_close_error to transport_close(listener)
+        if conn_close_error != TRANSPORT_ERR_NONE or else listener_close_error != TRANSPORT_ERR_NONE:
+            return 4
         return 3
 
     set msg_type to map_get_val(request and "msg_type")
     set payload_data to map_get_val(request and "payload")
+    set send_error to 0
+    set handled to 0
 
     if msg_type equals "GIT_PULL":
+        set handled to 1
         set branch to payload_data
         set commit to git_pull_ref(repo and branch)
         set ok to transport_send(conn and "GIT_PULL_RESP" and commit)
+        if ok != 0:
+            set send_error to ok
 
     if msg_type equals "GIT_FETCH_OBJ":
+        set handled to 1
         set obj to git_get_object(repo and payload_data)
         set ok to transport_send(conn and "GIT_OBJ_RESP" and obj)
+        if ok != 0:
+            set send_error to ok
 
     if msg_type equals "GIT_PUSH":
+        set handled to 1
         # Real push handling (was missing — the client sent GIT_PUSH but the server
         # never received it). git_apply_push enforces collaborator auth + signature.
         set push_resp to git_apply_push(repo and payload_data)
         set ok to transport_send(conn and "GIT_PUSH_RESP" and push_resp)
+        if ok != 0:
+            set send_error to ok
 
-    set ok to transport_close(conn)
-    set ok to transport_close(listener)
+    set conn_close_error to transport_close(conn)
+    set listener_close_error to transport_close(listener)
+    if handled == 0 or else send_error != 0 or else conn_close_error != 0 or else listener_close_error != 0:
+        return 4
     return 0

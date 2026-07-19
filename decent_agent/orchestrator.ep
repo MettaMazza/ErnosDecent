@@ -9,10 +9,20 @@
 import "collections"
 import "string"
 import "memory"
+import "sync"
+import "trace"
+import "../storage"
 
-external define cast_borrow_to_map with b returning Map
-external define cast_map_to_int with m returning Int
-external define cast_int_to_map with i returning Map
+# Forward declarations break the deliberate react_loop ↔ orchestrator module cycle.
+# The implementations are defined in react_loop.ep and linked into every caller that
+# constructs or runs an orchestrator.
+external define react_run with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and user_prompt as Str returning Str
+external define react_write_mid_message with session_id as Str and content as Str returning Int
+external define react_request_cancel with session_id as Str returning Int
+
+external define cast_borrow_to_map with borrow b as Map returning Map
+external define cast_map_to_int with m as Map returning Int
+external define cast_int_to_map with i as Int returning Map
 # react_run keeps its active session id in a thread-local (ep_active_session_id is
 # __thread), so each spawned sub-agent thread has its own and no longer clobbers the
 # parent's or its siblings'.
@@ -32,9 +42,11 @@ external define tools_set_active_session with sid as Str returning Int
 
 # orchestrator_drain_completed: framed text for this session's finished, unreported
 # sub-agents; marks them reported. Returns "" if none. Used by the active react loop.
-define orchestrator_drain_completed with orch as Int and session_id as Str returning Str:
+define orchestrator_drain_completed with orch as Map and session_id as Str returning Str:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator completion-drain mutex lock failed."
+        return "[SUB-AGENT ERROR: completion state lock failed]\n"
     set tasks to map_get_val(orch and "tasks")
     set tkeys to map_keys(tasks)
     set tlen to length_list(tkeys)
@@ -54,14 +66,21 @@ define orchestrator_drain_completed with orch as Int and session_id as Str retur
             set ok to map_insert(tm and "reported" and 1)
         set i to i + 1
     free_list(tkeys)
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        display "[-] Orchestrator completion-drain mutex unlock failed."
+        return concat(out and "[SUB-AGENT ERROR: completion state unlock failed]\n")
     return out
 
 # orchestrator_pull_completed: list of task_ids that are completed & not yet reported
 # (no marking). The scheduler peeks, then claims the idle ones.
-define orchestrator_pull_completed with orch as Int returning List:
+define orchestrator_pull_completed with orch as Map returning List:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator completion-list mutex lock failed."
+        set failed to create_list()
+        set ok to append_list(failed and "error:orchestrator_lock_failed")
+        return failed
     set tasks to map_get_val(orch and "tasks")
     set tkeys to map_keys(tasks)
     set tlen to length_list(tkeys)
@@ -76,14 +95,19 @@ define orchestrator_pull_completed with orch as Int returning List:
             set ok to append_list(out and k)
         set i to i + 1
     free_list(tkeys)
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        display "[-] Orchestrator completion-list mutex unlock failed."
+        set ok to append_list(out and "error:orchestrator_unlock_failed")
     return out
 
 # orchestrator_claim_report: atomically claim a task for proactive reporting. Returns
 # 1 if THIS caller marked it reported (it was completed & unreported), else 0.
-define orchestrator_claim_report with orch as Int and task_id as Str returning Int:
+define orchestrator_claim_report with orch as Map and task_id as Str returning Int:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator report-claim mutex lock failed."
+        return 0 - 1
     set tasks to map_get_val(orch and "tasks")
     set claimed to 0
     if map_contains(tasks and task_id) == 1:
@@ -93,20 +117,28 @@ define orchestrator_claim_report with orch as Int and task_id as Str returning I
         if st equals "completed" and rep == 0:
             set ok to map_insert(tm and "reported" and 1)
             set claimed to 1
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        display "[-] Orchestrator report-claim mutex unlock failed."
+        return 0 - 1
     return claimed
 
 # orchestrator_task_field: read a string field from a task map (parent_sid/role/result).
-define orchestrator_task_field with orch as Int and task_id as Str and field as Str returning Str:
+define orchestrator_task_field with orch as Map and task_id as Str and field as Str returning Str:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator task-field mutex lock failed."
+        return "error:orchestrator_lock_failed"
     set tasks to map_get_val(orch and "tasks")
     set val to ""
     if map_contains(tasks and task_id) == 1:
         set tm to map_get_val(tasks and task_id)
         if map_contains(tm and field) == 1:
             set val to ptr_to_str(map_get_val(tm and field))
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        display "[-] Orchestrator task-field mutex unlock failed."
+        return "error:orchestrator_unlock_failed"
     return val
 
 # ─────────────────────────────────────────────────────
@@ -120,6 +152,9 @@ define orchestrator_create returning Int:
     set tasks to create_map()
     set results to create_map()
     set mtx to create_mutex()
+    if mtx == 0:
+        display "[-] Orchestrator mutex creation failed."
+        return 0
     set ok to map_insert(orch and "tasks" and tasks)
     set ok to map_insert(orch and "results" and results)
     set ok to map_insert(orch and "counter" and 0)
@@ -133,13 +168,18 @@ define orchestrator_create returning Int:
 # increments internal counter, unlocks, and returns
 # a string of the form "agent_N".
 # ─────────────────────────────────────────────────────
-define orchestrator_generate_id with orch as Int returning Str:
+define orchestrator_generate_id with orch as Map returning Str:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator ID mutex lock failed."
+        return "error:orchestrator_lock_failed"
     set counter to map_get_val(orch and "counter")
     set counter to counter + 1
     set ok to map_insert(orch and "counter" and counter)
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        display "[-] Orchestrator ID mutex unlock failed."
+        return "error:orchestrator_unlock_failed"
     set id_str to concat("agent_" and int_to_string(counter))
     return id_str
 
@@ -150,7 +190,13 @@ define orchestrator_generate_id with orch as Int returning Str:
 # prompt, calls react_run to execute the ReAct loop,
 # then sends the result through the provided channel.
 # ─────────────────────────────────────────────────────
-async define orchestrator_spawn_worker with task_id as Str and instruction as Str and role as Str and model as Int and memory_mgr as Map and tools_mgr as Map and ctx as Map and result_ch as Int and orch as Int and parent_sid as Str returning Int:
+define orchestrator_trace_emit_checked with db as Int and session_id as Str and event_type as Str and content as Str returning Int:
+    set trace_error to trace_emit(db and session_id and event_type and content)
+    if trace_error != 0:
+        display concat("[-] Orchestrator trace persistence failed: " and event_type)
+    return trace_error
+
+async define orchestrator_spawn_worker with task_id as Str and instruction as Str and role as Str and model as Int and memory_mgr as Map and tools_mgr as Map and ctx as Map and result_ch as Int and orch as Map and parent_sid as Str returning Int:
     set role_prefix to concat("[Role: " and role)
     set prompt to concat(role_prefix and concat("] " and instruction))
     display concat("[DELEGATE] worker thread BEGIN task=" and task_id)
@@ -159,12 +205,15 @@ async define orchestrator_spawn_worker with task_id as Str and instruction as St
     # memory_mgr, tools_mgr and ctx are the caller's freshly-cloned, owned Maps handed
     # off to this thread (so concurrent map writes can't race the main agent). Only
     # `model` stays shared — it is read-only during a run.
-    set result to react_run(cast_borrow_to_map(model) and memory_mgr and tools_mgr and ctx and prompt)
+    set result to react_run(cast_int_to_map(model) and memory_mgr and tools_mgr and ctx and prompt)
     display concat("[DELEGATE] worker thread END   task=" and concat(task_id and concat(" result_len=" and int_to_string(string_length(result)))))
     # Record the result on the task map + results map (mutex-guarded) so a polling
     # orchestrator_check sees completion even if no one is blocked in orchestrator_wait.
     set wmtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(wmtx)
+    if wmtx == 0 or else lock_mutex(wmtx) == 0:
+        display concat("[-] Orchestrator worker completion mutex lock failed for task=" and task_id)
+        send "Error: sub-agent result could not be recorded because the orchestrator lock failed." to result_ch
+        return 1
     set wtasks to map_get_val(orch and "tasks")
     if map_contains(wtasks and task_id) == 1:
         set wtm to map_get_val(wtasks and task_id)
@@ -172,23 +221,32 @@ async define orchestrator_spawn_worker with task_id as Str and instruction as St
         set ok to map_insert(wtm and "result" and result)
     set wresults to map_get_val(orch and "results")
     set ok to map_insert(wresults and task_id and result)
-    set ok to unlock_mutex(wmtx)
+    set unlock_ok to unlock_mutex(wmtx)
+    if unlock_ok == 0:
+        display concat("[-] Orchestrator worker completion mutex unlock failed for task=" and task_id)
+        send "Error: sub-agent result was produced but the orchestrator unlock failed." to result_ch
+        return 1
     display concat("[DELEGATE] worker recorded completion task=" and concat(task_id and concat(" parent_sid=" and parent_sid)))
     # TRACE: notify the parent session that this sub-agent finished so Discord/WebUI
     # can update status and stop polling. Uses parent_sid so the parent sees it.
     set cmp_db to storage_get_db()
     if cmp_db > 0:
         set cmp_summary to string_replace(substring(result and 0 and 200) and "\"" and "'")
-        set ok to trace_emit(cmp_db and parent_sid and "subagent_complete" and concat("{\"task_id\":\"" and concat(task_id and concat("\",\"status\":\"completed\",\"result_summary\":\"" and concat(cmp_summary and "\"}")))))
+        set ok to orchestrator_trace_emit_checked(cmp_db and parent_sid and "subagent_complete" and concat("{\"task_id\":\"" and concat(task_id and concat("\",\"status\":\"completed\",\"result_summary\":\"" and concat(cmp_summary and "\"}")))))
     # PROACTIVE PING: notify the user the moment the background sub-agent finishes by
     # pushing its result as a mid-turn message (trace 'mid_message' — the web/Discord
     # client polls it). orchestrator_claim_report atomically marks the task reported,
     # so if the parent's active turn already drained+reported it we skip (delivered once).
     set claimed to orchestrator_claim_report(orch and task_id)
+    if claimed < 0:
+        display concat("[-] Sub-agent completion could not be claimed for task=" and task_id)
     if claimed == 1:
         set pmsg to concat("✓ Sub-agent '" and concat(role and concat("' (" and concat(task_id and concat(") finished:\n" and result)))))
         set ok to react_write_mid_message(parent_sid and pmsg)
-        display concat("[DELEGATE] worker pinged user with result task=" and task_id)
+        if ok != 0:
+            display concat("[-] Sub-agent completion message delivery failed for task=" and task_id)
+        else:
+            display concat("[DELEGATE] worker pinged user with result task=" and task_id)
     # Wake any blocked orchestrator_wait. Channel is buffered (cap 1024) so this
     # never blocks the worker even if the parent hasn't called wait yet.
     send result to result_ch
@@ -238,17 +296,19 @@ define _orch_clone_memory with src as Map returning Map:
 # stores them in the task_map to keep them GC-safe,
 # and spawns the worker thread.
 # ─────────────────────────────────────────────────────
-define orchestrator_spawn with orch as Int and instruction as Str and role as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int returning Str:
+define orchestrator_spawn with orch as Map and instruction as Str and role as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int returning Str:
     set task_id to orchestrator_generate_id(orch)
+    if string_index_of(task_id and "error:") == 0:
+        return task_id
     set ch to create_channel()
     display concat("[DELEGATE] orchestrator_spawn ENTRY task=" and concat(task_id and concat(" role=" and role)))
 
     # Clone context, memory AND tools to prevent concurrent mutations / data races.
     # tools_mgr is cloned because tool/schema building writes back into it (e.g. the
     # cached "schemas" string) — sharing it with the running main agent raced.
-    set child_ctx to _orch_clone_map(cast_borrow_to_map(ctx))
-    set child_memory to _orch_clone_memory(cast_borrow_to_map(memory_mgr))
-    set child_tools to _orch_clone_map(cast_borrow_to_map(tools_mgr))
+    set child_ctx to _orch_clone_map(cast_int_to_map(ctx))
+    set child_memory to _orch_clone_memory(cast_int_to_map(memory_mgr))
+    set child_tools to _orch_clone_map(cast_int_to_map(tools_mgr))
 
     # Capture the parent's session id from the CLONE (a legitimately-owned Map),
     # before we strip it below. Reading it via an assigned `cast_borrow_to_map(ctx)`
@@ -308,10 +368,15 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
 
     # Store task under orchestrator with mutex protection
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display concat("[-] Orchestrator task registration mutex lock failed for task=" and task_id)
+        return "error:orchestrator_lock_failed"
     set tasks to map_get_val(orch and "tasks")
     set ok to map_insert(tasks and task_id and task_map)
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        display concat("[-] Orchestrator task registration mutex unlock failed for task=" and task_id)
+        return "error:orchestrator_unlock_failed"
 
     # Spawn the sub-agent on its OWN thread so multiple sub-agents run in parallel.
     # Each thread has: its own thread-local active session (ep_active_session_id is
@@ -331,9 +396,15 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
     # sub-agent with a SINGLE await (the compiler mis-lowers awaits in loops inside
     # async defines — see tools_validation_block — so await-once-then-check is the
     # only safe sequencing primitive for async coordinators).
-    set ok to lock_mutex(mtx)
+    set future_lock_ok to lock_mutex(mtx)
+    if future_lock_ok == 0:
+        display concat("[-] Orchestrator future mutex lock failed for task=" and task_id)
+        return concat("error:orchestrator_future_lock_failed:" and task_id)
     set ok to map_insert(task_map and "future" and subfut)
-    set ok to unlock_mutex(mtx)
+    set future_unlock_ok to unlock_mutex(mtx)
+    if future_unlock_ok == 0:
+        display concat("[-] Orchestrator future mutex unlock failed for task=" and task_id)
+        return concat("error:orchestrator_future_unlock_failed:" and task_id)
     # TRACE: notify the parent session so Discord/WebUI can create sub-agent
     # threads and monitoring panels. The event is under parent_sid so the
     # parent's trace poll picks it up.
@@ -341,7 +412,7 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
     if sp_db > 0:
         set sp_inst_esc to string_replace(substring(instruction and 0 and 100) and "\"" and "'")
         set sp_role_esc to string_replace(role and "\"" and "'")
-        set ok to trace_emit(sp_db and parent_sid and "subagent_spawn" and concat("{\"task_id\":\"" and concat(task_id and concat("\",\"role\":\"" and concat(sp_role_esc and concat("\",\"instruction\":\"" and concat(sp_inst_esc and "\"}")))))))
+        set ok to orchestrator_trace_emit_checked(sp_db and parent_sid and "subagent_spawn" and concat("{\"task_id\":\"" and concat(task_id and concat("\",\"role\":\"" and concat(sp_role_esc and concat("\",\"instruction\":\"" and concat(sp_inst_esc and "\"}")))))))
     return task_id
 
 
@@ -356,27 +427,39 @@ define orchestrator_spawn with orch as Int and instruction as Str and role as St
 # The completion FUTURE of a task's worker (0 when unknown). For async callers that
 # need to sequence on a sub-agent with one await; the result text still comes from
 # orchestrator_check afterwards ("completed:<response>").
-define orchestrator_task_future with orch as Int and task_id as Str returning Int:
+define orchestrator_task_future with orch as Map and task_id as Str returning Int:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator task-future mutex lock failed."
+        return 0 - 1
     set tasks to map_get_val(orch and "tasks")
     if map_contains(tasks and task_id) == 0:
-        set ok to unlock_mutex(mtx)
+        set unlock_ok to unlock_mutex(mtx)
+        if unlock_ok == 0:
+            display "[-] Orchestrator task-future mutex unlock failed."
+            return 0 - 1
         return 0
     set task_map to map_get_val(tasks and task_id)
     set fut to 0
     if map_contains(task_map and "future") == 1:
         set fut to map_get_val(task_map and "future")
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        display "[-] Orchestrator task-future mutex unlock failed."
+        return 0 - 1
     return fut
 
-define orchestrator_wait with orch as Int and task_id as Str returning Str:
+define orchestrator_wait with orch as Map and task_id as Str returning Str:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator wait mutex lock failed."
+        return "error:orchestrator_lock_failed"
     set tasks to map_get_val(orch and "tasks")
     set has_task to map_contains(tasks and task_id)
     if has_task == 0:
-        set ok to unlock_mutex(mtx)
+        set unlock_ok to unlock_mutex(mtx)
+        if unlock_ok == 0:
+            return "error:orchestrator_unlock_failed"
         return "error:task_not_found"
     set task_map to map_get_val(tasks and task_id)
     # If the worker already finished, return its recorded result without touching the
@@ -384,11 +467,15 @@ define orchestrator_wait with orch as Int and task_id as Str returning Str:
     set cur_status to ptr_to_str(map_get_val(task_map and "status"))
     if cur_status equals "completed":
         set done_result to ptr_to_str(map_get_val(task_map and "result"))
-        set ok to unlock_mutex(mtx)
+        set unlock_ok to unlock_mutex(mtx)
+        if unlock_ok == 0:
+            return "error:orchestrator_unlock_failed"
         display concat("[DELEGATE] orchestrator_wait (already done) task=" and task_id)
         return done_result
     set ch to map_get_val(task_map and "channel")
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        return "error:orchestrator_unlock_failed"
     display concat("[DELEGATE] orchestrator_wait BLOCKING on channel task=" and task_id)
     # Block until the worker thread sends its result down the buffered channel.
     set rcv to receive from ch
@@ -405,26 +492,36 @@ define orchestrator_wait with orch as Int and task_id as Str returning Str:
 #   "cancelled"            — task was cancelled
 #   "not_found"            — no such task_id
 # ─────────────────────────────────────────────────────
-define orchestrator_check with orch as Int and task_id as Str returning Str:
+define orchestrator_check with orch as Map and task_id as Str returning Str:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator status mutex lock failed."
+        return "error:orchestrator_lock_failed"
     set tasks to map_get_val(orch and "tasks")
     set has_task to map_contains(tasks and task_id)
     if has_task == 0:
-        set ok to unlock_mutex(mtx)
+        set unlock_ok to unlock_mutex(mtx)
+        if unlock_ok == 0:
+            return "error:orchestrator_unlock_failed"
         return "not_found"
     set task_map to map_get_val(tasks and task_id)
     set status to ptr_to_str(map_get_val(task_map and "status"))
     if status equals "completed":
         set result to ptr_to_str(map_get_val(task_map and "result"))
-        set ok to unlock_mutex(mtx)
+        set unlock_ok to unlock_mutex(mtx)
+        if unlock_ok == 0:
+            return "error:orchestrator_unlock_failed"
         set response to concat("completed:" and result)
         return response
     if status equals "cancelled":
-        set ok to unlock_mutex(mtx)
+        set unlock_ok to unlock_mutex(mtx)
+        if unlock_ok == 0:
+            return "error:orchestrator_unlock_failed"
         return "cancelled"
     # Status is still "running"
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        return "error:orchestrator_unlock_failed"
     return "running"
 
 
@@ -434,16 +531,22 @@ define orchestrator_check with orch as Int and task_id as Str returning Str:
 # Used by the approval-forwarding system (react_resume_subagent_approval) to
 # access the child's ctx and its approval_channel for channel-based suspend/resume.
 # ─────────────────────────────────────────────────────
-define orchestrator_get_task with orch as Int and task_id as Str returning Int:
+define orchestrator_get_task with orch as Map and task_id as Str returning Int:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator task-read mutex lock failed."
+        return 0 - 1
     set tasks to map_get_val(orch and "tasks")
     set has_task to map_contains(tasks and task_id)
     if has_task == 0:
-        set ok to unlock_mutex(mtx)
+        set unlock_ok to unlock_mutex(mtx)
+        if unlock_ok == 0:
+            return 0 - 1
         return 0
     set task_map to map_get_val(tasks and task_id)
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        return 0 - 1
     return cast_map_to_int(task_map)
 
 
@@ -454,20 +557,28 @@ define orchestrator_get_task with orch as Int and task_id as Str returning Int:
 # the task status to "cancelled".
 # Returns "cancelled" or "not_found".
 # ─────────────────────────────────────────────────────
-define orchestrator_cancel with orch as Int and task_id as Str returning Str:
+define orchestrator_cancel with orch as Map and task_id as Str returning Str:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator cancel mutex lock failed."
+        return "error:orchestrator_lock_failed"
     set tasks to map_get_val(orch and "tasks")
     set has_task to map_contains(tasks and task_id)
     if has_task == 0:
-        set ok to unlock_mutex(mtx)
+        set unlock_ok to unlock_mutex(mtx)
+        if unlock_ok == 0:
+            return "error:orchestrator_unlock_failed"
         return "not_found"
     set task_map to map_get_val(tasks and task_id)
     set ok to map_insert(task_map and "status" and "cancelled")
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        return "error:orchestrator_unlock_failed"
     # Cancel the ReAct loop outside the lock to avoid
     # holding the mutex during an external call
-    set ok to react_request_cancel(task_id)
+    set cancel_error to react_request_cancel(task_id)
+    if cancel_error != 0:
+        return concat("error:cancel_request_failed:" and int_to_string(cancel_error))
     return "cancelled"
 
 
@@ -478,13 +589,17 @@ define orchestrator_cancel with orch as Int and task_id as Str returning Str:
 #   task_id | role | status
 # Returns "No active tasks." if the task map is empty.
 # ─────────────────────────────────────────────────────
-define orchestrator_list with orch as Int returning Str:
+define orchestrator_list with orch as Map returning Str:
     set mtx to map_get_val(orch and "mutex")
-    set ok to lock_mutex(mtx)
+    if mtx == 0 or else lock_mutex(mtx) == 0:
+        display "[-] Orchestrator list mutex lock failed."
+        return "error:orchestrator_lock_failed"
     set tasks to map_get_val(orch and "tasks")
     set keys to map_keys(tasks)
     set count to length_list(keys)
-    set ok to unlock_mutex(mtx)
+    set unlock_ok to unlock_mutex(mtx)
+    if unlock_ok == 0:
+        return "error:orchestrator_unlock_failed"
     if count == 0:
         free_list(keys)
         return "No active tasks."
@@ -495,11 +610,17 @@ define orchestrator_list with orch as Int returning Str:
     set i to 0
     repeat while i < count:
         set key to get_list(keys and i)
-        set ok to lock_mutex(mtx)
+        set row_lock_ok to lock_mutex(mtx)
+        if row_lock_ok == 0:
+            free_list(keys)
+            return "error:orchestrator_lock_failed"
         set task_map to map_get_val(tasks and key)
         set role to ptr_to_str(map_get_val(task_map and "role"))
         set status to ptr_to_str(map_get_val(task_map and "status"))
-        set ok to unlock_mutex(mtx)
+        set row_unlock_ok to unlock_mutex(mtx)
+        if row_unlock_ok == 0:
+            free_list(keys)
+            return "error:orchestrator_unlock_failed"
         set row to concat(ptr_to_str(key) and " | ")
         set row to concat(row and concat(role and " | "))
         set row to concat(row and concat(status and "\n"))
@@ -542,7 +663,7 @@ define _orch_split_by_pipe with input as Str returning Int:
 # Merges a list of result strings by concatenating
 # them with "---" separators between each.
 # ─────────────────────────────────────────────────────
-define _orch_merge_concat with results as Int returning Str:
+define _orch_merge_concat with results as List returning Str:
     set count to length_list(results)
     if count == 0:
         return ""
@@ -560,7 +681,7 @@ define _orch_merge_concat with results as Int returning Str:
 # Selects the "best" result by choosing the response
 # with the greatest string length.
 # ─────────────────────────────────────────────────────
-define _orch_merge_best with results as Int returning Str:
+define _orch_merge_best with results as List returning Str:
     set count to length_list(results)
     if count == 0:
         return ""
@@ -584,7 +705,7 @@ define _orch_merge_best with results as Int returning Str:
 # frequent one. Falls back to the first result if all
 # responses are unique.
 # ─────────────────────────────────────────────────────
-define _orch_merge_vote with results as Int returning Str:
+define _orch_merge_vote with results as List returning Str:
     set count to length_list(results)
     if count == 0:
         return ""
@@ -621,7 +742,7 @@ define _orch_merge_vote with results as Int returning Str:
 #   "vote"   — majority vote on identical results
 # Falls back to "concat" for unknown strategies.
 # ─────────────────────────────────────────────────────
-define orchestrator_swarm with orch as Int and instruction as Str and sub_tasks_str as Str and join_strategy as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int returning Str:
+define orchestrator_swarm with orch as Map and instruction as Str and sub_tasks_str as Str and join_strategy as Str and model as Int and memory_mgr as Int and tools_mgr as Int and ctx as Int returning Str:
     # Split the sub-tasks string by "|"
     set parts to _orch_split_by_pipe(sub_tasks_str)
     set num_tasks to length_list(parts)
@@ -642,6 +763,9 @@ define orchestrator_swarm with orch as Int and instruction as Str and sub_tasks_
         set full_instruction to concat(instruction and concat(": " and sub_task))
         set role to concat("swarm_worker_" and int_to_string(i))
         set tid to orchestrator_spawn(orch and full_instruction and role and model and memory_mgr and tools_mgr and ctx)
+        if string_index_of(tid and "error:") == 0:
+            free_list(parts)
+            return concat("error:swarm_dispatch_failed:" and tid)
         set dispatched to concat(dispatched and concat("\n - " and concat(role and concat(" (" and concat(tid and concat("): " and sub_task))))))
         set i to i + 1
     free_list(parts)

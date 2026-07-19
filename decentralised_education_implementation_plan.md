@@ -31,7 +31,7 @@
 | Knowledge retrieval over course material | `rag_search` (session-scoped, currently indexes uploads only — needs a reference-corpus indexing step for `stdlib/`+docs, see §3.3) + `workspace_read`/`workspace_read_range` |
 | Per-learner progress & notes | `decent_agent/memory.ep` (synaptic graph, lessons, scratchpad) |
 | Run/grade ErnosPlain code | **NET-NEW, safety-critical**: an isolated runner (see §3.3). Today only `run_command` exists — unsandboxed, denylist-checked, approval-gated. NOT usable as-is for untrusted learner code. |
-| Lessons/curricula as shareable units | `storage.ep` content-addressed blocks (BLAKE3) + CAR export/import |
+| Lessons/curricula as shareable units | `storage.ep` SHA-256 content-addressed blocks + CAR export/import |
 | Discovery & sharing across nodes | DHT (`dht_*`) + P2P/relay + name registry |
 | Learner-facing UI | `decent_web/web_server.ep` (WebSocket) + `decent_web/app.js` (new "Learning" tab) |
 | Proactive "your lesson/agent is ready" pings | `react_write_mid_message` → `trace_poll` (already used by the web) |
@@ -68,7 +68,7 @@ This is a security component, not a wrapper; it needs its own threat-model revie
 **Reference-corpus grounding:** to ground correct syntax, `stdlib/` + compiler docs must first be **indexed into a known RAG corpus** (a one-time `rag_index` pass into a fixed reference session) — `rag_search` is session-scoped and today only indexes user uploads, so this indexing step is required, not free.
 
 ### 3.4 Curriculum & lesson format (content-addressed)
-- A **lesson** = a small structured block: `{title, objective, prerequisites[], method-taught, steps[], checks[], exercises[]}` stored as a content-addressed block (BLAKE3 hash = lesson id).
+- A **lesson** = a small structured block: `{title, objective, prerequisites[], method-taught, steps[], checks[], exercises[]}` stored as a content-addressed block (SHA-256 hash = lesson id).
 - A **curriculum** = an ordered DAG of lesson hashes (a "skill tree"), itself a content block. ErnosPlain zero→expert ships as the first curriculum.
 - Authoring: an `author_lesson` agent flow that turns a topic/PDF into a lesson block, so any node can generate and publish curricula. (OpenMAIC reports ~30 min/lesson on their infra; that's *their* metric, not a promise here — local generation time depends entirely on the model and hardware.)
 - Storage: lesson/curriculum blocks via `storage_content_put` (verified) keyed by an `ep_sha256` hash (verified). **CAR export/import is NOT a dependency** — the README attributes it to `content.ep` but the EP-level API is unverified; sharing works over `storage_content_put` + DHT without it.

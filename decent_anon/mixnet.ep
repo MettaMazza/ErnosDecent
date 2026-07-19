@@ -87,9 +87,16 @@ define mixnet_forward_packets with packets as List and next_hop_address as Str a
         set pkt_ptr to get_list(packets and i)
         set pkt_str to ptr_to_str(pkt_ptr)
         set ok to transport_send(conn and "MIXNET_PACKET" and pkt_str)
+        if ok != 0:
+            set close_error to transport_close(conn)
+            if close_error != TRANSPORT_ERR_NONE:
+                display "[-] Mixnet send failed and the transport could not be closed."
+            return 1
         set i to i + 1
 
     set ok to transport_close(conn)
+    if ok != 0:
+        return 1
     return 0
 
 define mixnet_receive_loop with pool as Map and port as Int and next_hop_address as Str and next_hop_port as Int returning Int:
@@ -103,10 +110,13 @@ define mixnet_receive_loop with pool as Map and port as Int and next_hop_address
     set conn_err to map_get_val(conn and "error")
     if conn_err != 0:
         set ok to transport_close(listener)
+        if ok != 0:
+            return 3
         return 2
 
     # Receive packets until connection closes
     set receiving to 1
+    set fwd_ok to 0
     repeat while receiving == 1:
         set msg to transport_recv(conn)
         set recv_err to map_get_val(msg and "error")
@@ -118,7 +128,12 @@ define mixnet_receive_loop with pool as Map and port as Int and next_hop_address
             if should_flush == 1:
                 set flushed to mixnet_flush_pool(pool)
                 set fwd_ok to mixnet_forward_packets(flushed and next_hop_address and next_hop_port)
+                free_list(flushed)
+                if fwd_ok != 0:
+                    set receiving to 0
 
-    set ok to transport_close(conn)
-    set ok to transport_close(listener)
+    set conn_close_error to transport_close(conn)
+    set listener_close_error to transport_close(listener)
+    if fwd_ok != 0 or else conn_close_error != 0 or else listener_close_error != 0:
+        return 3
     return 0

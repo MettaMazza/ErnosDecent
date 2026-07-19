@@ -32,6 +32,10 @@ long long cast_borrow_to_map(long long b) {
     return b;
 }
 
+long long cast_int_to_map(long long i) {
+    return i;
+}
+
 long long cast_map_to_int(long long m) {
     return m;
 }
@@ -249,7 +253,7 @@ second = content.find(pat, first + 1)
 if second > 0:
     content = content[:second] + inject + content[second:]
 else:
-    print('WARNING: could not find second ep_net_send in ' + cfile + ' — additive helpers NOT injected')
+    raise SystemExit('ERROR: could not find second ep_net_send in ' + cfile + ' — additive helpers not injected')
 
 # THREAD-SAFE RUN QUEUE: the compiler emits an unlocked linked-list run queue, which
 # worker threads can still touch via un-awaited async dispatch (e.g. a sub-agent tool
@@ -305,30 +309,53 @@ if old_q in content:
 elif new_q in content:
     print('Injected additive runtime helpers into ' + cfile + ' (run queue already thread-safe)')
 else:
-    print('WARNING: run-queue pattern not found in ' + cfile + ' — queue left UNLOCKED (compiler output changed?)')
+    raise SystemExit('ERROR: run-queue pattern not found in ' + cfile + ' — refusing an unlocked build')
 
 with open(cfile, 'w') as f:
     f.write(content)
 "
 }
 
+if [ "${1:-}" = "--inject-additive-runtime" ]; then
+    if [ "$#" -ne 2 ] || [ ! -s "$2" ]; then
+        echo "[-] Usage: build.sh --inject-additive-runtime <emitted.c>" >&2
+        exit 64
+    fi
+    inject_additive_helpers "$2"
+    exit 0
+fi
+
 # ── Shared: local image-generation FFI (libstable-diffusion, ggml/Metal) ─────────────
 # The shim (decent_agent/vendor/sd/sd_ep_shim.c) is compiled into BOTH the node and the
 # test build so image_gen.ep's `external define sd_ep_generate` always resolves — and the
-# two never drift (the exact failure mode that had killed the test suite). The 55MB dylib
-# lives OUTSIDE the git tree in ~/.ernosdecent/lib; when present we link it and define
-# SD_EP_HAVE_LIB, otherwise the shim compiles as a stub so the build still links cleanly.
+# two never drift. The runtime is a required production dependency: a build without it
+# stops with an actionable error and cannot emit a binary that advertises a non-working
+# image generator.
 SD_SHIM_SRC="decent_agent/vendor/sd/sd_ep_shim.cpp"
 SD_LIB_DIR="$HOME/.ernosdecent/lib"
 SD_CFLAGS=""
-if [ "$(uname -s)" = "Darwin" ] && [ -f "$SD_LIB_DIR/libstable-diffusion.dylib" ]; then
-    SD_CFLAGS="-DSD_EP_HAVE_LIB -Idecent_agent/vendor/sd -L$SD_LIB_DIR -lstable-diffusion -Wl,-rpath,$SD_LIB_DIR -lc++"
-    echo "[*] Image FFI: linking libstable-diffusion from $SD_LIB_DIR"
-else
-    echo "[*] Image FFI: libstable-diffusion.dylib absent — compiling stub (generate_image reports unavailable)."
+case "$(uname -s)" in
+    Darwin)
+        SD_LIBRARY="$SD_LIB_DIR/libstable-diffusion.dylib"
+        SD_CXX_LIB="-lc++"
+        ;;
+    Linux)
+        SD_LIBRARY="$SD_LIB_DIR/libstable-diffusion.so"
+        SD_CXX_LIB="-lstdc++"
+        ;;
+    *)
+        echo "[-] Unsupported image-runtime platform: $(uname -s)"
+        exit 1
+        ;;
+esac
+if [ ! -f "$SD_LIBRARY" ]; then
+    echo "[-] Required image runtime missing: $SD_LIBRARY"
+    exit 1
 fi
+SD_CFLAGS="-DSD_EP_HAVE_LIB -Idecent_agent/vendor/sd -L$SD_LIB_DIR -lstable-diffusion -Wl,-rpath,$SD_LIB_DIR $SD_CXX_LIB"
+echo "[*] Image FFI: linking $SD_LIBRARY"
 
-if [ "$1" = "test" ] || [ "$1" = "--test" ]; then
+if [ "${1:-}" = "test" ] || [ "${1:-}" = "--test" ] || [ "${1:-}" = "--compile-agent-test" ]; then
     echo "[*] Building Cognitive Agent Test Suite..."
     
     # Locate compiler
@@ -343,9 +370,21 @@ if [ "$1" = "test" ] || [ "$1" = "--test" ]; then
         exit 1
     fi
     
+    rm -f decent_agent/test_agent_compiled.c
     set +e
-    $ERNOS decent_agent/test_agent.ep 2>&1
+    AGENT_COMPILE_OUT=$($ERNOS decent_agent/test_agent.ep 2>&1)
+    AGENT_COMPILE_STATUS=$?
     set -e
+    printf '%s\n' "$AGENT_COMPILE_OUT"
+    if [ ! -s decent_agent/test_agent_compiled.c ]; then
+        echo "[-] Cognitive-agent compiler did not emit fresh C." >&2
+        exit 1
+    fi
+    if [ "$AGENT_COMPILE_STATUS" -ne 0 ] && ! printf '%s\n' "$AGENT_COMPILE_OUT" | grep -qE "undefined symbol|Undefined symbols|undefined reference"; then
+        echo "[-] Cognitive-agent compilation failed before the expected runtime-link stage." >&2
+        exit "$AGENT_COMPILE_STATUS"
+    fi
+    python3 scripts/patch_generated_network.py decent_agent/test_agent_compiled.c
 
     # Step 1b: Patch conflicting mutex declarations and inject cast_borrow_to_map, cast_map_to_int and ep_net_send_raw
     python3 -c "
@@ -374,9 +413,9 @@ long long tools_set_active_session(long long sid_ptr) {
     const char* sid = (const char*)sid_ptr;
     if (sid) {
         strncpy(ep_active_session_id, sid, sizeof(ep_active_session_id) - 1);
-        ep_active_session_id[sizeof(ep_active_session_id) - 1] = '\\0';
+        ep_active_session_id[sizeof(ep_active_session_id) - 1] = '\\\\0';
     } else {
-        ep_active_session_id[0] = '\\0';
+        ep_active_session_id[0] = '\\\\0';
     }
     return 0;
 }
@@ -470,29 +509,32 @@ print('Patched conflicting mutex declarations, test blocking barriers, and SQLit
     case "$OS" in
         Darwin)
             if [ -d "/opt/homebrew/lib" ]; then
-                CFLAGS="$CFLAGS -L/opt/homebrew/lib -lsodium -L/opt/homebrew/opt/openssl/lib -lcrypto"
+                CFLAGS="$CFLAGS -I/opt/homebrew/include -L/opt/homebrew/lib -lsodium -lsecp256k1 -I/opt/homebrew/opt/openssl/include -L/opt/homebrew/opt/openssl/lib -lcrypto"
             elif [ -d "/usr/local/lib" ]; then
-                CFLAGS="$CFLAGS -L/usr/local/lib -lsodium -L/usr/local/opt/openssl/lib -lcrypto"
+                CFLAGS="$CFLAGS -I/usr/local/include -L/usr/local/lib -lsodium -lsecp256k1 -I/usr/local/opt/openssl/include -L/usr/local/opt/openssl/lib -lcrypto"
             else
-                CFLAGS="$CFLAGS -lsodium -lcrypto"
+                CFLAGS="$CFLAGS -lsodium -lsecp256k1 -lcrypto"
             fi
             ;;
         Linux)
-            CFLAGS="$CFLAGS -lsodium -lcrypto -lm"
+            CFLAGS="$CFLAGS -lsodium -lsecp256k1 -lcrypto -lm"
             ;;
     esac
     
-    clang decent_agent/test_agent_compiled.c $SD_SHIM_SRC -o ./decent_agent/test_agent $CFLAGS $SD_CFLAGS 2>&1
+    clang decent_agent/test_agent_compiled.c runtime/websocket_runtime.c runtime/nostr_runtime.c $SD_SHIM_SRC -o ./decent_agent/test_agent $CFLAGS $SD_CFLAGS 2>&1
     if [ "$OS" = "Darwin" ]; then
-        codesign --force -s - ./decent_agent/test_agent 2>/dev/null || true
+        codesign --force -s - ./decent_agent/test_agent
     fi
     echo "[+] Build complete: ./decent_agent/test_agent"
+    if [ "${1:-}" = "--compile-agent-test" ]; then
+        exit 0
+    fi
     echo "[*] Running tests..."
     ./decent_agent/test_agent
     
     echo ""
     echo "[*] Building GitDec Host Election Test Suite..."
-    $ERNOS decent_net/test_host_election.ep 2>&1
+    bash scripts/compile_ep.sh decent_net/test_host_election.ep
     echo "[*] Running GitDec Host Election tests..."
     ./decent_net/test_host_election
     
@@ -529,14 +571,25 @@ $ERNOS emit decent_web/app.ep --js -o decent_web/app.js
 # relink below). BUT we must FAIL LOUD if the type-checker aborted and no fresh C
 # was emitted -- otherwise build.sh silently relinks a STALE node_compiled.c and
 # ships a binary that doesn't match the source.
+rm -f node_compiled.c
 set +e
 ERNOS_OUT=$($ERNOS node.ep 2>&1)
+ERNOS_STATUS=$?
 set -e
 echo "$ERNOS_OUT" | tail -6
 # Fail loud if the compiler aborted before emitting fresh C. Cover BOTH classes that
 # leave a stale node_compiled.c behind: type errors AND codegen/safety errors (e.g.
 # "Code Generation Error", "Safety Error", "Compilation failed"). The latter do NOT
 # contain "type error", so a grep for only that would silently relink the stale C.
+if [ ! -s node_compiled.c ]; then
+    echo "[-] BUILD FAILED: 'ernos node.ep' did not emit fresh C."
+    exit 1
+fi
+python3 scripts/patch_generated_network.py node_compiled.c
+if [ "$ERNOS_STATUS" -ne 0 ] && ! printf '%s\n' "$ERNOS_OUT" | grep -qE "undefined symbol|Undefined symbols|undefined reference"; then
+    echo "[-] BUILD FAILED: 'ernos node.ep' failed before the expected runtime-link stage."
+    exit "$ERNOS_STATUS"
+fi
 if echo "$ERNOS_OUT" | grep -qE "type error\(s\) found|Code Generation Error|Safety Error|Compilation failed|Compiler Error"; then
     echo "[-] BUILD FAILED: 'ernos node.ep' aborted (type or codegen/safety error) and did NOT emit fresh C."
     echo "[-] Refusing to relink the stale node_compiled.c. Fix the error reported above first."
@@ -666,7 +719,7 @@ if match:
         f.write(src)
     print('Patched ep_signal_handler dynamically in node_compiled.c')
 else:
-    print('WARNING: ep_signal_handler signature not found — crash log patch skipped', file=sys.stderr)
+    raise SystemExit('ERROR: ep_signal_handler signature not found — refusing build without crash logging')
 "
     echo "[*] Crash log patch applied."
 fi
@@ -710,7 +763,7 @@ if second > 0:
         f.write(content)
     print('Injected ep_net_send_raw before non-wasm ep_net_send')
 else:
-    print('WARNING: could not find second ep_net_send')
+    raise SystemExit('ERROR: could not find second ep_net_send')
 "
     echo "[*] Injected ep_net_send_raw (binary-safe send)."
 fi
@@ -855,7 +908,7 @@ if second > 0:
         f.write(content)
     print('Injected cast_borrow_to_map/cast_map_to_int')
 else:
-    print('WARNING: could not find second ep_net_send for cast_borrow_to_map')
+    raise SystemExit('ERROR: could not find second ep_net_send for cast_borrow_to_map')
 "
     echo "[*] Injected cast_borrow_to_map/cast_map_to_int."
 fi
@@ -939,7 +992,7 @@ if second > 0:
         f.write(content)
     print('Patched ep_net_recv_bytes in node_compiled.c')
 else:
-    print('WARNING: could not find second ep_net_recv_bytes')
+    raise SystemExit('ERROR: could not find second ep_net_recv_bytes')
 "
 
 # Step 2f: Patch ep_run_command to be dynamic and overflow-safe
@@ -992,7 +1045,7 @@ if second > 0:
         f.write(content)
     print('Patched ep_run_command in node_compiled.c')
 else:
-    print('WARNING: could not find second ep_run_command')
+    raise SystemExit('ERROR: could not find second ep_run_command')
 "
 
 # Step 2g: Bind the local control plane to loopback (security hardening).
@@ -1195,7 +1248,7 @@ long long tools_set_active_session(long long sid_ptr) {
                 f.write(content)
             print('[*] Patched HTTP Client non-blocking session check in node_compiled.c')
         else:
-            print('WARNING: could not find old_recv_loop exactly, trying normalized spacing replacement')
+            print('Exact HTTP receive-loop pattern changed; trying the verified structural pattern.')
             import re
             loop_pattern = r'char\\\\s+recv_buf\\\\[4096\\\\];.*?while\\\\s*\\\\(\\\\(n\\\\s*=\\\\s*recv.*?close\\\\(sockfd\\\\);'
             content, count = re.subn(loop_pattern, new_recv_loop, content, flags=re.DOTALL)
@@ -1204,9 +1257,9 @@ long long tools_set_active_session(long long sid_ptr) {
                     f.write(content)
                 print('[*] Patched HTTP Client non-blocking session check via regex in node_compiled.c')
             else:
-                print('ERROR: HTTP client patch failed to locate recv loop target.')
+                raise SystemExit('ERROR: HTTP client patch failed to locate recv loop target')
     else:
-        print('ERROR: HTTP client patch failed to locate ep_http_request.')
+        raise SystemExit('ERROR: HTTP client patch failed to locate ep_http_request')
 "
 
 # Step 2i: Patch SQLite functions and wrap blocking calls to be thread-safe
@@ -1266,19 +1319,19 @@ case "$OS" in
         # macOS: detect Homebrew prefix (ARM64 vs Intel)
         if [ -d "/opt/homebrew/lib" ]; then
             # Apple Silicon (ARM64)
-            CFLAGS="$CFLAGS -L/opt/homebrew/lib -lsodium"
-            CFLAGS="$CFLAGS -L/opt/homebrew/opt/openssl/lib -lcrypto"
+            CFLAGS="$CFLAGS -I/opt/homebrew/include -L/opt/homebrew/lib -lsodium -lsecp256k1"
+            CFLAGS="$CFLAGS -I/opt/homebrew/opt/openssl/include -L/opt/homebrew/opt/openssl/lib -lcrypto"
         elif [ -d "/usr/local/lib" ]; then
             # Intel Mac (x86_64 Homebrew)
-            CFLAGS="$CFLAGS -L/usr/local/lib -lsodium"
-            CFLAGS="$CFLAGS -L/usr/local/opt/openssl/lib -lcrypto"
+            CFLAGS="$CFLAGS -I/usr/local/include -L/usr/local/lib -lsodium -lsecp256k1"
+            CFLAGS="$CFLAGS -I/usr/local/opt/openssl/include -L/usr/local/opt/openssl/lib -lcrypto"
         else
-            CFLAGS="$CFLAGS -lsodium -lcrypto"
+            CFLAGS="$CFLAGS -lsodium -lsecp256k1 -lcrypto"
         fi
         ;;
     Linux)
         # Linux: libraries from system paths
-        CFLAGS="$CFLAGS -lsodium -lcrypto"
+        CFLAGS="$CFLAGS -lsodium -lsecp256k1 -lcrypto"
         # Some distros need explicit math lib
         CFLAGS="$CFLAGS -lm"
         ;;
@@ -1286,7 +1339,7 @@ case "$OS" in
         echo "[-] Native Windows build is not supported by this script."
         echo "    On Windows, run ErnosDecent under WSL2 (Ubuntu) — it builds + runs"
         echo "    exactly like Linux. Install WSL2, open the Ubuntu shell, then:"
-        echo "        sudo apt install -y clang libsodium-dev libssl-dev libsqlite3-dev"
+        echo "        sudo apt install -y clang libsodium-dev libsecp256k1-dev libssl-dev libsqlite3-dev"
         echo "        ./INSTALL.sh   (or bash build.sh if the toolchain is already installed)"
         exit 1
         ;;
@@ -1297,12 +1350,12 @@ case "$OS" in
         ;;
 esac
 
-echo "[*] Compiling with: clang node_compiled.c $SD_SHIM_SRC -o ./node $CFLAGS $SD_CFLAGS"
-clang node_compiled.c $SD_SHIM_SRC -o ./node $CFLAGS $SD_CFLAGS 2>&1
+echo "[*] Compiling node with the checked WebSocket and image runtimes."
+clang node_compiled.c runtime/websocket_runtime.c runtime/nostr_runtime.c $SD_SHIM_SRC -o ./node $CFLAGS $SD_CFLAGS 2>&1
 
 # Step 4: Sign the binary (macOS requirement for notarization)
 if [ "$OS" = "Darwin" ]; then
-    codesign --force -s - ./node 2>/dev/null || true
+    codesign --force -s - ./node
 fi
 
 echo "[+] Build complete: ./node"

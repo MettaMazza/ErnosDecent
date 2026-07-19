@@ -1,7 +1,6 @@
 # ErnosDecent — Symbiotic Collaborative Resource Mesh
 # Component: decent_pool/mesh.ep
-# Implements: Orchestration of bandwidth pooling, compute pooling, and onion privacy routing
-# Status: Production — OperationTrojanClaude Phase 12
+# Implements: Bandwidth accounting, compute-job coordination, and redundant local inference verification
 
 import "bandwidth"
 import "compute"
@@ -54,6 +53,8 @@ define mesh_allocate_resource with mesh as Map and requestor_id as Str and req_t
     
     # Ensure peer is registered in pool
     set ok to bandwidth_add_peer(bp and requestor_id)
+    if ok != BANDWIDTH_ERR_NONE:
+        return MESH_ERR_ALLOCATION_FAILED
 
     if req_type equals "bandwidth":
         # Bandwidth cost: record traffic as download
@@ -63,10 +64,10 @@ define mesh_allocate_resource with mesh as Map and requestor_id as Str and req_t
         return MESH_ERR_NONE
 
     if req_type equals "compute":
-        # Compute cost: verify requestor is not rate limited (simulate via bandwidth limit check)
-        set peers to map_get_val(bp and "peers")
-        set peer to map_get_val(peers and requestor_id)
-        set tier_name to map_get_val(peer and "tier_name")
+        # Compute cost: verify requestor is not rate limited by the live accounting window.
+        set tier_name to bandwidth_peer_tier(bp and requestor_id)
+        if string_length(tier_name) == 0:
+            return MESH_ERR_ALLOCATION_FAILED
         set lim to bandwidth_check_limit(bp and requestor_id and tier_name)
         if lim != 0:
             return MESH_ERR_ALLOCATION_FAILED
@@ -75,7 +76,7 @@ define mesh_allocate_resource with mesh as Map and requestor_id as Str and req_t
     return MESH_ERR_ALLOCATION_FAILED
 
 # ================================================================
-# Collaborative AI Execution (Mesh + Onion + Compute)
+# Collaborative AI Execution (Compute Manager + Redundant Local Verification)
 # ================================================================
 
 define mesh_execute_collaborative_ai with mesh as Map and requestor_id as Str and prompt as Str returning Str:
@@ -84,12 +85,15 @@ define mesh_execute_collaborative_ai with mesh as Map and requestor_id as Str an
     if alloc_err != 0:
         return "ERROR: Resource allocation failed (rate limited or unauthorized)"
 
-    # 2. Submit the task to the distributed compute pool.
+    # 2. Submit the task to the compute manager.
     set cm to map_get_val(mesh and "compute_mgr")
     set job_id to compute_submit_job(cm and requestor_id and prompt)
+    if string_length(job_id) == 0:
+        return "ERROR: Compute job submission failed"
 
-    # 3. Redundant execution: two workers run REAL local inference (this was a
-    #    hardcoded string_upper(prompt) stub). With deterministic decoding the two
+    # 3. Redundant execution: two logical worker identities run local inference.
+    #    This path does not dispatch inference over the network or through onion routes.
+    #    With deterministic decoding the two
     #    workers produce identical output and the redundant-result consensus below
     #    confirms it; if inference is unavailable both return "" (honestly empty,
     #    not a faked answer), and if it is non-deterministic they may disagree and
@@ -98,19 +102,27 @@ define mesh_execute_collaborative_ai with mesh as Map and requestor_id as Str an
     set worker2 to "node_charlie"
     set assigned_job_1 to compute_assign_job(cm and worker1)
     set assigned_job_2 to compute_assign_job(cm and worker2)
+    if (assigned_job_1 equals job_id) == 0 or else (assigned_job_2 equals job_id) == 0:
+        return "ERROR: Redundant worker assignment failed"
 
     set local_result_1 to query_local_llm(prompt and "")
     set local_result_2 to query_local_llm(prompt and "")
+    if string_length(local_result_1) == 0 or else string_length(local_result_2) == 0:
+        return "ERROR: Local inference failed"
 
-    set ok to compute_submit_result(cm and job_id and worker1 and local_result_1)
-    set ok to compute_submit_result(cm and job_id and worker2 and local_result_2)
+    set submit_err_1 to compute_submit_result(cm and job_id and worker1 and local_result_1)
+    if submit_err_1 != COMPUTE_ERR_NONE:
+        return concat("ERROR: First worker result rejected (" and concat(int_to_string(submit_err_1) and ")"))
+    set submit_err_2 to compute_submit_result(cm and job_id and worker2 and local_result_2)
+    if submit_err_2 != COMPUTE_ERR_NONE:
+        return concat("ERROR: Second worker result rejected (" and concat(int_to_string(submit_err_2) and ")"))
 
     # 4. Verify via the real redundant-result consensus.
     set verify_err to compute_verify_result(cm and job_id)
     if verify_err != 0:
-        return "ERROR: Consensus verification failed (workers disputed)"
+        return concat("ERROR: Consensus verification failed (" and concat(int_to_string(verify_err) and ")"))
 
-    set jobs to map_get_val(cm and "jobs")
-    set job to map_get_val(jobs and job_id)
-    set verified_res to ptr_to_str(map_get_val(job and "result"))
+    set verified_res to compute_job_result(cm and job_id)
+    if string_length(verified_res) == 0:
+        return "ERROR: Verified compute result is unavailable"
     return verified_res

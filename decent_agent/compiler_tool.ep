@@ -8,17 +8,24 @@ import "string"
 import "../logging"
 
 define run_upgrade_background returning Int:
-    set res to run_command("bash upgrade.sh")
+    set res to run_command("bash upgrade.sh 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if string_contains(res and "__ERNOS_EXIT__:0") == 0:
+        display concat("[Compiler] upgrade.sh failed: " and res)
+        return 1
+    display "[Compiler] upgrade.sh completed successfully."
     return 0
+
+define compiler_command_succeeded with output as Str returning Int:
+    return string_contains(output and "__ERNOS_EXIT__:0")
 
 define system_recompile returning Str:
     log_info("compiler" and "Starting safety-gated system self-recompilation pipeline.")
     
     # 1. Run build
-    set build_res to run_command("bash build.sh")
+    set build_res to run_command("bash build.sh 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
     
     # Check if compilation failed
-    if string_contains(build_res and "Error: Clang compilation failed") == 1 or else string_contains(build_res and "error:") == 1:
+    if compiler_command_succeeded(build_res) == 0:
         return concat("RECOMPILE BLOCKED: Compilation failed.\n\n" and build_res)
         
     # Check for warnings gate
@@ -26,24 +33,28 @@ define system_recompile returning Str:
         return concat("RECOMPILE BLOCKED: Compiler warnings detected. You must fix all warnings first.\n\n" and build_res)
         
     # 2. Run unit tests
-    set test_res to run_command("bash build.sh test")
-    if string_contains(test_res and "ALL COGNITIVE AGENT TESTS PASSED!") == 0 or else string_contains(test_res and "FAIL") == 1:
+    set test_res to run_command("bash build.sh test 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if compiler_command_succeeded(test_res) == 0:
         return concat("RECOMPILE BLOCKED: Unit tests failed.\n\n" and test_res)
         
     # 3. Stage the binary
     if file_exists("./node") == 1:
         # Save resume state
-        set resume_json to "{\n  \"message\": \"System recompile completed successfully. Upgraded daemon is online.\",\n  \"compiled_at\": \"staged\"\n}"
+        set resume_json to "{\n  \"message\": \"Recompile and tests completed; a verified binary was staged and restart is pending.\",\n  \"compiled_at\": \"staged\"\n}"
         set ok to write_file("config/resume.json" and resume_json)
+        if ok == 0:
+            return "RECOMPILE BLOCKED: unable to persist restart resume state."
         
         # Stage binary as node_next
-        set cp_res to run_command("cp ./node ./node_next")
+        set cp_res to run_command("cp ./node ./node_next 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+        if compiler_command_succeeded(cp_res) == 0:
+            return concat("RECOMPILE BLOCKED: unable to stage node_next.\n\n" and cp_res)
         
         # 4. Trigger hot-swap script upgrade.sh in the background
         if file_exists("upgrade.sh") == 1:
             spawn run_upgrade_background()
-            return "RECOMPILE SUCCESSFUL: staged binary as node_next. upgrade.sh launched in background."
+            return "RECOMPILE VERIFIED AND STAGED: node_next is ready and upgrade.sh was launched; restart completion is pending background verification."
         else:
-            return "RECOMPILE SUCCESSFUL: staged binary as node_next. upgrade.sh not found."
+            return "RECOMPILE VERIFIED AND STAGED: node_next is ready, but upgrade.sh was not found, so no restart was attempted."
             
     return "Error: Compiled binary './node' not found."

@@ -3,7 +3,7 @@
 # Loads TOML config file with sensible defaults
 # Status: Production
 
-import "toml"
+import "./config_toml.ep"
 import "string"
 import "fs"
 import "os"
@@ -30,8 +30,11 @@ define config_defaults returning Map:
     set ok to map_insert(cfg and "network.web_port" and 8088)
     set ok to map_insert(cfg and "network.max_connections" and 256)
     set ok to map_insert(cfg and "network.max_message_size" and 1048576)
+    set ok to map_insert(cfg and "network.public_host" and "")
     set ok to map_insert(cfg and "network.seed_addr" and "")
     set ok to map_insert(cfg and "network.seed_port" and 0)
+    set ok to map_insert(cfg and "network.enable_host_election" and 1)
+    set ok to map_insert(cfg and "network.is_static_host" and 0)
 
     # [consensus]
     set ok to map_insert(cfg and "consensus.raft_port" and 9103)
@@ -68,6 +71,10 @@ define config_load with path as Str returning Map:
         return cfg
 
     set toml_store to toml_parse(content)
+    if map_contains(toml_store and "__error") == 1:
+        set parse_error to ptr_to_str(map_get_val(toml_store and "__error"))
+        set ok to map_insert(cfg and "config.error" and parse_error)
+        return cfg
 
     # Override defaults with TOML values
     set ok to config_override_str(cfg and toml_store and "node" and "name" and "node.name")
@@ -82,8 +89,11 @@ define config_load with path as Str returning Map:
     set ok to config_override_int(cfg and toml_store and "network" and "web_port" and "network.web_port")
     set ok to config_override_int(cfg and toml_store and "network" and "max_connections" and "network.max_connections")
     set ok to config_override_int(cfg and toml_store and "network" and "max_message_size" and "network.max_message_size")
+    set ok to config_override_str(cfg and toml_store and "network" and "public_host" and "network.public_host")
     set ok to config_override_str(cfg and toml_store and "network" and "seed_addr" and "network.seed_addr")
     set ok to config_override_int(cfg and toml_store and "network" and "seed_port" and "network.seed_port")
+    set ok to config_override_int(cfg and toml_store and "network" and "enable_host_election" and "network.enable_host_election")
+    set ok to config_override_int(cfg and toml_store and "network" and "is_static_host" and "network.is_static_host")
 
     set ok to config_override_str(cfg and toml_store and "ai" and "whisper_host" and "ai.whisper_host")
     set ok to config_override_int(cfg and toml_store and "ai" and "whisper_port" and "ai.whisper_port")
@@ -105,18 +115,17 @@ define config_load with path as Str returning Map:
 # Override helpers
 # ================================================================
 
-define config_override_str with cfg as Map and toml_store as Int and section as Str and key as Str and cfg_key as Str returning Int:
+define config_override_str with cfg as Map and toml_store as Map and section as Str and key as Str and cfg_key as Str returning Int:
     set val to toml_get_string(toml_store and section and key)
     if string_length(val) > 0:
         set ok to map_insert(cfg and cfg_key and val)
     return 0
 
-define config_override_int with cfg as Map and toml_store as Int and section as Str and key as Str and cfg_key as Str returning Int:
+define config_override_int with cfg as Map and toml_store as Map and section as Str and key as Str and cfg_key as Str returning Int:
     set val_str to toml_get_string(toml_store and section and key)
     if string_length(val_str) > 0:
         set val to toml_get_int(toml_store and section and key)
-        if val != 0:
-            set ok to map_insert(cfg and cfg_key and val)
+        set ok to map_insert(cfg and cfg_key and val)
     return 0
 
 # ================================================================
@@ -163,7 +172,12 @@ define config_generate_default with path as Str returning Int:
     set content to concat(content and "ipc_port = 5000\n")
     set content to concat(content and "web_port = 8088\n")
     set content to concat(content and "max_connections = 256\n")
-    set content to concat(content and "max_message_size = 1048576\n\n")
+    set content to concat(content and "max_message_size = 1048576\n")
+    set content to concat(content and "public_host = \"\"\n")
+    set content to concat(content and "seed_addr = \"\"\n")
+    set content to concat(content and "seed_port = 0\n")
+    set content to concat(content and "enable_host_election = 1\n")
+    set content to concat(content and "is_static_host = 0\n\n")
 
     set content to concat(content and "[consensus]\n")
     set content to concat(content and "raft_port = 9103\n")
@@ -207,8 +221,11 @@ define config_save with path as Str and cfg as Map returning Int:
     set content to concat(content and concat("web_port = " and concat(int_to_string(config_get_int(cfg and "network.web_port")) and "\n")))
     set content to concat(content and concat("max_connections = " and concat(int_to_string(config_get_int(cfg and "network.max_connections")) and "\n")))
     set content to concat(content and concat("max_message_size = " and concat(int_to_string(config_get_int(cfg and "network.max_message_size")) and "\n")))
+    set content to concat(content and concat("public_host = \"" and concat(config_get_str(cfg and "network.public_host") and "\"\n")))
     set content to concat(content and concat("seed_addr = \"" and concat(config_get_str(cfg and "network.seed_addr") and "\"\n")))
-    set content to concat(content and concat("seed_port = " and concat(int_to_string(config_get_int(cfg and "network.seed_port")) and "\n\n")))
+    set content to concat(content and concat("seed_port = " and concat(int_to_string(config_get_int(cfg and "network.seed_port")) and "\n")))
+    set content to concat(content and concat("enable_host_election = " and concat(int_to_string(config_get_int(cfg and "network.enable_host_election")) and "\n")))
+    set content to concat(content and concat("is_static_host = " and concat(int_to_string(config_get_int(cfg and "network.is_static_host")) and "\n\n")))
 
     set content to concat(content and "[consensus]\n")
     set content to concat(content and concat("raft_port = " and concat(int_to_string(config_get_int(cfg and "consensus.raft_port")) and "\n")))
@@ -224,6 +241,9 @@ define config_save with path as Str and cfg as Map returning Int:
     set content to concat(content and concat("max_content_size = " and concat(int_to_string(config_get_int(cfg and "storage.max_content_size")) and "\n")))
     set content to concat(content and concat("dht_ttl_sec = " and concat(int_to_string(config_get_int(cfg and "storage.dht_ttl_sec")) and "\n")))
 
+    set content to concat(content and "\n[ai]\n")
+    set content to concat(content and concat("whisper_host = \"" and concat(config_get_str(cfg and "ai.whisper_host") and "\"\n")))
+    set content to concat(content and concat("whisper_port = " and concat(int_to_string(config_get_int(cfg and "ai.whisper_port")) and "\n")))
+
     set ok to write_file(path and content)
     return ok
-

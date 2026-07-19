@@ -3,11 +3,11 @@
 # Auto-compiled to app.js via: ernos emit app.ep --js -o app.js
 
 # ---- Helper functions for keyword compatibility ----
-define set_prop with target and key and value:
+define set_prop with target as Obj and key as Str and value as Obj returning Int:
     set setFn to get_list(Reflect and "set")
     setFn.call(Reflect and target and key and value)
 
-define send_msg with ws and payload:
+define send_msg with ws as Obj and payload as Str returning Int:
     if not ws:
         return 0
     set readyState to get_list(ws and "readyState")
@@ -16,25 +16,207 @@ define send_msg with ws and payload:
     set sendFn to get_list(ws and "send")
     sendFn.call(ws and payload)
 
-define substring with str and start and len:
+define substring with str as Str and start as Int and len as Int returning Str:
     if not str:
         return ""
     set subFn to get_list(str and "substring")
     return subFn.call(str and start and start + len)
 
-define string_index_of with str and sub:
+define string_index_of with str as Str and sub as Str returning Int:
     if not str:
         return 0 - 1
     set idxFn to get_list(str and "indexOf")
     return idxFn.call(str and sub)
 
-define string_length with str:
+define string_length with str as Str returning Int:
     if not str:
         return 0
     return get_list(str and "length")
 
+define clearWebSession returning Int:
+    window.sessionStorage.removeItem("ernode_session_token")
+    window.sessionStorage.removeItem("ernode_session_did")
+    window.sessionStorage.removeItem("ernode_session_issued")
+    window.sessionStorage.removeItem("ernode_session_expires")
+    window.sessionStorage.removeItem("ernode_session_nonce")
+    return 0
+
+define webSessionAvailable returning Int:
+    set token to window.sessionStorage.getItem("ernode_session_token")
+    set did to window.sessionStorage.getItem("ernode_session_did")
+    set issued to window.sessionStorage.getItem("ernode_session_issued")
+    set expires to window.sessionStorage.getItem("ernode_session_expires")
+    set nonce to window.sessionStorage.getItem("ernode_session_nonce")
+    if not token || not did || not issued || not expires || not nonce:
+        return 0
+    if parseInt(expires) <= Math.floor(Date.now() / 1000):
+        clearWebSession()
+        return 0
+    return 1
+
+define buildWebSocketAuth returning Obj:
+    set auth to Object()
+    set auth.type to "auth"
+    set auth.token to window.sessionStorage.getItem("ernode_session_token") || ""
+    set auth.did to window.sessionStorage.getItem("ernode_session_did") || ""
+    set auth.issued_at to window.sessionStorage.getItem("ernode_session_issued") || ""
+    set auth.expires_at to window.sessionStorage.getItem("ernode_session_expires") || ""
+    set auth.nonce to window.sessionStorage.getItem("ernode_session_nonce") || ""
+    return auth
+
+define authenticatedFetch with path as Str and method as Str and body as Str returning Obj:
+    set options to Object()
+    set options.method to method
+    set headers to Object()
+    set_prop(headers and "X-Session-Token" and window.sessionStorage.getItem("ernode_session_token") || "")
+    set_prop(headers and "X-Session-Did" and window.sessionStorage.getItem("ernode_session_did") || "")
+    set_prop(headers and "X-Session-Issued" and window.sessionStorage.getItem("ernode_session_issued") || "")
+    set_prop(headers and "X-Session-Expires" and window.sessionStorage.getItem("ernode_session_expires") || "")
+    set_prop(headers and "X-Session-Nonce" and window.sessionStorage.getItem("ernode_session_nonce") || "")
+    if string_length(body) > 0:
+        set_prop(headers and "Content-Type" and "application/json")
+        set options.body to body
+    set options.headers to headers
+    return window.fetch(path and options)
+
+define requestCancellation with button as Obj returning Int:
+    if button:
+        set button.disabled to true
+        set button.textContent to "Stopping…"
+    authenticatedFetch("/api/cancel" and "POST" and "").then(given response:
+        if not response.ok:
+            console.error(f"Cancellation request failed with HTTP {response.status}")
+            if button:
+                set button.disabled to false
+                set button.textContent to "Stop"
+        return 0
+    ).catch(given error:
+        console.error(concat("Cancellation request failed: " and String(error)))
+        if button:
+            set button.disabled to false
+            set button.textContent to "Stop"
+        return 0
+    )
+    return 0
+
+define toggleAutoapprove with button as Obj returning Int:
+    set enable to button.getAttribute("data-on") != "1"
+    set requestBody to Object()
+    set_prop(requestBody and "on" and enable)
+    set button.disabled to true
+    authenticatedFetch("/api/autoapprove" and "POST" and JSON.stringify(requestBody)).then(given response:
+        if response.ok:
+            if enable:
+                button.setAttribute("data-on" and "1")
+                set button.textContent to "🔓 Auto-approve: ON"
+            else:
+                button.setAttribute("data-on" and "0")
+                set button.textContent to "🔒 Auto-approve: OFF"
+        else:
+            console.error(f"Auto-approve request failed with HTTP {response.status}")
+        set button.disabled to false
+        return 0
+    ).catch(given error:
+        console.error(concat("Auto-approve request failed: " and String(error)))
+        set button.disabled to false
+        return 0
+    )
+    return 0
+
+define showLogin returning Int:
+    if document.getElementById("ernode-login-overlay"):
+        return 0
+    handleDisconnect()
+    set overlay to document.createElement("div")
+    set overlay.id to "ernode-login-overlay"
+    set_prop(overlay.style and "position" and "fixed")
+    set_prop(overlay.style and "inset" and "0")
+    set_prop(overlay.style and "zIndex" and "100000")
+    set_prop(overlay.style and "display" and "flex")
+    set_prop(overlay.style and "alignItems" and "center")
+    set_prop(overlay.style and "justifyContent" and "center")
+    set_prop(overlay.style and "background" and "rgba(4, 8, 18, 0.96)")
+
+    set form to document.createElement("form")
+    set_prop(form.style and "width" and "min(420px, calc(100vw - 32px))")
+    set_prop(form.style and "padding" and "28px")
+    set_prop(form.style and "border" and "1px solid rgba(118, 169, 255, 0.35)")
+    set_prop(form.style and "borderRadius" and "16px")
+    set_prop(form.style and "background" and "#0b1220")
+
+    set title to document.createElement("h2")
+    set title.textContent to "Unlock ErnosDecent"
+    set subtitle to document.createElement("p")
+    set subtitle.textContent to "Enter the Web UI password stored in ~/.ernosdecent/web-password."
+    set_prop(subtitle.style and "color" and "rgba(255,255,255,0.65)")
+    set input to document.createElement("input")
+    set input.type to "password"
+    set input.autocomplete to "current-password"
+    set input.required to true
+    set input.placeholder to "Web UI password"
+    set_prop(input.style and "width" and "100%")
+    set_prop(input.style and "margin" and "18px 0 12px")
+    set button to document.createElement("button")
+    set button.type to "submit"
+    set button.textContent to "Unlock"
+    set button.className to "btn-primary"
+    set status to document.createElement("p")
+    set status.id to "ernode-login-status"
+    set status.textContent to ""
+    set_prop(status.style and "minHeight" and "20px")
+    set_prop(status.style and "color" and "#ff7b8b")
+
+    form.appendChild(title)
+    form.appendChild(subtitle)
+    form.appendChild(input)
+    form.appendChild(button)
+    form.appendChild(status)
+    overlay.appendChild(form)
+    document.body.appendChild(overlay)
+    input.focus()
+
+    form.addEventListener("submit" and given event:
+        event.preventDefault()
+        set passphrase to input.value
+        if not passphrase:
+            set status.textContent to "A password is required."
+            return 0
+        set button.disabled to true
+        set status.textContent to "Authenticating…"
+        set loginBody to Object()
+        set loginBody.passphrase to passphrase
+        set loginOptions to Object()
+        set loginOptions.method to "POST"
+        set loginHeaders to Object()
+        set_prop(loginHeaders and "Content-Type" and "application/json")
+        set loginOptions.headers to loginHeaders
+        set loginOptions.body to JSON.stringify(loginBody)
+        window.fetch("/api/login" and loginOptions).then(given response:
+            return response.json()
+        ).then(given data:
+            if not data.success:
+                set status.textContent to data.message || "Authentication failed."
+                set button.disabled to false
+                return 0
+            window.sessionStorage.setItem("ernode_session_token" and data.token)
+            window.sessionStorage.setItem("ernode_session_did" and data.did)
+            window.sessionStorage.setItem("ernode_session_issued" and String(data.issued_at))
+            window.sessionStorage.setItem("ernode_session_expires" and String(data.expires_at))
+            window.sessionStorage.setItem("ernode_session_nonce" and data.nonce)
+            overlay.remove()
+            connectDaemon()
+            return 0
+        ).catch(given error:
+            set status.textContent to concat("Authentication request failed: " and String(error))
+            set button.disabled to false
+            return 0
+        )
+        return 0
+    )
+    return 0
+
 # ---- HTML Escaping for XSS Prevention ----
-define escapeHTML with str:
+define escapeHTML with str as Str returning Str:
     if not str:
         return ""
     set reClass to get_list(window and "RegExp")
@@ -46,7 +228,7 @@ define escapeHTML with str:
     set res to str.replace(reAmp and "&amp;").replace(reLt and "&lt;").replace(reGt and "&gt;").replace(reQuot and "&quot;").replace(reApos and "&#039;")
     return res
 
-define decodeHTMLEntities with str:
+define decodeHTMLEntities with str as Str returning Str:
     if not str:
         return ""
     set temp to document.createElement("textarea")
@@ -54,7 +236,7 @@ define decodeHTMLEntities with str:
     return temp.value
 
 # ---- Controls state helper ----
-define setControlsEnabled with enabled:
+define setControlsEnabled with enabled as Int returning Int:
     set inputs to document.querySelectorAll("input, button[type='submit'], .btn-primary, .btn-secondary")
     inputs.forEach(given el:
         set isNav to el.closest(".nav-menu")
@@ -68,7 +250,7 @@ define setControlsEnabled with enabled:
     )
 
 # ---- Disconnect handler ----
-define handleDisconnect:
+define handleDisconnect returning Int:
     set window.isConnected to false
     set indicator to document.getElementById("connection-indicator")
     indicator.classList.remove("online")
@@ -102,8 +284,72 @@ define handleDisconnect:
     
     setControlsEnabled(false)
 
+define requestInitialState with ws as Obj returning Int:
+    set msgStatus to Object()
+    set msgStatus.type to "get_status"
+    send_msg(ws and JSON.stringify(msgStatus))
+    set msgIdentity to Object()
+    set msgIdentity.type to "get_identity"
+    send_msg(ws and JSON.stringify(msgIdentity))
+    set msgWallet to Object()
+    set msgWallet.type to "get_wallet"
+    send_msg(ws and JSON.stringify(msgWallet))
+    set msgStorage to Object()
+    set msgStorage.type to "get_storage"
+    send_msg(ws and JSON.stringify(msgStorage))
+    set msgPool to Object()
+    set msgPool.type to "get_pool"
+    send_msg(ws and JSON.stringify(msgPool))
+    set msgNetwork to Object()
+    set msgNetwork.type to "get_network"
+    send_msg(ws and JSON.stringify(msgNetwork))
+    set msgHosts to Object()
+    set msgHosts.type to "dht_get"
+    set msgHosts.key to "network:host_nodes"
+    send_msg(ws and JSON.stringify(msgHosts))
+    set msgMemory to Object()
+    set msgMemory.type to "get_agent_memory"
+    send_msg(ws and JSON.stringify(msgMemory))
+    set msgTuring to Object()
+    set msgTuring.type to "get_turing_grid"
+    send_msg(ws and JSON.stringify(msgTuring))
+    set msgModels to Object()
+    set msgModels.type to "get_ai_models"
+    send_msg(ws and JSON.stringify(msgModels))
+    set msgPlatforms to Object()
+    set msgPlatforms.type to "get_platforms"
+    send_msg(ws and JSON.stringify(msgPlatforms))
+    set msgPlugins to Object()
+    set msgPlugins.type to "get_plugins"
+    send_msg(ws and JSON.stringify(msgPlugins))
+    set msgPrompts to Object()
+    set msgPrompts.type to "get_prompts"
+    send_msg(ws and JSON.stringify(msgPrompts))
+    set msgSys to Object()
+    set msgSys.type to "get_system_config"
+    send_msg(ws and JSON.stringify(msgSys))
+    set msgSessActive to Object()
+    set msgSessActive.type to "session_get_active"
+    send_msg(ws and JSON.stringify(msgSessActive))
+    set activeTab to window.localStorage.getItem("ernode_active_tab") || "overview"
+    if activeTab == "guide":
+        set navList to document.getElementById("guide-nav-list")
+        if navList:
+            set activeBtn to navList.querySelector("button.active")
+            if activeBtn:
+                set file to activeBtn.getAttribute("data-guide-file")
+                set msg to Object()
+                set msg.type to "gitdec_get_repo_file"
+                set msg.repo_id to "ErnosDecent"
+                set msg.filename to file
+                send_msg(ws and JSON.stringify(msg))
+    return 0
+
 # ---- Connect to daemon ----
-define connectDaemon:
+define connectDaemon returning Int:
+    if webSessionAvailable() == 0:
+        showLogin()
+        return 0
     set port to window.location.port || "8080"
     set hostname to window.location.hostname || "127.0.0.1"
     if hostname equals "localhost":
@@ -114,110 +360,52 @@ define connectDaemon:
     set wsClass to get_list(window and "WebSocket")
     set ws to Reflect.construct(wsClass and [wsUrl])
     set window.ws to ws
+    set window.wsAuthenticated to false
     
     set ws.onopen to given event:
         console.log("Connected to ErnosDecent Daemon.")
-        set window.isConnected to true
-        set indicator to document.getElementById("connection-indicator")
-        indicator.classList.remove("offline")
-        indicator.classList.add("online")
-        set statusText to indicator.querySelector(".status-text")
-        set statusText.textContent to "Daemon Connected"
-        setControlsEnabled(true)
-        
-        # Fetch status and other dashboard info on connection
-        set msgStatus to Object()
-        set msgStatus.type to "get_status"
-        send_msg(ws and JSON.stringify(msgStatus))
-        
-        set msgIdentity to Object()
-        set msgIdentity.type to "get_identity"
-        send_msg(ws and JSON.stringify(msgIdentity))
-        
-        set msgWallet to Object()
-        set msgWallet.type to "get_wallet"
-        send_msg(ws and JSON.stringify(msgWallet))
-        
-        set msgStorage to Object()
-        set msgStorage.type to "get_storage"
-        send_msg(ws and JSON.stringify(msgStorage))
-        
-        set msgPool to Object()
-        set msgPool.type to "get_pool"
-        send_msg(ws and JSON.stringify(msgPool))
-        
-        set msgNetwork to Object()
-        set msgNetwork.type to "get_network"
-        send_msg(ws and JSON.stringify(msgNetwork))
-        
-        set msgHosts to Object()
-        set msgHosts.type to "dht_get"
-        set msgHosts.key to "network:host_nodes"
-        send_msg(ws and JSON.stringify(msgHosts))
-        
-        set msgMemory to Object()
-        set msgMemory.type to "get_agent_memory"
-        send_msg(ws and JSON.stringify(msgMemory))
-        
-        set msgTuring to Object()
-        set msgTuring.type to "get_turing_grid"
-        send_msg(ws and JSON.stringify(msgTuring))
-        
-        set msgModels to Object()
-        set msgModels.type to "get_ai_models"
-        send_msg(ws and JSON.stringify(msgModels))
-        
-        set msgPlatforms to Object()
-        set msgPlatforms.type to "get_platforms"
-        send_msg(ws and JSON.stringify(msgPlatforms))
-        
-        set msgPlugins to Object()
-        set msgPlugins.type to "get_plugins"
-        send_msg(ws and JSON.stringify(msgPlugins))
-        
-        set msgPrompts to Object()
-        set msgPrompts.type to "get_prompts"
-        send_msg(ws and JSON.stringify(msgPrompts))
-        
-        set msgSys to Object()
-        set msgSys.type to "get_system_config"
-        send_msg(ws and JSON.stringify(msgSys))
-        
-        set msgSessActive to Object()
-        set msgSessActive.type to "session_get_active"
-        send_msg(ws and JSON.stringify(msgSessActive))
-        
-        # If currently on the guide tab, load the active document
-        set activeTab to window.localStorage.getItem("ernode_active_tab") || "overview"
-        if activeTab == "guide":
-            set navList to document.getElementById("guide-nav-list")
-            if navList:
-                set activeBtn to navList.querySelector("button.active")
-                if activeBtn:
-                    set file to activeBtn.getAttribute("data-guide-file")
-                    set msg to Object()
-                    set msg.type to "gitdec_get_repo_file"
-                    set msg.repo_id to "ErnosDecent"
-                    set msg.filename to file
-                    send_msg(ws and JSON.stringify(msg))
+        send_msg(ws and JSON.stringify(buildWebSocketAuth()))
         
     set ws.onmessage to given event:
         set dataStr to event.data
-        set msg to JSON.parse(dataStr)
-        handleDaemonMessage(msg)
+        set responseClass to get_list(window and "Response")
+        set frameResponse to Reflect.construct(responseClass and [dataStr])
+        frameResponse.json().then(given msg:
+            if msg.type == "auth_ok":
+                set window.wsAuthenticated to true
+                set window.isConnected to true
+                set indicator to document.getElementById("connection-indicator")
+                indicator.classList.remove("offline")
+                indicator.classList.add("online")
+                set statusText to indicator.querySelector(".status-text")
+                set statusText.textContent to "Daemon Connected"
+                setControlsEnabled(true)
+                requestInitialState(ws)
+            else:
+                handleDaemonMessage(msg)
+            return 0
+        ).catch(given error:
+            console.error(concat("Rejected malformed daemon frame: " and String(error)))
+            return 0
+        )
         
     set ws.onclose to given event:
         console.log("Daemon disconnected.")
         handleDisconnect()
-        setTimeout(given dummy:
-            connectDaemon()
-        and 5000)
+        if window.wsAuthenticated:
+            setTimeout(given dummy:
+                connectDaemon()
+            and 5000)
+        else:
+            clearWebSession()
+            showLogin()
         
     set ws.onerror to given event:
         console.log("Daemon connection error.")
+    return 0
 
 # ---- Local Storage Persistence Helpers ----
-define saveChatMessage with chanName and sender and text and type and timeStr:
+define saveChatMessage with chanName as Str and sender as Str and text as Str and type as Str and timeStr as Str returning Int:
     set historyStr to window.localStorage.getItem("ernode_chat_history")
     set historyObj to Object()
     if historyStr:
@@ -237,7 +425,7 @@ define saveChatMessage with chanName and sender and text and type and timeStr:
     
     window.localStorage.setItem("ernode_chat_history" and JSON.stringify(historyObj))
 
-define saveAiMessage with sender and text and type and timeStr:
+define saveAiMessage with sender as Str and text as Str and type as Str and timeStr as Str returning Int:
     set historyStr to window.localStorage.getItem("ernode_ai_history")
     set historyList to []
     if historyStr:
@@ -252,7 +440,7 @@ define saveAiMessage with sender and text and type and timeStr:
     
     window.localStorage.setItem("ernode_ai_history" and JSON.stringify(historyList))
 
-define renderChatHistory with chanName:
+define renderChatHistory with chanName as Str returning Int:
     set window.chatContainer.innerHTML to ""
     set historyStr to window.localStorage.getItem("ernode_chat_history")
     if not historyStr:
@@ -271,7 +459,7 @@ define renderChatHistory with chanName:
     )
     return 0
 
-define renderAiHistory:
+define renderAiHistory returning Int:
     set window.aiContainer.innerHTML to ""
     set historyStr to window.localStorage.getItem("ernode_ai_history")
     if not historyStr:
@@ -285,7 +473,7 @@ define renderAiHistory:
     return 0
 
 # ---- Append chat messages ----
-define appendMessageRaw with container and sender and text and type and timeStr:
+define appendMessageRaw with container as Obj and sender as Str and text as Str and type as Str and timeStr as Str returning Int:
     set bubble to document.createElement("div")
     set bubble.className to f"chat-bubble {type}"
     set escapedText to escapeHTML(text).replace("\n" and "<br>")
@@ -296,7 +484,7 @@ define appendMessageRaw with container and sender and text and type and timeStr:
     set container.scrollTop to container.scrollHeight
 
 # ---- TTS: request audio for an AI message and attach a 🔊 button ----
-define requestTts with text and btn:
+define requestTts with text as Str and btn as Obj returning Int:
     if not text:
         return 0
     if text.length == 0:
@@ -314,7 +502,7 @@ define requestTts with text and btn:
     send_msg(window.ws and JSON.stringify(ttsMsg))
     return 0
 
-define attachTtsButton with bubble and text:
+define attachTtsButton with bubble as Obj and text as Str returning Int:
     set btn to document.createElement("button")
     set btn.className to "btn-tts"
     set btn.title to "Play audio (Fable voice)"
@@ -324,7 +512,7 @@ define attachTtsButton with bubble and text:
     bubble.appendChild(btn)
     return 0
 
-define appendMessage with container and sender and text and type:
+define appendMessage with container as Obj and sender as Str and text as Str and type as Str returning Int:
     set dateStr to Date()
     set timeParts to dateStr.split(" ")
     set timeStrSec to get_list(timeParts and 4)
@@ -342,7 +530,7 @@ define appendMessage with container and sender and text and type:
 # Which message surface the streaming AI response should render into. Defaults to the
 # AI Playground tab; the Learning tab flips window.aiSurface to "learning" when it
 # sends a tutor prompt so the response streams into the tutor chat instead.
-define activeAiMessages:
+define activeAiMessages returning Obj:
     if window.aiSurface == "learning":
         set lc to document.getElementById("learning-messages-container")
         if lc:
@@ -352,7 +540,7 @@ define activeAiMessages:
 # ---- Learning tab: Socratic tutor chat + sandbox playground ----
 # Send a message to the tutor (mode=tutor). Routes the streamed response into the
 # Learning chat by flipping the AI surface, and locks the input while it runs.
-define sendTutorPrompt with text:
+define sendTutorPrompt with text as Str returning Int:
     if not text || not window.isConnected:
         return 0
     set container to document.getElementById("learning-messages-container")
@@ -385,7 +573,7 @@ define sendTutorPrompt with text:
     send_msg(window.ws and JSON.stringify(msg))
     return 0
 
-define renderLessonsList with items:
+define renderLessonsList with items as Obj returning Int:
     set container to document.getElementById("learning-lessons-list")
     if not container:
         return 0
@@ -401,21 +589,21 @@ define renderLessonsList with items:
     set container.innerHTML to html
     return 0
 
-define requestLessonsList:
+define requestLessonsList returning Int:
     if window.isConnected && window.ws:
         set m to Object()
         set m.type to "lessons_list"
         send_msg(window.ws and JSON.stringify(m))
     return 0
 
-define requestAccessState:
+define requestAccessState returning Int:
     if window.isConnected && window.ws:
         set m to Object()
         set m.type to "get_access"
         send_msg(window.ws and JSON.stringify(m))
     return 0
 
-define setupAccessToggle:
+define setupAccessToggle returning Int:
     set t to document.getElementById("full-pc-toggle")
     if t:
         t.addEventListener("change" and given e:
@@ -430,7 +618,7 @@ define setupAccessToggle:
     requestAccessState()
     return 0
 
-define setupLearningTab:
+define setupLearningTab returning Int:
     set form to document.getElementById("learning-send-form")
     if form:
         form.addEventListener("submit" and given event:
@@ -482,7 +670,7 @@ define setupLearningTab:
     requestLessonsList()
     return 0
 
-define appendAiToken with token:
+define appendAiToken with token as Str returning Int:
     if not window.currentAiResponseBubble:
         set bubble to document.createElement("div")
         set bubble.className to "chat-bubble received ai-bot"
@@ -495,7 +683,7 @@ define appendAiToken with token:
     set_prop(activeAiMessages() and "scrollTop" and activeAiMessages().scrollHeight)
 
 # ---- Tool Pending Approval Card ----
-define appendApprovalCard with toolName and summary:
+define appendApprovalCard with toolName as Str and summary as Str returning Int:
     set bubble to document.createElement("div")
     set bubble.className to "chat-bubble received"
     set_prop(bubble.style and "border" and "1px solid rgba(245, 158, 11, 0.3)")
@@ -594,7 +782,7 @@ define appendApprovalCard with toolName and summary:
         set denyMsg to "{\"type\":\"tool_deny\"}"
         set_prop(window.ws and "send" and denyMsg)
 
-define appendClarifyCard with questionsJson:
+define appendClarifyCard with questionsJson as Str returning Int:
     # F3: render the agent's clarifying questions as clickable option cards. Each
     # question is "text||opt1||opt2||..."; the user clicks an option (or types one),
     # then "Send answers" — or "Work with what we have" to let the agent proceed.
@@ -686,7 +874,7 @@ define appendClarifyCard with questionsJson:
             return 0
     )
 
-define appendReasoningBubble with b64:
+define appendReasoningBubble with b64 as Str returning Int:
     # F1: show the model's captured reasoning for the turn as a collapsed panel above
     # the answer. base64 (newline/comma-safe over IPC); decoded UTF-8-aware in-browser.
     set decoded to decodeURIComponent(escape(atob(b64)))
@@ -699,7 +887,7 @@ define appendReasoningBubble with b64:
     activeAiMessages().appendChild(bubble)
     set_prop(activeAiMessages() and "scrollTop" and activeAiMessages().scrollHeight)
 
-define updateHostsTableUI with jsonStr:
+define updateHostsTableUI with jsonStr as Str returning Int:
     set tbody to document.getElementById("hosts-table-body")
     if not tbody:
         return 0
@@ -740,7 +928,7 @@ define updateHostsTableUI with jsonStr:
     return 0
 
 # ---- DHT log handler ----
-define handleDhtResult with msg:
+define handleDhtResult with msg as Str returning Int:
     if msg.key == "network:host_nodes":
         if msg.found:
             updateHostsTableUI(msg.value)
@@ -765,7 +953,7 @@ define handleDhtResult with msg:
     set dhtLog.scrollTop to dhtLog.scrollHeight
 
 # ---- Name resolution log handler ----
-define handleNameResult with msg:
+define handleNameResult with msg as Str returning Int:
     set nameLog to document.getElementById("name-log")
     if not nameLog:
         return 0
@@ -795,7 +983,7 @@ define handleNameResult with msg:
     set nameLog.scrollTop to nameLog.scrollHeight
 
 # ---- Select AI model ----
-define selectAiModel with modelName and skipSave:
+define selectAiModel with modelName as Str and skipSave as Int returning Int:
     set window.selectedAiModel to modelName
     
     set aiModelSelect to document.getElementById("ai-model-select")
@@ -821,7 +1009,7 @@ define selectAiModel with modelName and skipSave:
         send_msg(window.ws and JSON.stringify(msg))
 
 # ---- Update models dropdown and sidebar list ----
-define updateAiModelsUI with models:
+define updateAiModelsUI with models as Obj returning Int:
     set aiModelSelect to document.getElementById("ai-model-select")
     if aiModelSelect:
         set currentSelected to window.selectedAiModel
@@ -871,7 +1059,7 @@ define updateAiModelsUI with models:
         )
 
 # ---- Session Management Client Helpers ----
-define selectSession with id:
+define selectSession with id as Str returning Int:
     set window.activeSessionId to id
     if window.isConnected && window.ws:
         set msg to Object()
@@ -880,7 +1068,7 @@ define selectSession with id:
         send_msg(window.ws and JSON.stringify(msg))
     return 0
 
-define renameSession with id and title:
+define renameSession with id as Str and title as Str returning Int:
     set msg to Object()
     set msg.type to "session_rename"
     set msg.id to id
@@ -888,14 +1076,14 @@ define renameSession with id and title:
     send_msg(window.ws and JSON.stringify(msg))
     return 0
 
-define deleteSession with id:
+define deleteSession with id as Str returning Int:
     set msg to Object()
     set msg.type to "session_delete"
     set msg.id to id
     send_msg(window.ws and JSON.stringify(msg))
     return 0
 
-define updatePlatformsUI:
+define updatePlatformsUI returning Int:
     if not window.platforms:
         return 0
         
@@ -987,7 +1175,7 @@ define updatePlatformsUI:
             
     return 0
 
-define updatePromptsUI:
+define updatePromptsUI returning Int:
     if not window.prompts:
         return 0
     set kernelArea to document.getElementById("settings-prompt-kernel")
@@ -1001,7 +1189,7 @@ define updatePromptsUI:
         set observerArea.value to window.prompts.observer || ""
     return 0
 
-define showPromptsStatus with text as Str and isSuccess as Int:
+define showPromptsStatus with text as Str and isSuccess as Int returning Int:
     set el to document.getElementById("settings-status-msg")
     if el:
         set el.textContent to text
@@ -1016,7 +1204,7 @@ define showPromptsStatus with text as Str and isSuccess as Int:
         and 4000)
     return 0
 
-define renderPluginsUI:
+define renderPluginsUI returning Int:
     set body to document.getElementById("plugins-list-body")
     if not body:
         return 0
@@ -1068,7 +1256,7 @@ define renderPluginsUI:
     
     return 0
 
-define togglePlugin with id:
+define togglePlugin with id as Str returning Int:
     if not window.plugins:
         return 0
     window.plugins.forEach(given p:
@@ -1083,7 +1271,7 @@ define togglePlugin with id:
     renderPluginsUI()
     return 0
 
-define deletePlugin with id:
+define deletePlugin with id as Str returning Int:
     if not window.plugins:
         return 0
     if not confirm("Are you sure you want to delete this plugin?"):
@@ -1098,7 +1286,7 @@ define deletePlugin with id:
     renderPluginsUI()
     return 0
 
-define savePluginsSettings:
+define savePluginsSettings returning Int:
     if not window.ws || not window.isConnected:
         return 0
     set payload to Object()
@@ -1107,7 +1295,7 @@ define savePluginsSettings:
     send_msg(window.ws and JSON.stringify(payload))
     return 0
 
-define savePromptsConfig:
+define savePromptsConfig returning Int:
     if not window.ws || not window.isConnected:
         showPromptsStatus("Error: Daemon disconnected." and 0)
         return 0
@@ -1127,7 +1315,7 @@ define savePromptsConfig:
     send_msg(window.ws and JSON.stringify(payload))
     return 0
 
-define updateSystemConfigUI:
+define updateSystemConfigUI returning Int:
     if not window.systemConfig:
         return 0
     
@@ -1182,6 +1370,10 @@ define updateSystemConfigUI:
     set maxMsg to document.getElementById("cfg-network-max-message-size")
     if maxMsg:
         set maxMsg.value to window.systemConfig.network_max_message_size || 0
+
+    set publicHost to document.getElementById("cfg-network-public-host")
+    if publicHost:
+        set publicHost.value to window.systemConfig.network_public_host || ""
         
     set seedAddr to document.getElementById("cfg-network-seed-addr")
     if seedAddr:
@@ -1225,7 +1417,7 @@ define updateSystemConfigUI:
         
     return 0
 
-define showSystemConfigStatus with text as Str and statusType as Int:
+define showSystemConfigStatus with text as Str and statusType as Int returning Int:
     set el to document.getElementById("settings-sys-status-msg")
     if el:
         set el.textContent to text
@@ -1243,7 +1435,7 @@ define showSystemConfigStatus with text as Str and statusType as Int:
         and 5000)
     return 0
 
-define saveSystemConfig:
+define saveSystemConfig returning Int:
     if not window.ws || not window.isConnected:
         showSystemConfigStatus("Error: Daemon disconnected." and 0)
         return 0
@@ -1288,6 +1480,9 @@ define saveSystemConfig:
     
     set val to document.getElementById("cfg-network-max-message-size").value
     set window.systemConfig.network_max_message_size to val
+
+    set val to document.getElementById("cfg-network-public-host").value.trim()
+    set window.systemConfig.network_public_host to val
     
     set val to document.getElementById("cfg-network-seed-addr").value.trim()
     set window.systemConfig.network_seed_addr to val
@@ -1331,7 +1526,7 @@ define saveSystemConfig:
     send_msg(window.ws and JSON.stringify(payload))
     return 0
 
-define savePlatformConfig with platformId:
+define savePlatformConfig with platformId as Str returning Int:
     if not window.platforms || not window.ws || not window.isConnected:
         return 0
         
@@ -1392,7 +1587,7 @@ define savePlatformConfig with platformId:
     updatePlatformsUI()
     return 0
 
-define handlePlatformToggle with platformId:
+define handlePlatformToggle with platformId as Str returning Int:
     if not window.platforms || not window.ws || not window.isConnected:
         return 0
         
@@ -1432,7 +1627,7 @@ define handlePlatformToggle with platformId:
     updatePlatformsUI()
     return 0
 
-define registerPlugin:
+define registerPlugin returning Int:
     if not window.plugins:
         set window.plugins to []
         
@@ -1459,7 +1654,7 @@ define registerPlugin:
     renderPluginsUI()
     return 0
 
-define updateSessionsUI with sessions:
+define updateSessionsUI with sessions as Obj returning Int:
     set container to document.getElementById("ai-sessions-list-container")
     if not container:
         return 0
@@ -1538,7 +1733,7 @@ define updateSessionsUI with sessions:
     return 0
 
 # ---- Memory Canvas Visualizer init ----
-define initMemoryCanvas:
+define initMemoryCanvas returning Int:
     set container to document.getElementById("memory-graph-viz")
     if not container:
         return 0
@@ -1566,7 +1761,7 @@ define initMemoryCanvas:
         animateGraph()
 
 # ---- Re-calculate Hebbian memory graph data ----
-define updateMemoryGraphData with edges:
+define updateMemoryGraphData with edges as Obj returning Int:
     if not window.canvasElement:
         initMemoryCanvas()
     if not window.canvasElement:
@@ -1603,7 +1798,7 @@ define updateMemoryGraphData with edges:
     set window.graphLinks to edges
 
 # ---- Animate memory canvas graph nodes ----
-define animateGraph:
+define animateGraph returning Int:
     if not window.isConnected:
         set window.animationFrameId to requestAnimationFrame(given dummy:
             animateGraph()
@@ -1717,7 +1912,7 @@ define animateGraph:
     )
 
 # ---- Render Turing Grid overlay ----
-define renderTuringGrid with data:
+define renderTuringGrid with data as Obj returning Int:
     set container to document.getElementById("turing-grid-viz")
     if not container:
         return 0
@@ -1765,7 +1960,7 @@ define renderTuringGrid with data:
     set turingCellsCount.textContent to Object.keys(data.cells).length
 
 # ---- Update scratchpad / lessons Hebbian tables ----
-define updateMemoryTables with data:
+define updateMemoryTables with data as Obj returning Int:
     set sBody to document.getElementById("scratchpad-body")
     if sBody:
         set sBody.innerHTML to ""
@@ -1795,7 +1990,7 @@ define updateMemoryTables with data:
             )
 
 # ---- Handle incoming telemetry daemon payloads ----
-define handleDaemonMessage with msg:
+define handleDaemonMessage with msg as Str returning Int:
     set type to msg.type
     if type == "status":
         set roleUpper to msg.role.toUpperCase()
@@ -1946,25 +2141,45 @@ define handleDaemonMessage with msg:
         appendReasoningBubble(msg.b64)
 
     else if type == "file_attached":
-        # A file the agent produced/shared — image renders inline, anything else as a
-        # download link. Served by the jailed /files/<rowid> route. WebUI↔Discord parity.
+        # Fetch with the signed session headers, then expose only a browser-local Blob
+        # URL. The attachment route itself never accepts an enumerable unauthenticated URL.
         set faBubble to document.createElement("div")
         set_prop(faBubble.style and "margin" and "8px 0")
-        if msg.is_image == 1:
-            set faImg to document.createElement("img")
-            set faImg.src to msg.url
-            set_prop(faImg.style and "maxWidth" and "360px")
-            set_prop(faImg.style and "borderRadius" and "8px")
-            set_prop(faImg.style and "display" and "block")
-            set_prop(faImg.style and "marginBottom" and "4px")
-            faBubble.appendChild(faImg)
-        set faLink to document.createElement("a")
-        set faLink.href to msg.url
-        set faLink.textContent to concat("📎 " and msg.name)
-        faLink.setAttribute("download" and msg.name)
-        faLink.setAttribute("target" and "_blank")
-        faBubble.appendChild(faLink)
+        set faStatus to document.createElement("span")
+        set faStatus.textContent to concat("Loading attachment: " and msg.name)
+        faBubble.appendChild(faStatus)
         activeAiMessages().appendChild(faBubble)
+        authenticatedFetch(msg.url and "GET" and "").then(given response:
+            if not response.ok:
+                set faStatus.textContent to f"Attachment request failed with HTTP {response.status}."
+                return null
+            return response.blob()
+        ).then(given blob:
+            if not blob:
+                return 0
+            faStatus.remove()
+            set objectUrl to URL.createObjectURL(blob)
+            if msg.is_image == 1:
+                set faImg to document.createElement("img")
+                set faImg.src to objectUrl
+                set_prop(faImg.style and "maxWidth" and "360px")
+                set_prop(faImg.style and "borderRadius" and "8px")
+                set_prop(faImg.style and "display" and "block")
+                set_prop(faImg.style and "marginBottom" and "4px")
+                faBubble.appendChild(faImg)
+            set faLink to document.createElement("a")
+            set faLink.href to objectUrl
+            set faLink.textContent to concat("📎 " and msg.name)
+            faLink.setAttribute("download" and msg.name)
+            faBubble.appendChild(faLink)
+            setTimeout(given dummy:
+                URL.revokeObjectURL(objectUrl)
+            and 60000)
+            return 0
+        ).catch(given error:
+            set faStatus.textContent to concat("Attachment request failed: " and String(error))
+            return 0
+        )
 
     else if type == "mid_message":
         appendMessage(activeAiMessages() and "ErnOS" and msg.text and "received")
@@ -2201,7 +2416,13 @@ define handleDaemonMessage with msg:
         updateSystemConfigUI()
         
     else if type == "system_config_saved":
-        showSystemConfigStatus("Configuration saved! Restart daemon to apply network changes." and 2)
+        if msg.success:
+            showSystemConfigStatus("Configuration saved! Restart daemon to apply network changes." and 2)
+        else:
+            showSystemConfigStatus(msg.message and 0)
+
+    else if type == "system_config_error":
+        showSystemConfigStatus(msg.message and 0)
         
     else if type == "error":
         console.error(f"Daemon error: {msg.message}")
@@ -2263,7 +2484,7 @@ define handleDaemonMessage with msg:
         if type == "session_delete_result" && window.activeSessionId == msg.id:
             selectSession("default")
             
-    else if type == "onion_result":
+    else if type == "search_result":
         handleOnionResult(msg)
         
     else if type == "onion_view_result":
@@ -2330,27 +2551,52 @@ define handleDaemonMessage with msg:
     else if type == "gitdec_collab_error":
         alert(concat("Collaborator error: " and (msg.message || "Unauthorized")))
 
-define handleOnionResult with msg:
+define handleOnionResult with msg as Obj returning Int:
     set resultsBox to document.getElementById("onion-results-box")
     if not resultsBox:
         return 0
         
     set results to msg.results
+    set sourceLabel to document.createElement("div")
+    set_prop(sourceLabel.style and "color" and "var(--text-muted)")
+    set_prop(sourceLabel.style and "marginBottom" and "10px")
+    if msg.source == "local+onion":
+        set sourceLabel.textContent to "Results: local index plus a verified multi-hop onion query."
+    else:
+        set sourceLabel.textContent to "Results: local index plus direct authenticated federation; origin anonymity was not available."
+    resultsBox.replaceChildren(sourceLabel)
     if not results || results.length == 0:
-        set resultsBox.innerHTML to "<div style='color: var(--text-muted); text-align: center; padding: 20px 0;'>No results found.</div>"
+        set emptyState to document.createElement("div")
+        set emptyState.textContent to "No results found."
+        set_prop(emptyState.style and "color" and "var(--text-muted)")
+        set_prop(emptyState.style and "textAlign" and "center")
+        set_prop(emptyState.style and "padding" and "20px 0")
+        resultsBox.appendChild(emptyState)
         return 0
         
-    set html to ""
     results.forEach(given r:
-        set decodedTitle to decodeHTMLEntities(r.title)
-        set decodedSnippet to decodeHTMLEntities(r.snippet)
-        set escTitle to escapeHTML(decodedTitle)
-        set escUrl to escapeHTML(r.url)
-        set escSnippet to escapeHTML(decodedSnippet)
-        
-        set html to concat(html and f"<div class=\"search-result-item\"><a class=\"search-result-title\" onclick=\"window.onionViewPage('{r.url}')\">{escTitle}</a><span class=\"search-result-url\">{escUrl}</span><p class=\"search-result-snippet\">{escSnippet}</p></div>")
+        set item to document.createElement("div")
+        set item.className to "search-result-item"
+        set link to document.createElement("a")
+        set link.className to "search-result-title"
+        set link.href to "#"
+        set link.textContent to decodeHTMLEntities(r.title || r.url || "Untitled result")
+        link.addEventListener("click" and given event:
+            event.preventDefault()
+            window.onionViewPage(r.url)
+        )
+        set urlLine to document.createElement("span")
+        set urlLine.className to "search-result-url"
+        set urlLine.textContent to r.url || ""
+        item.appendChild(link)
+        item.appendChild(urlLine)
+        if r.snippet:
+            set snippet to document.createElement("p")
+            set snippet.className to "search-result-snippet"
+            set snippet.textContent to decodeHTMLEntities(r.snippet)
+            item.appendChild(snippet)
+        resultsBox.appendChild(item)
     )
-    set resultsBox.innerHTML to html
     return 0
 
 define getActiveTab returning Obj:
@@ -2361,7 +2607,7 @@ define getActiveTab returning Obj:
     )
     return activeTab
 
-define createBrowserTab with url and activate returning Int:
+define createBrowserTab with url as Str and activate as Int returning Int:
     set id to concat("tab_" and Math.random().toString(36).substring(2 and 9))
     set tab to Object()
     set tab.id to id
@@ -2430,7 +2676,7 @@ define renderBrowserTabs returning Int:
     )
     return 0
 
-define switchBrowserTab with tabId returning Int:
+define switchBrowserTab with tabId as Int returning Int:
     set window.activeTabId to tabId
     renderBrowserTabs()
     
@@ -2468,7 +2714,7 @@ define switchBrowserTab with tabId returning Int:
     updateStarButton(tab)
     return 0
 
-define closeBrowserTab with tabId returning Int:
+define closeBrowserTab with tabId as Int returning Int:
     set idx to -1
     set i to 0
     window.browserTabs.forEach(given t:
@@ -2498,7 +2744,7 @@ define closeBrowserTab with tabId returning Int:
     switchBrowserTab(window.activeTabId)
     return 0
 
-define navigateTab with tab and url returning Int:
+define navigateTab with tab as Obj and url as Str returning Int:
     set targetUrl to url.trim()
     if targetUrl == "":
         return 0
@@ -2551,7 +2797,7 @@ define navigateTab with tab and url returning Int:
     send_msg(window.ws and JSON.stringify(viewMsg))
     return 0
 
-define navigateActiveTab with url and isHistoryNavigation returning Int:
+define navigateActiveTab with url as Str and isHistoryNavigation as Int returning Int:
     set activeTab to getActiveTab()
     if not activeTab:
         return 0
@@ -2564,7 +2810,7 @@ define navigateActiveTab with url and isHistoryNavigation returning Int:
     navigateTab(activeTab and url)
     return 0
 
-define updateNavButtons with tab returning Int:
+define updateNavButtons with tab as Obj returning Int:
     set btnBack to document.getElementById("btn-browser-back")
     if btnBack:
         set btnBack.disabled to tab.historyIndex <= 0
@@ -2574,7 +2820,7 @@ define updateNavButtons with tab returning Int:
         set btnForward.disabled to tab.historyIndex >= tab.history.length - 1
     return 0
 
-define updateStarButton with tab returning Int:
+define updateStarButton with tab as Obj returning Int:
     set btnStar to document.getElementById("btn-browser-star")
     if not btnStar:
         return 0
@@ -2656,7 +2902,7 @@ define renderBookmarksBar returning Int:
     )
     return 0
 
-define resolveRelativeUrl with baseUrl and relativeUrl returning Str:
+define resolveRelativeUrl with baseUrl as Str and relativeUrl as Str returning Str:
     if string_index_of(relativeUrl and "://") >= 0 || string_index_of(relativeUrl and "data:") == 0:
         return relativeUrl
         
@@ -2699,12 +2945,12 @@ define interceptViewportClicks returning Int:
     )
     return 0
 
-define renderNewTabPage with tab returning Int:
+define renderNewTabPage with tab as Obj returning Int:
     set contentArea to document.getElementById("reader-modal-content")
     if tab.id != window.activeTabId:
         return 0
         
-    set newTabHtml to "<div class=\"newtab-container\"><div class=\"newtab-logo\">&#x1F331;</div><div class=\"newtab-title\">Ernos Private Browser</div><div class=\"newtab-search-box\"><form id=\"newtab-search-form\" class=\"newtab-search-form\" onsubmit=\"return false;\"><input type=\"text\" id=\"newtab-search-input\" class=\"newtab-search-input\" placeholder=\"Search privately with DuckDuckGo or enter URL...\" required><button type=\"submit\" class=\"newtab-search-btn\">Search</button></form></div><div class=\"newtab-grid\"><div class=\"newtab-shortcut\" id=\"shortcut-ddg\"><span class=\"newtab-shortcut-icon\">&#x1F50D;</span><span class=\"newtab-shortcut-title\">DuckDuckGo</span></div><div class=\"newtab-shortcut\" id=\"shortcut-wiki\"><span class=\"newtab-shortcut-icon\">&#x1F4D6;</span><span class=\"newtab-shortcut-title\">Wikipedia</span></div><div class=\"newtab-shortcut\" id=\"shortcut-tor\"><span class=\"newtab-shortcut-icon\">&#x1F9C5;</span><span class=\"newtab-shortcut-title\">Tor Project</span></div><div class=\"newtab-shortcut\" id=\"shortcut-github\"><span class=\"newtab-shortcut-icon\">&#x1F47E;</span><span class=\"newtab-shortcut-title\">GitHub</span></div></div><div class=\"newtab-circuit-info\"><strong>&#x1F512; Secure DHT Onion Circuit:</strong> Traffic is encrypted and routed through multiple nodes of the Ernos decentralized network. No tracking, no censorship.</div></div>"
+    set newTabHtml to "<div class=\"newtab-container\"><div class=\"newtab-logo\">&#x1F331;</div><div class=\"newtab-title\">Ernos Sanitized Reader</div><div class=\"newtab-search-box\"><form id=\"newtab-search-form\" class=\"newtab-search-form\" onsubmit=\"return false;\"><input type=\"text\" id=\"newtab-search-input\" class=\"newtab-search-input\" placeholder=\"Enter a URL for the sanitized reader...\" required><button type=\"submit\" class=\"newtab-search-btn\">Search</button></form></div><div class=\"newtab-grid\"><div class=\"newtab-shortcut\" id=\"shortcut-ddg\"><span class=\"newtab-shortcut-icon\">&#x1F50D;</span><span class=\"newtab-shortcut-title\">DuckDuckGo</span></div><div class=\"newtab-shortcut\" id=\"shortcut-wiki\"><span class=\"newtab-shortcut-icon\">&#x1F4D6;</span><span class=\"newtab-shortcut-title\">Wikipedia</span></div><div class=\"newtab-shortcut\" id=\"shortcut-tor\"><span class=\"newtab-shortcut-icon\">&#x1F9C5;</span><span class=\"newtab-shortcut-title\">Tor Project</span></div><div class=\"newtab-shortcut\" id=\"shortcut-github\"><span class=\"newtab-shortcut-icon\">&#x1F47E;</span><span class=\"newtab-shortcut-title\">GitHub</span></div></div><div class=\"newtab-circuit-info\"><strong>&#x1F512; Search routing:</strong> Multi-hop onion routing is used only when enough verified relays are available; otherwise results use direct authenticated federation.</div></div>"
     
     set_prop(contentArea and "innerHTML" and newTabHtml)
     
@@ -2737,7 +2983,7 @@ define renderNewTabPage with tab returning Int:
         )
     return 0
 
-define handleOnionViewResult with msg:
+define handleOnionViewResult with msg as Str returning Int:
     set tabId to msg.tabId
     set targetTab to null
     
@@ -2792,9 +3038,17 @@ define handleOnionViewResult with msg:
         set contentArea to document.getElementById("reader-modal-content")
         set_prop(loader.style and "display" and "none")
         set_prop(contentArea.style and "display" and "block")
-        set_prop(contentArea and "innerHTML" and concat(f"<base href=\"{targetTab.url}\">" and msg.html))
-        
-        interceptViewportClicks()
+        set contentArea.textContent to ""
+        set readerFrame to document.createElement("iframe")
+        readerFrame.setAttribute("sandbox" and "")
+        readerFrame.setAttribute("referrerpolicy" and "no-referrer")
+        readerFrame.setAttribute("title" and targetTab.title)
+        set_prop(readerFrame.style and "width" and "100%")
+        set_prop(readerFrame.style and "height" and "100%")
+        set_prop(readerFrame.style and "border" and "0")
+        set safeBase to escapeHTML(targetTab.url)
+        set readerFrame.srcdoc to concat(f"<base href=\"{safeBase}\">" and msg.html)
+        contentArea.appendChild(readerFrame)
         
     renderBrowserTabs()
     
@@ -2806,7 +3060,7 @@ define handleOnionViewResult with msg:
     return 0
 
 # ---- GitDec Frontend Functions ----
-define updateGitDecRepos with reposStr:
+define updateGitDecRepos with reposStr as Str returning Int:
     set listContainer to document.getElementById("gitdec-repo-list")
     if not listContainer:
         return 0
@@ -2845,7 +3099,7 @@ define updateGitDecRepos with reposStr:
     )
     return 0
 
-define selectGitDecRepo with repoId:
+define selectGitDecRepo with repoId as Str returning Int:
     set window.gitdecActiveRepo to repoId
     
     set noSelected to document.getElementById("gitdec-no-repo-selected")
@@ -2891,7 +3145,7 @@ define selectGitDecRepo with repoId:
     
     return 0
 
-define handleGitDecFile with repoId and filename and content:
+define handleGitDecFile with repoId as Str and filename as Str and content as Str returning Int:
     if repoId equals "ErnosDecent" and also (filename equals "docs/gitdec_user_guide.md" or else filename equals "docs/system_guide_synthesis.md" or else filename equals "docs/ERNOS_REFERENCE.md" or else filename equals "README.md" or else filename equals "docs/settings_guide.md" or else filename equals "docs/identity_registry_guide.md" or else filename equals "docs/network_dht_guide.md" or else filename equals "docs/resource_pooling_guide.md" or else filename equals "docs/turing_hebbian_guide.md" or else filename equals "docs/messaging_social_guide.md" or else filename equals "docs/storage_crdt_guide.md" or else filename equals "docs/ledger_dex_guide.md"):
         set guideViewer to document.getElementById("guide-text-content")
         if guideViewer:
@@ -3094,7 +3348,7 @@ define handleGitDecFile with repoId and filename and content:
             set fileViewer.textContent to content
     return 0
 
-define renderGitDecFiles with repoId and filesStr:
+define renderGitDecFiles with repoId as Str and filesStr as Str returning Int:
     if repoId != window.gitdecActiveRepo:
         return 0
         
@@ -3155,7 +3409,7 @@ define renderGitDecFiles with repoId and filesStr:
         
     return 0
 
-define showGitDecIssueDetail with issue:
+define showGitDecIssueDetail with issue as Obj returning Int:
     set window.gitdecActiveIssue to issue
     set detailCard to document.getElementById("gitdec-issue-detail-card")
     set_prop(detailCard.style and "display" and "block")
@@ -3182,7 +3436,7 @@ define showGitDecIssueDetail with issue:
         )
     return 0
 
-define showGitDecPrDetail with pr:
+define showGitDecPrDetail with pr as Obj returning Int:
     set window.gitdecActivePr to pr
     set detailCard to document.getElementById("gitdec-pr-detail-card")
     set_prop(detailCard.style and "display" and "block")
@@ -3675,7 +3929,7 @@ define initGitDec returning Int:
     return 0
 
 # ---- Document initialization / event routing ----
-define main:
+define main returning Int:
     # Set up global mutable parameters on window
     set window.ws to null
     set window.isConnected to false
@@ -3712,7 +3966,7 @@ define main:
         set onionCard.className to "card"
         set onionCard.id to "onion-search-card"
         
-        set onionSearchHtml to "<h3>Private Onion Search Browser</h3><form id=\"onion-search-form\" class=\"standard-form inline-form\" onsubmit=\"return false;\"><div class=\"form-row\"><div class=\"form-group\" style=\"flex: 0 0 120px;\"><label for=\"onion-engine\">Engine</label><select id=\"onion-engine\"><option value=\"DuckDuckGo\">DuckDuckGo</option><option value=\"Google\">Google</option><option value=\"Bing\">Bing</option></select></div><div class=\"form-group\" style=\"flex: 1;\"><label for=\"onion-query-input\">Query</label><input type=\"text\" id=\"onion-query-input\" placeholder=\"Search privately...\" required></div><button type=\"submit\" class=\"btn-primary\" id=\"btn-onion-search\">Search Privately</button></div></form><div id=\"onion-circuit-container\" style=\"display: none; margin: 20px 0;\"><div class=\"circuit-title\">Secure Onion Route:</div><svg id=\"onion-circuit-svg\" width=\"100%\" height=\"80\" viewBox=\"0 0 400 80\"><line x1=\"50\" y1=\"40\" x2=\"150\" y2=\"40\" class=\"circuit-line\" /><line x1=\"150\" y1=\"40\" x2=\"250\" y2=\"40\" class=\"circuit-line\" /><line x1=\"250\" y1=\"40\" x2=\"350\" y2=\"40\" class=\"circuit-line\" /><circle cx=\"50\" cy=\"40\" r=\"4\" class=\"circuit-pulse\" id=\"pulse-1\" style=\"display:none;\"><animate attributeName=\"cx\" from=\"50\" to=\"150\" dur=\"0.3s\" fill=\"freeze\" begin=\"indefinite\" id=\"anim-1\" /></circle><circle cx=\"150\" cy=\"40\" r=\"4\" class=\"circuit-pulse\" id=\"pulse-2\" style=\"display:none;\"><animate attributeName=\"cx\" from=\"150\" to=\"250\" dur=\"0.3s\" fill=\"freeze\" begin=\"indefinite\" id=\"anim-2\" /></circle><circle cx=\"250\" cy=\"40\" r=\"4\" class=\"circuit-pulse\" id=\"pulse-3\" style=\"display:none;\"><animate attributeName=\"cx\" from=\"250\" to=\"350\" dur=\"0.4s\" fill=\"freeze\" begin=\"indefinite\" id=\"anim-3\" /></circle><circle cx=\"50\" cy=\"40\" r=\"12\" class=\"circuit-node client\" /><text x=\"50\" y=\"43\" class=\"circuit-node-label\" text-anchor=\"middle\">UA</text><circle cx=\"150\" cy=\"40\" r=\"10\" class=\"circuit-node guard\" /><text x=\"150\" y=\"43\" class=\"circuit-node-label\" text-anchor=\"middle\">G</text><circle cx=\"250\" cy=\"40\" r=\"10\" class=\"circuit-node middle\" /><text x=\"250\" y=\"43\" class=\"circuit-node-label\" text-anchor=\"middle\">M</text><circle cx=\"350\" cy=\"40\" r=\"12\" class=\"circuit-node exit\" /><text x=\"350\" y=\"43\" class=\"circuit-node-label\" text-anchor=\"middle\">E</text><text x=\"50\" y=\"68\" class=\"circuit-node-text\" text-anchor=\"middle\">Client</text><text x=\"150\" y=\"68\" class=\"circuit-node-text\" text-anchor=\"middle\">Guard</text><text x=\"250\" y=\"68\" class=\"circuit-node-text\" text-anchor=\"middle\">Middle</text><text x=\"350\" y=\"68\" class=\"circuit-node-text\" text-anchor=\"middle\">Exit</text></svg></div><div class=\"search-results-box\" id=\"onion-results-box\"><div style=\"color: var(--text-muted); text-align: center; padding: 20px 0;\">Anonymous search results will appear here...</div></div>"
+        set onionSearchHtml to "<h3>Decentralized Search</h3><form id=\"onion-search-form\" class=\"standard-form inline-form\" onsubmit=\"return false;\"><div class=\"form-row\"><div class=\"form-group\" style=\"flex: 1;\"><label for=\"onion-query-input\">Query</label><input type=\"text\" id=\"onion-query-input\" placeholder=\"Search the decentralized index...\" required></div><button type=\"submit\" class=\"btn-primary\" id=\"btn-onion-search\">Search Index</button></div></form><div class=\"search-results-box\" id=\"onion-results-box\"><div style=\"color: var(--text-muted); text-align: center; padding: 20px 0;\">Search results will appear here...</div></div>"
         
         set_prop(onionCard and "innerHTML" and onionSearchHtml)
         
@@ -3728,7 +3982,7 @@ define main:
     set readerModal.className to "modal-overlay"
     set readerModal.id to "reader-view-modal"
     
-    set readerModalHtml to "<div class=\"browser-window\"><div class=\"browser-titlebar\"><div class=\"mac-dots\"><span class=\"dot close\"></span><span class=\"dot minimize\"></span><span class=\"dot maximize\"></span></div><div class=\"browser-tabbar\" id=\"browser-tabbar\"></div><button class=\"browser-add-tab-btn\" id=\"btn-browser-add-tab\">+</button><div class=\"browser-window-controls\"><button class=\"browser-close-btn\" id=\"btn-close-browser\">&times;</button></div></div><div class=\"browser-toolbar\"><div class=\"browser-nav-controls\"><button class=\"browser-nav-btn\" id=\"btn-browser-back\" title=\"Back\">&larr;</button><button class=\"browser-nav-btn\" id=\"btn-browser-forward\" title=\"Forward\">&rarr;</button><button class=\"browser-nav-btn\" id=\"btn-browser-reload\" title=\"Reload\">&#x21BB;</button><button class=\"browser-nav-btn\" id=\"btn-browser-home\" title=\"Home\">&#x2302;</button></div><div class=\"browser-address-container\"><span class=\"browser-security-icon\" id=\"browser-security-icon\">&#x1F9C5;</span><input type=\"text\" class=\"browser-address-input\" id=\"browser-address-input\" placeholder=\"Search privately or enter URL...\"><button class=\"browser-bookmark-star\" id=\"btn-browser-star\" title=\"Bookmark this page\">&#x2606;</button></div><div class=\"browser-extensions\"><button class=\"browser-ext-btn shield-active\" id=\"btn-browser-shield\" title=\"Ernos Shield: Active (Blocking Trackers)\">&#x1F6E1;</button><button class=\"browser-ext-btn\" id=\"btn-browser-menu\" title=\"Customize and control Ernos Browser\">&#x22EE;</button><div class=\"browser-menu-dropdown\" id=\"browser-menu-dropdown\" style=\"display: none;\"><div class=\"menu-item\" id=\"menu-new-tab\">New tab <span class=\"shortcut\">Ctrl+T</span></div><div class=\"menu-item\" id=\"menu-new-incognito\">New incognito tab</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-reload\">Reload</div><div class=\"menu-item\" id=\"menu-bookmark\">Bookmark this tab</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-history\">History</div><div class=\"menu-item\" id=\"menu-settings\">Settings</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-exit\">Exit Browser</div></div></div></div><div class=\"browser-bookmarks-bar\" id=\"browser-bookmarks-bar\"></div><div class=\"browser-progress-bar-container\"><div class=\"browser-progress-bar\" id=\"browser-progress-bar\" style=\"width: 0%;\"></div></div><div class=\"browser-viewport\" id=\"browser-viewport\"><div class=\"modal-loader\" id=\"reader-modal-loader\" style=\"display: none;\"><div class=\"modal-spinner\"></div><span style=\"color: var(--text-muted);\">Routing through secure onion circuits...</span></div><div id=\"reader-modal-content\"></div></div></div>"
+    set readerModalHtml to "<div class=\"browser-window\"><div class=\"browser-titlebar\"><div class=\"mac-dots\"><span class=\"dot close\"></span><span class=\"dot minimize\"></span><span class=\"dot maximize\"></span></div><div class=\"browser-tabbar\" id=\"browser-tabbar\"></div><button class=\"browser-add-tab-btn\" id=\"btn-browser-add-tab\">+</button><div class=\"browser-window-controls\"><button class=\"browser-close-btn\" id=\"btn-close-browser\">&times;</button></div></div><div class=\"browser-toolbar\"><div class=\"browser-nav-controls\"><button class=\"browser-nav-btn\" id=\"btn-browser-back\" title=\"Back\">&larr;</button><button class=\"browser-nav-btn\" id=\"btn-browser-forward\" title=\"Forward\">&rarr;</button><button class=\"browser-nav-btn\" id=\"btn-browser-reload\" title=\"Reload\">&#x21BB;</button><button class=\"browser-nav-btn\" id=\"btn-browser-home\" title=\"Home\">&#x2302;</button></div><div class=\"browser-address-container\"><span class=\"browser-security-icon\" id=\"browser-security-icon\">&#x1F9C5;</span><input type=\"text\" class=\"browser-address-input\" id=\"browser-address-input\" placeholder=\"Search privately or enter URL...\"><button class=\"browser-bookmark-star\" id=\"btn-browser-star\" title=\"Bookmark this page\">&#x2606;</button></div><div class=\"browser-extensions\"><button class=\"browser-ext-btn shield-active\" id=\"btn-browser-shield\" title=\"Reader sanitizer enabled\">&#x1F6E1;</button><button class=\"browser-ext-btn\" id=\"btn-browser-menu\" title=\"Customize and control Ernos Browser\">&#x22EE;</button><div class=\"browser-menu-dropdown\" id=\"browser-menu-dropdown\" style=\"display: none;\"><div class=\"menu-item\" id=\"menu-new-tab\">New tab <span class=\"shortcut\">Ctrl+T</span></div><div class=\"menu-item\" id=\"menu-new-incognito\">New incognito tab</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-reload\">Reload</div><div class=\"menu-item\" id=\"menu-bookmark\">Bookmark this tab</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-history\">History</div><div class=\"menu-item\" id=\"menu-settings\">Settings</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-exit\">Exit Browser</div></div></div></div><div class=\"browser-bookmarks-bar\" id=\"browser-bookmarks-bar\"></div><div class=\"browser-progress-bar-container\"><div class=\"browser-progress-bar\" id=\"browser-progress-bar\" style=\"width: 0%;\"></div></div><div class=\"browser-viewport\" id=\"browser-viewport\"><div class=\"modal-loader\" id=\"reader-modal-loader\" style=\"display: none;\"><div class=\"modal-spinner\"></div><span style=\"color: var(--text-muted);\">Fetching and sanitizing reader content...</span></div><div id=\"reader-modal-content\"></div></div></div>"
     
     set_prop(readerModal and "innerHTML" and readerModalHtml)
     document.body.appendChild(readerModal)
@@ -3871,48 +4125,15 @@ define main:
     if onionForm:
         onionForm.addEventListener("submit" and given event:
             event.preventDefault()
-            set engineSelect to document.getElementById("onion-engine")
             set queryInput to document.getElementById("onion-query-input")
-            set engine to engineSelect.value
             set query to queryInput.value
             
-            set circuitContainer to document.getElementById("onion-circuit-container")
-            set_prop(circuitContainer.style and "display" and "block")
-            
-            set pulse1 to document.getElementById("pulse-1")
-            set pulse2 to document.getElementById("pulse-2")
-            set pulse3 to document.getElementById("pulse-3")
-            
-            set_prop(pulse1.style and "display" and "none")
-            set_prop(pulse2.style and "display" and "none")
-            set_prop(pulse3.style and "display" and "none")
-            
             set resultsBox to document.getElementById("onion-results-box")
-            set_prop(resultsBox and "innerHTML" and "<div style='color: var(--text-muted); text-align: center; padding: 20px 0;'><div class='modal-spinner' style='width:24px; height:24px; margin:0 auto 10px auto;'></div>Routing encrypted packet through onion hops...</div>")
-            
-            setTimeout(given dummy:
-                set_prop(pulse1.style and "display" and "block")
-                set anim1 to document.getElementById("anim-1")
-                anim1.beginElement()
-                
-                setTimeout(given dummy2:
-                    set_prop(pulse2.style and "display" and "block")
-                    set anim2 to document.getElementById("anim-2")
-                    anim2.beginElement()
-                    
-                    setTimeout(given dummy3:
-                        set_prop(pulse3.style and "display" and "block")
-                        set anim3 to document.getElementById("anim-3")
-                        anim3.beginElement()
-                        
-                        set searchMsg to Object()
-                        set searchMsg.type to "onion_search"
-                        set searchMsg.engine to engine
-                        set searchMsg.query to query
-                        send_msg(window.ws and JSON.stringify(searchMsg))
-                    and 400)
-                and 300)
-            and 300)
+            set_prop(resultsBox and "innerHTML" and "<div style='color: var(--text-muted); text-align: center; padding: 20px 0;'><div class='modal-spinner' style='width:24px; height:24px; margin:0 auto 10px auto;'></div>Searching the local and federated index...</div>")
+            set searchMsg to Object()
+            set searchMsg.type to "onion_search"
+            set searchMsg.query to query
+            send_msg(window.ws and JSON.stringify(searchMsg))
         )
 
     # Attach onion view callback to window
@@ -4134,6 +4355,30 @@ define main:
     # ---- Learning tab: Socratic tutor chat + sandbox playground ----
     setupLearningTab()
     setupAccessToggle()
+
+    set imageCancelButton to document.getElementById("image-gen-cancel")
+    if imageCancelButton:
+        imageCancelButton.addEventListener("click" and given event:
+            requestCancellation(imageCancelButton)
+            set imageOverlay to document.getElementById("image-gen-overlay")
+            if imageOverlay:
+                set_prop(imageOverlay.style and "display" and "none")
+        )
+    set agentStopButton to document.getElementById("btn-stop-ai")
+    if agentStopButton:
+        agentStopButton.addEventListener("click" and given event:
+            requestCancellation(agentStopButton)
+        )
+    set learningStopButton to document.getElementById("btn-stop-learning")
+    if learningStopButton:
+        learningStopButton.addEventListener("click" and given event:
+            requestCancellation(learningStopButton)
+        )
+    set autoapproveButton to document.getElementById("btn-autoapprove")
+    if autoapproveButton:
+        autoapproveButton.addEventListener("click" and given event:
+            toggleAutoapprove(autoapproveButton)
+        )
 
     set channelBtns to document.querySelectorAll("[data-channel]")
     channelBtns.forEach(given btn:

@@ -38,8 +38,13 @@ set CHAN_ROLE_MEMBER to 3
 define chan_generate_id returning Str:
     # Generate random 256-bit ID using libsodium
     set err to init_crypto()
+    if err != 0:
+        return ""
     set buf to alloc_bytes(32)
     set fn to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    if buf == 0 or else fn == 0:
+        set ok to free_bytes(buf)
+        return ""
     set ok to ep_dlcall2(fn and buf and 32)
     set hex to raw_to_hex(buf and 32)
     set ok to free_bytes(buf)
@@ -49,7 +54,7 @@ define chan_generate_id returning Str:
 # Channel Creation & Membership Management
 # ================================================================
 
-define chan_create with name as Str and creator_id as Str and key_hex as Str:
+define chan_create with name as Str and creator_id as Str and key_hex as Str returning Map:
     set chan to create_map()
     set chan_id to chan_generate_id()
     set ok to map_insert(chan and "id" and chan_id)
@@ -82,17 +87,17 @@ define chan_create with name as Str and creator_id as Str and key_hex as Str:
 
     return chan
 
-define chan_get_member_role with chan as Int and member_id as Str returning Int:
+define chan_get_member_role with chan as Map and member_id as Str returning Int:
     set members to map_get_val(chan and "members")
     return map_get_val(members and member_id)
 
-define chan_is_member with chan as Int and member_id as Str returning Int:
+define chan_is_member with chan as Map and member_id as Str returning Int:
     set role to chan_get_member_role(chan and member_id)
     if role > 0:
         return 1
     return 0
 
-define chan_add_member with chan as Int and adder_id as Str and new_member_id as Str and role as Int returning Int:
+define chan_add_member with chan as Map and adder_id as Str and new_member_id as Str and role as Int returning Int:
     # Verify adder has permission (must be Owner or Admin)
     set adder_role to chan_get_member_role(chan and adder_id)
     if adder_role != CHAN_ROLE_OWNER:
@@ -113,7 +118,7 @@ define chan_add_member with chan as Int and adder_id as Str and new_member_id as
 
     return CHAN_ERR_NONE
 
-define chan_remove_member with chan as Int and remover_id as Str and member_id as Str returning Int:
+define chan_remove_member with chan as Map and remover_id as Str and member_id as Str returning Int:
     # Verify permission: remover must be Owner/Admin, OR member leaving voluntarily
     set remover_role to chan_get_member_role(chan and remover_id)
     set is_self to 0
@@ -161,7 +166,7 @@ define chan_remove_member with chan as Int and remover_id as Str and member_id a
 # Channel Message Handling
 # ================================================================
 
-define chan_encrypt_body with body as Str and channel_key_hex as Str:
+define chan_encrypt_body with body as Str and channel_key_hex as Str returning Map:
     set result to create_map()
     if string_length(body) == 0:
         set ok to map_insert(result and "error" and CHAN_ERR_EMPTY_BODY)
@@ -180,7 +185,7 @@ define chan_encrypt_body with body as Str and channel_key_hex as Str:
     set ok to map_insert(result and "error" and CHAN_ERR_NONE)
     return result
 
-define chan_decrypt_body with ciphertext as Str and nonce as Str and channel_key_hex as Str:
+define chan_decrypt_body with ciphertext as Str and nonce as Str and channel_key_hex as Str returning Map:
     set result to create_map()
     set dec_result to decrypt_symmetric(ciphertext and nonce and channel_key_hex)
     set err to map_get_val(dec_result and "error")
@@ -193,7 +198,7 @@ define chan_decrypt_body with ciphertext as Str and nonce as Str and channel_key
     set ok to map_insert(result and "error" and CHAN_ERR_NONE)
     return result
 
-define chan_send_message with chan as Int and sender_id as Str and encrypted_body as Str and msg_type as Int returning Int:
+define chan_send_message with chan as Map and sender_id as Str and encrypted_body as Str and msg_type as Int returning Int:
     # Verify sender is member
     if chan_is_member(chan and sender_id) == 0:
         return CHAN_ERR_NOT_MEMBER
@@ -214,7 +219,7 @@ define chan_send_message with chan as Int and sender_id as Str and encrypted_bod
 
     return CHAN_ERR_NONE
 
-define chan_get_messages with chan as Int and offset as Int and limit as Int:
+define chan_get_messages with chan as Map and offset as Int and limit as Int returning List:
     set result to create_list()
     set messages to map_get_val(chan and "messages")
     set total to map_get_val(chan and "message_count")
@@ -234,7 +239,7 @@ define chan_get_messages with chan as Int and offset as Int and limit as Int:
 # Encrypted Key Sharing
 # ================================================================
 
-define chan_share_key with channel_key as Str and recipient_pk_hex as Str and sender_sk_hex as Str:
+define chan_share_key with channel_key as Str and recipient_pk_hex as Str and sender_sk_hex as Str returning Map:
     set result to create_map()
     
     # Encrypt channel key with recipient's public key (using sender's private key for authentication)
@@ -251,7 +256,7 @@ define chan_share_key with channel_key as Str and recipient_pk_hex as Str and se
     set ok to map_insert(result and "error" and CHAN_ERR_NONE)
     return result
 
-define chan_receive_shared_key with encrypted_envelope as Int and sender_pk_hex as Str and recipient_sk_hex as Str:
+define chan_receive_shared_key with encrypted_envelope as Map and sender_pk_hex as Str and recipient_sk_hex as Str returning Map:
     set result to create_map()
     set ciphertext to map_get_val(encrypted_envelope and "ciphertext")
     set nonce to map_get_val(encrypted_envelope and "nonce")

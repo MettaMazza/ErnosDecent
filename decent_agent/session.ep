@@ -118,6 +118,9 @@ define session_serialize with sess as Map and path as Str returning Int:
     set json_str to concat(json_str and "  ]\n}")
     
     set ok to write_file(path and json_str)
+    if ok == 0:
+        display f"[-] Session serialization failed: {path}."
+        return 1
     return 0
 
 # ---- Deserialize JSON ----
@@ -198,6 +201,9 @@ define session_manager_load_all with mgr as Map returning Int:
     set dir to map_get_val(mgr and "sessions_dir")
     if file_exists(dir) == 0:
         set ok to create_directory(dir)
+        if ok == 0:
+            display f"[-] Session directory creation failed: {dir}."
+            return 1
         return 0
     set files to list_directory(dir)
     set len to length_list(files)
@@ -244,7 +250,9 @@ define session_manager_get_active with mgr as Map returning Map:
         # Save to disk
         set dir to map_get_val(mgr and "sessions_dir")
         set filepath to path_join(dir and "default.json")
-        set ok to session_serialize(sess and filepath)
+        set serialize_error to session_serialize(sess and filepath)
+        if serialize_error != 0:
+            return 0
         
     return map_get_val(sessions_map and active_id)
 
@@ -269,11 +277,11 @@ define session_manager_set_guidance with mgr as Map and text as Str returning In
     set active_id to map_get_val(mgr and "active_session_id")
     set dir to map_get_val(mgr and "sessions_dir")
     set filepath to path_join(dir and concat(active_id and ".json"))
-    set ok to session_serialize(sess and filepath)
-    return 0
+    return session_serialize(sess and filepath)
 
 define session_manager_new_session with mgr as Map and id as Str and title as Str and model as Str and sys_prompt as Str returning Map:
     set sessions_map to map_get_val(mgr and "sessions")
+    set previous_active_id to map_get_val(mgr and "active_session_id")
     set sess to session_create_new(id and title and model and sys_prompt)
     set ok to map_insert(sessions_map and id and sess)
     set ok to map_insert(mgr and "active_session_id" and id)
@@ -284,24 +292,36 @@ define session_manager_new_session with mgr as Map and id as Str and title as St
     # Save to disk
     set dir to map_get_val(mgr and "sessions_dir")
     set filepath to path_join(dir and concat(id and ".json"))
-    set ok to session_serialize(sess and filepath)
+    set serialize_error to session_serialize(sess and filepath)
+    if serialize_error != 0:
+        set cleanup_result to map_delete(sessions_map and id)
+        set restore_result to map_insert(mgr and "active_session_id" and previous_active_id)
+        return 0
     
     # Persist active session ID
     set active_file to path_join(dir and "active_session.txt")
-    set ok to write_file(active_file and id)
+    set write_ok to write_file(active_file and id)
+    if write_ok == 0:
+        set cleanup_file_ok to remove_file(filepath)
+        if cleanup_file_ok == 0 and also file_exists(filepath) == 1:
+            display f"[-] Failed to remove partially created session file: {filepath}."
+        set cleanup_result to map_delete(sessions_map and id)
+        set restore_result to map_insert(mgr and "active_session_id" and previous_active_id)
+        return 0
     
     return sess
 
 define session_manager_switch_to with mgr as Map and id as Str returning Int:
     set sessions_map to map_get_val(mgr and "sessions")
     if map_contains(sessions_map and id) == 1:
-        set ok to map_insert(mgr and "active_session_id" and id)
-        
         # Persist active session ID
         set dir to map_get_val(mgr and "sessions_dir")
         set filepath to path_join(dir and "active_session.txt")
-        set ok to write_file(filepath and id)
-        
+        set write_ok to write_file(filepath and id)
+        if write_ok == 0:
+            display f"[-] Active session tracker write failed: {filepath}."
+            return 0
+        set updated to map_insert(mgr and "active_session_id" and id)
         return 1
     return 0
 
@@ -311,7 +331,10 @@ define session_manager_delete with mgr as Map and id as Str returning Int:
         set dir to map_get_val(mgr and "sessions_dir")
         set filepath to path_join(dir and concat(id and ".json"))
         if file_exists(filepath) == 1:
-            set ok to remove_file(filepath)
+            set remove_ok to remove_file(filepath)
+            if remove_ok == 0 and also file_exists(filepath) == 1:
+                display f"[-] Session file removal failed: {filepath}."
+                return 0
         set ok to map_delete(sessions_map and id)
         return 1
     return 0
@@ -320,10 +343,14 @@ define session_manager_rename with mgr as Map and id as Str and new_title as Str
     set sessions_map to map_get_val(mgr and "sessions")
     if map_contains(sessions_map and id) == 1:
         set sess to map_get_val(sessions_map and id)
+        set old_title to map_get_val(sess and "title")
         set ok to map_insert(sess and "title" and new_title)
         set dir to map_get_val(mgr and "sessions_dir")
         set filepath to path_join(dir and concat(id and ".json"))
-        set ok to session_serialize(sess and filepath)
+        set serialize_error to session_serialize(sess and filepath)
+        if serialize_error != 0:
+            set restore_result to map_insert(sess and "title" and old_title)
+            return 0
         return 1
     return 0
 
@@ -339,8 +366,12 @@ define session_manager_factory_reset with mgr as Map returning Int:
     repeat while i < n:
         set ok to map_delete(sessions_map and get_list(keys and i))
         set i to i + 1
+    free_list(keys)
     set sess to session_manager_new_session(mgr and "default" and "Default Session" and "" and "You are a helpful assistant.")
-    return 0
+    if sess == 0:
+        display "[-] Factory reset could not create the default session."
+        return 0
+    return 1
 
 # Resolve a session reference to an id: exact id → exact title (case-insensitive) →
 # UNIQUE case-insensitive title substring. Returns "" when unknown or ambiguous. Lets
@@ -527,6 +558,10 @@ define session_compress_active with mgr as Map and sess as Map and model_name as
         set idx to idx + 1
     set json_str to concat(json_str and "]")
     set ok to write_file(transcript_path and json_str)
+    if ok == 0:
+        display concat("[Session] Failed to persist compressed transcript: " and transcript_path)
+        free_list(comp_msgs)
+        return 0
     
     set ok to append_list(comp_list and transcript_path)
     
@@ -554,16 +589,24 @@ define session_compress_active with mgr as Map and sess as Map and model_name as
     
     set sess_filepath to path_join(dir and concat(sess_id and ".json"))
     set ok to session_serialize(sess and sess_filepath)
+    if ok != 0:
+        display concat("[Session] Failed to persist compressed session: " and sess_filepath)
+        free_list(comp_msgs)
+        return 0
+    free_list(comp_msgs)
     return 1
 
 define session_manager_set_model with mgr as Map and id as Str and model as Str returning Int:
     set sessions_map to map_get_val(mgr and "sessions")
     if map_contains(sessions_map and id) == 1:
         set sess to map_get_val(sessions_map and id)
+        set old_model to map_get_val(sess and "model")
         set ok to map_insert(sess and "model" and model)
         set dir to map_get_val(mgr and "sessions_dir")
         set filepath to path_join(dir and concat(id and ".json"))
         set ok to session_serialize(sess and filepath)
+        if ok != 0:
+            set ok to map_insert(sess and "model" and old_model)
+            return 0
         return 1
     return 0
-

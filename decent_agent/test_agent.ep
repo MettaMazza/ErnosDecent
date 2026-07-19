@@ -8,6 +8,7 @@ import "string"
 import "fs"
 import "os"
 import "json"
+import "../storage"
 
 # Subsystems
 import "prompt"
@@ -29,11 +30,21 @@ import "scheduler_tool"
 import "../logging"
 import "../decent_net/gitdec"
 
-define main:
+define main returning Int:
     display "==================================================="
     display "  ErnOS Agent Rebuild -- Unit Test Suite"
     display "==================================================="
     display ""
+
+    set test_storage_dir to concat("/tmp/ernos_agent_test_" and int_to_string(ep_time_now_ms()))
+    set storage_err to storage_init(test_storage_dir)
+    if storage_err != STORAGE_ERR_NONE:
+        display f"FATAL: test storage initialization failed with {storage_err}"
+        return 1
+    set trace_err to trace_init(storage_get_db())
+    if trace_err != 0:
+        display f"FATAL: test trace schema initialization failed with {trace_err}"
+        return 1
 
     set tests_passed to 0
     set tests_failed to 0
@@ -373,13 +384,13 @@ define main:
         set tests_failed to tests_failed + 1
 
     # ===========================================================
-    # TEST 9: Sleep Cycle simulated LoRA updates
+    # TEST 9: Sleep-cycle memory consolidation
     # ===========================================================
-    display "TEST 9: Sleep Cycle simulated SFT/ORPO cycles"
+    display "TEST 9: Sleep-cycle ranks memories and updates one reflection"
     set t9_ok to 1
     
     set reflection to sleep_cycle(mem)
-    if string_length(reflection) > 0:
+    if string_length(reflection) > 0 and also string_index_of(reflection and "error:") != 0:
         display "  Sleep cycle executed and updated persona reflections"
     else:
         display "  FAIL: Reflection text empty"
@@ -596,9 +607,10 @@ define main:
 
     # Push commit
     set commit_payload to "commit: initial commit data"
+    set commit_hash to ep_sha256(commit_payload)
     set sign_res to sign_message(commit_payload and sec_key)
     set signature to map_get_val(sign_res and "signature")
-    set push_err to gitdec_push_commit(repo_id and did_val and "main" and "commit_hash_1" and commit_payload and signature)
+    set push_err to gitdec_push_commit(repo_id and did_val and "main" and commit_hash and commit_payload and signature)
     if push_err == 0:
         display "  Pushed signed commit successfully"
     else:
@@ -607,14 +619,14 @@ define main:
 
     # Pull ref
     set pulled_ref to gitdec_pull_ref(repo_id and "main")
-    if pulled_ref equals "commit_hash_1":
+    if pulled_ref equals commit_hash:
         display "  Ref pulled successfully"
     else:
         display f"  FAIL: Pull ref mismatch: got '{pulled_ref}'"
         set t13_ok to 0
 
     # Get object
-    set obj to gitdec_get_object(repo_id and "commit_hash_1")
+    set obj to gitdec_get_object(repo_id and commit_hash)
     if obj equals commit_payload:
         display "  Commit object retrieved successfully"
     else:

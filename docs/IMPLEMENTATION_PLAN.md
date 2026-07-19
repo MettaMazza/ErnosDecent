@@ -1,190 +1,80 @@
-# ErnosDecent — Full Implementation Plan
+# ErnosDecent — Implementation and Verification Record
 
-## ErnosDecent: The Decentralised Internet, Written in Ernos
+This file records implemented behavior and verification evidence. It does not describe ErnosDecent as a replacement for TCP/IP, BGP, the public DNS root, cloud infrastructure, or the entire public internet. Those claims are not supported by the code.
 
-**The architecture's own product builds the exit from the architecture.**
+## Build and runtime
 
----
+Ernos source is compiled to C and linked into native binaries. The node currently depends on Clang, SQLite, libsodium, OpenSSL, libsecp256k1, pthreads, and stable-diffusion.cpp. The web application is emitted from `decent_web/app.ep` to JavaScript. These are explicit platform dependencies.
 
-## What We Are Building
+The supported CI targets are the macOS and Linux runners declared in `.github/workflows/ci.yml`. A platform is not considered verified until that workflow completes on that platform.
 
-A complete, 1:1 replacement for every layer of the captured internet. Written entirely in native Ernos (`.ep`). No bridges, no stubs, and no platform-intermediated dependencies. Built from cryptographic primitives upward, compiled to native binaries via Clang, running at native C speed.
+## Implemented components
 
-One binary. One system. Every layer.
+| Area | Implemented behavior | Boundary |
+|---|---|---|
+| Identity | Ed25519 signing, X25519 encryption, DID:key/DID:peer helpers, signed capabilities, authenticated IPC | This is not an OAuth provider or a replacement for every account system. |
+| Networking | Framed TCP transport, UDP-backed subsystem transports, Noise sessions, DHT routing, relay forwarding, host election, checked WebSocket framing | This does not replace TCP/IP or BGP. |
+| Storage | SQLite persistence, SHA-256 content addressing, CRDT data structures, RAG and knowledge stores | Content addressing uses SHA-256, not BLAKE3. |
+| Messaging | Signed/encrypted messages, conversations, channels, persistence, network delivery | Direct-message keys are static; the code explicitly provides no forward-secret ratchet. |
+| Social | NIP-01 canonical event hashing and BIP-340 secp256k1 signing, filters, feed aggregation, ActivityPub-shaped data structures | The Nostr client supports plain WebSocket transport; it does not provide `wss` TLS. ActivityPub federation interoperability is not established. |
+| Naming | Persistent name registry, cache, signed DHT publication and remote resolution | This is an ErnosDecent naming system, not an authoritative public-DNS implementation. |
+| Money | UTXO validation, PoS selection, tokens, NFTs, contracts, AMM/order-book structures, persistent blocks | No claim of production financial safety is made without an independent security audit. |
+| AI | Local/remote model routing, deterministic inference references, whisper.cpp HTTP transcription, Kokoro/ONNX TTS, stable-diffusion.cpp image generation | Reference inference and speech functions are not represented as trained production models. Backends report unavailability rather than fabricate output. |
+| Media | SDP/STUN/SRTP-related structures, codecs, streaming and CDN primitives | The current DTLS/media path is not a complete browser-interoperable WebRTC stack. |
+| Resource pooling | Mutex-protected bandwidth windows, configured kbps enforcement, redundant compute jobs, and TCP worker assignment/result acknowledgement | The mesh convenience call executes its two inference passes on the coordinator; the TCP worker protocol is available separately and is not represented as automatic cross-node inference. |
+| Search/privacy | Local crawl/index/ranking, authenticated federation, multi-hop onion search when verified relays are available | The UI reports when it falls back to direct federation. Reader-page fetching is direct and sandboxed; it is not labeled anonymous. |
+| Hosting | Static HTTP hosting plus documented SMTP/IMAP command subsets and Git hosting helpers | The email server implements a command subset, not complete SMTP/IMAP standards. |
+| Agent | ReAct loop, prompt/persona management, memory, tools, scheduling, workspaces, tracing, local and remote provider routing | Test-only deterministic inference is explicitly gated by test state. |
+| Dashboard | Password login, signed expiring sessions, CSRF/origin checks, authenticated HTTP/WebSocket APIs, sandboxed reader and attachment delivery | Authentication is local-node authentication, not a public multi-tenant identity service. |
 
----
+## Verification evidence
 
-## The 1:1 Mapping
+The following native suites were compiled and run during the July 2026 adherence repair. A count is recorded only when the executable produced that result and did not report a failure marker.
 
-Every layer of the contemporary captured internet has an ErnosDecent replacement.
+- Identity: keys 17, DID 14, auth 11.
+- Networking: DHT 18, Noise 8, relay 15, transport 6, Noise transport 2, DHT transport 8, relay transport 5, host election 2.
+- Consensus: consensus 4 and Raft TCP 3.
+- Messaging/storage: message 13, channel 10, content 13, CRDT 20, persistence 11.
+- Money/media/social/AI: money 6, media 7, social 8, AI 6.
+- Privacy/pooling/hosting: circuit 15, pool 4, host 4.
+- Integration: E2E 10, multi-node 4, networking 10, security 6, CLI 10, stress 5, plus the platform executable.
+- Runtime-specific: WebSocket framing 8 and BIP-340 runtime 4.
 
-### Transport
+These counts are historical evidence from that run, not a permanent assertion. CI and local release checks must execute the binaries again after code changes.
 
-| Captured Internet | ErnosDecent | Component |
-|------------------|-------------|-----------|
-| TCP/IP | UDP with P2P routing / simulated transport | `decent_net/` |
-| TLS/SSL | Noise Protocol handshakes + libsodium crypto | `decent_net/noise.ep` |
-| DNS root servers | DHT-backed decentralised naming | `decent_name/` |
-| BGP routing | DHT + relay mesh | `decent_net/dht.ep`, `decent_net/relay.ep` |
-| NAT traversal | UDP hole punching / encrypted relay fallback | `decent_net/relay.ep` |
+The checked release matrix contains 32 subsystem, integration, persistence, security,
+stress, platform, Raft, and CLI binaries. All 32 were freshly compiled and exited
+successfully without failure markers on 19 July 2026. The separately linked cognitive
+agent suite passed 13 of 13 sections, and the WebSocket and BIP-340 runtime binaries
+passed 8 and 4 checks respectively. The production node was rebuilt after the Web
+password startup repair and authenticated login was then verified against the live
+`/api/login` endpoint.
 
-### Data & Storage
+The live harnesses additionally passed 47 of 47 multi-node checks and 16 of 16
+isolated stress checks. The isolated live E2E harness passed 108 of 108 checks. Its
+`AI INFER` assertions follow the asynchronous contract: IPC returns correlated
+session/turn acceptance, and completion is delivered through trace/session state
+rather than an inline `RESPONSE` payload. A freshly linked AddressSanitizer and
+UndefinedBehaviorSanitizer node also completed clean startup after the emitted-runtime
+unsigned-shift repair without a sanitizer finding.
 
-| Captured Internet | ErnosDecent | Component |
-|------------------|-------------|-----------|
-| Cloud databases | Local SQLite + CRDT synchronization | `decent_store/crdt.ep` |
-| Cloud storage | Content-addressed P2P storage (BLAKE3) | `decent_store/content.ep` |
-| CDNs | P2P content delivery network | `decent_media/cdn.ep` |
+Bootstrap does not ship a literal external seed. It accepts an explicit operator seed or previously verified cached peers, rejects wildcard/non-dialable endpoints, requires a framed DHT `PONG`, and reports connection, send, receive, invalid-response, close, registration, and invalid-endpoint failures distinctly. Without a reachable candidate, the node is truthfully reported as a mesh root. A configured static host skips operated default aliases while retaining explicit and cached peer eligibility. `network.public_host` is now preserved across default generation, load/save, and dashboard editing. Adding an operated default remains gated on a stable DNS record and independent external DHT verification.
 
-### Identity & Access
+Public bootstrap remains explicitly **pre-launch** as of 19 July 2026. External TCP
+reachability was verified for `9100` and `9101`; DDNS and external reachability for
+`9102`–`9104` were deferred by the operator. Fresh nodes therefore require an explicit
+or cached seed, and no documentation or startup output represents a public mesh as live.
 
-| Captured Internet | ErnosDecent | Component |
-|------------------|-------------|-----------|
-| Email/password accounts | DID:key (keypair is your identity) | `decent_id/did.ep` |
-| OAuth/Google Sign-In | Self-sovereign auth (challenge-response) | `decent_id/auth.ep` |
-| Capability management | Cryptographically signed capability tokens | `decent_id/auth.ep` |
+The July 19 adherence run validated all 221 native-target `.ep` sources in the working tree with `ernos check`. The browser-target `decent_web/app.ep` emitted a 4,764-line JavaScript artifact successfully. Its browser globals are validated by the JavaScript emitter, not by the native-target checker. `scripts/release_check.sh` is the reproducible local entrypoint for these source, build, native-matrix, cognitive-agent, runtime, shell, and whitespace checks.
 
----
+## Release gate
 
-## Build Phases
+A release is accepted only when all of the following are true:
 
-### Phase 1: Cryptographic Foundation — COMPLETE
-**Deliverables**: Key generation, signing, symmetric/asymmetric encryption, password hashing, and derivation.
-- `decent_id/keys.ep` — Complete primitive layer using libsodium FFI.
-- **Verification**: Verified via `decent_id/test_keys.ep` (16/16 tests passing).
-
-### Phase 2: Identity + Networking Foundation — COMPLETE
-**Deliverables**: W3C DID Core, capability authorization, and Noise protocol handshakes.
-- `decent_id/did.ep` — Base58btc codec, DID resolution (`did:key`, `did:peer`), and challenge-response authentication.
-- `decent_id/auth.ep` — Signed session tokens and capability-based delegation with action checks.
-- `decent_net/noise.ep` — Full Noise_XX handshake (X25519 DH + ChaChaPoly + HMAC-SHA256) over UDP.
-- **Verification**: Verified via `decent_id/test_did.ep` (14/14 tests) and `decent_id/test_auth.ep` (11/11 tests).
-
-### Phase 3: Peer Discovery — COMPLETE
-**Deliverables**: Kademlia DHT routing table and encrypted relay circuits.
-- `decent_net/dht.ep` — XOR distance metrics, k-bucket routing table, FIND_NODE/FIND_VALUE/STORE/PING RPCs.
-- `decent_net/relay.ep` — Encrypted relay registration, circuit creation, and data forwarding fallback loops.
-- **Verification**: Verified via `decent_net/test_dht.ep` (17/17 tests) and `decent_net/test_relay.ep` (15/15 tests).
-
-### Phase 4: Storage — COMPLETE
-**Deliverables**: Content-addressed chunk store and eventually-consistent synchronization.
-- `decent_store/content.ep` — BLAKE3 chunk store, deduplication, SQLite index, CAR file archiver, Merkle trees.
-- `decent_store/crdt.ep` — PN-Counters, LWW-Registers, Observed-Remove Sets, Multi-Value Registers.
-- **Verification**: Verified via `decent_store/test_content.ep` (13/13 tests) and `decent_store/test_crdt.ep` (15/15 tests).
-
-### Phase 5: Messaging — COMPLETE
-**Deliverables**: E2E encrypted direct messages and multi-party secure channels.
-- `decent_msg/message.ep` — Encrypted conversational message store, history query pagination.
-- `decent_msg/channel.ep` — Group channels with member addition/removal and encrypted key distribution.
-- **Verification**: Verified via `decent_msg/test_message.ep` (13/13 tests) and `decent_msg/test_channel.ep` (10/10 tests).
-
-### Phase 6: Social Publishing — COMPLETE
-**Deliverables**: Nostr event engine, ActivityPub inbox delivery, and unified chronological feeds.
-- `decent_social/nostr.ep` — Nostr event signing, filters, and subscription queries.
-- `decent_social/activitypub.ep` — Actor Person profile generation, activity wrapping (Create, Follow, Accept, Like).
-- `decent_social/feed.ep` — Unified aggregator normalising events.
-- `decent_social/publish.ep` — Multi-protocol broadcasting.
-- **Verification**: Verified via `decent_social/test_social.ep` (8/8 tests).
-
-### Phase 7: Naming & Hosting — COMPLETE
-**Deliverables**: DNS caching resolver, `.ernos` domain registrar, and native HTTP hosting.
-- `decent_name/resolver.ep` — Caching DNS resolver with record TTL invalidation.
-- `decent_name/registry.ep` — Decentralised registrar mapping names to owner DIDs.
-- `decent_host/http.ep` — Socket listener parsing HTTP requests and serving responses.
-- `decent_host/static.ep` — Static route mapper.
-- **Verification**: Verified via `decent_host/test_host.ep` (21/21 assertions).
-
-### Phase 8: Financial Systems — COMPLETE
-**Deliverables**: HD wallets, PoS distributed ledger, fungible/NFT assets, constant-product AMM DEX, and smart contract engine.
-- `decent_money/wallet.ep` — BIP39 mnemonics, BIP44 HD derivation.
-- `decent_money/ledger.ep` — UTXO verification, block mining, PoS election.
-- `decent_money/token.ep` — ERC-20 equivalent token standard.
-- `decent_money/nft.ep` — ERC-721 equivalent NFT standard with royalties.
-- `decent_money/exchange.ep` — Hybrid constant-product AMM and limit order priority orderbook.
-- `decent_money/contracts.ep` — Smart contract persistent state, evaluations, rolling back on REVERT.
-- **Verification**: Verified via `decent_money/test_money.ep` (6/6 tests).
-
-### Phase 9: Local AI — COMPLETE
-**Deliverables**: Local GGUF transformer inference, vector embeddings, and speech-to-text.
-- `decent_ai/models.ep` — Model registry with integrity checks.
-- `decent_ai/inference.ep` — GGUF v3 parsing, fixed-point attention/generation.
-- `decent_ai/embeddings.ep` — Average token representations, cosine similarity.
-- `decent_ai/speech.ep` — Feature pooling, vocabulary projections, CTC decoding.
-- **Verification**: Verified via `decent_ai/test_ai.ep` (6/6 tests).
-
-### Phase 10: Media & Communication — COMPLETE
-**Deliverables**: SDP negotiation, STUN mapping, DTLS/SRTP cryptography, adaptive segmenting, Opus/VP8, and P2P CDN CDN.
-- `decent_media/webrtc.ep` — SDP Offer/Answer, STUN Binding, SRTP encryption/decryption.
-- `decent_media/stream.ep` — Media segmentation, adaptive bitrate HLS manifests, LRU cache.
-- `decent_media/codec.ep` — FFI wrappers and IMA-ADPCM/RLE fallbacks.
-- `decent_media/cdn.ep` — Segment swarm distribution over Kademlia DHT.
-- **Verification**: Verified via `decent_media/test_media.ep` (7/7 tests).
-
-### Phase 11: Privacy & Search — COMPLETE
-**Deliverables**: Anonymity overlays and decentralized crawler and rank engines.
-- `decent_anon/onion.ep` — Multi-hop layered onion routing.
-- `decent_anon/mixnet.ep` — Traffic mixing and packet timing delays to resist analysis.
-- `decent_search/crawl.ep` — Distributed network web crawler.
-- `decent_search/rank.ep` — BM25 text relevance and PageRank authority ranking.
-- `decent_search/query.ep` — Decentralised query processing and merging.
-- **Verification**: Verified via `decent_anon/test_anon_search.ep` (3/3 tests passing).
-
-### Phase 12: Collaborative Resource Pooling (Bandwidth & Compute) — COMPLETE
-**Deliverables**: Shared P2P bandwidth proxying, distributed AI inference execution, and secure mesh resource pooling.
-- `decent_pool/bandwidth.ep` — Bandwidth rate limits and contribution tracking.
-- `decent_pool/compute.ep` — Compute job delegation, worker scheduling, contribution tracking, execution consensus.
-- `decent_pool/mesh.ep` — Symbiotic resource mesh integration.
-- **Verification**: Verified via `decent_pool/test_pool.ep` (3/3 tests passing).
-
-### Phase 13: Email, Git, and Consensus — COMPLETE
-**Deliverables**: SMTP/IMAP protocol hosting, decentralized Git server, and Raft consensus.
-- `decent_host/email.ep` — Native SMTP/IMAP server mapping email identities to DIDs.
-- `decent_host/git.ep` — Secure P2P git repository host.
-- `decent_consensus/raft.ep` — Raft consensus state machine.
-- `decent_consensus/state.ep` — Replicated log state replication.
-- `decent_consensus/election.ep` — Leader election loops.
-- **Verification**: Verified via `decent_consensus/test_consensus.ep` (4/4 integration tests passing).
-
-### Phase 14: Node Daemon & Cross-Platform Packaging — COMPLETE
-**Deliverables**: Unified main node daemon executable and target platform configurations.
-- `node.ep` — Core daemon coordinating all completed subsystems and network interfaces.
-- `decent_cli/decent_cli.ep` — Command line control interface CLI tools.
-- `decent_cli/test_cli.ep` — CLI integration test suite.
-- **Verification**: Verified via `decent_cli/test_cli.ep` (1/1 test suite passing).
-
-### Phase 15: Sovereign Dashboard App (UI Integration) — COMPLETE
-**Deliverables**: Premium glassmorphic Web UI client and daemon HTTP/WebSocket integration server.
-- `decent_web/index.html`, `style.css`, `app.js` — Single-Page Application (SPA) dashboard presenting real-time telemetry, local wallet transactions, AMM swap engine, P2P CDN file storage explorer, and streaming AI playground interface.
-- `decent_web/web_server.ep` — Native HTTP and WebSocket gateway server serving static assets, REST JSON telemetry endpoints, and streaming GGUF transformer completion tokens.
-- **Verification**: Verified via automated HTTP/JSON API requests (1/1 verification suite passing).
-
-### Phase 16: Cognitive Agent Brain (ErnOS Agent) — COMPLETE
-**Deliverables**: ReAct decision-making loop, Hebbian memory systems, secure observer execution audits, and cognitive routing.
-- `decent_agent/react_loop.ep` — Core agentic ReAct loop managing prompt assembly, tool call parsing (with unescaped quote truncation fallback), and turn orchestration.
-- `decent_agent/tools.ep` — Extensible tool executor with 18+ registered tools (filesystem, git, network, and node IPC).
-- `decent_agent/memory.ep` — Tiered memory management utilizing a Hebbian association graph for dynamic beliefs and knowledge consolidation.
-- `decent_agent/observer.ep` — Independent, fail-closed LLM observer audit pipeline checking for harmful output, prompt injections, and dangerous terminal commands.
-- `decent_agent/llm.ep`, `provider_*.ep` — Standardized LLM client abstractions for OpenAI-compatible local APIs and Hugging Face local models.
-
-### Phase 17: Workspace, Changelog, and Discord Transparency — COMPLETE
-**Deliverables**: Per-session workspace rotation, SHA-256 code change logging, and real-time Discord transparency streaming.
-- `decent_agent/workspace.ep` — Session-isolated workspaces under `config/workspaces/active/` with automatic tar-gzip archival of older workspaces (14-day policy) and cross-session retrieval.
-- `decent_agent/changelog.ep` — Automated codebase write logging using SHA-256 file hashing on changes, combined with boot-time git diff auditing.
-- `decent_agent/trace.ep` — SQLite-backed tracing of agent execution events across 12 ReAct stages.
-- `decent_net/discord_bridge.py` — Bidirectional Discord connector that spawns real-time reasoning trace threads per prompt, schedules self-deletions after 2 minutes, and cleans up expired threads crash-resiliently via SQLite.
-- **Verification**: Verified via integration compilation and unit/lint checks (`ernos check` on all 7 affected `.ep` modules and python compiling).
-
----
-
-## Verification Plan
-
-### Per-Component Testing
-- Companion integration tests (`test_*.ep`) must accompany all code.
-- Coverage criteria: happy paths, malformed parameters, bounds boundaries, concurrency, and error handling.
-- Executed using `ernos test` or compiling/running test binaries natively.
-
-### Cross-Platform Verification
-- Compiles via Clang:
-  - macOS ARM64 (Apple Silicon)
-  - Linux x86_64
-  - Linux ARM64
+1. Every native-target `.ep` source passes `ernos check`; the browser-target `decent_web/app.ep` emits JavaScript successfully with `ernos emit ... --js`.
+2. Every parameter and return value has an explicit Ernos type.
+3. The forbidden source markers in `AGENT.md` are absent from production code.
+4. `bash build.sh` succeeds from freshly generated C and produces a signed macOS binary when run on macOS.
+5. The subsystem, integration, security, persistence, malformed-input, transport, and runtime-specific suites exit successfully without printed failure markers.
+6. The live node starts from the new binary, binds only its configured interfaces, and passes authenticated API and WebSocket checks.
+7. Documentation states implementation boundaries exactly; unimplemented interoperability is never labeled complete.

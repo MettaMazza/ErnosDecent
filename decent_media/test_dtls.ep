@@ -16,15 +16,17 @@ define pass_if with label as Str and cond as Int returning Int:
     display concat("FAIL: " and label)
     return 0
 
-define main:
+define main returning Int:
     set passes to 0
     set keys_client to create_map()
     set keys_server to create_map()
     set okneg to webrtc_dtls_negotiate(keys_client and keys_server and "/tmp/ernos_dtls_cert.pem" and "/tmp/ernos_dtls_key.pem")
     set passes to passes + pass_if("dtls_handshake_succeeds" and (okneg == 1))
     if okneg == 0:
-        display "RESULT: 1/5 passed (DTLS unavailable)"
-        return 0
+        display "RESULT: 0/5 passed (DTLS unavailable)"
+        set ok to free_map(keys_client)
+        set ok to free_map(keys_server)
+        return 1
 
     # keys present + correct length (32 hex key, 28 hex salt)
     set ck to map_get_val(keys_client and "send_key")
@@ -58,4 +60,23 @@ define main:
     set passes to passes + pass_if("dtls_keyed_srtp_roundtrip" and rt_ok)
 
     display concat("RESULT: " and concat(int_to_string(passes) and "/5 passed"))
+    set enc_ptr to map_get_val(enc and "packet_ptr")
+    set dec_ptr to map_get_val(dec and "payload_ptr")
+    if enc_ptr != 0:
+        set ok to free_bytes(enc_ptr)
+    if dec_ptr != 0:
+        set ok to free_bytes(dec_ptr)
+    set ok to free_bytes(p)
+    set close_client_err to webrtc_close_srtp_keys(keys_client)
+    set close_server_err to webrtc_close_srtp_keys(keys_server)
+    set ok to free_map(enc)
+    set ok to free_map(dec)
+    set ok to free_map(keys_client)
+    set ok to free_map(keys_server)
+    if file_exists("/tmp/ernos_dtls_cert.pem") == 1:
+        set cleanup_ok to remove_file("/tmp/ernos_dtls_cert.pem")
+    if file_exists("/tmp/ernos_dtls_key.pem") == 1:
+        set cleanup_ok to remove_file("/tmp/ernos_dtls_key.pem")
+    if passes != 5 or else close_client_err != 0 or else close_server_err != 0:
+        return 1
     return 0

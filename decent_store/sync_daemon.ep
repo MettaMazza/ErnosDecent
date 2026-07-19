@@ -117,7 +117,13 @@ define sync_client_run with address as Str and port as Int and local_clock as Ma
     set my_store_str to sync_store_serialize(local_store)
     set req_payload to concat(my_clock_str and concat("#" and my_store_str))
     
-    set ok to transport_send(conn and "SYNC_PUSH" and req_payload)
+    set send_err to transport_send(conn and "SYNC_PUSH" and req_payload)
+    if send_err != TRANSPORT_ERR_NONE:
+        set close_err to transport_close(conn)
+        free_map(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            return 4
+        return 2
     
     set resp to transport_recv(conn)
     set resp_err to map_get_val(resp and "error")
@@ -140,8 +146,12 @@ define sync_client_run with address as Str and port as Int and local_clock as Ma
                 free_list(parts)
                 
     free_map(resp)
-    set ok to transport_close(conn)
+    set close_err to transport_close(conn)
     free_map(conn)
+    if resp_err != TRANSPORT_ERR_NONE:
+        return 3
+    if close_err != TRANSPORT_ERR_NONE:
+        return 4
     return 0
 
 define sync_server_handle_once with server_conn as Map and local_clock as Map and local_store as Map returning Int:
@@ -161,11 +171,22 @@ define sync_server_handle_once with server_conn as Map and local_clock as Map an
             set reply_payload to sync_handle_push_payload(payload and local_clock and local_store)
             if string_length(reply_payload) > 0:
                 if reply_payload equals "ok":
-                    set ok to transport_send(conn and "SYNC_PUSH" and "ok")
+                    set send_err to transport_send(conn and "SYNC_PUSH" and "ok")
                 else:
-                    set ok to transport_send(conn and "SYNC_PUSH" and reply_payload)
+                    set send_err to transport_send(conn and "SYNC_PUSH" and reply_payload)
+                if send_err != TRANSPORT_ERR_NONE:
+                    free_map(req)
+                    set close_err to transport_close(conn)
+                    free_map(conn)
+                    if close_err != TRANSPORT_ERR_NONE:
+                        return 4
+                    return 2
                     
     free_map(req)
-    set ok to transport_close(conn)
+    set close_err to transport_close(conn)
     free_map(conn)
+    if req_err != TRANSPORT_ERR_NONE:
+        return 3
+    if close_err != TRANSPORT_ERR_NONE:
+        return 4
     return 0

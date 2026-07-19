@@ -7,6 +7,8 @@ import "string"
 import "net"
 import "os"
 import "../config.ep"
+import "../decent_id/auth"
+import "client"
 
 define get_command_from_args with args as List returning Str:
     set argc to length_list(args)
@@ -21,7 +23,7 @@ define get_command_from_args with args as List returning Str:
         set i to i + 1
     return cmd
 
-define print_usage:
+define print_usage returning Int:
     display "==================================================="
     display "  ErnosDecent CLI Client"
     display "==================================================="
@@ -33,7 +35,7 @@ define print_usage:
     display "==================================================="
     return 0
 
-define main:
+define main returning Int:
     set args to get_args()
     set argc to length_list(args)
     
@@ -50,36 +52,24 @@ define main:
     # so a node started with a non-default --port is still reachable. Defaults to 5000.
     set home to get_home_dir()
     set cfg to config_load(concat(home and "/.ernosdecent/config.toml"))
+    if map_contains(cfg and "config.error") == 1:
+        display concat("[-] Error: invalid configuration: " and ptr_to_str(map_get_val(cfg and "config.error")))
+        return 1
     set ipc_port to config_get_int(cfg and "network.ipc_port")
     if ipc_port <= 0:
         set ipc_port to 5000
 
-    # Connect to the daemon
-    set fd to ep_net_connect("127.0.0.1" and ipc_port)
-    if fd < 0:
-        display f"[-] Error: Could not connect to ErnosDecent daemon on port {ipc_port}. Is the daemon running?"
+    # Read the IPC auth token; the daemon requires an "AUTH <token>" prefix.
+    set tok to ipc_read_token()
+    if string_length(tok) == 0:
+        display "[-] Error: IPC authentication token is missing or unreadable."
         return 1
 
-    # Read the IPC auth token; the daemon requires an "AUTH <token>" prefix.
-    set tok_path to concat(home and "/.ernosdecent/ipc-token")
-    set tok to ""
-    if file_exists(tok_path) == 1:
-        set tok to string_trim(file_read(tok_path))
-
-    # Send command (token-prefixed)
-    set send_ok to ep_net_send(fd and concat("AUTH " and concat(tok and concat(" " and cmd))))
-    
-    # Receive response loop until EOF
-    set resp to ""
-    set reading to 1
-    repeat while reading == 1:
-        set chunk to ep_net_recv(fd and 65536)
-        if string_length(chunk) > 0:
-            set resp to concat(resp and chunk)
-        else:
-            set reading to 0
+    set result to cli_send_command("127.0.0.1" and ipc_port and tok and cmd)
+    set err to map_get_val(result and "error")
+    set resp to ptr_to_str(map_get_val(result and "response"))
+    if err != CLI_ERR_NONE:
+        display f"[-] Error: IPC command failed with code {err}."
+        return 1
     display resp
-    
-    # Close connection
-    set close_ok to ep_net_close(fd)
     return 0

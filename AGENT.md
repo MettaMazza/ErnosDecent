@@ -235,7 +235,7 @@ ernosdecent/
 │   ├── security.ep      # IP rate-limiting & command validator
 │   └── transport.ep     # Low-level TCP/UDP socket abstraction
 ├── decent_store/        # Content-Addressed Storage
-│   ├── content.ep       # Chunk store, BLAKE3, GC, and file DB
+│   ├── content.ep       # SHA-256 chunk store, GC, and file DB
 │   └── crdt.ep          # Deterministic state-merge structures (LWW, PN)
 ├── decent_msg/          # Encrypted Messaging
 │   ├── channel.ep       # Group symmetric key envelopes

@@ -57,9 +57,7 @@ define parse_env_file with path as Str and key as Str returning Str:
 
 # Resolve key from OS environment or file configs
 define web_search_get_api_key with key as Str returning Str:
-    set cmd to concat("printenv " and key)
-    set raw_env to run_command(cmd)
-    set env_val to string_trim(raw_env)
+    set env_val to string_trim(get_env(key))
     if string_length(env_val) > 0 and also string_contains(env_val and "not found") == 0:
         return env_val
     set local_val to parse_env_file(".env" and key)
@@ -73,9 +71,63 @@ define web_search_get_api_key with key as Str returning Str:
         return ws_val
     return ""
 
+define web_search_url_host with url as Str returning Str:
+    set host to url
+    set scheme_pos to string_index_of(host and "://")
+    if scheme_pos >= 0:
+        set host to substring(host and scheme_pos + 3 and string_length(host) - scheme_pos - 3)
+    set slash_pos to string_index_of(host and "/")
+    if slash_pos >= 0:
+        set host to substring(host and 0 and slash_pos)
+    if string_contains(host and "@") == 1:
+        return ""
+    if string_index_of(host and "[") == 0:
+        set rb to string_index_of(host and "]")
+        if rb > 0:
+            return substring(host and 1 and rb - 1)
+    set colon_pos to string_index_of(host and ":")
+    if colon_pos >= 0:
+        set host to substring(host and 0 and colon_pos)
+    return string_lower(host)
+
+define web_search_url_safe with url as Str returning Int:
+    set lower to string_lower(url)
+    if string_index_of(lower and "http://") != 0 and also string_index_of(lower and "https://") != 0:
+        return 0
+    set host to web_search_url_host(url)
+    if string_length(host) == 0:
+        return 0
+    if host equals "localhost" or else host equals "0.0.0.0" or else host equals "::" or else host equals "::1":
+        return 0
+    if string_contains(host and ".local") == 1:
+        return 0
+    if string_index_of(host and "127.") == 0 or else string_index_of(host and "10.") == 0:
+        return 0
+    if string_index_of(host and "192.168.") == 0 or else string_index_of(host and "169.254.") == 0:
+        return 0
+    if string_index_of(host and "172.") == 0:
+        set rest to substring(host and 4 and string_length(host) - 4)
+        set dot_pos to string_index_of(rest and ".")
+        if dot_pos > 0:
+            set second_octet to string_to_int(substring(rest and 0 and dot_pos))
+            if second_octet >= 16 and also second_octet <= 31:
+                return 0
+    if string_index_of(host and "fe80") == 0 or else string_index_of(host and "fc") == 0 or else string_index_of(host and "fd") == 0:
+        if string_index_of(host and ".") < 0:
+            return 0
+    return 1
+
+define web_search_command_body with raw as Str returning Str:
+    set marker_pos to string_last_index_of(raw and "__ERNOS_EXIT__:0")
+    if marker_pos < 0:
+        return "Error: HTTP request failed"
+    return substring(raw and 0 and marker_pos)
+
 # Execute standard system curl commands
 define web_search_http_get with url as Str and headers_list as List returning Str:
-    set cmd to "curl -s -L"
+    if web_search_url_safe(url) == 0:
+        return "Error: blocked disallowed or internal URL"
+    set cmd to "curl -sS -f --proto '=http,https' --max-redirs 0 --connect-timeout 10 --max-time 30"
     set h_len to length_list(headers_list)
     set hi to 0
     repeat while hi < h_len:
@@ -97,9 +149,9 @@ define web_search_http_get with url as Str and headers_list as List returning St
         
     set url_escaped to string_replace(url and "'" and "'\\''")
     set cmd to concat(cmd and concat(" '" and concat(url_escaped and "'")))
-    
-    set res to run_command(cmd)
-    return res
+    set cmd to concat(cmd and "; printf '\n__ERNOS_EXIT__:%s' $?")
+    set raw to run_command(cmd)
+    return web_search_command_body(raw)
 
 # Strip script, style, and HTML elements
 define web_search_strip_html with html as Str returning Str:
@@ -257,9 +309,9 @@ define web_search_serper with query as Str and api_key as Str returning Str:
     set payload_escaped to string_replace(payload and "'" and "'\\''")
     
     set api_key_escaped to string_replace(api_key and "'" and "'\\''")
-    set cmd to concat("curl -s -X POST -H 'X-API-KEY: " and concat(api_key_escaped and concat("' -H 'Content-Type: application/json' -d '" and concat(payload_escaped and "' 'https://google.serper.dev/search'"))))
-    
-    set raw_resp to run_command(cmd)
+    set cmd to concat("curl -sS -f --proto '=https' --connect-timeout 10 --max-time 30 -X POST -H 'X-API-KEY: " and concat(api_key_escaped and concat("' -H 'Content-Type: application/json' -d '" and concat(payload_escaped and "' 'https://google.serper.dev/search'"))))
+    set cmd to concat(cmd and "; printf '\n__ERNOS_EXIT__:%s' $?")
+    set raw_resp to web_search_command_body(run_command(cmd))
     if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
         return ""
         
@@ -334,8 +386,9 @@ define web_search_tavily with query as Str and api_key as Str returning Str:
     set payload to concat("{\"api_key\": \"" and concat(api_key_escaped and concat("\", \"query\": \"" and concat(q_escaped and "\", \"search_depth\": \"basic\", \"max_results\": 8, \"include_answer\": true}"))))
     set payload_escaped to string_replace(payload and "'" and "'\\''")
     
-    set cmd to concat("curl -s -X POST -H 'Content-Type: application/json' -d '" and concat(payload_escaped and "' 'https://api.tavily.com/search'"))
-    set raw_resp to run_command(cmd)
+    set cmd to concat("curl -sS -f --proto '=https' --connect-timeout 10 --max-time 30 -X POST -H 'Content-Type: application/json' -d '" and concat(payload_escaped and "' 'https://api.tavily.com/search'"))
+    set cmd to concat(cmd and "; printf '\n__ERNOS_EXIT__:%s' $?")
+    set raw_resp to web_search_command_body(run_command(cmd))
     
     if string_length(raw_resp) == 0 or else string_index_of(raw_resp and "Error:") == 0:
         return ""
@@ -715,8 +768,8 @@ define web_search_waterfall with query as Str returning Str:
 
 # Webpage visiting tool
 define web_search_visit with url as Str returning Str:
-    if string_index_of(url and "http://") != 0 and also string_index_of(url and "https://") != 0:
-        return "Error: URL must start with http:// or https://"
+    if web_search_url_safe(url) == 0:
+        return "Error: URL is disallowed by SSRF protection."
     set headers to create_list()
     set raw_resp to web_search_http_get(url and headers)
     if string_length(raw_resp) == 0:

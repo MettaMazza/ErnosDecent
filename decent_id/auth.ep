@@ -44,7 +44,7 @@ set CAP_DELEGATE to "delegate"
 # Payload: SHA256(did + issued_at + expires_at + nonce)
 # ================================================================
 
-define create_session_token with did as Str and secret_key_hex as Str and ttl_seconds as Int:
+define create_session_token with did as Str and secret_key_hex as Str and ttl_seconds as Int returning Map:
     set result to create_map()
 
     if string_length(did) == 0:
@@ -69,6 +69,10 @@ define create_session_token with did as Str and secret_key_hex as Str and ttl_se
 
     set nonce_buf to alloc_bytes(16)
     set fn_rand to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    if nonce_buf == 0 or else fn_rand == 0:
+        set ok to free_bytes(nonce_buf)
+        set ok to map_insert(result and "error" and AUTH_ERR_SIGNATURE_FAILED)
+        return result
     set ok to ep_dlcall2(fn_rand and nonce_buf and 16)
     set nonce to raw_to_hex(nonce_buf and 16)
     set ok to free_bytes(nonce_buf)
@@ -107,7 +111,7 @@ define create_session_token with did as Str and secret_key_hex as Str and ttl_se
     set ok to map_insert(result and "error" and AUTH_ERR_NONE)
     return result
 
-define verify_session_token with token as Str and public_key_hex as Str and expected_payload_hash as Str:
+define verify_session_token with token as Str and public_key_hex as Str and expected_payload_hash as Str returning Map:
     # Verify a session token:
     # 1. Extract payload_hash and signature from token
     # 2. Verify signature matches public key
@@ -164,7 +168,7 @@ define is_token_expired with expires_at as Int returning Int:
 # Format: signed JSON-like structure with resource + actions + expiry
 # ================================================================
 
-define create_capability with granter_did as Str and grantee_did as Str and resource as Str and actions as Str and granter_secret_key as Str and ttl_seconds as Int:
+define create_capability with granter_did as Str and grantee_did as Str and resource as Str and actions as Str and granter_secret_key as Str and ttl_seconds as Int returning Map:
     # Create a capability token granting specific permissions
     # actions: comma-separated list e.g. "read,write"
     set result to create_map()
@@ -222,7 +226,7 @@ define create_capability with granter_did as Str and grantee_did as Str and reso
     set ok to map_insert(result and "error" and AUTH_ERR_NONE)
     return result
 
-define verify_capability with cap as Str and granter_pub_hex as Str and grantee_did as Str and resource as Str and required_action as Str:
+define verify_capability with cap as Str and granter_pub_hex as Str and grantee_did as Str and resource as Str and required_action as Str returning Map:
     # Verify a capability token:
     # 1. Parse the capability fields
     # 2. Verify the granter's signature
@@ -323,7 +327,7 @@ define verify_capability with cap as Str and granter_pub_hex as Str and grantee_
 # Serialized capability format for wire transmission
 # ================================================================
 
-define serialize_capability with cap_map as Int returning Str:
+define serialize_capability with cap_map as Map returning Str:
     # Serialize a capability map to wire format: body.signature
     set granter to map_get_val(cap_map and "granter")
     set grantee to map_get_val(cap_map and "grantee")
@@ -353,7 +357,7 @@ define serialize_capability with cap_map as Int returning Str:
 # Authorize a new device by signing its DID with an existing device's key
 # ================================================================
 
-define authorize_device with authorizer_did as Str and authorizer_secret_key as Str and new_device_did as Str:
+define authorize_device with authorizer_did as Str and authorizer_secret_key as Str and new_device_did as Str returning Map:
     # The authorizer (existing device) signs a statement:
     # "I (authorizer_did) authorize (new_device_did) at time (timestamp)"
     set result to create_map()
@@ -427,15 +431,28 @@ define ipc_read_token returning Str:
     set p to ipc_token_path()
     if file_exists(p) == 0:
         return ""
+    set chmod_error to keys_chmod(p and 384)
+    if chmod_error != 0:
+        display f"[-] IPC token permissions could not be enforced at {p}: {chmod_error}."
+        return ""
     return string_trim(read_file(p))
 
 define ipc_get_or_create_token returning Str:
     set p to ipc_token_path()
     if file_exists(p) == 1:
-        return string_trim(read_file(p))
+        return ipc_read_token()
     set tok to keys_random_hex(24)
     if string_length(tok) == 0:
         return ""
-    set ok to write_file(p and tok)
-    set ok to keys_chmod(p and 384)
+    set write_ok to write_file(p and tok)
+    if write_ok == 0:
+        display f"[-] IPC token could not be written at {p}."
+        return ""
+    set chmod_error to keys_chmod(p and 384)
+    if chmod_error != 0:
+        display f"[-] IPC token permissions could not be enforced at {p}: {chmod_error}."
+        set remove_ok to remove_file(p)
+        if remove_ok == 0 and also file_exists(p) == 1:
+            display f"[-] Insecure IPC token file could not be removed: {p}."
+        return ""
     return tok

@@ -9,9 +9,10 @@ import "./static"
 import "./http"
 import "../decent_name/registry"
 import "../decent_name/resolver"
+import "../storage"
 
 # Helper to run the HTTP server step in a spawned thread
-define run_server_step with server_fd as Int and mapper as Int:
+define run_server_step with server_fd as Int and mapper as Map returning Int:
     set ok to http_server_step(server_fd and mapper)
     return ok
 
@@ -19,27 +20,28 @@ define run_server_step with server_fd as Int and mapper as Int:
 # Test 1: Registry and Resolver Functionality
 # ================================================================
 
-define test_registry_and_resolver:
+define test_registry_and_resolver returning Int:
     display "TEST 1: Name Registry and DNS Resolver Cache"
     
     # 1. Initialize Registry
     set reg to registry_create()
+    set no_dht to create_map()
     
     # 2. Register name to DID
     set alice_did to "did:key:z6MkpTHR8VNsBxRceSt30uFRQ68asdfasdf"
-    set reg_err to registry_register(reg and "alice.ernos" and alice_did)
+    set reg_err to registry_register(reg and "alice.ernos" and alice_did and no_dht and "" and 0 and "" and "")
     assert_true(reg_err == REG_ERR_NONE and "registering name should succeed")
     
     # 3. Try to register duplicate name
-    set reg_err_dup to registry_register(reg and "alice.ernos" and "did:key:another")
+    set reg_err_dup to registry_register(reg and "alice.ernos" and "did:key:another" and no_dht and "" and 0 and "" and "")
     assert_true(reg_err_dup == REG_ERR_NAME_TAKEN and "registering duplicate name should fail")
     
     # 4. Resolve name to DID
-    set resolved_did to registry_resolve(reg and "alice.ernos")
+    set resolved_did to registry_resolve(reg and "alice.ernos" and no_dht and "" and 0)
     assert_true(resolved_did equals alice_did and "resolved DID should match registered DID")
     
     # 5. Resolve unknown name
-    set resolved_unknown to registry_resolve(reg and "unknown.ernos")
+    set resolved_unknown to registry_resolve(reg and "unknown.ernos" and no_dht and "" and 0)
     assert_true(resolved_unknown equals "" and "unknown name should resolve to empty string")
     
     # 6. Initialize DNS Resolver Cache
@@ -65,7 +67,7 @@ define test_registry_and_resolver:
 # Test 2: Static Route Mapper
 # ================================================================
 
-define test_static_route_mapper:
+define test_static_route_mapper returning Int:
     display "TEST 2: Static Route File Mapper"
     
     set mapper to static_create_mapper()
@@ -92,7 +94,7 @@ define test_static_route_mapper:
 # Test 3: HTTP Parsing & Response Builder
 # ================================================================
 
-define test_http_parsing_and_response:
+define test_http_parsing_and_response returning Int:
     display "TEST 3: HTTP Request Parsing and Response Builder"
     
     # Parse request paths
@@ -117,13 +119,15 @@ define test_http_parsing_and_response:
 # Test 4: Integration (Registry -> Resolver -> Server -> Request)
 # ================================================================
 
-define test_integration_flow:
+define test_integration_flow returning Int:
     display "TEST 4: End-to-End Integration Flow"
     
     # 1. Setup Registry
     set reg to registry_create()
+    set no_dht to create_map()
     set alice_did to "did:key:z6MkpTHR8VNsBxRceSt30uFRQ68asdfasdf"
-    registry_register(reg and "alice.ernos" and alice_did)
+    set reg_err to registry_register(reg and "alice.ernos" and alice_did and no_dht and "" and 0 and "" and "")
+    assert_true(reg_err == REG_ERR_NONE and "integration name registration should succeed")
     
     # 2. Setup Resolver and Cache Endpoint for Alice
     set res to resolver_create()
@@ -183,12 +187,17 @@ define test_integration_flow:
 # Main -- Run all tests
 # ================================================================
 
-define main:
+define main returning Int:
     display "==================================================="
     display "  ErnosDecent -- decent_host & decent_name Test Suite"
     display "  OperationTrojanClaude Phase 7"
     display "==================================================="
     display ""
+    set test_storage_dir to concat("/tmp/ernos_host_test_" and int_to_string(ep_time_now_ms()))
+    set storage_err to storage_init(test_storage_dir)
+    if storage_err != STORAGE_ERR_NONE:
+        display f"FATAL: test storage initialization failed with {storage_err}"
+        return 1
     
     test_registry_and_resolver()
     test_static_route_mapper()
@@ -199,4 +208,7 @@ define main:
     display "==================================================="
     display "  All Phase 7 tests executed."
     display "==================================================="
+    set close_err to storage_close()
+    if close_err != STORAGE_ERR_NONE:
+        return 1
     return 0

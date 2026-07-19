@@ -13,8 +13,9 @@ import "react_loop"
 import "./orchestrator"
 import "../logging"
 import "../decent_id/auth"
+import "../config.ep"
 
-external define cast_borrow_to_map with b returning Map
+external define cast_borrow_to_map with borrow b as Map returning Map
 
 # Submit a scheduled job's instruction to the LOCAL IPC daemon as a client, instead of
 # calling react_run() directly. The scheduler runs on its own spawned OS thread; react_run
@@ -23,11 +24,28 @@ external define cast_borrow_to_map with b returning Map
 # owner of react runs, so routing through it makes the scheduled turn run on the IPC thread,
 # serialized with user turns. This thread just blocks on the socket until the turn returns.
 define scheduler_submit_via_ipc with instruction as Str returning Str:
-    set fd to ep_net_connect("127.0.0.1" and 5000)
+    set cfg to config_load(concat(get_home_dir() and "/.ernosdecent/config.toml"))
+    if map_contains(cfg and "config.error") == 1:
+        return concat("error:invalid_config:" and ptr_to_str(map_get_val(cfg and "config.error")))
+    set ipc_port to config_get_int(cfg and "network.ipc_port")
+    if ipc_port <= 0:
+        return "error:invalid_ipc_port"
+    set fd to ep_net_connect("127.0.0.1" and ipc_port)
     if fd < 0:
         return "error:daemon_offline"
     set tok to ipc_read_token()
-    set ok to ep_net_send(fd and concat("AUTH " and concat(tok and concat(" AI INFER " and instruction))))
+    if string_length(tok) == 0:
+        set close_err to ep_net_close(fd)
+        if close_err != 0:
+            return "error:missing_ipc_token_and_close_failed"
+        return "error:missing_ipc_token"
+    set request to concat("AUTH " and concat(tok and concat(" AI INFER " and instruction)))
+    set sent to ep_net_send(fd and request)
+    if sent != string_length(request):
+        set close_err to ep_net_close(fd)
+        if close_err != 0:
+            return "error:ipc_send_and_close_failed"
+        return "error:ipc_send_failed"
     set resp to ""
     set reading to 1
     repeat while reading == 1:
@@ -36,7 +54,9 @@ define scheduler_submit_via_ipc with instruction as Str returning Str:
             set reading to 0
         else:
             set resp to concat(resp and chunk)
-    set ok to ep_net_close(fd)
+    set close_err to ep_net_close(fd)
+    if close_err != 0:
+        return "error:ipc_close_failed"
     return resp
 
 define cast_int_to_str with val as Int returning Str:
@@ -167,6 +187,8 @@ define scheduler_load returning List:
 
     if modified == 1:
         set ok to scheduler_save(jobs_list)
+        if ok != 0:
+            display "[-] Scheduler defaults are active in memory but were not persisted."
 
     return jobs_list
 
@@ -201,6 +223,9 @@ define scheduler_save with jobs_list as List returning Int:
         set i to i + 1
     set json_str to concat(json_str and "]")
     set ok to write_file("config/scheduler_jobs.json" and json_str)
+    if ok == 0:
+        display "[-] Scheduler job persistence failed."
+        return 1
     return 0
 
 # Check if job is due
@@ -261,7 +286,12 @@ define perform_token_rotation returning Int:
                         if now >= expires_at:
                             # Expired! Delete file
                             set ok to fs_delete_file(filepath)
-                            set cleaned_count to cleaned_count + 1
+                            if ok == 1:
+                                set cleaned_count to cleaned_count + 1
+                            else:
+                                log_error("scheduler" and concat("Failed to delete expired session token: " and filepath))
+                                free_list(files)
+                                return 1
         set i to i + 1
         
     free_list(files)
@@ -275,9 +305,12 @@ define perform_cert_rotation returning Int:
     set key_path to "/persist/step-ca/secrets/intermediate_ca_key"
     if file_exists(cert_path) == 1:
         log_info("scheduler" and f"step-ca intermediate certificate found at {cert_path}. Checking renewal...")
-        set cmd to f"step ca renew --force --daemon {cert_path} {key_path}"
+        set cmd to f"step ca renew --force --daemon {cert_path} {key_path} 2>&1; printf '\n__ERNOS_EXIT__:%s' $?"
         set res to run_command(cmd)
         log_info("scheduler" and concat("step ca renew output: " and res))
+        if string_contains(res and "__ERNOS_EXIT__:0") == 0:
+            log_error("scheduler" and "step-ca intermediate certificate renewal failed.")
+            return 1
     else:
         log_info("scheduler" and "No step-ca intermediate certificate found. Skipping cert rotation.")
     return 0
@@ -311,6 +344,9 @@ define scheduler_execute_job with job_id as Str and instruction as Str and model
         set i to i + 1
     if found == 1:
         set ok to scheduler_save(jobs_list)
+        if ok != 0:
+            free_list(jobs_list)
+            return 1
     
     free_list(jobs_list)
     
@@ -324,25 +360,37 @@ define scheduler_execute_job with job_id as Str and instruction as Str and model
 
 define get_total_ram_gb returning Int:
     set ram_gb to 8
-    set sys_res to run_command("sysctl -n hw.memsize 2>/dev/null")
-    if string_length(sys_res) > 0:
-        set bytes to string_to_int(sys_res)
-        if bytes > 0:
-            return bytes / 1073741824
-    set mem_res to run_command("grep MemTotal /proc/meminfo 2>/dev/null")
-    if string_length(mem_res) > 0:
+    set os_name to ep_os_name()
+    if os_name equals "macos":
+        set sys_res to run_command("sysctl -n hw.memsize 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+        set marker to string_index_of(sys_res and "__ERNOS_EXIT__:")
+        if string_contains(sys_res and "__ERNOS_EXIT__:0") == 1 and marker > 0:
+            set bytes to string_to_int(substring(sys_res and 0 and marker))
+            if bytes > 0:
+                return bytes / 1073741824
+        display "[-] Scheduler could not determine macOS RAM; using the configured 8 GiB fallback."
+        return ram_gb
+    if os_name equals "linux":
+        set mem_res to run_command("grep MemTotal /proc/meminfo 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+        set marker to string_index_of(mem_res and "__ERNOS_EXIT__:")
+        set mem_body to ""
+        if string_contains(mem_res and "__ERNOS_EXIT__:0") == 1 and marker > 0:
+            set mem_body to substring(mem_res and 0 and marker)
         set clean_digits to ""
-        set len to string_length(mem_res)
+        set len to string_length(mem_body)
         set i to 0
         repeat while i < len:
-            set ch to get_character(mem_res and i)
+            set ch to get_character(mem_body and i)
             if ch >= 48 and ch <= 57:
-                set clean_digits to concat(clean_digits and substring(mem_res and i and 1))
+                set clean_digits to concat(clean_digits and substring(mem_body and i and 1))
             set i to i + 1
         if string_length(clean_digits) > 0:
             set kb to string_to_int(clean_digits)
             if kb > 0:
                 return kb / 1048576
+        display "[-] Scheduler could not determine Linux RAM; using the configured 8 GiB fallback."
+        return ram_gb
+    display "[-] Scheduler is running on an unknown OS; using the configured 8 GiB RAM fallback."
     return ram_gb
 
 # ─────────────────────────────────────────────────────
@@ -425,10 +473,12 @@ define scheduler_tick_loop with model as Map and memory as Map and tools as Map 
                     # Mark as running/last_run immediately in this thread to avoid multiple dispatches
                     set ok to map_insert(job_map and "last_run" and int_to_string(now_epoch))
                     set ok to scheduler_save(jobs_list)
-                    
-                    set ok to map_insert(ctx and "active_jobs" and active_jobs + 1)
-                    # Spawn job execution thread
-                    spawn scheduler_execute_job(job_id and inst_val and cast_borrow_to_map(model) and cast_borrow_to_map(memory) and cast_borrow_to_map(tools) and cast_borrow_to_map(ctx))
+                    if ok == 0:
+                        set ok to map_insert(ctx and "active_jobs" and active_jobs + 1)
+                        # Spawn job execution thread only after its running state is durable.
+                        spawn scheduler_execute_job(job_id and inst_val and cast_borrow_to_map(borrow model) and cast_borrow_to_map(borrow memory) and cast_borrow_to_map(borrow tools) and cast_borrow_to_map(borrow ctx))
+                    else:
+                        log_error("scheduler" and concat("Failed to persist dispatch state for job " and job_id))
             set i to i + 1
 
         free_list(jobs_list)

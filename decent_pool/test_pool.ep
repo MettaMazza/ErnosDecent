@@ -9,6 +9,28 @@ import "mesh"
 import "string"
 import "collections"
 
+external define cast_borrow_to_map with borrow value as Map returning Map
+
+define pool_bandwidth_worker with pool as Map and node_id as Str and done_ch as Int returning Int:
+    set worker_ok to 1
+    set i to 0
+    repeat while i < 100:
+        set err to bandwidth_record_traffic(pool and node_id and 1000 and "download")
+        if err != BANDWIDTH_ERR_NONE:
+            set worker_ok to 0
+        set i to i + 1
+    send worker_ok to done_ch
+    return 0
+
+define pool_compute_submit_worker with mgr as Map and worker_number as Int and done_ch as Int returning Int:
+    set delegator to concat("concurrent_delegator_" and int_to_string(worker_number))
+    set job_id to compute_submit_job(mgr and delegator and "concurrent_input")
+    set worker_ok to 0
+    if string_length(job_id) > 0:
+        set worker_ok to 1
+    send worker_ok to done_ch
+    return 0
+
 # ================================================================
 # Test 1: Bandwidth Rate Limits & Contribution Tracking
 # ================================================================
@@ -49,6 +71,27 @@ define test_bandwidth_pooling returning Int:
     set proxy_status to ptr_to_str(map_get_val(proxy_res and "status"))
     assert_true(proxy_status equals "unreachable" and "bandwidth proxy honestly reports unreachable destination")
 
+    # A caller cannot claim a higher tier than the peer has earned.
+    set bob_id to "node_bob"
+    set ok to bandwidth_add_peer(pool and bob_id)
+    assert_equal(bandwidth_check_limit(pool and bob_id and "premium") and BANDWIDTH_ERR_INVALID_TIER and "tier escalation is rejected")
+    assert_equal(bandwidth_record_traffic(pool and bob_id and -1 and "download") and BANDWIDTH_ERR_INVALID_BYTES and "negative traffic is rejected")
+
+    # Eight concurrent recorders exercise the shared pool mutex. 800,000 bytes in the
+    # same 60-second window exceeds the free tier's exact 750,000-byte allowance.
+    set done to channel
+    set worker to 0
+    repeat while worker < 8:
+        spawn pool_bandwidth_worker(cast_borrow_to_map(borrow pool) and bob_id and done)
+        set worker to worker + 1
+    set joined to 0
+    set worker_passes to 0
+    repeat while joined < 8:
+        set worker_passes to worker_passes + receive from done
+        set joined to joined + 1
+    assert_equal(worker_passes and 8 and "all concurrent bandwidth recorders complete")
+    assert_equal(bandwidth_check_limit(pool and bob_id and "free") and BANDWIDTH_ERR_RATE_LIMITED and "configured free-tier kbps limit is enforced over 60 seconds")
+
     display "  bandwidth_pooling: PASS"
     return 0
 
@@ -72,13 +115,15 @@ define test_compute_pooling returning Int:
     # Consensus verification requires redundancy (2 matching submissions)
     # So verifying now should not change status to completed
     set verify1 to compute_verify_result(mgr and job_id)
+    assert_equal(verify1 and COMPUTE_ERR_INSUFFICIENT_RESULTS and "verification reports insufficient redundant results")
     set jobs to map_get_val(mgr and "jobs")
     set job to map_get_val(jobs and job_id)
     set status1 to ptr_to_str(map_get_val(job and "status"))
     assert_true((status1 equals "completed") == 0 and "job not completed without redundant verification")
 
-    # Assign to worker 2 (Charlie)
-    # Submit matching result
+    # Assign to worker 2 (Charlie) and submit a matching result.
+    set assigned2 to compute_assign_job(mgr and "node_charlie")
+    assert_true(assigned2 equals job_id and "same job assigned to redundant worker charlie")
     set ok to compute_submit_result(mgr and job_id and "node_charlie" and "matrix_res_42")
     set verify2 to compute_verify_result(mgr and job_id)
 
@@ -89,7 +134,50 @@ define test_compute_pooling returning Int:
     set final_res to ptr_to_str(map_get_val(job and "result"))
     assert_true(final_res equals "matrix_res_42" and "job result stored matches consensus")
 
+    # Concurrent submissions must allocate distinct IDs without racing the counter or map.
+    set concurrent_mgr to compute_create_manager()
+    set done to channel
+    set worker to 0
+    repeat while worker < 16:
+        spawn pool_compute_submit_worker(cast_borrow_to_map(borrow concurrent_mgr) and worker and done)
+        set worker to worker + 1
+    set joined to 0
+    set worker_passes to 0
+    repeat while joined < 16:
+        set worker_passes to worker_passes + receive from done
+        set joined to joined + 1
+    set concurrent_jobs to map_get_val(concurrent_mgr and "jobs")
+    assert_equal(worker_passes and 16 and "all concurrent compute submissions complete")
+    assert_equal(map_size(concurrent_jobs) and 16 and "concurrent compute submissions preserve distinct jobs")
+
     display "  compute_pooling: PASS"
+    return 0
+
+define test_compute_network_roundtrip returning Int:
+    set mgr to compute_create_manager()
+    set job_id to compute_submit_job(mgr and "network_delegator" and "network_input")
+    assert_true(string_length(job_id) > 0 and "network compute job submitted")
+
+    set port to 19841
+    spawn compute_serve(cast_borrow_to_map(borrow mgr) and port)
+    set sleep_ok to ep_sleep_ms(100)
+
+    set worker1 to compute_worker_connect("127.0.0.1" and port and "network_worker_1")
+    assert_equal(map_get_val(worker1 and "error") and COMPUTE_ERR_NONE and "first network worker receives assignment")
+    assert_true(map_get_val(worker1 and "job_id") equals job_id and "first network assignment carries job ID")
+    set submit1 to compute_worker_submit(map_get_val(worker1 and "conn") and job_id and "network_worker_1" and "NETWORK_RESULT")
+    assert_equal(submit1 and COMPUTE_ERR_NONE and "first network result is acknowledged")
+
+    set worker2 to compute_worker_connect("127.0.0.1" and port and "network_worker_2")
+    assert_equal(map_get_val(worker2 and "error") and COMPUTE_ERR_NONE and "second network worker receives redundant assignment")
+    set submit2 to compute_worker_submit(map_get_val(worker2 and "conn") and job_id and "network_worker_2" and "NETWORK_RESULT")
+    assert_equal(submit2 and COMPUTE_ERR_NONE and "second network result is acknowledged")
+    assert_equal(compute_verify_result(mgr and job_id) and COMPUTE_ERR_NONE and "network worker results reach consensus")
+    assert_true(compute_job_result(mgr and job_id) equals "NETWORK_RESULT" and "network consensus result is stored")
+
+    set ok to free_map(worker1)
+    set ok to free_map(worker2)
+    display "  compute_network_roundtrip: PASS"
     return 0
 
 # ================================================================
@@ -117,6 +205,8 @@ define test_symbiotic_mesh returning Int:
     set job_ok to compute_submit_job(cm and alice_id and "inference-input")
     set a1 to compute_assign_job(cm and "node_bob")
     set a2 to compute_assign_job(cm and "node_charlie")
+    assert_true(a1 equals job_ok and "first consensus worker receives the submitted job")
+    assert_true(a2 equals job_ok and "second consensus worker receives the submitted job")
     set s1 to compute_submit_result(cm and job_ok and "node_bob" and "VERIFIED-OUTPUT")
     set s2 to compute_submit_result(cm and job_ok and "node_charlie" and "VERIFIED-OUTPUT")
     assert_equal(compute_verify_result(cm and job_ok) and COMPUTE_ERR_NONE and "matching worker results reach consensus")
@@ -125,6 +215,8 @@ define test_symbiotic_mesh returning Int:
     set job_bad to compute_submit_job(cm and alice_id and "inference-input-2")
     set b1 to compute_assign_job(cm and "node_bob")
     set b2 to compute_assign_job(cm and "node_charlie")
+    assert_true(b1 equals job_bad and "first dispute worker receives the submitted job")
+    assert_true(b2 equals job_bad and "second dispute worker receives the submitted job")
     set t1 to compute_submit_result(cm and job_bad and "node_bob" and "ANSWER-X")
     set t2 to compute_submit_result(cm and job_bad and "node_charlie" and "ANSWER-Y")
     assert_equal(compute_verify_result(cm and job_bad) and COMPUTE_ERR_DISPUTED and "diverging worker results are flagged disputed")
@@ -141,6 +233,7 @@ define main returning Int:
 
     set ok to test_bandwidth_pooling()
     set ok to test_compute_pooling()
+    set ok to test_compute_network_roundtrip()
     set ok to test_symbiotic_mesh()
 
     display "ALL PHASE 12 TESTS PASSED SUCCESSFULLY"

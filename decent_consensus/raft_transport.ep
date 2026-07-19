@@ -28,6 +28,7 @@ set RAFT_TRANSPORT_ERR_CONNECT to 1
 set RAFT_TRANSPORT_ERR_SEND to 2
 set RAFT_TRANSPORT_ERR_RECV to 3
 set RAFT_TRANSPORT_ERR_NOT_LEADER to 4
+set RAFT_TRANSPORT_ERR_CLOSE to 5
 
 # ================================================================
 # Serialization: Raft RPCs → wire format strings
@@ -258,18 +259,27 @@ define raft_send_rpc with address as Str and port as Int and msg_str as Str retu
 
     set send_err to transport_send(conn and MSG_TYPE_CONSENSUS and msg_str)
     if send_err != TRANSPORT_ERR_NONE:
-        set ok to transport_close(conn)
-        set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_SEND)
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_CLOSE)
+        else:
+            set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_SEND)
         return result
 
     set recv_result to transport_recv(conn)
     set recv_err to map_get_val(recv_result and "error")
     if recv_err != TRANSPORT_ERR_NONE:
-        set ok to transport_close(conn)
-        set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_RECV)
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_CLOSE)
+        else:
+            set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_RECV)
         return result
 
-    set ok to transport_close(conn)
+    set close_err to transport_close(conn)
+    if close_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and RAFT_TRANSPORT_ERR_CLOSE)
+        return result
 
     # Deserialize the response payload
     set resp_payload to ptr_to_str(map_get_val(recv_result and "payload"))
@@ -282,7 +292,7 @@ define raft_send_rpc with address as Str and port as Int and msg_str as Str retu
 # Dispatches to raft_handle_request_vote / raft_handle_append_entries
 # ================================================================
 
-define raft_server_handle_connection with conn as Map and node as Map:
+define raft_server_handle_connection with conn as Map and node as Map returning Int:
     set recv_result to transport_recv(conn)
     set recv_err to map_get_val(recv_result and "error")
     if recv_err != TRANSPORT_ERR_NONE:
@@ -293,14 +303,12 @@ define raft_server_handle_connection with conn as Map and node as Map:
 
     # Only handle CONSENSUS messages
     if (msg_type equals MSG_TYPE_CONSENSUS) == 0:
-        set ok to transport_send(conn and "ERROR" and "unknown_msg_type")
-        return 0
+        return transport_send(conn and "ERROR" and "unknown_msg_type")
 
     set parsed to raft_deserialize_message(payload)
     set parse_err to map_get_val(parsed and "error")
     if parse_err != 0:
-        set ok to transport_send(conn and MSG_TYPE_CONSENSUS and "ERR|parse_failed")
-        return 0
+        return transport_send(conn and MSG_TYPE_CONSENSUS and "ERR|parse_failed")
 
     set rpc_type to ptr_to_str(map_get_val(parsed and "type"))
     set my_id to ptr_to_str(map_get_val(node and "node_id"))
@@ -316,7 +324,9 @@ define raft_server_handle_connection with conn as Map and node as Map:
         set vote_granted to map_get_val(resp and "vote_granted")
 
         set resp_str to raft_serialize_request_vote_response(resp_term and vote_granted and my_id)
-        set ok to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+        set send_err to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+        if send_err != TRANSPORT_ERR_NONE:
+            return send_err
 
     if rpc_type equals RAFT_MSG_APPEND_ENTRIES:
         set term to map_get_val(parsed and "term")
@@ -345,7 +355,9 @@ define raft_server_handle_connection with conn as Map and node as Map:
 
         set match_idx to length_list(map_get_val(node and "log"))
         set resp_str to raft_serialize_append_entries_response(resp_term and success and match_idx and my_id)
-        set ok to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+        set send_err to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+        if send_err != TRANSPORT_ERR_NONE:
+            return send_err
 
     if rpc_type equals RAFT_MSG_CLIENT_PROPOSE:
         set command to ptr_to_str(map_get_val(parsed and "command"))
@@ -354,7 +366,9 @@ define raft_server_handle_connection with conn as Map and node as Map:
         if (role equals RAFT_ROLE_LEADER) == 0:
             # Not leader — reject with leader hint
             set resp_str to raft_serialize_client_propose_response(0 and "")
-            set ok to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+            set send_err to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+            if send_err != TRANSPORT_ERR_NONE:
+                return send_err
         else:
             # Append to leader's log
             set log to map_get_val(node and "log")
@@ -369,11 +383,13 @@ define raft_server_handle_connection with conn as Map and node as Map:
             set ok to append_list(log and entry)
 
             set resp_str to raft_serialize_client_propose_response(1 and my_id)
-            set ok to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+            set send_err to transport_send(conn and MSG_TYPE_CONSENSUS and resp_str)
+            if send_err != TRANSPORT_ERR_NONE:
+                return send_err
 
     return 0
 
-define raft_server_thread with node as Map and port as Int:
+define raft_server_thread with node as Map and port as Int returning Int:
     set my_id to ptr_to_str(map_get_val(node and "node_id"))
     set listener to transport_listen(port)
     set listen_err to map_get_val(listener and "error")
@@ -388,11 +404,17 @@ define raft_server_thread with node as Map and port as Int:
         set conn to transport_accept(listener)
         set conn_err to map_get_val(conn and "error")
         if conn_err == TRANSPORT_ERR_NONE:
-            raft_server_handle_connection(conn and node)
-            set ok to transport_close(conn)
+            set handle_err to raft_server_handle_connection(conn and node)
+            if handle_err != 0:
+                display f"[RAFT] {my_id}: connection handler failed with {handle_err}"
+            set close_err to transport_close(conn)
+            if close_err != TRANSPORT_ERR_NONE:
+                display f"[RAFT] {my_id}: connection close failed with {close_err}"
 
-    set ok to transport_close(listener)
-    return 0
+    set close_err to transport_close(listener)
+    if close_err != TRANSPORT_ERR_NONE:
+        return RAFT_TRANSPORT_ERR_CLOSE
+    return RAFT_TRANSPORT_ERR_NONE
 
 # ================================================================
 # Election Timer Thread: Drives election ticks and sends RPCs
@@ -413,7 +435,7 @@ define raft_parse_peer_address with addr_str as Str returning Map:
     set ok to map_insert(result and "port" and string_to_int(port_str))
     return result
 
-define raft_dispatch_outgoing with node as Map and requests as List and peer_addresses as Map:
+define raft_dispatch_outgoing with node as Map and requests as List and peer_addresses as Map returning Int:
     # Send each outgoing RPC to the appropriate peer over TCP
     set num_requests to length_list(requests)
     set i to 0
@@ -530,7 +552,7 @@ define raft_dispatch_outgoing with node as Map and requests as List and peer_add
         set i to i + 1
     return 0
 
-define raft_election_timer_thread with node as Map and peer_addresses as Map:
+define raft_election_timer_thread with node as Map and peer_addresses as Map returning Int:
     set my_id to ptr_to_str(map_get_val(node and "node_id"))
 
     # Wait for server to be ready before starting timer

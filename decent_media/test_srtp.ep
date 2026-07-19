@@ -13,7 +13,7 @@ define pass_if with label as Str and cond as Int returning Int:
     display concat("FAIL: " and label)
     return 0
 
-define main:
+define main returning Int:
     set passes to 0
     set keys to create_map()
     set ok to map_insert(keys and "master_key" and ep_sha256("shared-secret-test"))
@@ -35,13 +35,15 @@ define main:
     set passes to passes + pass_if("srtp_unprotect_valid" and (map_get_val(dec and "valid") == 1))
     set passes to passes + pass_if("payload_len_20" and (map_get_val(dec and "payload_len") == 20))
     # byte-exact recovery
-    set match to 1
+    set match to 0
     set dp to map_get_val(dec and "payload_ptr")
-    set i to 0
-    repeat while i < 20:
-        if peek_byte(dp and i) != (i * 7) modulo 256:
-            set match to 0
-        set i to i + 1
+    if map_get_val(dec and "valid") == 1 and also dp != 0:
+        set match to 1
+        set i to 0
+        repeat while i < 20:
+            if peek_byte(dp and i) != (i * 7) modulo 256:
+                set match to 0
+            set i to i + 1
     set passes to passes + pass_if("payload_bytes_exact" and match)
 
     # tamper: flip a payload byte → HMAC auth must reject
@@ -51,4 +53,18 @@ define main:
     set passes to passes + pass_if("tampered_packet_rejected" and (map_get_val(dec2 and "valid") == 0))
 
     display concat("RESULT: " and concat(int_to_string(passes) and "/6 passed"))
+    set enc_ptr to map_get_val(enc and "packet_ptr")
+    set dec_ptr to map_get_val(dec and "payload_ptr")
+    if enc_ptr != 0:
+        set ok to free_bytes(enc_ptr)
+    if dec_ptr != 0:
+        set ok to free_bytes(dec_ptr)
+    set ok to free_bytes(p)
+    set close_err to webrtc_close_srtp_keys(keys)
+    set ok to free_map(enc)
+    set ok to free_map(dec)
+    set ok to free_map(dec2)
+    set ok to free_map(keys)
+    if passes != 6 or else close_err != 0:
+        return 1
     return 0

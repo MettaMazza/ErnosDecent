@@ -12,9 +12,11 @@ ErnosDecent is a cryptographic system. Security vulnerabilities are treated with
 
 ### How to Report
 
-**DO NOT open a public issue for security vulnerabilities.**
+**Do not open a public issue for security vulnerabilities.** The previously listed
+`security@ernosdecent.org` address is not active because that domain is not registered.
+Use GitHub's enabled private-vulnerability-reporting form instead:
 
-Instead, email: **security@ernosdecent.org**
+**[Privately report a vulnerability](https://github.com/MettaMazza/ErnosDecent/security/advisories/new)**
 
 Include:
 - **Description** of the vulnerability
@@ -23,11 +25,11 @@ Include:
 - **Impact assessment** — what an attacker could achieve
 - **Suggested fix** (if you have one)
 
-### Response Timeline
+### Response Targets
 
-- **Acknowledgement**: Within 48 hours
-- **Initial assessment**: Within 7 days
-- **Fix or mitigation**: Depends on severity, targeting 30 days for critical issues
+- **Acknowledgement target**: Within 48 hours
+- **Initial-assessment target**: Within 7 days
+- **Critical fix or mitigation target**: Within 30 days when technically possible
 
 ### Scope
 
@@ -73,10 +75,10 @@ ErnosDecent relies on [libsodium](https://doc.libsodium.org/) for all cryptograp
 | Symmetric encryption | XChaCha20-Poly1305 | libsodium |
 | Key derivation | HKDF-SHA256 | libsodium |
 | Password hashing | Argon2id | libsodium |
-| Content hashing | BLAKE3 | Pure Ernos implementation |
+| Content hashing | SHA-256 | Ernos runtime (`ep_sha256`) |
 | Wallet seed | PBKDF2-HMAC-SHA512 | Pure Ernos implementation |
 
-No custom cryptography is used. All implementations follow published standards and use well-audited libraries.
+The identity and authenticated-encryption paths use libsodium. Content addressing and wallet derivation use the Ernos runtime implementations named above; this table does not claim an external audit of those implementations.
 
 ---
 

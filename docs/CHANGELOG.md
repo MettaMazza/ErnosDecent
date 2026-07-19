@@ -176,7 +176,7 @@ verified.
 ```
 decent_id     → Cryptographic identity (Ed25519, DIDs, capability auth)
 decent_net    → P2P networking (Noise XX, Kademlia DHT, encrypted relays)
-decent_store  → Storage (BLAKE3 content-addressing, CRDTs)
+decent_store  → Storage (SHA-256 content-addressing, CRDTs)
 decent_msg    → Messaging (E2E encrypted direct + group channels)
 decent_social → Social (Nostr + ActivityPub federation)
 decent_name   → Naming (DNS resolver, .ernos TLD registry)
@@ -268,9 +268,9 @@ This release completes Phase 11 (Privacy & Search) and Phase 12 (Collaborative R
 - **Query Merger (`query.ep`)**: Query processing merging and result formatting. Parses search query terms, calculates combined BM25+PageRank scores, and merges de-duplicated local/remote P2P results.
 
 #### Subsystem 13: Collaborative Resource Pooling (`decent_pool/`)
-- **Bandwidth Sharing (`bandwidth.ep`)**: Manages bandwidth tiers (free, emergency, premium), uploaded/downloaded byte counters, dynamic contribution scoring, rate limits, and anonymous routing proxy simulation.
+- **Bandwidth Sharing (`bandwidth.ep`)**: Manages bandwidth tiers, uploaded/downloaded byte counters, contribution scoring, rate limits, and a checked TCP routing proxy.
 - **Compute Pooling (`compute.ep`)**: Job submission queue, worker scheduling, contribution tracking, and redundant execution consensus verification.
-- **Symbiotic Mesh Coordinate (`mesh.ep`)**: Orchestrates bandwidth sharing, compute delegation, and onion-routed anonymous AI inference execution.
+- **Symbiotic Mesh Coordinate (`mesh.ep`)**: Orchestrates bandwidth accounting and compute-job coordination. The current collaborative-AI path runs redundant local inference and verifies matching results; it does not onion-route inference.
 - **Resource Mesh Integration tests (`test_pool.ep`)**: End-to-end verification of the symbiotic pooling architecture.
 
 ### Fixed
@@ -307,7 +307,7 @@ This is the initial pre-alpha research release of the ErnosDecent decentralized 
 - **Group Channels (`channel.ep`)**: Multi-party messaging channels. Supports owner role delegation, membership list updates, and secure symmetric key envelopes distributed using public-key encryption.
 
 #### Subsystem 5: Social Protocols (`decent_social/`)
-- **Nostr (`nostr.ep`)**: Event creation, stable serialization, Ed25519 signing/verification, and subscription filters.
+- **Nostr (`nostr.ep`)**: NIP-01 canonical event serialization, BIP-340 secp256k1 signing/verification, and subscription filters.
 - **ActivityPub (`activitypub.ep`)**: Actor Person profiles, activity wrappers (`Create`, `Follow`, `Accept`, `Like`), and local actor inbox/outbox delivery loops.
 - **Chronological Feed (`feed.ep`, `publish.ep`)**: Unified feeds aggregating and sorting Nostr and ActivityPub events chronologically.
 

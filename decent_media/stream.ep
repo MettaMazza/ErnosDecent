@@ -79,10 +79,7 @@ define stream_cache_get with cache as Map and key as Str returning Str:
     set i to 0
     repeat while i < num_keys:
         set k to get_list(order_list and i)
-        if k equals key:
-            # Skip it so we can append it at the end
-            set dummy to 0
-        else:
+        if k != key:
             set ok to append_list(new_order and k)
         set i to i + 1
         
@@ -118,9 +115,7 @@ define stream_cache_put with cache as Map and key as Str and val as Str returnin
     set i to 0
     repeat while i < num_keys:
         set k to get_list(order_list and i)
-        if k equals key:
-            set dummy to 0
-        else:
+        if k != key:
             set ok to append_list(new_order and k)
         set i to i + 1
     set ok to append_list(new_order and key)
@@ -206,6 +201,8 @@ define stream_serve_segments with playlist as Map and port as Int returning Int:
     set conn_err to map_get_val(conn and "error")
     if conn_err != 0:
         set ok to transport_close(listener)
+        if ok != 0:
+            return 3
         return 2
 
     # Send all segments
@@ -214,29 +211,46 @@ define stream_serve_segments with playlist as Map and port as Int returning Int:
         set seg to get_list(segments and si)
         set data to map_get_val(seg and "data")
         set ok to stream_send_chunk(conn and si and data)
+        if ok != 0:
+            set conn_close_error to transport_close(conn)
+            set listener_close_error to transport_close(listener)
+            return 3
         set si to si + 1
 
-    set ok to transport_close(conn)
-    set ok to transport_close(listener)
+    set conn_close_error to transport_close(conn)
+    set listener_close_error to transport_close(listener)
+    if conn_close_error != 0 or else listener_close_error != 0:
+        return 3
     return 0
 
-define stream_fetch_segments with address as Str and port as Int and expected_count as Int returning List:
+define stream_fetch_segments with address as Str and port as Int and expected_count as Int returning Map:
     # Fetch media segments from a remote peer over TCP
+    set response to create_map()
     set result to create_list()
+    set ok to map_insert(response and "segments" and result)
     set conn to transport_connect(address and port)
     set err to map_get_val(conn and "error")
     if err != 0:
-        return result
+        set ok to map_insert(response and "error" and err)
+        return response
 
     set received to 0
     repeat while received < expected_count:
         set chunk to stream_receive_chunk(conn)
         set chunk_err to map_get_val(chunk and "error")
         if chunk_err != 0:
-            set ok to transport_close(conn)
-            return result
+            set close_err to transport_close(conn)
+            if close_err != TRANSPORT_ERR_NONE:
+                set ok to map_insert(response and "error" and close_err)
+            else:
+                set ok to map_insert(response and "error" and chunk_err)
+            return response
         set ok to append_list(result and chunk)
         set received to received + 1
 
-    set ok to transport_close(conn)
-    return result
+    set close_err to transport_close(conn)
+    if close_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(response and "error" and close_err)
+        return response
+    set ok to map_insert(response and "error" and TRANSPORT_ERR_NONE)
+    return response

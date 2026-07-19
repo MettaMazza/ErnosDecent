@@ -44,8 +44,208 @@ function string_length(str) {
     return str["length"];
 }
 
+function clearWebSession() {
+    window.sessionStorage.removeItem("ernode_session_token");
+    window.sessionStorage.removeItem("ernode_session_did");
+    window.sessionStorage.removeItem("ernode_session_issued");
+    window.sessionStorage.removeItem("ernode_session_expires");
+    window.sessionStorage.removeItem("ernode_session_nonce");
+    return 0;
+}
+
+function webSessionAvailable() {
+    let nonce, token, expires, issued, did;
+    token = window.sessionStorage.getItem("ernode_session_token");
+    did = window.sessionStorage.getItem("ernode_session_did");
+    issued = window.sessionStorage.getItem("ernode_session_issued");
+    expires = window.sessionStorage.getItem("ernode_session_expires");
+    nonce = window.sessionStorage.getItem("ernode_session_nonce");
+    if (((((!token || !did) || !issued) || !expires) || !nonce)) {
+        return 0;
+    }
+    if ((parseInt(expires) <= Math.floor((Date.now() / 1000)))) {
+        clearWebSession();
+        return 0;
+    }
+    return 1;
+}
+
+function buildWebSocketAuth() {
+    let auth;
+    auth = Object();
+    auth.type = "auth";
+    auth.token = (window.sessionStorage.getItem("ernode_session_token") || "");
+    auth.did = (window.sessionStorage.getItem("ernode_session_did") || "");
+    auth.issued_at = (window.sessionStorage.getItem("ernode_session_issued") || "");
+    auth.expires_at = (window.sessionStorage.getItem("ernode_session_expires") || "");
+    auth.nonce = (window.sessionStorage.getItem("ernode_session_nonce") || "");
+    return auth;
+}
+
+function authenticatedFetch(path, method, body) {
+    let options, headers;
+    options = Object();
+    options.method = method;
+    headers = Object();
+    set_prop(headers, "X-Session-Token", (window.sessionStorage.getItem("ernode_session_token") || ""));
+    set_prop(headers, "X-Session-Did", (window.sessionStorage.getItem("ernode_session_did") || ""));
+    set_prop(headers, "X-Session-Issued", (window.sessionStorage.getItem("ernode_session_issued") || ""));
+    set_prop(headers, "X-Session-Expires", (window.sessionStorage.getItem("ernode_session_expires") || ""));
+    set_prop(headers, "X-Session-Nonce", (window.sessionStorage.getItem("ernode_session_nonce") || ""));
+    if ((body.length > 0)) {
+        set_prop(headers, "Content-Type", "application/json");
+        options.body = body;
+    }
+    options.headers = headers;
+    return window.fetch(path, options);
+}
+
+function requestCancellation(button) {
+    if (button) {
+        button.disabled = true;
+        button.textContent = "Stopping…";
+    }
+    authenticatedFetch("/api/cancel", "POST", "").then((response) => {
+    if (!response.ok) {
+        console.error(("Cancellation request failed with HTTP " + String(response.status)));
+        if (button) {
+            button.disabled = false;
+            button.textContent = "Stop";
+        }
+    }
+    return 0;
+}).catch((error) => {
+    console.error(("Cancellation request failed: " + String(error)));
+    if (button) {
+        button.disabled = false;
+        button.textContent = "Stop";
+    }
+    return 0;
+});
+    return 0;
+}
+
+function toggleAutoapprove(button) {
+    let requestBody, enable;
+    enable = (button.getAttribute("data-on") !== "1");
+    requestBody = Object();
+    set_prop(requestBody, "on", enable);
+    button.disabled = true;
+    authenticatedFetch("/api/autoapprove", "POST", JSON.stringify(requestBody)).then((response) => {
+    if (response.ok) {
+        if (enable) {
+            button.setAttribute("data-on", "1");
+            button.textContent = "🔓 Auto-approve: ON";
+        } else {
+            button.setAttribute("data-on", "0");
+            button.textContent = "🔒 Auto-approve: OFF";
+        }
+    } else {
+        console.error(("Auto-approve request failed with HTTP " + String(response.status)));
+    }
+    button.disabled = false;
+    return 0;
+}).catch((error) => {
+    console.error(("Auto-approve request failed: " + String(error)));
+    button.disabled = false;
+    return 0;
+});
+    return 0;
+}
+
+function showLogin() {
+    let input, button, status, overlay, title, form, subtitle;
+    if (document.getElementById("ernode-login-overlay")) {
+        return 0;
+    }
+    handleDisconnect();
+    overlay = document.createElement("div");
+    overlay.id = "ernode-login-overlay";
+    set_prop(overlay.style, "position", "fixed");
+    set_prop(overlay.style, "inset", "0");
+    set_prop(overlay.style, "zIndex", "100000");
+    set_prop(overlay.style, "display", "flex");
+    set_prop(overlay.style, "alignItems", "center");
+    set_prop(overlay.style, "justifyContent", "center");
+    set_prop(overlay.style, "background", "rgba(4, 8, 18, 0.96)");
+    form = document.createElement("form");
+    set_prop(form.style, "width", "min(420px, calc(100vw - 32px))");
+    set_prop(form.style, "padding", "28px");
+    set_prop(form.style, "border", "1px solid rgba(118, 169, 255, 0.35)");
+    set_prop(form.style, "borderRadius", "16px");
+    set_prop(form.style, "background", "#0b1220");
+    title = document.createElement("h2");
+    title.textContent = "Unlock ErnosDecent";
+    subtitle = document.createElement("p");
+    subtitle.textContent = "Enter the Web UI password stored in ~/.ernosdecent/web-password.";
+    set_prop(subtitle.style, "color", "rgba(255,255,255,0.65)");
+    input = document.createElement("input");
+    input.type = "password";
+    input.autocomplete = "current-password";
+    input.required = true;
+    input.placeholder = "Web UI password";
+    set_prop(input.style, "width", "100%");
+    set_prop(input.style, "margin", "18px 0 12px");
+    button = document.createElement("button");
+    button.type = "submit";
+    button.textContent = "Unlock";
+    button.className = "btn-primary";
+    status = document.createElement("p");
+    status.id = "ernode-login-status";
+    status.textContent = "";
+    set_prop(status.style, "minHeight", "20px");
+    set_prop(status.style, "color", "#ff7b8b");
+    form.appendChild(title);
+    form.appendChild(subtitle);
+    form.appendChild(input);
+    form.appendChild(button);
+    form.appendChild(status);
+    overlay.appendChild(form);
+    document.body.appendChild(overlay);
+    input.focus();
+    form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    passphrase = input.value;
+    if (!passphrase) {
+        status.textContent = "A password is required.";
+        return 0;
+    }
+    button.disabled = true;
+    status.textContent = "Authenticating…";
+    loginBody = Object();
+    loginBody.passphrase = passphrase;
+    loginOptions = Object();
+    loginOptions.method = "POST";
+    loginHeaders = Object();
+    set_prop(loginHeaders, "Content-Type", "application/json");
+    loginOptions.headers = loginHeaders;
+    loginOptions.body = JSON.stringify(loginBody);
+    window.fetch("/api/login", loginOptions).then((response) => response.json()).then((data) => {
+    if (!data.success) {
+        status.textContent = (data.message || "Authentication failed.");
+        button.disabled = false;
+        return 0;
+    }
+    window.sessionStorage.setItem("ernode_session_token", data.token);
+    window.sessionStorage.setItem("ernode_session_did", data.did);
+    window.sessionStorage.setItem("ernode_session_issued", String(data.issued_at));
+    window.sessionStorage.setItem("ernode_session_expires", String(data.expires_at));
+    window.sessionStorage.setItem("ernode_session_nonce", data.nonce);
+    overlay.remove();
+    connectDaemon();
+    return 0;
+}).catch((error) => {
+    status.textContent = ("Authentication request failed: " + String(error));
+    button.disabled = false;
+    return 0;
+});
+    return 0;
+});
+    return 0;
+}
+
 function escapeHTML(str) {
-    let reGt, reClass, reAmp, reQuot, reApos, res, reLt;
+    let reClass, reAmp, reLt, reQuot, res, reGt, reApos;
     if (!str) {
         return "";
     }
@@ -87,7 +287,7 @@ function setControlsEnabled(enabled) {
 }
 
 function handleDisconnect() {
-    let headerDid, dhtSize, nodeRole, nodePeers, indicator, statusText, didFull, walletVal, nodeTerm, chunkCount;
+    let headerDid, didFull, walletVal, chunkCount, statusText, nodeTerm, dhtSize, nodePeers, indicator, nodeRole;
     window.isConnected = false;
     indicator = document.getElementById("connection-indicator");
     indicator.classList.remove("online");
@@ -113,27 +313,8 @@ function handleDisconnect() {
     setControlsEnabled(false);
 }
 
-function connectDaemon() {
-    let port, hostname, wsClass, ws, wsUrl;
-    port = (window.location.port || "8080");
-    hostname = (window.location.hostname || "127.0.0.1");
-    if ((hostname === "localhost")) {
-        hostname = "127.0.0.1";
-    }
-    wsUrl = (((("ws://" + String(hostname)) + ":") + String(port)) + "/ws");
-    console.log(("Connecting to Daemon: " + String(wsUrl)));
-    wsClass = window["WebSocket"];
-    ws = Reflect.construct(wsClass, [wsUrl]);
-    window.ws = ws;
-    ws.onopen = (event) => {
-    console.log("Connected to ErnosDecent Daemon.");
-    window.isConnected = true;
-    indicator = document.getElementById("connection-indicator");
-    indicator.classList.remove("offline");
-    indicator.classList.add("online");
-    statusText = indicator.querySelector(".status-text");
-    statusText.textContent = "Daemon Connected";
-    setControlsEnabled(true);
+function requestInitialState(ws) {
+    let file, msgMemory, msgIdentity, msgSessActive, msgModels, msgPlugins, msgNetwork, msgHosts, msgTuring, msgPlatforms, msgPool, activeTab, activeBtn, msgStorage, msgStatus, msgSys, msg, msgWallet, navList, msgPrompts;
     msgStatus = Object();
     msgStatus.type = "get_status";
     send_msg(ws, JSON.stringify(msgStatus));
@@ -195,26 +376,74 @@ function connectDaemon() {
             }
         }
     }
+    return 0;
+}
+
+function connectDaemon() {
+    let wsUrl, port, hostname, wsClass, ws;
+    if ((webSessionAvailable() === 0)) {
+        showLogin();
+        return 0;
+    }
+    port = (window.location.port || "8080");
+    hostname = (window.location.hostname || "127.0.0.1");
+    if ((hostname === "localhost")) {
+        hostname = "127.0.0.1";
+    }
+    wsUrl = (((("ws://" + String(hostname)) + ":") + String(port)) + "/ws");
+    console.log(("Connecting to Daemon: " + String(wsUrl)));
+    wsClass = window["WebSocket"];
+    ws = Reflect.construct(wsClass, [wsUrl]);
+    window.ws = ws;
+    window.wsAuthenticated = false;
+    ws.onopen = (event) => {
+    console.log("Connected to ErnosDecent Daemon.");
+    send_msg(ws, JSON.stringify(buildWebSocketAuth()));
 };
     ws.onmessage = (event) => {
     dataStr = event.data;
-    msg = JSON.parse(dataStr);
-    handleDaemonMessage(msg);
+    responseClass = window["Response"];
+    frameResponse = Reflect.construct(responseClass, [dataStr]);
+    frameResponse.json().then((msg) => {
+    if ((msg.type === "auth_ok")) {
+        window.wsAuthenticated = true;
+        window.isConnected = true;
+        indicator = document.getElementById("connection-indicator");
+        indicator.classList.remove("offline");
+        indicator.classList.add("online");
+        statusText = indicator.querySelector(".status-text");
+        statusText.textContent = "Daemon Connected";
+        setControlsEnabled(true);
+        requestInitialState(ws);
+    } else {
+        handleDaemonMessage(msg);
+    }
+    return 0;
+}).catch((error) => {
+    console.error(("Rejected malformed daemon frame: " + String(error)));
+    return 0;
+});
 };
     ws.onclose = (event) => {
     console.log("Daemon disconnected.");
     handleDisconnect();
-    setTimeout((dummy) => {
+    if (window.wsAuthenticated) {
+        setTimeout((dummy) => {
     connectDaemon();
 }, 5000);
+    } else {
+        clearWebSession();
+        showLogin();
+    }
 };
     ws.onerror = (event) => {
     console.log("Daemon connection error.");
 };
+    return 0;
 }
 
 function saveChatMessage(chanName, sender, text, type, timeStr) {
-    let historyObj, historyStr, msg, hasChannel, channelList;
+    let channelList, msg, historyStr, historyObj, hasChannel;
     historyStr = window.localStorage.getItem("ernode_chat_history");
     historyObj = Object();
     if (historyStr) {
@@ -235,7 +464,7 @@ function saveChatMessage(chanName, sender, text, type, timeStr) {
 }
 
 function saveAiMessage(sender, text, type, timeStr) {
-    let historyStr, historyList, msg;
+    let historyList, msg, historyStr;
     historyStr = window.localStorage.getItem("ernode_ai_history");
     historyList = [];
     if (historyStr) {
@@ -337,7 +566,7 @@ function attachTtsButton(bubble, text) {
 }
 
 function appendMessage(container, sender, text, type) {
-    let dateStr, timeStrSec, timeStr, secParts, timeParts;
+    let timeStr, dateStr, timeParts, timeStrSec, secParts;
     dateStr = Date();
     timeParts = dateStr.split(" ");
     timeStrSec = timeParts[4];
@@ -363,7 +592,7 @@ function activeAiMessages() {
 }
 
 function sendTutorPrompt(text) {
-    let loader, sb, inp, msg, modelVal, modelSel, stp, container;
+    let modelSel, loader, msg, modelVal, stp, inp, sb, container;
     if ((!text || !window.isConnected)) {
         return 0;
     }
@@ -404,7 +633,7 @@ function sendTutorPrompt(text) {
 }
 
 function renderLessonsList(items) {
-    let html, container;
+    let container, html;
     container = document.getElementById("learning-lessons-list");
     if (!container) {
         return 0;
@@ -463,7 +692,7 @@ function setupAccessToggle() {
 }
 
 function setupLearningTab() {
-    let form, seedBtn, lessonsList, runBtn, startBtn;
+    let form, seedBtn, startBtn, runBtn, lessonsList;
     form = document.getElementById("learning-send-form");
     if (form) {
         form.addEventListener("submit", (event) => {
@@ -528,7 +757,7 @@ function setupLearningTab() {
 }
 
 function appendAiToken(token) {
-    let bubble, textNode;
+    let textNode, bubble;
     if (!window.currentAiResponseBubble) {
         bubble = document.createElement("div");
         bubble.className = "chat-bubble received ai-bot";
@@ -542,7 +771,7 @@ function appendAiToken(token) {
 }
 
 function appendApprovalCard(toolName, summary) {
-    let approveAllBtn, actionsHtml, escapedTool, approveBtn, bubble, denyBtn, contentHtml, btnSubmit, escapedSummary;
+    let escapedSummary, denyBtn, approveBtn, btnSubmit, approveAllBtn, escapedTool, contentHtml, actionsHtml, bubble;
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
     set_prop(bubble.style, "border", "1px solid rgba(245, 158, 11, 0.3)");
@@ -629,7 +858,7 @@ function appendApprovalCard(toolName, summary) {
 }
 
 function appendClarifyCard(questionsJson) {
-    let questions, stopB, bubble, nq;
+    let nq, stopB, bubble, questions;
     questions = JSON.parse(questionsJson);
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -725,7 +954,7 @@ function appendClarifyCard(questionsJson) {
 }
 
 function appendReasoningBubble(b64) {
-    let html, decoded, bubble;
+    let bubble, html, decoded;
     decoded = decodeURIComponent(escape(atob(b64)));
     bubble = document.createElement("div");
     bubble.className = "chat-bubble received";
@@ -738,7 +967,7 @@ function appendReasoningBubble(b64) {
 }
 
 function updateHostsTableUI(jsonStr) {
-    let list, electedHostEl, primary, tbody, i;
+    let list, tbody, primary, electedHostEl, i;
     tbody = document.getElementById("hosts-table-body");
     if (!tbody) {
         return 0;
@@ -812,7 +1041,7 @@ function handleDhtResult(msg) {
 }
 
 function handleNameResult(msg) {
-    let nameLog, entry, headerDid;
+    let headerDid, nameLog, entry;
     nameLog = document.getElementById("name-log");
     if (!nameLog) {
         return 0;
@@ -845,7 +1074,7 @@ function handleNameResult(msg) {
 }
 
 function selectAiModel(modelName, skipSave) {
-    let modelText, aiModelSelect, btns, msg;
+    let msg, btns, aiModelSelect, modelText;
     window.selectedAiModel = modelName;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
@@ -873,7 +1102,7 @@ function selectAiModel(modelName, skipSave) {
 }
 
 function updateAiModelsUI(models) {
-    let aiModelSelect, prevLearn, activeClass, learnModelSelect, currentSelected, isIncluded;
+    let prevLearn, currentSelected, aiModelSelect, learnModelSelect, activeClass, isIncluded;
     aiModelSelect = document.getElementById("ai-model-select");
     if (aiModelSelect) {
         currentSelected = window.selectedAiModel;
@@ -957,7 +1186,7 @@ function deleteSession(id) {
 }
 
 function updatePlatformsUI() {
-    let waToggle, tgToggle, tgToken, telegramConfig, whatsappConfig, waToken, discordConfig, discToken, waStatus, tgStatus, waPhoneId, discToggle, discStatus, statusText, discChannel;
+    let waToken, statusText, discToken, waStatus, telegramConfig, discordConfig, tgStatus, tgToken, tgToggle, waPhoneId, discStatus, whatsappConfig, discChannel, discToggle, waToggle;
     if (!window.platforms) {
         return 0;
     }
@@ -1096,7 +1325,7 @@ function showPromptsStatus(text, isSuccess) {
 }
 
 function renderPluginsUI() {
-    let deleteBtns, toggleBtns, body;
+    let toggleBtns, deleteBtns, body;
     body = document.getElementById("plugins-list-body");
     if (!body) {
         return 0;
@@ -1196,7 +1425,7 @@ function savePluginsSettings() {
 }
 
 function savePromptsConfig() {
-    let payload, personaArea, kernelArea, observerArea;
+    let personaArea, payload, kernelArea, observerArea;
     if ((!window.ws || !window.isConnected)) {
         showPromptsStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1219,7 +1448,7 @@ function savePromptsConfig() {
 }
 
 function updateSystemConfigUI() {
-    let webPort, nodeName, ipcPort, rateLimit, seedPort, dataDir, enableHostElect, raftPort, p2pPort, dhtTtl, dhtPort, banDur, banThresh, maxConn, maxContent, maxMsg, heartbeat, logLevel, isStaticHost, relayPort, seedAddr, electTimeout, listenAddr;
+    let p2pPort, dhtPort, electTimeout, banDur, maxConn, webPort, banThresh, publicHost, raftPort, nodeName, rateLimit, isStaticHost, ipcPort, maxMsg, logLevel, relayPort, dhtTtl, seedPort, enableHostElect, listenAddr, maxContent, seedAddr, dataDir, heartbeat;
     if (!window.systemConfig) {
         return 0;
     }
@@ -1274,6 +1503,10 @@ function updateSystemConfigUI() {
     maxMsg = document.getElementById("cfg-network-max-message-size");
     if (maxMsg) {
         maxMsg.value = (window.systemConfig.network_max_message_size || 0);
+    }
+    publicHost = document.getElementById("cfg-network-public-host");
+    if (publicHost) {
+        publicHost.value = (window.systemConfig.network_public_host || "");
     }
     seedAddr = document.getElementById("cfg-network-seed-addr");
     if (seedAddr) {
@@ -1340,7 +1573,7 @@ function showSystemConfigStatus(text, statusType) {
 }
 
 function saveSystemConfig() {
-    let isStaticHost, val, valElect, payload, enableHostElect, valStatic;
+    let val, valStatic, valElect, payload, enableHostElect, isStaticHost;
     if ((!window.ws || !window.isConnected)) {
         showSystemConfigStatus("Error: Daemon disconnected.", 0);
         return 0;
@@ -1372,6 +1605,8 @@ function saveSystemConfig() {
     window.systemConfig.network_web_port = val;
     val = document.getElementById("cfg-network-max-message-size").value;
     window.systemConfig.network_max_message_size = val;
+    val = document.getElementById("cfg-network-public-host").value.trim();
+    window.systemConfig.network_public_host = val;
     val = document.getElementById("cfg-network-seed-addr").value.trim();
     window.systemConfig.network_seed_addr = val;
     val = document.getElementById("cfg-network-seed-port").value;
@@ -1408,7 +1643,7 @@ function saveSystemConfig() {
 }
 
 function savePlatformConfig(platformId) {
-    let telegramConfig, phoneVal, payload, enabledVal, tokenVal, discConfig, chanVal, whatsappConfig;
+    let telegramConfig, whatsappConfig, phoneVal, chanVal, tokenVal, payload, enabledVal, discConfig;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1471,7 +1706,7 @@ function savePlatformConfig(platformId) {
 }
 
 function handlePlatformToggle(platformId) {
-    let payload, whatsappConfig, enabledVal, discConfig, telegramConfig;
+    let telegramConfig, whatsappConfig, discConfig, enabledVal, payload;
     if (((!window.platforms || !window.ws) || !window.isConnected)) {
         return 0;
     }
@@ -1518,7 +1753,7 @@ function handlePlatformToggle(platformId) {
 }
 
 function registerPlugin() {
-    let newPlugin, desc, endpoint, name;
+    let endpoint, newPlugin, name, desc;
     if (!window.plugins) {
         window.plugins = [];
     }
@@ -1628,7 +1863,7 @@ function updateSessionsUI(sessions) {
 }
 
 function initMemoryCanvas() {
-    let height, emptyState, canvas, container, oldCanvas, width;
+    let container, oldCanvas, width, height, emptyState, canvas;
     container = document.getElementById("memory-graph-viz");
     if (!container) {
         return 0;
@@ -1656,7 +1891,7 @@ function initMemoryCanvas() {
 }
 
 function updateMemoryGraphData(edges) {
-    let width, incomingNodes, currentIds, height;
+    let width, incomingNodes, height, currentIds;
     if (!window.canvasElement) {
         initMemoryCanvas();
     }
@@ -1693,7 +1928,7 @@ function updateMemoryGraphData(edges) {
 }
 
 function animateGraph() {
-    let dist, force, height, dx, n2, j, nodeIds, dy, fx, n1, width, i, fy;
+    let dx, height, dist, fy, nodeIds, i, n2, n1, width, force, fx, dy, j;
     if (!window.isConnected) {
         window.animationFrameId = requestAnimationFrame((dummy) => {
     animateGraph();
@@ -1801,7 +2036,7 @@ function animateGraph() {
 }
 
 function renderTuringGrid(data) {
-    let container, r, cellClass, turingHeadPos, html, turingCellsCount, headX, headZ, value, headY, cellKey, c, isHead;
+    let headY, container, value, cellClass, r, c, html, headZ, isHead, turingHeadPos, turingCellsCount, cellKey, headX;
     container = document.getElementById("turing-grid-viz");
     if (!container) {
         return 0;
@@ -1848,7 +2083,7 @@ function renderTuringGrid(data) {
 }
 
 function updateMemoryTables(data) {
-    let sBody, keys, lBody;
+    let sBody, lBody, keys;
     sBody = document.getElementById("scratchpad-body");
     if (sBody) {
         sBody.innerHTML = "";
@@ -1882,7 +2117,7 @@ function updateMemoryTables(data) {
 }
 
 function handleDaemonMessage(msg) {
-    let faLink, activeCircuits, saaBanner, lStop, ttsAudio, aiText, sess, igTimer, lLoader, saBody, igOverlay, saaApproveBtn, secParts, msgSessions, saInstr, igTimer2, saLog, scEntry, igPrompt, ok, sigKeyEl, refresh, faBubble, saWRow, nodeRole, gdBadge, lInput, btnSubmit, headerDid, type, nameInput, roleUpper, saWBtn, chunkCount, saaBtns, saaDenyBtn, igO2, lSubmit, stopBtn, uiStaticHost, textNode, ipStatus, saaCard, bwDown, timeStr, uiHostElect, detailsPanel, igCanvas, saWInput, sad, sess_id, walletVal, igCtx, saCard, timeParts, encKeyEl, faImg, summaryNotice, noSelected, scStatus, scLog, didFull, natMode, saHeader, isLearning, timeStrSec, idNameEl, rvFile, rvRepos, computeSlots, repOut, fpToggle, scCard, saaBannerP, dhtSize, scd, igO2c, fpLabel, repBtn, storageBody, nodeTerm, saaBody, ipd, bwUp, igO3, nodePeers, dateStr, auToggle, saad;
+    let saWRow, igTimer, saHeader, summaryNotice, activeCircuits, nodePeers, igTimer2, rvRepos, saCard, chunkCount, igCanvas, saLog, headerDid, uiHostElect, ok, detailsPanel, uiStaticHost, saBody, faStatus, didFull, ipd, igPrompt, sess, sess_id, isLearning, saInstr, dateStr, saaDenyBtn, fpLabel, idNameEl, scStatus, repBtn, bwDown, saaBannerP, repOut, sad, secParts, saaBtns, timeStr, saad, saaBody, nodeTerm, timeStrSec, noSelected, saWInput, saWBtn, roleUpper, encKeyEl, walletVal, msgSessions, natMode, gdBadge, sigKeyEl, lLoader, scCard, saaCard, saaApproveBtn, lSubmit, fpToggle, scLog, timeParts, rvFile, type, refresh, lInput, auToggle, ipStatus, igO3, igO2c, btnSubmit, storageBody, igO2, dhtSize, scEntry, nameInput, ttsAudio, scd, aiText, saaBanner, lStop, igCtx, faBubble, stopBtn, igOverlay, textNode, computeSlots, nodeRole, bwUp;
     type = msg.type;
     if ((type === "status")) {
         roleUpper = msg.role.toUpperCase();
@@ -2037,22 +2272,44 @@ function handleDaemonMessage(msg) {
     } else if ((type === "file_attached")) {
         faBubble = document.createElement("div");
         set_prop(faBubble.style, "margin", "8px 0");
-        if ((msg.is_image === 1)) {
-            faImg = document.createElement("img");
-            faImg.src = msg.url;
-            set_prop(faImg.style, "maxWidth", "360px");
-            set_prop(faImg.style, "borderRadius", "8px");
-            set_prop(faImg.style, "display", "block");
-            set_prop(faImg.style, "marginBottom", "4px");
-            faBubble.appendChild(faImg);
-        }
-        faLink = document.createElement("a");
-        faLink.href = msg.url;
-        faLink.textContent = ("📎 " + msg.name);
-        faLink.setAttribute("download", msg.name);
-        faLink.setAttribute("target", "_blank");
-        faBubble.appendChild(faLink);
+        faStatus = document.createElement("span");
+        faStatus.textContent = ("Loading attachment: " + msg.name);
+        faBubble.appendChild(faStatus);
         activeAiMessages().appendChild(faBubble);
+        authenticatedFetch(msg.url, "GET", "").then((response) => {
+    if (!response.ok) {
+        faStatus.textContent = (("Attachment request failed with HTTP " + String(response.status)) + ".");
+        return null;
+    }
+    return response.blob();
+}).then((blob) => {
+    if (!blob) {
+        return 0;
+    }
+    faStatus.remove();
+    objectUrl = URL.createObjectURL(blob);
+    if ((msg.is_image === 1)) {
+        faImg = document.createElement("img");
+        faImg.src = objectUrl;
+        set_prop(faImg.style, "maxWidth", "360px");
+        set_prop(faImg.style, "borderRadius", "8px");
+        set_prop(faImg.style, "display", "block");
+        set_prop(faImg.style, "marginBottom", "4px");
+        faBubble.appendChild(faImg);
+    }
+    faLink = document.createElement("a");
+    faLink.href = objectUrl;
+    faLink.textContent = ("📎 " + msg.name);
+    faLink.setAttribute("download", msg.name);
+    faBubble.appendChild(faLink);
+    setTimeout((dummy) => {
+    URL.revokeObjectURL(objectUrl);
+}, 60000);
+    return 0;
+}).catch((error) => {
+    faStatus.textContent = ("Attachment request failed: " + String(error));
+    return 0;
+});
     } else if ((type === "mid_message")) {
         appendMessage(activeAiMessages(), "ErnOS", msg.text, "received");
     } else if ((type === "image_progress")) {
@@ -2294,7 +2551,13 @@ function handleDaemonMessage(msg) {
         window.systemConfig = msg.data;
         updateSystemConfigUI();
     } else if ((type === "system_config_saved")) {
-        showSystemConfigStatus("Configuration saved! Restart daemon to apply network changes.", 2);
+        if (msg.success) {
+            showSystemConfigStatus("Configuration saved! Restart daemon to apply network changes.", 2);
+        } else {
+            showSystemConfigStatus(msg.message, 0);
+        }
+    } else if ((type === "system_config_error")) {
+        showSystemConfigStatus(msg.message, 0);
     } else if ((type === "error")) {
         console.error(("Daemon error: " + String(msg.message)));
     } else if ((type === "swap_result")) {
@@ -2348,7 +2611,7 @@ function handleDaemonMessage(msg) {
         if (((type === "session_delete_result") && (window.activeSessionId === msg.id))) {
             selectSession("default");
         }
-    } else if ((type === "onion_result")) {
+    } else if ((type === "search_result")) {
         handleOnionResult(msg);
     } else if ((type === "onion_view_result")) {
         handleOnionViewResult(msg);
@@ -2407,26 +2670,54 @@ function handleDaemonMessage(msg) {
 }
 
 function handleOnionResult(msg) {
-    let resultsBox, results, html;
+    let emptyState, results, resultsBox, sourceLabel;
     resultsBox = document.getElementById("onion-results-box");
     if (!resultsBox) {
         return 0;
     }
     results = msg.results;
+    sourceLabel = document.createElement("div");
+    set_prop(sourceLabel.style, "color", "var(--text-muted)");
+    set_prop(sourceLabel.style, "marginBottom", "10px");
+    if ((msg.source === "local+onion")) {
+        sourceLabel.textContent = "Results: local index plus a verified multi-hop onion query.";
+    } else {
+        sourceLabel.textContent = "Results: local index plus direct authenticated federation; origin anonymity was not available.";
+    }
+    resultsBox.replaceChildren(sourceLabel);
     if ((!results || (results.length === 0))) {
-        resultsBox.innerHTML = "<div style='color: var(--text-muted); text-align: center; padding: 20px 0;'>No results found.</div>";
+        emptyState = document.createElement("div");
+        emptyState.textContent = "No results found.";
+        set_prop(emptyState.style, "color", "var(--text-muted)");
+        set_prop(emptyState.style, "textAlign", "center");
+        set_prop(emptyState.style, "padding", "20px 0");
+        resultsBox.appendChild(emptyState);
         return 0;
     }
-    html = "";
     results.forEach((r) => {
-    decodedTitle = decodeHTMLEntities(r.title);
-    decodedSnippet = decodeHTMLEntities(r.snippet);
-    escTitle = escapeHTML(decodedTitle);
-    escUrl = escapeHTML(r.url);
-    escSnippet = escapeHTML(decodedSnippet);
-    html = (html + (((((((("<div class=\"search-result-item\"><a class=\"search-result-title\" onclick=\"window.onionViewPage('" + String(r.url)) + "')\">") + String(escTitle)) + "</a><span class=\"search-result-url\">") + String(escUrl)) + "</span><p class=\"search-result-snippet\">") + String(escSnippet)) + "</p></div>"));
+    item = document.createElement("div");
+    item.className = "search-result-item";
+    link = document.createElement("a");
+    link.className = "search-result-title";
+    link.href = "#";
+    link.textContent = decodeHTMLEntities(((r.title || r.url) || "Untitled result"));
+    link.addEventListener("click", (event) => {
+    event.preventDefault();
+    window.onionViewPage(r.url);
 });
-    resultsBox.innerHTML = html;
+    urlLine = document.createElement("span");
+    urlLine.className = "search-result-url";
+    urlLine.textContent = (r.url || "");
+    item.appendChild(link);
+    item.appendChild(urlLine);
+    if (r.snippet) {
+        snippet = document.createElement("p");
+        snippet.className = "search-result-snippet";
+        snippet.textContent = decodeHTMLEntities(r.snippet);
+        item.appendChild(snippet);
+    }
+    resultsBox.appendChild(item);
+});
     return 0;
 }
 
@@ -2550,7 +2841,7 @@ function switchBrowserTab(tabId) {
 }
 
 function closeBrowserTab(tabId) {
-    let i, modal, tObj, idx;
+    let idx, i, modal, tObj;
     idx = (0 - 1);
     i = 0;
     window.browserTabs.forEach((t) => {
@@ -2582,7 +2873,7 @@ function closeBrowserTab(tabId) {
 }
 
 function navigateTab(tab, url) {
-    let targetUrl, isSearch, loader, contentArea, progressBar, hasProtocol, hasDot, addressInput, viewMsg;
+    let targetUrl, addressInput, viewMsg, loader, contentArea, isSearch, hasProtocol, progressBar, hasDot;
     targetUrl = url.trim();
     if ((targetUrl === "")) {
         return 0;
@@ -2650,7 +2941,7 @@ function navigateActiveTab(url, isHistoryNavigation) {
 }
 
 function updateNavButtons(tab) {
-    let btnBack, btnForward;
+    let btnForward, btnBack;
     btnBack = document.getElementById("btn-browser-back");
     if (btnBack) {
         btnBack.disabled = (tab.historyIndex <= 0);
@@ -2663,7 +2954,7 @@ function updateNavButtons(tab) {
 }
 
 function updateStarButton(tab) {
-    let isBookmarked, btnStar;
+    let btnStar, isBookmarked;
     btnStar = document.getElementById("btn-browser-star");
     if (!btnStar) {
         return 0;
@@ -2717,7 +3008,7 @@ function toggleBookmarkActiveTab() {
 }
 
 function renderBookmarksBar() {
-    let homeItem, bar;
+    let bar, homeItem;
     bar = document.getElementById("browser-bookmarks-bar");
     if (!bar) {
         return 0;
@@ -2748,7 +3039,7 @@ function renderBookmarksBar() {
 }
 
 function resolveRelativeUrl(baseUrl, relativeUrl) {
-    let domain, protoIdx, firstSlash, afterProto, lastSlash, baseFolder;
+    let firstSlash, lastSlash, protoIdx, domain, afterProto, baseFolder;
     if (((string_index_of(relativeUrl, "://") >= 0) || (string_index_of(relativeUrl, "data:") === 0))) {
         return relativeUrl;
     }
@@ -2777,7 +3068,7 @@ function resolveRelativeUrl(baseUrl, relativeUrl) {
 }
 
 function interceptViewportClicks() {
-    let links, contentArea;
+    let contentArea, links;
     contentArea = document.getElementById("reader-modal-content");
     if (!contentArea) {
         return 0;
@@ -2798,12 +3089,12 @@ function interceptViewportClicks() {
 }
 
 function renderNewTabPage(tab) {
-    let form, scGithub, scDdg, scWiki, scTor, newTabHtml, contentArea;
+    let contentArea, form, newTabHtml, scWiki, scTor, scGithub, scDdg;
     contentArea = document.getElementById("reader-modal-content");
     if ((tab.id !== window.activeTabId)) {
         return 0;
     }
-    newTabHtml = "<div class=\"newtab-container\"><div class=\"newtab-logo\">&#x1F331;</div><div class=\"newtab-title\">Ernos Private Browser</div><div class=\"newtab-search-box\"><form id=\"newtab-search-form\" class=\"newtab-search-form\" onsubmit=\"return false;\"><input type=\"text\" id=\"newtab-search-input\" class=\"newtab-search-input\" placeholder=\"Search privately with DuckDuckGo or enter URL...\" required><button type=\"submit\" class=\"newtab-search-btn\">Search</button></form></div><div class=\"newtab-grid\"><div class=\"newtab-shortcut\" id=\"shortcut-ddg\"><span class=\"newtab-shortcut-icon\">&#x1F50D;</span><span class=\"newtab-shortcut-title\">DuckDuckGo</span></div><div class=\"newtab-shortcut\" id=\"shortcut-wiki\"><span class=\"newtab-shortcut-icon\">&#x1F4D6;</span><span class=\"newtab-shortcut-title\">Wikipedia</span></div><div class=\"newtab-shortcut\" id=\"shortcut-tor\"><span class=\"newtab-shortcut-icon\">&#x1F9C5;</span><span class=\"newtab-shortcut-title\">Tor Project</span></div><div class=\"newtab-shortcut\" id=\"shortcut-github\"><span class=\"newtab-shortcut-icon\">&#x1F47E;</span><span class=\"newtab-shortcut-title\">GitHub</span></div></div><div class=\"newtab-circuit-info\"><strong>&#x1F512; Secure DHT Onion Circuit:</strong> Traffic is encrypted and routed through multiple nodes of the Ernos decentralized network. No tracking, no censorship.</div></div>";
+    newTabHtml = "<div class=\"newtab-container\"><div class=\"newtab-logo\">&#x1F331;</div><div class=\"newtab-title\">Ernos Sanitized Reader</div><div class=\"newtab-search-box\"><form id=\"newtab-search-form\" class=\"newtab-search-form\" onsubmit=\"return false;\"><input type=\"text\" id=\"newtab-search-input\" class=\"newtab-search-input\" placeholder=\"Enter a URL for the sanitized reader...\" required><button type=\"submit\" class=\"newtab-search-btn\">Search</button></form></div><div class=\"newtab-grid\"><div class=\"newtab-shortcut\" id=\"shortcut-ddg\"><span class=\"newtab-shortcut-icon\">&#x1F50D;</span><span class=\"newtab-shortcut-title\">DuckDuckGo</span></div><div class=\"newtab-shortcut\" id=\"shortcut-wiki\"><span class=\"newtab-shortcut-icon\">&#x1F4D6;</span><span class=\"newtab-shortcut-title\">Wikipedia</span></div><div class=\"newtab-shortcut\" id=\"shortcut-tor\"><span class=\"newtab-shortcut-icon\">&#x1F9C5;</span><span class=\"newtab-shortcut-title\">Tor Project</span></div><div class=\"newtab-shortcut\" id=\"shortcut-github\"><span class=\"newtab-shortcut-icon\">&#x1F47E;</span><span class=\"newtab-shortcut-title\">GitHub</span></div></div><div class=\"newtab-circuit-info\"><strong>&#x1F512; Search routing:</strong> Multi-hop onion routing is used only when enough verified relays are available; otherwise results use direct authenticated federation.</div></div>";
     set_prop(contentArea, "innerHTML", newTabHtml);
     form = document.getElementById("newtab-search-form");
     if (form) {
@@ -2840,7 +3131,7 @@ function renderNewTabPage(tab) {
 }
 
 function handleOnionViewResult(msg) {
-    let title, htmlLower, contentArea, progressBar, activeTab, tStart, urlParts, targetTab, tEnd, loader, tabId;
+    let tabId, safeBase, contentArea, progressBar, readerFrame, title, tStart, tEnd, htmlLower, activeTab, urlParts, targetTab, loader;
     tabId = msg.tabId;
     targetTab = null;
     window.browserTabs.forEach((t) => {
@@ -2896,8 +3187,17 @@ function handleOnionViewResult(msg) {
         contentArea = document.getElementById("reader-modal-content");
         set_prop(loader.style, "display", "none");
         set_prop(contentArea.style, "display", "block");
-        set_prop(contentArea, "innerHTML", ((("<base href=\"" + String(targetTab.url)) + "\">") + msg.html));
-        interceptViewportClicks();
+        contentArea.textContent = "";
+        readerFrame = document.createElement("iframe");
+        readerFrame.setAttribute("sandbox", "");
+        readerFrame.setAttribute("referrerpolicy", "no-referrer");
+        readerFrame.setAttribute("title", targetTab.title);
+        set_prop(readerFrame.style, "width", "100%");
+        set_prop(readerFrame.style, "height", "100%");
+        set_prop(readerFrame.style, "border", "0");
+        safeBase = escapeHTML(targetTab.url);
+        readerFrame.srcdoc = ((("<base href=\"" + String(safeBase)) + "\">") + msg.html);
+        contentArea.appendChild(readerFrame);
     }
     renderBrowserTabs();
     activeTab = getActiveTab();
@@ -2955,7 +3255,7 @@ function updateGitDecRepos(reposStr) {
 }
 
 function selectGitDecRepo(repoId) {
-    let msg2, activeIdEl, msgFileList, viewerName, msg3, msg1, viewerContent, detailsPanel, noSelected;
+    let detailsPanel, msgFileList, noSelected, viewerName, viewerContent, msg1, activeIdEl, msg2, msg3;
     window.gitdecActiveRepo = repoId;
     noSelected = document.getElementById("gitdec-no-repo-selected");
     detailsPanel = document.getElementById("gitdec-repo-details");
@@ -2994,7 +3294,7 @@ function selectGitDecRepo(repoId) {
 }
 
 function handleGitDecFile(repoId, filename, content) {
-    let auQuery, visBadge, localRole, fileViewer, listEl, sRepoName, branches, manifest, visToggle, keys, issueListEl, data, prListEl, b_keys, branchSelect, guideViewer, removeBtns, isOwner, sRepoId, visVal, titleEl, opt, commitListEl, activeFileSpan;
+    let localRole, guideViewer, visBadge, manifest, commitListEl, isOwner, sRepoId, auQuery, titleEl, branchSelect, b_keys, data, opt, sRepoName, issueListEl, activeFileSpan, fileViewer, visToggle, listEl, removeBtns, branches, visVal, keys, prListEl;
     if (((repoId === "ErnosDecent") && ((((((((((((filename === "docs/gitdec_user_guide.md") || (filename === "docs/system_guide_synthesis.md")) || (filename === "docs/ERNOS_REFERENCE.md")) || (filename === "README.md")) || (filename === "docs/settings_guide.md")) || (filename === "docs/identity_registry_guide.md")) || (filename === "docs/network_dht_guide.md")) || (filename === "docs/resource_pooling_guide.md")) || (filename === "docs/turing_hebbian_guide.md")) || (filename === "docs/messaging_social_guide.md")) || (filename === "docs/storage_crdt_guide.md")) || (filename === "docs/ledger_dex_guide.md")))) {
         guideViewer = document.getElementById("guide-text-content");
         if (guideViewer) {
@@ -3250,7 +3550,7 @@ function renderGitDecFiles(repoId, filesStr) {
 }
 
 function showGitDecIssueDetail(issue) {
-    let bodyRow, titleEl, detailCard, commentsContainer;
+    let detailCard, titleEl, bodyRow, commentsContainer;
     window.gitdecActiveIssue = issue;
     detailCard = document.getElementById("gitdec-issue-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -3276,7 +3576,7 @@ function showGitDecIssueDetail(issue) {
 }
 
 function showGitDecPrDetail(pr) {
-    let reviewsContainer, branchEl, detailCard, titleEl, descRow;
+    let titleEl, branchEl, detailCard, reviewsContainer, descRow;
     window.gitdecActivePr = pr;
     detailCard = document.getElementById("gitdec-pr-detail-card");
     set_prop(detailCard.style, "display", "block");
@@ -3310,7 +3610,7 @@ function showGitDecPrDetail(pr) {
 }
 
 function initGuide() {
-    let navList, activeBtn, file, msg, btns;
+    let btns, navList, activeBtn, msg, file;
     navList = document.getElementById("guide-nav-list");
     if (!navList) {
         return 0;
@@ -3347,7 +3647,7 @@ function initGuide() {
 }
 
 function initGitDec() {
-    let commitsPanel, formCreateIssue, modalNewPr, modalNewIssue, filesBtn, prsBtn, formCreatePr, btnToggleVis, formReviewPr, btnNewIssue, btnNewRepo, autoUpdateToggle, formImportRepo, formCreateRepo, formCommentIssue, btnCloseNewPr, formSettingsAddCollab, btnImportRepo, btnCloneRepo, commitsBtn, btnDeleteRepo, issuesBtn, issuesPanel, prsPanel, settingsPanel, btnCloseImportRepo, btnCloseNewIssue, modalNewRepo, btnMergeMain, repoSearch, btnNewPr, modalImportRepo, filesPanel, btnCloseNewRepo, modalCloneRepo, formCloneRepo, btnCloseCloneRepo, settingsBtn, btnCloseIssue;
+    let prsBtn, commitsPanel, repoSearch, btnCloseImportRepo, btnCloseNewPr, filesBtn, btnCloseIssue, prsPanel, btnImportRepo, filesPanel, btnNewRepo, commitsBtn, btnCloseCloneRepo, issuesBtn, btnCloseNewIssue, formCloneRepo, btnCloneRepo, btnMergeMain, settingsBtn, modalNewIssue, modalNewRepo, modalCloneRepo, autoUpdateToggle, btnNewPr, modalNewPr, formCreatePr, settingsPanel, formCreateIssue, formImportRepo, btnCloseNewRepo, formCommentIssue, formReviewPr, btnNewIssue, issuesPanel, formSettingsAddCollab, formCreateRepo, modalImportRepo, btnToggleVis, btnDeleteRepo;
     commitsBtn = document.getElementById("gitdec-tab-commits");
     filesBtn = document.getElementById("gitdec-tab-files");
     issuesBtn = document.getElementById("gitdec-tab-issues");
@@ -3748,7 +4048,7 @@ function initGitDec() {
 }
 
 function main() {
-    let tabPanels, torBookmark, aiForm, chatForm, btnDecayMemory, turingForm, nameForm, channelBtns, btnMenu, onionSearchHtml, readerModal, toggleWhatsapp, savedLastName, menuNewTab, btnAddTab, btnForward, btnSaveTelegram, dhtForm, btnSaveDiscord, guideBtns, savedTab, networkGrid, toggleTelegram, aiModelSelect, clickFn, menuBookmarkOption, menuNewIncognito, btnSwapTokens, btnTriggerAutonomy, btnSaveWhatsapp, onionCard, ddgBookmark, btnAddPlugin, targetBtn, btnNewSession, wikiBookmark, transferForm, dhtCardWide, btnCloseBrowser, btnBack, btnRefreshHosts, addressInput, guideSections, subTabs, pageTitle, navItems, menuReloadOption, nameInput, readerModalHtml, onionForm, toggleDiscord, btnStar, menuExitOption, btnSaveSystemConfig, btnSavePrompts, btnReload, btnHome;
+    let savedTab, learningStopButton, guideSections, tabPanels, chatForm, agentStopButton, btnSaveSystemConfig, subTabs, btnHome, dhtForm, btnRefreshHosts, btnMenu, autoapproveButton, btnBack, nameForm, addressInput, btnSwapTokens, onionForm, pageTitle, guideBtns, readerModalHtml, btnDecayMemory, btnNewSession, menuBookmarkOption, nameInput, ddgBookmark, navItems, menuNewTab, aiForm, transferForm, btnAddTab, btnTriggerAutonomy, btnCloseBrowser, turingForm, btnStar, toggleTelegram, btnAddPlugin, wikiBookmark, btnForward, btnSaveDiscord, onionSearchHtml, torBookmark, toggleWhatsapp, btnReload, btnSavePrompts, targetBtn, imageCancelButton, savedLastName, menuReloadOption, channelBtns, toggleDiscord, btnSaveTelegram, readerModal, btnSaveWhatsapp, networkGrid, aiModelSelect, onionCard, menuNewIncognito, menuExitOption, clickFn, dhtCardWide;
     window.ws = null;
     window.isConnected = false;
     window.uptimeSeconds = 0;
@@ -3780,7 +4080,7 @@ function main() {
         onionCard = document.createElement("div");
         onionCard.className = "card";
         onionCard.id = "onion-search-card";
-        onionSearchHtml = "<h3>Private Onion Search Browser</h3><form id=\"onion-search-form\" class=\"standard-form inline-form\" onsubmit=\"return false;\"><div class=\"form-row\"><div class=\"form-group\" style=\"flex: 0 0 120px;\"><label for=\"onion-engine\">Engine</label><select id=\"onion-engine\"><option value=\"DuckDuckGo\">DuckDuckGo</option><option value=\"Google\">Google</option><option value=\"Bing\">Bing</option></select></div><div class=\"form-group\" style=\"flex: 1;\"><label for=\"onion-query-input\">Query</label><input type=\"text\" id=\"onion-query-input\" placeholder=\"Search privately...\" required></div><button type=\"submit\" class=\"btn-primary\" id=\"btn-onion-search\">Search Privately</button></div></form><div id=\"onion-circuit-container\" style=\"display: none; margin: 20px 0;\"><div class=\"circuit-title\">Secure Onion Route:</div><svg id=\"onion-circuit-svg\" width=\"100%\" height=\"80\" viewBox=\"0 0 400 80\"><line x1=\"50\" y1=\"40\" x2=\"150\" y2=\"40\" class=\"circuit-line\" /><line x1=\"150\" y1=\"40\" x2=\"250\" y2=\"40\" class=\"circuit-line\" /><line x1=\"250\" y1=\"40\" x2=\"350\" y2=\"40\" class=\"circuit-line\" /><circle cx=\"50\" cy=\"40\" r=\"4\" class=\"circuit-pulse\" id=\"pulse-1\" style=\"display:none;\"><animate attributeName=\"cx\" from=\"50\" to=\"150\" dur=\"0.3s\" fill=\"freeze\" begin=\"indefinite\" id=\"anim-1\" /></circle><circle cx=\"150\" cy=\"40\" r=\"4\" class=\"circuit-pulse\" id=\"pulse-2\" style=\"display:none;\"><animate attributeName=\"cx\" from=\"150\" to=\"250\" dur=\"0.3s\" fill=\"freeze\" begin=\"indefinite\" id=\"anim-2\" /></circle><circle cx=\"250\" cy=\"40\" r=\"4\" class=\"circuit-pulse\" id=\"pulse-3\" style=\"display:none;\"><animate attributeName=\"cx\" from=\"250\" to=\"350\" dur=\"0.4s\" fill=\"freeze\" begin=\"indefinite\" id=\"anim-3\" /></circle><circle cx=\"50\" cy=\"40\" r=\"12\" class=\"circuit-node client\" /><text x=\"50\" y=\"43\" class=\"circuit-node-label\" text-anchor=\"middle\">UA</text><circle cx=\"150\" cy=\"40\" r=\"10\" class=\"circuit-node guard\" /><text x=\"150\" y=\"43\" class=\"circuit-node-label\" text-anchor=\"middle\">G</text><circle cx=\"250\" cy=\"40\" r=\"10\" class=\"circuit-node middle\" /><text x=\"250\" y=\"43\" class=\"circuit-node-label\" text-anchor=\"middle\">M</text><circle cx=\"350\" cy=\"40\" r=\"12\" class=\"circuit-node exit\" /><text x=\"350\" y=\"43\" class=\"circuit-node-label\" text-anchor=\"middle\">E</text><text x=\"50\" y=\"68\" class=\"circuit-node-text\" text-anchor=\"middle\">Client</text><text x=\"150\" y=\"68\" class=\"circuit-node-text\" text-anchor=\"middle\">Guard</text><text x=\"250\" y=\"68\" class=\"circuit-node-text\" text-anchor=\"middle\">Middle</text><text x=\"350\" y=\"68\" class=\"circuit-node-text\" text-anchor=\"middle\">Exit</text></svg></div><div class=\"search-results-box\" id=\"onion-results-box\"><div style=\"color: var(--text-muted); text-align: center; padding: 20px 0;\">Anonymous search results will appear here...</div></div>";
+        onionSearchHtml = "<h3>Decentralized Search</h3><form id=\"onion-search-form\" class=\"standard-form inline-form\" onsubmit=\"return false;\"><div class=\"form-row\"><div class=\"form-group\" style=\"flex: 1;\"><label for=\"onion-query-input\">Query</label><input type=\"text\" id=\"onion-query-input\" placeholder=\"Search the decentralized index...\" required></div><button type=\"submit\" class=\"btn-primary\" id=\"btn-onion-search\">Search Index</button></div></form><div class=\"search-results-box\" id=\"onion-results-box\"><div style=\"color: var(--text-muted); text-align: center; padding: 20px 0;\">Search results will appear here...</div></div>";
         set_prop(onionCard, "innerHTML", onionSearchHtml);
         networkGrid = document.querySelector("#tab-network .grid-layout");
         if (networkGrid) {
@@ -3794,7 +4094,7 @@ function main() {
     readerModal = document.createElement("div");
     readerModal.className = "modal-overlay";
     readerModal.id = "reader-view-modal";
-    readerModalHtml = "<div class=\"browser-window\"><div class=\"browser-titlebar\"><div class=\"mac-dots\"><span class=\"dot close\"></span><span class=\"dot minimize\"></span><span class=\"dot maximize\"></span></div><div class=\"browser-tabbar\" id=\"browser-tabbar\"></div><button class=\"browser-add-tab-btn\" id=\"btn-browser-add-tab\">+</button><div class=\"browser-window-controls\"><button class=\"browser-close-btn\" id=\"btn-close-browser\">&times;</button></div></div><div class=\"browser-toolbar\"><div class=\"browser-nav-controls\"><button class=\"browser-nav-btn\" id=\"btn-browser-back\" title=\"Back\">&larr;</button><button class=\"browser-nav-btn\" id=\"btn-browser-forward\" title=\"Forward\">&rarr;</button><button class=\"browser-nav-btn\" id=\"btn-browser-reload\" title=\"Reload\">&#x21BB;</button><button class=\"browser-nav-btn\" id=\"btn-browser-home\" title=\"Home\">&#x2302;</button></div><div class=\"browser-address-container\"><span class=\"browser-security-icon\" id=\"browser-security-icon\">&#x1F9C5;</span><input type=\"text\" class=\"browser-address-input\" id=\"browser-address-input\" placeholder=\"Search privately or enter URL...\"><button class=\"browser-bookmark-star\" id=\"btn-browser-star\" title=\"Bookmark this page\">&#x2606;</button></div><div class=\"browser-extensions\"><button class=\"browser-ext-btn shield-active\" id=\"btn-browser-shield\" title=\"Ernos Shield: Active (Blocking Trackers)\">&#x1F6E1;</button><button class=\"browser-ext-btn\" id=\"btn-browser-menu\" title=\"Customize and control Ernos Browser\">&#x22EE;</button><div class=\"browser-menu-dropdown\" id=\"browser-menu-dropdown\" style=\"display: none;\"><div class=\"menu-item\" id=\"menu-new-tab\">New tab <span class=\"shortcut\">Ctrl+T</span></div><div class=\"menu-item\" id=\"menu-new-incognito\">New incognito tab</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-reload\">Reload</div><div class=\"menu-item\" id=\"menu-bookmark\">Bookmark this tab</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-history\">History</div><div class=\"menu-item\" id=\"menu-settings\">Settings</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-exit\">Exit Browser</div></div></div></div><div class=\"browser-bookmarks-bar\" id=\"browser-bookmarks-bar\"></div><div class=\"browser-progress-bar-container\"><div class=\"browser-progress-bar\" id=\"browser-progress-bar\" style=\"width: 0%;\"></div></div><div class=\"browser-viewport\" id=\"browser-viewport\"><div class=\"modal-loader\" id=\"reader-modal-loader\" style=\"display: none;\"><div class=\"modal-spinner\"></div><span style=\"color: var(--text-muted);\">Routing through secure onion circuits...</span></div><div id=\"reader-modal-content\"></div></div></div>";
+    readerModalHtml = "<div class=\"browser-window\"><div class=\"browser-titlebar\"><div class=\"mac-dots\"><span class=\"dot close\"></span><span class=\"dot minimize\"></span><span class=\"dot maximize\"></span></div><div class=\"browser-tabbar\" id=\"browser-tabbar\"></div><button class=\"browser-add-tab-btn\" id=\"btn-browser-add-tab\">+</button><div class=\"browser-window-controls\"><button class=\"browser-close-btn\" id=\"btn-close-browser\">&times;</button></div></div><div class=\"browser-toolbar\"><div class=\"browser-nav-controls\"><button class=\"browser-nav-btn\" id=\"btn-browser-back\" title=\"Back\">&larr;</button><button class=\"browser-nav-btn\" id=\"btn-browser-forward\" title=\"Forward\">&rarr;</button><button class=\"browser-nav-btn\" id=\"btn-browser-reload\" title=\"Reload\">&#x21BB;</button><button class=\"browser-nav-btn\" id=\"btn-browser-home\" title=\"Home\">&#x2302;</button></div><div class=\"browser-address-container\"><span class=\"browser-security-icon\" id=\"browser-security-icon\">&#x1F9C5;</span><input type=\"text\" class=\"browser-address-input\" id=\"browser-address-input\" placeholder=\"Search privately or enter URL...\"><button class=\"browser-bookmark-star\" id=\"btn-browser-star\" title=\"Bookmark this page\">&#x2606;</button></div><div class=\"browser-extensions\"><button class=\"browser-ext-btn shield-active\" id=\"btn-browser-shield\" title=\"Reader sanitizer enabled\">&#x1F6E1;</button><button class=\"browser-ext-btn\" id=\"btn-browser-menu\" title=\"Customize and control Ernos Browser\">&#x22EE;</button><div class=\"browser-menu-dropdown\" id=\"browser-menu-dropdown\" style=\"display: none;\"><div class=\"menu-item\" id=\"menu-new-tab\">New tab <span class=\"shortcut\">Ctrl+T</span></div><div class=\"menu-item\" id=\"menu-new-incognito\">New incognito tab</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-reload\">Reload</div><div class=\"menu-item\" id=\"menu-bookmark\">Bookmark this tab</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-history\">History</div><div class=\"menu-item\" id=\"menu-settings\">Settings</div><div class=\"menu-divider\"></div><div class=\"menu-item\" id=\"menu-exit\">Exit Browser</div></div></div></div><div class=\"browser-bookmarks-bar\" id=\"browser-bookmarks-bar\"></div><div class=\"browser-progress-bar-container\"><div class=\"browser-progress-bar\" id=\"browser-progress-bar\" style=\"width: 0%;\"></div></div><div class=\"browser-viewport\" id=\"browser-viewport\"><div class=\"modal-loader\" id=\"reader-modal-loader\" style=\"display: none;\"><div class=\"modal-spinner\"></div><span style=\"color: var(--text-muted);\">Fetching and sanitizing reader content...</span></div><div id=\"reader-modal-content\"></div></div></div>";
     set_prop(readerModal, "innerHTML", readerModalHtml);
     document.body.appendChild(readerModal);
     window.browserTabs = [];
@@ -3935,40 +4235,14 @@ function main() {
     if (onionForm) {
         onionForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    engineSelect = document.getElementById("onion-engine");
     queryInput = document.getElementById("onion-query-input");
-    engine = engineSelect.value;
     query = queryInput.value;
-    circuitContainer = document.getElementById("onion-circuit-container");
-    set_prop(circuitContainer.style, "display", "block");
-    pulse1 = document.getElementById("pulse-1");
-    pulse2 = document.getElementById("pulse-2");
-    pulse3 = document.getElementById("pulse-3");
-    set_prop(pulse1.style, "display", "none");
-    set_prop(pulse2.style, "display", "none");
-    set_prop(pulse3.style, "display", "none");
     resultsBox = document.getElementById("onion-results-box");
-    set_prop(resultsBox, "innerHTML", "<div style='color: var(--text-muted); text-align: center; padding: 20px 0;'><div class='modal-spinner' style='width:24px; height:24px; margin:0 auto 10px auto;'></div>Routing encrypted packet through onion hops...</div>");
-    setTimeout((dummy) => {
-    set_prop(pulse1.style, "display", "block");
-    anim1 = document.getElementById("anim-1");
-    anim1.beginElement();
-    setTimeout((dummy2) => {
-    set_prop(pulse2.style, "display", "block");
-    anim2 = document.getElementById("anim-2");
-    anim2.beginElement();
-    setTimeout((dummy3) => {
-    set_prop(pulse3.style, "display", "block");
-    anim3 = document.getElementById("anim-3");
-    anim3.beginElement();
+    set_prop(resultsBox, "innerHTML", "<div style='color: var(--text-muted); text-align: center; padding: 20px 0;'><div class='modal-spinner' style='width:24px; height:24px; margin:0 auto 10px auto;'></div>Searching the local and federated index...</div>");
     searchMsg = Object();
     searchMsg.type = "onion_search";
-    searchMsg.engine = engine;
     searchMsg.query = query;
     send_msg(window.ws, JSON.stringify(searchMsg));
-}, 400);
-}, 300);
-}, 300);
 });
     }
     window.onionViewPage = (viewUrl) => {
@@ -4168,6 +4442,34 @@ function main() {
 });
     setupLearningTab();
     setupAccessToggle();
+    imageCancelButton = document.getElementById("image-gen-cancel");
+    if (imageCancelButton) {
+        imageCancelButton.addEventListener("click", (event) => {
+    requestCancellation(imageCancelButton);
+    imageOverlay = document.getElementById("image-gen-overlay");
+    if (imageOverlay) {
+        set_prop(imageOverlay.style, "display", "none");
+    }
+});
+    }
+    agentStopButton = document.getElementById("btn-stop-ai");
+    if (agentStopButton) {
+        agentStopButton.addEventListener("click", (event) => {
+    requestCancellation(agentStopButton);
+});
+    }
+    learningStopButton = document.getElementById("btn-stop-learning");
+    if (learningStopButton) {
+        learningStopButton.addEventListener("click", (event) => {
+    requestCancellation(learningStopButton);
+});
+    }
+    autoapproveButton = document.getElementById("btn-autoapprove");
+    if (autoapproveButton) {
+        autoapproveButton.addEventListener("click", (event) => {
+    toggleAutoapprove(autoapproveButton);
+});
+    }
     channelBtns = document.querySelectorAll("[data-channel]");
     channelBtns.forEach((btn) => {
     btn.addEventListener("click", (event) => {

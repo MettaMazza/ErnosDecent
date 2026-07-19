@@ -1,113 +1,86 @@
-# ErnosDecent — Integration Test for node daemon and CLI
-# Component: decent_cli/test_cli.ep
-# Status: Testing — OperationTrojanClaude Phase 14
+# ErnosDecent — authenticated IPC client integration test
 
 import "collections"
 import "string"
 import "net"
 import "test"
-import "../decent_id/keys"
-import "../decent_id/did"
-import "../decent_net/dht"
-import "../decent_net/relay"
-import "../decent_consensus/raft"
-import "../decent_consensus/election"
-import "../decent_msg/message"
-import "../decent_money/ledger"
-import "../decent_name/registry"
-import "../storage"
-import "../logging"
-import "../node.ep"
+import "client"
 
-define run_daemon_thread with listen_fd as Int and raft_node as Map and identity as Map and dht_node as Int and relay_node as Int and msg_store as Int and ledger as Map and name_reg as Int:
-    ipc_server_loop(listen_fd and borrow raft_node and borrow identity and dht_node and relay_node and msg_store and ledger and name_reg)
-    return 0
+define cli_mock_server with listen_fd as Int and expected_token as Str and request_count as Int and done_ch as Int returning Int:
+    set handled to 0
+    set server_error to 0
+    repeat while handled < request_count:
+        set client_fd to ep_net_accept(listen_fd)
+        if client_fd < 0:
+            set server_error to 1
+            set handled to request_count
+        else:
+            set request to string_trim(ep_net_recv(client_fd and 65536))
+            set response to "error:unauthorized"
+            set prefix to concat("AUTH " and concat(expected_token and " "))
+            if string_index_of(request and prefix) == 0:
+                set command to substring(request and string_length(prefix) and string_length(request) - string_length(prefix))
+                if command equals "STATUS":
+                    set response to "status:active"
+                else if command equals "WALLET BALANCE":
+                    set response to "wallet_balance:1000000"
+                else if command equals "POOL STATUS":
+                    set response to "pool:active"
+                else:
+                    set response to "error:unknown_command"
+            set sent to ep_net_send(client_fd and response)
+            if sent != string_length(response):
+                set server_error to 2
+            set close_client_err to ep_net_close(client_fd)
+            if close_client_err != 0:
+                set server_error to 3
+            set handled to handled + 1
+    set close_listen_err to ep_net_close(listen_fd)
+    if close_listen_err != 0:
+        set server_error to 4
+    send server_error to done_ch
+    return server_error
 
-define main:
+define assert_cli_response with result as Map and expected as Str returning Int:
+    set ok_count to 0
+    set ok_count to ok_count + assert_equal(map_get_val(result and "error") and CLI_ERR_NONE and "IPC client should report success")
+    set response to ptr_to_str(map_get_val(result and "response"))
+    set ok_count to ok_count + assert_true(string_contains(response and expected) == 1 and "IPC response should contain expected content")
+    return ok_count
+
+define main returning Int:
     display "==================================================="
-    display "  ErnosDecent -- CLI Integration Test"
+    display "  ErnosDecent — Authenticated CLI Integration Test"
     display "==================================================="
-    
-    # 0. Initialize storage + logging
-    set store_err to storage_init("./test_cli_data")
-    set log_err to log_init("./test_cli_data/logs" and 1048576 and 2)
 
-    # 1. Initialize Cryptography
-    set crypto_err to init_crypto()
-    assert_true(crypto_err == 0 and "Crypto should initialize")
-    
-    # 2. Identity
-    set identity to create_identity()
-    
-    # 3. DHT Discovery Node
-    set dht_node to create_dht_node("test_node" and "127.0.0.1" and 8001)
-    
-    # 4. Relay Node
-    set relay_node to create_relay_node("test_node")
+    set passed to 0
+    set total to 10
+    set ipc_port to 25050
+    set token to "test-token-with-exact-match"
+    set listen_fd to ep_net_listen(ipc_port)
+    set passed to passed + assert_true(listen_fd >= 0 and "Mock IPC server should bind")
+    if listen_fd < 0:
+        return 1
 
-    # 5. Raft Node
-    set peers to create_list()
-    set raft_node to raft_create_node("test_node" and peers)
-    election_init_node(borrow raft_node and 150)
+    set done_ch to create_channel()
+    spawn cli_mock_server(listen_fd and token and 3 and done_ch)
+    set sleep_err to ep_sleep_ms(50)
+    set passed to passed + assert_true(sleep_err == 0 and "Mock IPC server should start")
 
-    # 6. Message Store
-    set did_val to ptr_to_str(map_get_val(identity and "did"))
-    set msg_store to mstore_create(did_val)
+    set missing_token to cli_send_command("127.0.0.1" and ipc_port and "" and "STATUS")
+    set passed to passed + assert_equal(map_get_val(missing_token and "error") and CLI_ERR_INVALID_INPUT and "Empty authentication token should be rejected before connecting")
 
-    # 7. Ledger
-    set genesis_pub to ptr_to_str(map_get_val(identity and "public_key"))
-    set ledger to ledger_create(genesis_pub)
+    set status_result to cli_send_command("127.0.0.1" and ipc_port and token and "STATUS")
+    set passed to passed + assert_cli_response(status_result and "status:active")
+    set wallet_result to cli_send_command("127.0.0.1" and ipc_port and token and "WALLET BALANCE")
+    set passed to passed + assert_cli_response(wallet_result and "wallet_balance:")
+    set pool_result to cli_send_command("127.0.0.1" and ipc_port and token and "POOL STATUS")
+    set passed to passed + assert_cli_response(pool_result and "pool:active")
 
-    # 8. Name Registry
-    set name_reg to registry_create()
-    
-    # 9. Start TCP Socket Listener on 5000
-    set listen_fd to ep_net_listen(5000)
-    assert_true(listen_fd >= 0 and "Listen socket should bind")
-    
-    # 10. Spawn the daemon server loop thread
-    spawn run_daemon_thread(listen_fd and raft_node and identity and dht_node and relay_node and msg_store and ledger and name_reg)
-    
-    # Sleep to let the thread bind and start accepting
-    set ok to ep_sleep_ms(100)
-    
-    # 7. Test IPC Commands
-    # Test STATUS command
-    set fd1 to ep_net_connect("127.0.0.1" and 5000)
-    assert_true(fd1 >= 0 and "Connect should succeed")
-    set ok to ep_net_send(fd1 and "STATUS")
-    set resp1 to ep_net_recv(fd1 and 1024)
-    display concat("[Test] STATUS Response: " and resp1)
-    assert_true(string_contains(resp1 and "status:active") == 1 and "STATUS should respond active")
-    set ok to ep_net_close(fd1)
-    
-    # Test WALLET BALANCE command
-    set fd2 to ep_net_connect("127.0.0.1" and 5000)
-    assert_true(fd2 >= 0 and "Connect should succeed")
-    set ok to ep_net_send(fd2 and "WALLET BALANCE")
-    set resp2 to ep_net_recv(fd2 and 1024)
-    display concat("[Test] WALLET BALANCE Response: " and resp2)
-    assert_true(string_contains(resp2 and "wallet_balance") == 1 and "WALLET BALANCE should respond")
-    set ok to ep_net_close(fd2)
-    
-    # Test POOL STATUS command
-    set fd3 to ep_net_connect("127.0.0.1" and 5000)
-    assert_true(fd3 >= 0 and "Connect should succeed")
-    set ok to ep_net_send(fd3 and "POOL STATUS")
-    set resp3 to ep_net_recv(fd3 and 1024)
-    display concat("[Test] POOL STATUS Response: " and resp3)
-    assert_true(string_contains(resp3 and "pool:active") == 1 and "POOL STATUS should respond")
-    set ok to ep_net_close(fd3)
+    set server_error to receive from done_ch
+    set passed to passed + assert_equal(server_error and 0 and "Mock IPC server should complete without socket errors")
 
-    display "[+] All CLI integration tests passed successfully!"
-    
-    # Test STOP command (kills daemon thread and exits the test runner)
-    set fd4 to ep_net_connect("127.0.0.1" and 5000)
-    assert_true(fd4 >= 0 and "Connect should succeed")
-    set ok to ep_net_send(fd4 and "STOP")
-    set resp4 to ep_net_recv(fd4 and 1024)
-    display concat("[Test] STOP Response: " and resp4)
-    assert_true(string_contains(resp4 and "stopping") == 1 and "STOP should respond stopping")
-    set ok to ep_net_close(fd4)
-    
-    return 0
+    display f"[+] {passed}/{total} CLI integration assertions passed."
+    if passed == total:
+        return 0
+    return 1

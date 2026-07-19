@@ -110,6 +110,10 @@ define sync_merge_lessons with memory_mgr as Map and incoming_lessons as Map ret
             # Cap confidence in imported knowledge (prefix with metadata)
             set merged_val to concat("Confidence: 0.8 | Imported: " and val_scrubbed)
             set ok to memory_store(memory_mgr and 2 and k and merged_val)
+            if ok != 0:
+                free_list(keys)
+                display concat("[-] Synchronization failed to merge lesson: " and k)
+                return 1
             set merged_any to 1
             
         set i to i + 1
@@ -117,6 +121,9 @@ define sync_merge_lessons with memory_mgr as Map and incoming_lessons as Map ret
     free_list(keys)
     if merged_any == 1:
         set ok to memory_serialize(memory_mgr and "config/agent_memory.json")
+        if ok != 0:
+            display "[-] Synchronization merged lessons in memory but could not persist them."
+            return 1
     return 0
 
 define sync_merge_synaptic_graph with memory_mgr as Map and incoming_nodes as Map and incoming_edges as List returning Int:
@@ -212,19 +219,72 @@ define sync_merge_synaptic_graph with memory_mgr as Map and incoming_nodes as Ma
         set i to i + 1
         
     set ok to memory_serialize(memory_mgr and "config/agent_memory.json")
+    if ok != 0:
+        display "[-] Synchronization merged the graph in memory but could not persist it."
+        return 1
     return 0
 
-define sync_stage_and_verify_patch with patch_content as Str returning Int:
-    set ok to write_file("scratch/staged_patch.diff" and patch_content)
-    
-    # Run build script verification check
-    # Note: run_command executes the script, returning the status or stdout
-    set cmd_out to run_command("bash build.sh")
-    if string_contains(cmd_out and "Build complete") == 1:
-        # Build succeeded! Apply the patch diff
-        set apply_out to run_command("patch -p1 < scratch/staged_patch.diff")
-        display "[+] P2P Code Patch Verification: build succeeded, patch applied."
-        return 0
-        
-    display "[-] P2P Code Patch Verification: build failed, patch rejected."
+define sync_command_succeeded with output as Str returning Int:
+    return string_contains(output and "__ERNOS_EXIT__:0")
+
+define sync_rollback_staged_patch returning Int:
+    set rollback_out to run_command("git apply --reverse --whitespace=nowarn scratch/staged_patch.diff 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if sync_command_succeeded(rollback_out) == 0:
+        display concat("[CRITICAL] P2P patch rollback failed; the worktree requires manual recovery: " and rollback_out)
+        return 1
+    set rebuild_out to run_command("bash build.sh 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if sync_command_succeeded(rebuild_out) == 0:
+        display concat("[CRITICAL] P2P patch source rollback succeeded, but the original binary could not be rebuilt: " and rebuild_out)
+        return 1
+    set remove_ok to remove_file("scratch/staged_patch.diff")
+    if remove_ok == 0:
+        display "[-] P2P patch was rolled back, but its staging file could not be removed."
+        return 1
+    display "[-] P2P patch was rolled back and the original source was rebuilt after verification failure."
     return 1
+
+define sync_stage_and_verify_patch with patch_content as Str returning Int:
+    if string_length(patch_content) == 0:
+        display "[-] P2P patch rejected: the patch is empty."
+        return 1
+    if file_exists("scratch") == 0:
+        set dir_ok to create_directory("scratch")
+        if dir_ok == 0:
+            display "[-] P2P patch rejected: scratch directory could not be created."
+            return 1
+    if is_directory("scratch") == 0:
+        display "[-] P2P patch rejected: scratch is not a directory."
+        return 1
+    set ok to write_file("scratch/staged_patch.diff" and patch_content)
+    if ok == 0:
+        display "[-] P2P patch rejected: staging write failed."
+        return 1
+
+    # git apply confines paths to the worktree and rejects malformed or conflicting
+    # patches before mutation. Verification then runs against the actual resulting tree.
+    set check_out to run_command("git apply --check --whitespace=error-all scratch/staged_patch.diff 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if sync_command_succeeded(check_out) == 0:
+        display concat("[-] P2P patch rejected by preflight: " and check_out)
+        return 1
+
+    set apply_out to run_command("git apply --whitespace=error-all scratch/staged_patch.diff 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if sync_command_succeeded(apply_out) == 0:
+        display concat("[-] P2P patch could not be applied: " and apply_out)
+        return 1
+
+    set build_out to run_command("bash build.sh 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if sync_command_succeeded(build_out) == 0:
+        display concat("[-] P2P patch build verification failed: " and build_out)
+        return sync_rollback_staged_patch()
+
+    set test_out to run_command("bash build.sh test 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if sync_command_succeeded(test_out) == 0:
+        display concat("[-] P2P patch test verification failed: " and test_out)
+        return sync_rollback_staged_patch()
+
+    set remove_ok to remove_file("scratch/staged_patch.diff")
+    if remove_ok == 0:
+        display "[-] P2P patch compiled and tested, but its staging file could not be removed."
+        return 1
+    display "[+] P2P patch applied, compiled, and passed the test suite."
+    return 0

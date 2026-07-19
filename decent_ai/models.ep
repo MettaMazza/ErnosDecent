@@ -5,17 +5,17 @@
 import "collections"
 import "crypto"
 
-external define SHA256 with data and len and hash_dest
-external define get_list_data_ptr with list
+external define SHA256 with data as Int and len as Int and hash_dest as Int returning Int
+external define get_list_data_ptr with list as List returning Int
 
-external define ep_dlopen with lib:
-external define ep_dlsym with handle and name:
-external define ep_dlcall1 with fn and a0:
-external define ep_dlcall2 with fn and a0 and a1:
-external define ep_dlcall3 with fn and a0 and a1 and a2:
-external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
+external define ep_dlopen with lib as Str returning Int:
+external define ep_dlsym with handle as Int and name as Str returning Int:
+external define ep_dlcall1 with fn as Int and a0 as Int returning Int:
+external define ep_dlcall2 with fn as Int and a0 as Int and a1 as Int returning Int:
+external define ep_dlcall3 with fn as Int and a0 as Int and a1 as Int and a2 as Int returning Int:
+external define ep_dlcall4 with fn as Int and a0 as Int and a1 as Int and a2 as Int and a3 as Int returning Int:
 
-define models_create:
+define models_create returning Map:
     set manager to create_map()
     set registry to create_map()
     set ok to map_insert(manager and "registry" and registry)
@@ -74,17 +74,40 @@ define models_verify with path as Str and expected_hash as Str returning Int:
     if file_ptr == 0:
         return 1003
         
-    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 2)
+    set seek_err to ep_dlcall3(fn_fseek and file_ptr and 0 and 2)
+    if seek_err != 0:
+        set close_err to ep_dlcall1(fn_fclose and file_ptr)
+        if close_err != 0:
+            return 1009
+        return 1006
     set size to ep_dlcall1(fn_ftell and file_ptr)
-    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 0)
+    set seek_err to ep_dlcall3(fn_fseek and file_ptr and 0 and 0)
+    if seek_err != 0:
+        set close_err to ep_dlcall1(fn_fclose and file_ptr)
+        if close_err != 0:
+            return 1009
+        return 1006
     
     if size <= 0:
-        set dummy to ep_dlcall1(fn_fclose and file_ptr)
+        set close_err to ep_dlcall1(fn_fclose and file_ptr)
+        if close_err != 0:
+            return 1009
         return 1004
-        
+
     set buf_ptr to alloc_bytes(size)
+    if buf_ptr == 0:
+        set close_err to ep_dlcall1(fn_fclose and file_ptr)
+        if close_err != 0:
+            return 1009
+        return 1007
     set read_bytes to ep_dlcall4(fn_fread and buf_ptr and 1 and size and file_ptr)
-    set dummy to ep_dlcall1(fn_fclose and file_ptr)
+    set close_err to ep_dlcall1(fn_fclose and file_ptr)
+    if read_bytes != size:
+        set free_err to free_bytes(buf_ptr)
+        return 1008
+    if close_err != 0:
+        set free_err to free_bytes(buf_ptr)
+        return 1009
     
     set hash_list to create_list()
     set ok to append_list(hash_list and 0)
@@ -93,8 +116,11 @@ define models_verify with path as Str and expected_hash as Str returning Int:
     set ok to append_list(hash_list and 0)
     
     set hash_ptr to get_list_data_ptr(hash_list)
-    set dummy to SHA256(buf_ptr and size and hash_ptr)
-    set dummy to free_bytes(buf_ptr)
+    set sha_result to SHA256(buf_ptr and size and hash_ptr)
+    set free_err to free_bytes(buf_ptr)
+    if sha_result == 0:
+        set ok to free_list(hash_list)
+        return 1010
     
     set hex_res to ""
     set word_idx to 0

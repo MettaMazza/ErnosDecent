@@ -51,8 +51,11 @@ define speech_path_is_safe with path as Str returning Int:
 define speech_whisper_up with host as Str and port as Int returning Int:
     set fd to ep_net_connect(host and port)
     if fd > 0:
-        set ok to ep_net_close(fd)
-        return 1
+        set close_err to ep_net_close(fd)
+        if close_err == 0:
+            return 1
+        display f"[-] Whisper server probe connected to {host}:{port} but could not close its socket."
+        return 0 - 1
     return 0
 
 # Extract the transcript from a whisper.cpp response. With response_format=json the
@@ -79,7 +82,12 @@ define speech_transcribe_whisper with audio_path as Str and host as Str and port
     set cmd to concat("curl -s --max-time 120 -F file=@'" and audio_path)
     set cmd to concat(cmd and "' -F response_format=json -F temperature=0 ")
     set cmd to concat(cmd and url)
-    set resp to run_command(cmd)
+    set cmd to concat(cmd and " 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    set raw_resp to run_command(cmd)
+    set marker_pos to string_last_index_of(raw_resp and "__ERNOS_EXIT__:0")
+    if marker_pos < 0:
+        return concat("ERROR:whisper_request_failed:" and raw_resp)
+    set resp to substring(raw_resp and 0 and marker_pos)
     if string_length(resp) == 0:
         return "ERROR:no_response"
     return speech_parse_whisper_json(resp)

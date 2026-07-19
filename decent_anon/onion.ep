@@ -157,15 +157,22 @@ define onion_forward with packet_map as Map and my_key_hex as Str returning Map:
     set next_hop to ptr_to_str(map_get_val(step and "next"))
 
     # Parse next_hop as "address:port"
-    set colon_idx to string_index_of(next_hop and ":")
+    set colon_idx to string_last_index_of(next_hop and ":")
+    if colon_idx <= 0 or else colon_idx >= string_length(next_hop) - 1:
+        set ok to map_insert(step and "error" and ONION_ERR_MALFORMED_PACKET)
+        return step
     set next_addr to substring(next_hop and 0 and colon_idx)
     set port_str to substring(next_hop and colon_idx + 1 and string_length(next_hop) - colon_idx - 1)
     set next_port to string_to_int(port_str)
+    if next_port <= 0 or else next_port > 65535:
+        set ok to map_insert(step and "error" and ONION_ERR_MALFORMED_PACKET)
+        return step
 
     set conn to transport_connect(next_addr and next_port)
     set conn_err to map_get_val(conn and "error")
     if conn_err != 0:
         set ok to map_insert(step and "error" and ONION_ERR_CRYPTO_FAILED)
+        set ok to free_map(conn)
         return step
 
     if is_exit == 1:
@@ -180,5 +187,9 @@ define onion_forward with packet_map as Map and my_key_hex as Str returning Map:
         set fwd_payload to concat(fwd_payload and inner_nc)
         set ok to transport_send(conn and "ONION_DATA" and fwd_payload)
 
-    set ok to transport_close(conn)
+    set send_error to ok
+    set close_error to transport_close(conn)
+    set ok to free_map(conn)
+    if send_error != 0 or else close_error != 0:
+        set ok to map_insert(step and "error" and ONION_ERR_CRYPTO_FAILED)
     return step

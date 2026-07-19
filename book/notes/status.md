@@ -25,7 +25,7 @@ is not yet re-verified by running, it is marked ⚠️.)*
 | decent_web | 2 | 4,728 | Web UI server (app.ep→app.js) + dashboard; WS gateway; now TTS routes |
 | decent_money | 6 | 3,377 | HD wallets, UTXO ledger, PoS, tokens/NFTs, AMM+orderbook DEX, contract VM |
 | decent_id | 6 | 2,434 | Ed25519/X25519, DIDs (did:key/did:peer), capability auth, keystore |
-| decent_store | 5 | 2,445 | Content-addressed storage (BLAKE3), 5 CRDT types, Merkle trees |
+| decent_store | 5 | 2,445 | Content-addressed storage (SHA-256), 5 CRDT types, Merkle trees |
 | decent_ai | 6 | 2,264 | GGUF inference, embeddings, speech-to-text, **TTS (Kokoro via FFI)** |
 | decent_media | 4 | 1,861 | WebRTC (SDP/STUN/DTLS/SRTP), HLS, real Opus/VP8 codecs, P2P CDN |
 | decent_consensus | 5 | 1,628 | Raft leader election, replicated log, state rollback |

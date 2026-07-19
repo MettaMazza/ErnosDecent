@@ -143,7 +143,8 @@ ErnosDecent/
 ├── decent_consensus/    # Raft consensus (election loops, log replication)
 ├── decent_cli/          # Daemon CLI (control CLI tool, CLI integration tests)
 ├── decent_web/          # Web UI App (glassmorphic dashboard, backend server)
-├── docs/                # Project documentation (AGENT.md, ERNOS_REFERENCE.md, CHANGELOG.md, CONTRIBUTING.md, etc.)
+├── AGENT.md             # Standing engineering laws
+├── docs/                # Project documentation (ERNOS_REFERENCE.md, CHANGELOG.md, CONTRIBUTING.md, etc.)
 ├── node.ep              # Sovereign Node Daemon (coordinates all subsystems)
 ├── README.md            # Project overview & roadmap
 └── LICENSE              # AGPL-3.0
@@ -205,7 +206,7 @@ define hash_content with data:
 
 ## The Eleven Laws
 
-Every contribution to ErnosDecent is held to these standards. They are defined in full in [AGENT.md](AGENT.md). The summary:
+Every contribution to ErnosDecent is held to these standards. They are defined in full in [AGENT.md](../AGENT.md). The summary:
 
 | # | Law | What it means |
 |---|-----|---------------|

@@ -7,6 +7,8 @@ import "collections"
 import "string"
 import "../decent_net/transport"
 
+external define cast_borrow_to_map with borrow value as Map returning Map
+
 # ================================================================
 # Constants and Error Codes
 # ================================================================
@@ -18,6 +20,12 @@ set COMPUTE_ERR_ALREADY_SUBMITTED to 812
 set COMPUTE_ERR_NOT_ASSIGNED to 813
 set COMPUTE_ERR_DISPUTED to 814
 set COMPUTE_ERR_NO_PENDING_JOBS to 815
+set COMPUTE_ERR_NETWORK to 816
+set COMPUTE_ERR_INSUFFICIENT_RESULTS to 817
+set COMPUTE_ERR_LOCK_FAILED to 818
+set COMPUTE_ERR_UNLOCK_FAILED to 819
+set COMPUTE_ERR_INVALID_INPUT to 820
+set COMPUTE_ERR_OVERFLOW to 821
 
 # Job Status
 # - "pending"
@@ -52,13 +60,48 @@ define compute_create_manager returning Map:
     set ok to map_insert(mgr and "pending" and pending_list)
     set ok to map_insert(mgr and "contributions" and worker_contributions)
     set ok to map_insert(mgr and "job_counter" and 0)
+    set mutex to create_mutex()
+    set ok to map_insert(mgr and "mutex" and mutex)
+    set ok to map_insert(mgr and "error" and 0)
+    if mutex == 0:
+        display "ERROR: compute manager mutex creation failed"
+        set ok to map_insert(mgr and "error" and COMPUTE_ERR_LOCK_FAILED)
     return mgr
 
+define compute_lock with mgr as Map returning Int:
+    set mutex to map_get_val(mgr and "mutex")
+    if mutex == 0:
+        return COMPUTE_ERR_LOCK_FAILED
+    set lock_ok to lock_mutex(mutex)
+    if lock_ok == 0:
+        return COMPUTE_ERR_LOCK_FAILED
+    return COMPUTE_ERR_NONE
+
+define compute_unlock with mgr as Map returning Int:
+    set mutex to map_get_val(mgr and "mutex")
+    if mutex == 0:
+        return COMPUTE_ERR_UNLOCK_FAILED
+    set unlock_ok to unlock_mutex(mutex)
+    if unlock_ok == 0:
+        return COMPUTE_ERR_UNLOCK_FAILED
+    return COMPUTE_ERR_NONE
+
 define compute_submit_job with mgr as Map and delegator_id as Str and input_data as Str returning Str:
+    if string_length(delegator_id) == 0 or else string_length(input_data) == 0:
+        display "ERROR: compute job requires a delegator and non-empty input"
+        return ""
+    set lock_err to compute_lock(mgr)
+    if lock_err != COMPUTE_ERR_NONE:
+        display "ERROR: compute job submission could not lock manager state"
+        return ""
     set jobs to map_get_val(mgr and "jobs")
     set pending_list to map_get_val(mgr and "pending")
     set counter to map_get_val(mgr and "job_counter")
     
+    if counter >= 9223372036854775807:
+        set unlock_err to compute_unlock(mgr)
+        display "ERROR: compute job counter exhausted"
+        return ""
     set job_idx to counter + 1
     set ok to map_insert(mgr and "job_counter" and job_idx)
 
@@ -77,53 +120,117 @@ define compute_submit_job with mgr as Map and delegator_id as Str and input_data
     # To implement redundant verification:
     # We will track all results submitted by different workers for this job.
     set submissions to create_map()
+    set assigned_workers to create_map()
     set ok to map_insert(job and "submissions" and submissions)
+    set ok to map_insert(job and "assigned_workers" and assigned_workers)
     set ok to map_insert(job and "required_redundancy" and 2)
 
     set ok to map_insert(jobs and job_id and job)
     set ok to append_list(pending_list and str_to_ptr(job_id))
 
+    set unlock_err to compute_unlock(mgr)
+    if unlock_err != COMPUTE_ERR_NONE:
+        display "ERROR: compute job submission could not unlock manager state"
+        return ""
     return job_id
 
 define compute_assign_job with mgr as Map and worker_id as Str returning Str:
+    if string_length(worker_id) == 0:
+        display "ERROR: compute worker ID cannot be empty"
+        return ""
+    set lock_err to compute_lock(mgr)
+    if lock_err != COMPUTE_ERR_NONE:
+        display "ERROR: compute assignment could not lock manager state"
+        return ""
     set pending_list to map_get_val(mgr and "pending")
     set size to length_list(pending_list)
     if size == 0:
+        set unlock_err to compute_unlock(mgr)
+        if unlock_err != COMPUTE_ERR_NONE:
+            display "ERROR: compute assignment could not unlock manager state"
         return ""
 
-    # Grab first job
-    set job_id_ptr to get_list(pending_list and 0)
-    set job_id to ptr_to_str(job_id_ptr)
-
-    # Remove from pending queue
-    set new_pending to create_list()
-    set i to 1
-    repeat while i < size:
-        set item to get_list(pending_list and i)
-        set ok to append_list(new_pending and item)
-        set i to i + 1
-    set ok to map_insert(mgr and "pending" and new_pending)
-
     set jobs to map_get_val(mgr and "jobs")
-    set job to map_get_val(jobs and job_id)
-    set ok to map_insert(job and "worker_id" and worker_id)
-    set ok to map_insert(job and "status" and "assigned")
+    set i to 0
+    repeat while i < size:
+        set job_id_ptr to get_list(pending_list and i)
+        set job_id to ptr_to_str(job_id_ptr)
+        set job to map_get_val(jobs and job_id)
+        if job != 0:
+            set assigned_workers to map_get_val(job and "assigned_workers")
+            if map_contains(assigned_workers and worker_id) == 0:
+                set ok to map_insert(assigned_workers and worker_id and 1)
+                set assigned_count to map_size(assigned_workers)
+                set required to map_get_val(job and "required_redundancy")
+                if string_length(ptr_to_str(map_get_val(job and "worker_id"))) == 0:
+                    set ok to map_insert(job and "worker_id" and worker_id)
+                set ok to map_insert(job and "status" and "assigned")
 
-    return job_id
+                # Keep the job available until enough distinct workers have been
+                # assigned for the configured redundancy level.
+                if assigned_count >= required:
+                    set new_pending to create_list()
+                    set j to 0
+                    repeat while j < size:
+                        if j != i:
+                            set item to get_list(pending_list and j)
+                            set ok to append_list(new_pending and item)
+                        set j to j + 1
+                    set ok to map_insert(mgr and "pending" and new_pending)
+                    set ok to free_list(pending_list)
+                set unlock_err to compute_unlock(mgr)
+                if unlock_err != COMPUTE_ERR_NONE:
+                    display "ERROR: compute assignment could not unlock manager state"
+                    return ""
+                return job_id
+        set i to i + 1
+    set unlock_err to compute_unlock(mgr)
+    if unlock_err != COMPUTE_ERR_NONE:
+        display "ERROR: compute assignment could not unlock manager state"
+    return ""
 
 define compute_submit_result with mgr as Map and job_id as Str and worker_id as Str and result as Str returning Int:
+    if string_length(job_id) == 0 or else string_length(worker_id) == 0 or else string_length(result) == 0:
+        return COMPUTE_ERR_INVALID_INPUT
+    set lock_err to compute_lock(mgr)
+    if lock_err != COMPUTE_ERR_NONE:
+        return lock_err
     set jobs to map_get_val(mgr and "jobs")
     set job to map_get_val(jobs and job_id)
     if job == 0:
+        set unlock_err to compute_unlock(mgr)
+        if unlock_err != COMPUTE_ERR_NONE:
+            return unlock_err
         return COMPUTE_ERR_JOB_NOT_FOUND
+
+    if string_length(worker_id) == 0:
+        set unlock_err to compute_unlock(mgr)
+        if unlock_err != COMPUTE_ERR_NONE:
+            return unlock_err
+        return COMPUTE_ERR_UNAUTHORIZED
 
     # Validate that the job has been assigned or is open for submissions
     set status to ptr_to_str(map_get_val(job and "status"))
     if (status equals "assigned") == 0 and (status equals "pending") == 0:
+        set unlock_err to compute_unlock(mgr)
+        if unlock_err != COMPUTE_ERR_NONE:
+            return unlock_err
         return COMPUTE_ERR_ALREADY_SUBMITTED
+
+    set assigned_workers to map_get_val(job and "assigned_workers")
+    if map_contains(assigned_workers and worker_id) == 0:
+        set unlock_err to compute_unlock(mgr)
+        if unlock_err != COMPUTE_ERR_NONE:
+            return unlock_err
+        return COMPUTE_ERR_NOT_ASSIGNED
 
     # Record worker's result submission
     set submissions to map_get_val(job and "submissions")
+    if map_contains(submissions and worker_id) == 1:
+        set unlock_err to compute_unlock(mgr)
+        if unlock_err != COMPUTE_ERR_NONE:
+            return unlock_err
+        return COMPUTE_ERR_ALREADY_SUBMITTED
     set ok to map_insert(submissions and worker_id and result)
 
     # Update main job result and worker if this is the first submission
@@ -132,16 +239,24 @@ define compute_submit_result with mgr as Map and job_id as Str and worker_id as 
         set ok to map_insert(job and "worker_id" and worker_id)
         set ok to map_insert(job and "result" and result)
 
-    return COMPUTE_ERR_NONE
+    return compute_unlock(mgr)
 
 # ================================================================
 # Redundant Consensus Verification
 # ================================================================
 
 define compute_verify_result with mgr as Map and job_id as Str returning Int:
+    if string_length(job_id) == 0:
+        return COMPUTE_ERR_INVALID_INPUT
+    set lock_err to compute_lock(mgr)
+    if lock_err != COMPUTE_ERR_NONE:
+        return lock_err
     set jobs to map_get_val(mgr and "jobs")
     set job to map_get_val(jobs and job_id)
     if job == 0:
+        set unlock_err to compute_unlock(mgr)
+        if unlock_err != COMPUTE_ERR_NONE:
+            return unlock_err
         return COMPUTE_ERR_JOB_NOT_FOUND
 
     set submissions to map_get_val(job and "submissions")
@@ -149,8 +264,10 @@ define compute_verify_result with mgr as Map and job_id as Str returning Int:
 
     set num_submissions to map_size(submissions)
     if num_submissions < req_red:
-        # Not enough submissions yet to perform consensus verification
-        return COMPUTE_ERR_NONE
+        set unlock_err to compute_unlock(mgr)
+        if unlock_err != COMPUTE_ERR_NONE:
+            return unlock_err
+        return COMPUTE_ERR_INSUFFICIENT_RESULTS
 
     set sub_keys to map_keys(submissions)
     set first_worker_ptr to get_list(sub_keys and 0)
@@ -183,11 +300,48 @@ define compute_verify_result with mgr as Map and job_id as Str returning Int:
             set ok to map_insert(contributions and worker_id and worker_score + 1)
             set i to i + 1
             
-        return COMPUTE_ERR_NONE
+        set ok to free_list(sub_keys)
+        return compute_unlock(mgr)
     else:
         # Mismatch detected: dispute
         set ok to map_insert(job and "status" and "disputed")
+        set ok to free_list(sub_keys)
+        set unlock_err to compute_unlock(mgr)
+        if unlock_err != COMPUTE_ERR_NONE:
+            return unlock_err
         return COMPUTE_ERR_DISPUTED
+
+define compute_job_input with mgr as Map and job_id as Str returning Str:
+    set lock_err to compute_lock(mgr)
+    if lock_err != COMPUTE_ERR_NONE:
+        display "ERROR: compute job input lookup could not lock manager state"
+        return ""
+    set jobs to map_get_val(mgr and "jobs")
+    set job to map_get_val(jobs and job_id)
+    set input_data to ""
+    if job != 0:
+        set input_data to map_get_val(job and "input_data")
+    set unlock_err to compute_unlock(mgr)
+    if unlock_err != COMPUTE_ERR_NONE:
+        display "ERROR: compute job input lookup could not unlock manager state"
+        return ""
+    return input_data
+
+define compute_job_result with mgr as Map and job_id as Str returning Str:
+    set lock_err to compute_lock(mgr)
+    if lock_err != COMPUTE_ERR_NONE:
+        display "ERROR: compute result lookup could not lock manager state"
+        return ""
+    set jobs to map_get_val(mgr and "jobs")
+    set job to map_get_val(jobs and job_id)
+    set result to ""
+    if job != 0:
+        set result to map_get_val(job and "result")
+    set unlock_err to compute_unlock(mgr)
+    if unlock_err != COMPUTE_ERR_NONE:
+        display "ERROR: compute result lookup could not unlock manager state"
+        return ""
+    return result
 
 # ================================================================
 # TCP Networking — remote job dispatch and worker connections
@@ -196,76 +350,202 @@ define compute_verify_result with mgr as Map and job_id as Str returning Int:
 define compute_worker_connect with address as Str and port as Int and worker_id as Str returning Map:
     # Connect to a compute manager, request a job, execute, and submit result
     set result to create_map()
+    if string_length(address) == 0 or else port <= 0 or else port > 65535 or else string_length(worker_id) == 0:
+        set ok to map_insert(result and "error" and COMPUTE_ERR_INVALID_INPUT)
+        return result
     set conn to transport_connect(address and port)
     set err to map_get_val(conn and "error")
     if err != 0:
-        set ok to map_insert(result and "error" and 1)
+        set ok to free_map(conn)
+        set ok to map_insert(result and "error" and COMPUTE_ERR_NETWORK)
         return result
 
     # Send job request
-    set ok to transport_send(conn and "COMPUTE_REQUEST" and worker_id)
+    set send_err to transport_send(conn and "COMPUTE_REQUEST" and worker_id)
+    if send_err != TRANSPORT_ERR_NONE:
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute worker request send and close both failed."
+        set ok to free_map(conn)
+        set ok to map_insert(result and "error" and COMPUTE_ERR_NETWORK)
+        return result
 
     # Receive job assignment
     set response to transport_recv(conn)
     set recv_err to map_get_val(response and "error")
     if recv_err != 0:
-        set ok to transport_close(conn)
-        set ok to map_insert(result and "error" and 2)
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute worker receive and close both failed."
+        set ok to free_map(response)
+        set ok to free_map(conn)
+        set ok to map_insert(result and "error" and COMPUTE_ERR_NETWORK)
         return result
 
+    set response_type to map_get_val(response and "msg_type")
     set job_data to map_get_val(response and "payload")
+    if response_type equals "COMPUTE_NO_JOBS":
+        set close_err to transport_close(conn)
+        set ok to free_map(response)
+        set ok to free_map(conn)
+        set ok to map_insert(result and "error" and COMPUTE_ERR_NO_PENDING_JOBS)
+        return result
+    if (response_type equals "COMPUTE_ASSIGN") == 0:
+        set close_err to transport_close(conn)
+        set ok to free_map(response)
+        set ok to free_map(conn)
+        set ok to map_insert(result and "error" and COMPUTE_ERR_NETWORK)
+        return result
+    set separator to string_index_of(job_data and ":")
+    if separator <= 0 or else separator >= string_length(job_data) - 1:
+        set close_err to transport_close(conn)
+        set ok to free_map(response)
+        set ok to free_map(conn)
+        set ok to map_insert(result and "error" and COMPUTE_ERR_INVALID_INPUT)
+        return result
+    set job_id to substring(job_data and 0 and separator)
+    set input_data to substring(job_data and separator + 1 and string_length(job_data) - separator - 1)
     set ok to map_insert(result and "conn" and conn)
     set ok to map_insert(result and "job_data" and job_data)
+    set ok to map_insert(result and "job_id" and job_id)
+    set ok to map_insert(result and "input_data" and input_data)
     set ok to map_insert(result and "error" and 0)
+    set ok to free_map(response)
     return result
 
 define compute_worker_submit with conn as Map and job_id as Str and worker_id as Str and result_data as Str returning Int:
     # Submit a computed result back to the manager
+    if string_length(job_id) == 0 or else string_length(worker_id) == 0 or else string_length(result_data) == 0:
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            return COMPUTE_ERR_NETWORK
+        return COMPUTE_ERR_INVALID_INPUT
     set payload to concat(job_id and ":")
     set payload to concat(payload and worker_id)
     set payload to concat(payload and ":")
     set payload to concat(payload and result_data)
-    set ok to transport_send(conn and "COMPUTE_RESULT" and payload)
-    set ok to transport_close(conn)
+    set send_err to transport_send(conn and "COMPUTE_RESULT" and payload)
+    if send_err != TRANSPORT_ERR_NONE:
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute result send and close both failed."
+        return COMPUTE_ERR_NETWORK
+    set ack to transport_recv(conn)
+    if map_get_val(ack and "error") != TRANSPORT_ERR_NONE:
+        set close_err to transport_close(conn)
+        set ok to free_map(ack)
+        if close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute result receive and close both failed."
+        return COMPUTE_ERR_NETWORK
+    set ack_type to map_get_val(ack and "msg_type")
+    set ack_payload to map_get_val(ack and "payload")
+    set submit_status to string_to_int(ack_payload)
+    set ok to free_map(ack)
+    set close_err to transport_close(conn)
+    if close_err != TRANSPORT_ERR_NONE:
+        return COMPUTE_ERR_NETWORK
+    if (ack_type equals "COMPUTE_ACK") == 0:
+        return COMPUTE_ERR_NETWORK
+    if submit_status != COMPUTE_ERR_NONE:
+        return submit_status
     return COMPUTE_ERR_NONE
 
-define compute_serve with mgr as Map and port as Int returning Int:
-    # Start a compute job server that accepts worker connections
-    set listener to transport_listen(port)
-    set err to map_get_val(listener and "error")
-    if err != 0:
-        return 1
-
-    # Accept one connection and handle it
-    set conn to transport_accept(listener)
-    set conn_err to map_get_val(conn and "error")
-    if conn_err != 0:
-        set ok to transport_close(listener)
-        return 2
-
-    # Read request
+define compute_handle_connection with mgr as Map and conn as Map returning Int:
     set request to transport_recv(conn)
     set recv_err to map_get_val(request and "error")
     if recv_err != 0:
-        set ok to transport_close(conn)
-        set ok to transport_close(listener)
-        return 3
+        set close_err to transport_close(conn)
+        set ok to free_map(request)
+        if close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute server request receive and close both failed."
+        return COMPUTE_ERR_NETWORK
 
     set msg_type to map_get_val(request and "msg_type")
     set worker_id to map_get_val(request and "payload")
+    set ok to free_map(request)
+    if (msg_type equals "COMPUTE_REQUEST") == 0 or else string_length(worker_id) == 0:
+        set send_err to transport_send(conn and "COMPUTE_ACK" and int_to_string(COMPUTE_ERR_INVALID_INPUT))
+        set close_err to transport_close(conn)
+        if send_err != TRANSPORT_ERR_NONE or else close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute server rejected malformed request but could not report or close cleanly."
+        return COMPUTE_ERR_INVALID_INPUT
 
     # Assign a job
     set job_id to compute_assign_job(mgr and worker_id)
     if string_length(job_id) == 0:
-        set ok to transport_send(conn and "COMPUTE_NO_JOBS" and "")
-    else:
-        set jobs to map_get_val(mgr and "jobs")
-        set job to map_get_val(jobs and job_id)
-        set input_data to map_get_val(job and "input_data")
-        set response_payload to concat(job_id and ":")
-        set response_payload to concat(response_payload and input_data)
-        set ok to transport_send(conn and "COMPUTE_ASSIGN" and response_payload)
+        set send_err to transport_send(conn and "COMPUTE_NO_JOBS" and "")
+        set close_err to transport_close(conn)
+        if send_err != TRANSPORT_ERR_NONE or else close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute server no-job response or close failed."
+            return COMPUTE_ERR_NETWORK
+        return COMPUTE_ERR_NO_PENDING_JOBS
 
-    set ok to transport_close(conn)
-    set ok to transport_close(listener)
+    set input_data to compute_job_input(mgr and job_id)
+    if string_length(input_data) == 0:
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute server input lookup and close both failed."
+        return COMPUTE_ERR_NETWORK
+    set response_payload to concat(job_id and ":")
+    set response_payload to concat(response_payload and input_data)
+    set send_err to transport_send(conn and "COMPUTE_ASSIGN" and response_payload)
+    if send_err != TRANSPORT_ERR_NONE:
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute server assignment send and close both failed."
+        return COMPUTE_ERR_NETWORK
+
+    # Keep the connection open for the worker's result and acknowledge manager acceptance.
+    set submission to transport_recv(conn)
+    if map_get_val(submission and "error") != TRANSPORT_ERR_NONE:
+        set close_err to transport_close(conn)
+        set ok to free_map(submission)
+        if close_err != TRANSPORT_ERR_NONE:
+            display "[-] Compute server result receive and close both failed."
+        return COMPUTE_ERR_NETWORK
+    set submission_type to map_get_val(submission and "msg_type")
+    set submission_payload to map_get_val(submission and "payload")
+    set submit_status to COMPUTE_ERR_INVALID_INPUT
+    if submission_type equals "COMPUTE_RESULT":
+        set first_sep to string_index_of(submission_payload and ":")
+        set remaining to ""
+        if first_sep > 0 and also first_sep < string_length(submission_payload) - 1:
+            set submitted_job_id to substring(submission_payload and 0 and first_sep)
+            set remaining to substring(submission_payload and first_sep + 1 and string_length(submission_payload) - first_sep - 1)
+            set second_sep to string_index_of(remaining and ":")
+            if second_sep > 0 and also second_sep < string_length(remaining) - 1:
+                set submitted_worker_id to substring(remaining and 0 and second_sep)
+                set submitted_result to substring(remaining and second_sep + 1 and string_length(remaining) - second_sep - 1)
+                if submitted_job_id equals job_id and also submitted_worker_id equals worker_id:
+                    set submit_status to compute_submit_result(mgr and submitted_job_id and submitted_worker_id and submitted_result)
+    set ok to free_map(submission)
+    set ack_err to transport_send(conn and "COMPUTE_ACK" and int_to_string(submit_status))
+    set close_err to transport_close(conn)
+    if ack_err != TRANSPORT_ERR_NONE or else close_err != TRANSPORT_ERR_NONE:
+        display "[-] Compute server acknowledgement or close failed."
+        return COMPUTE_ERR_NETWORK
+    return submit_status
+
+define compute_serve with mgr as Map and port as Int returning Int:
+    if port <= 0 or else port > 65535:
+        return COMPUTE_ERR_INVALID_INPUT
+    # Long-running compute server: each worker keeps its connection through result ACK,
+    # while independent workers are handled concurrently.
+    set listener to transport_listen(port)
+    set err to map_get_val(listener and "error")
+    if err != 0:
+        set ok to free_map(listener)
+        return COMPUTE_ERR_NETWORK
+
+    repeat while 1 == 1:
+        set conn to transport_accept(listener)
+        set conn_err to map_get_val(conn and "error")
+        if conn_err != 0:
+            set ok to free_map(conn)
+            set close_err to transport_close(listener)
+            set ok to free_map(listener)
+            if close_err != TRANSPORT_ERR_NONE:
+                display "[-] Compute listener accept and close both failed."
+            return COMPUTE_ERR_NETWORK
+        spawn compute_handle_connection(cast_borrow_to_map(borrow mgr) and conn)
     return 0

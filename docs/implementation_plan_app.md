@@ -1,5 +1,11 @@
 # Sovereign Dashboard — Unified App Implementation Plan
 
+> **Archived design record.** This proposal predates the implemented dashboard and is
+> retained for history. It is not an operator guide. The current authenticated Web UI
+> binds to `127.0.0.1:8088`; IPC binds to `127.0.0.1:5000`. See
+> [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) and the repository README for the
+> verified current behavior. Port `8080` references below describe the original proposal.
+
 We will design and build a premium, fully integrated Sovereign Dashboard app wired directly into the ErnosDecent node daemon. The dashboard will expose real-time metrics and controls for all 14 peer-to-peer subsystems: Identity/DID, DHT routing, storage collections, E2E encrypted messaging, social publishing (Nostr & ActivityPub), ledger wallet transactions, local transformer AI inference, WebRTC media streaming, onion privacy, search crawl/query, resource pooling, and Raft consensus.
 
 ---
@@ -27,7 +33,7 @@ We will introduce a new frontend module `decent_web/` and update the coordinatio
 
 ### Daemon Web server & API Integration (`/`)
 
-#### [MODIFY] [node.ep](file:///Users/mettamazza/Desktop/ErnosDecent./node.ep)
+#### [MODIFY] [node.ep](../node.ep)
 - Extend daemon start sequences to load and initialize `websocket` and `static_server` standard libraries.
 - Launch a new background thread running the web/API listener server on port `8080`.
 - Implement API routing handlers returning JSON snapshots:
@@ -40,21 +46,21 @@ We will introduce a new frontend module `decent_web/` and update the coordinatio
   - Handle live E2E messaging loops (`decent_msg` channels).
   - Stream local AI inference text completion tokens directly to the client.
 
-#### [MODIFY] [decent_cli/test_cli.ep](file:///Users/mettamazza/Desktop/ErnosDecent./decent_cli/test_cli.ep)
+#### [MODIFY] [decent_cli/test_cli.ep](../decent_cli/test_cli.ep)
 - Add mock assertions and connection queries verifying port `8080` HTTP routing alongside port `5000` IPC socket queries.
 
 ---
 
 ### Dashboard Frontend Web Client (`decent_web/`)
 
-#### [NEW] [index.html](file:///Users/mettamazza/Desktop/ErnosDecent./decent_web/index.html)
+#### [NEW] [index.html](../decent_web/index.html)
 - SPA structure containing:
   - Sidebar navigation (Overview, Identity, Storage, Social & Msg, Wallet, AI Playground, Telemetry).
   - Main panel dynamically swapping sections.
   - Real-time notification banner and console logger.
   - Clean semantic layout with accessible elements and unique IDs for automated testing.
 
-#### [NEW] [style.css](file:///Users/mettamazza/Desktop/ErnosDecent./decent_web/style.css)
+#### [NEW] [style.css](../decent_web/style.css)
 - Premium dark mode stylesheet:
   - Vibrant neon color palette (neon violet, cyan, amber, deep obsidian gradients).
   - Glassmorphic panels using `backdrop-filter: blur(16px)` and translucent borders.
@@ -62,7 +68,7 @@ We will introduce a new frontend module `decent_web/` and update the coordinatio
   - Smooth micro-animations for hover effects, state transitions, and loading skeletons.
   - Custom scrollbars and modern Google Font typography (e.g., *Outfit* and *JetBrains Mono*).
 
-#### [NEW] [app.js](file:///Users/mettamazza/Desktop/ErnosDecent./decent_web/app.js)
+#### [NEW] [app.js](../decent_web/app.js)
 - Application client-side core controller:
   - Establishes a WebSocket connection to the local daemon at `ws://127.0.0.1:8080/ws`.
   - Manages UI state and event routing (sending chat messages, posting Nostr notes, querying search terms).

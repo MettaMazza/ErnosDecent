@@ -19,13 +19,14 @@ set RELAY_NET_ERR_RECV_FAILED to 972
 set RELAY_NET_ERR_BAD_RESPONSE to 973
 set RELAY_NET_ERR_NOT_REGISTERED to 974
 set RELAY_NET_ERR_CIRCUIT_FAILED to 975
+set RELAY_NET_ERR_CLOSE_FAILED to 976
 
 # ================================================================
 # Outbound RPC: Client-side relay operations over TCP
 # ================================================================
 
-define relay_rpc_register with address as Str and port as Int and my_id as Str and my_pub_hex as Str returning Int:
-    set conn to transport_connect(address and port)
+define relay_rpc_register with relay_address as Str and relay_port as Int and my_id as Str and my_pub_hex as Str and advertised_address as Str and advertised_port as Int returning Int:
+    set conn to transport_connect(relay_address and relay_port)
     set conn_err to map_get_val(conn and "error")
     if conn_err != TRANSPORT_ERR_NONE:
         free_map(conn)
@@ -35,13 +36,15 @@ define relay_rpc_register with address as Str and port as Int and my_id as Str a
     set payload to concat(my_id and ",")
     set payload to concat(payload and my_pub_hex)
     set payload to concat(payload and ",")
-    set payload to concat(payload and address)
+    set payload to concat(payload and advertised_address)
     set payload to concat(payload and ",")
-    set payload to concat(payload and int_to_string(port))
+    set payload to concat(payload and int_to_string(advertised_port))
     set err to transport_send(conn and MSG_TYPE_RELAY_REQUEST and concat("REGISTER," and payload))
     if err != TRANSPORT_ERR_NONE:
-        transport_close(conn)
+        set close_err to transport_close(conn)
         free_map(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            return RELAY_NET_ERR_CLOSE_FAILED
         return RELAY_NET_ERR_SEND_FAILED
 
     set resp to transport_recv(conn)
@@ -50,8 +53,11 @@ define relay_rpc_register with address as Str and port as Int and my_id as Str a
     if recv_err == TRANSPORT_ERR_NONE:
         set resp_payload to map_get_val(resp and "payload")
     free_map(resp)
-    transport_close(conn)
+    set close_err to transport_close(conn)
     free_map(conn)
+
+    if close_err != TRANSPORT_ERR_NONE:
+        return RELAY_NET_ERR_CLOSE_FAILED
 
     if recv_err != TRANSPORT_ERR_NONE:
         return RELAY_NET_ERR_RECV_FAILED
@@ -75,24 +81,34 @@ define relay_rpc_connect with address as Str and port as Int and my_id as Str an
     set payload to concat(payload and target_id)
     set err to transport_send(conn and MSG_TYPE_RELAY_REQUEST and payload)
     if err != TRANSPORT_ERR_NONE:
-        transport_close(conn)
+        set close_err to transport_close(conn)
         free_map(conn)
-        set ok to map_insert(result and "error" and RELAY_NET_ERR_SEND_FAILED)
+        if close_err != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and RELAY_NET_ERR_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and RELAY_NET_ERR_SEND_FAILED)
         return result
 
     set resp to transport_recv(conn)
     set recv_err to map_get_val(resp and "error")
     if recv_err != TRANSPORT_ERR_NONE:
         free_map(resp)
-        transport_close(conn)
+        set close_err to transport_close(conn)
         free_map(conn)
-        set ok to map_insert(result and "error" and RELAY_NET_ERR_RECV_FAILED)
+        if close_err != TRANSPORT_ERR_NONE:
+            set ok to map_insert(result and "error" and RELAY_NET_ERR_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and RELAY_NET_ERR_RECV_FAILED)
         return result
 
     set resp_payload to map_get_val(resp and "payload")
     free_map(resp)
-    transport_close(conn)
+    set close_err to transport_close(conn)
     free_map(conn)
+
+    if close_err != TRANSPORT_ERR_NONE:
+        set ok to map_insert(result and "error" and RELAY_NET_ERR_CLOSE_FAILED)
+        return result
 
     # Parse "ok,circuit_id" or "error"
     if string_contains(resp_payload and "ok,") == 1:
@@ -118,15 +134,20 @@ define relay_rpc_forward with address as Str and port as Int and circuit_id as S
     set payload to concat(payload and encrypted_data)
     set err to transport_send(conn and MSG_TYPE_RELAY_DATA and payload)
     if err != TRANSPORT_ERR_NONE:
-        transport_close(conn)
+        set close_err to transport_close(conn)
         free_map(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            return RELAY_NET_ERR_CLOSE_FAILED
         return RELAY_NET_ERR_SEND_FAILED
 
     set resp to transport_recv(conn)
     set recv_err to map_get_val(resp and "error")
     free_map(resp)
-    transport_close(conn)
+    set close_err to transport_close(conn)
     free_map(conn)
+
+    if close_err != TRANSPORT_ERR_NONE:
+        return RELAY_NET_ERR_CLOSE_FAILED
 
     if recv_err != TRANSPORT_ERR_NONE:
         return RELAY_NET_ERR_RECV_FAILED
@@ -142,15 +163,20 @@ define relay_rpc_heartbeat with address as Str and port as Int and my_id as Str 
     set payload to concat("HEARTBEAT," and my_id)
     set err to transport_send(conn and MSG_TYPE_RELAY_REQUEST and payload)
     if err != TRANSPORT_ERR_NONE:
-        transport_close(conn)
+        set close_err to transport_close(conn)
         free_map(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            return RELAY_NET_ERR_CLOSE_FAILED
         return RELAY_NET_ERR_SEND_FAILED
 
     set resp to transport_recv(conn)
     set recv_err to map_get_val(resp and "error")
     free_map(resp)
-    transport_close(conn)
+    set close_err to transport_close(conn)
     free_map(conn)
+
+    if close_err != TRANSPORT_ERR_NONE:
+        return RELAY_NET_ERR_CLOSE_FAILED
 
     if recv_err != TRANSPORT_ERR_NONE:
         return RELAY_NET_ERR_RECV_FAILED
@@ -160,7 +186,7 @@ define relay_rpc_heartbeat with address as Str and port as Int and my_id as Str 
 # Inbound: Handle incoming relay messages from TCP
 # ================================================================
 
-define relay_handle_transport_message with relay as Int and conn as Map returning Int:
+define relay_handle_transport_message with relay as Map and conn as Map returning Int:
     set frame to transport_recv(conn)
     set recv_err to map_get_val(frame and "error")
     if recv_err != TRANSPORT_ERR_NONE:
@@ -179,15 +205,11 @@ define relay_handle_transport_message with relay as Int and conn as Map returnin
         set command to get_list(parts and 0)
 
     if command equals "REGISTER":
-        if part_count >= 3:
+        if part_count >= 5:
             set sender_id to get_list(parts and 1)
             set pub_hex to get_list(parts and 2)
-            set reg_addr to "127.0.0.1"
-            set reg_port to 9100
-            if part_count >= 4:
-                set reg_addr to get_list(parts and 3)
-            if part_count >= 5:
-                set reg_port to string_to_int(get_list(parts and 4))
+            set reg_addr to get_list(parts and 3)
+            set reg_port to string_to_int(get_list(parts and 4))
             set reg_err to relay_register(relay and sender_id and pub_hex and reg_addr and reg_port)
             free_list(parts)
             if reg_err == RELAY_ERR_NONE:
@@ -232,7 +254,13 @@ define relay_handle_transport_message with relay as Int and conn as Map returnin
                     if fwd_conn_err == 0:
                         set fwd_data to ptr_to_str(map_get_val(fwd and "data"))
                         set send_err to transport_send(fwd_conn and MSG_TYPE_RELAY_DATA and fwd_data)
-                        set ok to transport_close(fwd_conn)
+                        set close_err to transport_close(fwd_conn)
+                        if send_err != TRANSPORT_ERR_NONE or else close_err != TRANSPORT_ERR_NONE:
+                            set fwd_err to RELAY_NET_ERR_SEND_FAILED
+                    else:
+                        set fwd_err to RELAY_NET_ERR_SEND_FAILED
+                else:
+                    set fwd_err to RELAY_NET_ERR_SEND_FAILED
                     free_map(fwd_conn)
                 free_map(target_info)
             free_map(fwd)

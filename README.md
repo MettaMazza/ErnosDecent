@@ -20,9 +20,9 @@
 
 ---
 
-*ErnosDecent replaces the centralised internet stack — identity, networking, storage, messaging, social publishing, hosting, finance, AI, and media — with a single, auditable, natively compiled codebase.*
+*ErnosDecent is a local-first peer-to-peer application stack covering identity, networking, storage, messaging, social publishing, hosting, finance, AI, and media.*
 
-*No cloud. No platform. No intermediary.*
+*Implemented behavior and interoperability boundaries are recorded in [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).*
 
 <br/>
 
@@ -34,15 +34,22 @@
 
 ErnosDecent is a ground-up reimplementation of the services people depend on every day — identity, messaging, social media, hosting, payments, AI inference, and live media — as a unified peer-to-peer system. Every module is written in [Ernos](https://github.com/MettaMazza/Ernos-Programming-Language), a compiled programming language with plain English syntax that transpiles to C and compiles to native binaries via Clang.
 
-This is not a framework. This is not a wrapper around existing libraries. This is the stack itself, built from cryptographic primitives upward.
+The node is written in Ernos and links established native libraries for cryptography, persistence, Nostr signatures, and optional media/AI backends. The dependency list is explicit below.
 
 ### The problem it solves
 
-Every service on the current internet requires you to trust a third party with your data, your identity, and your relationships. ErnosDecent eliminates that requirement. Your keys are yours. Your data stays on your machine. Your connections are direct. Your compute is local.
+ErnosDecent provides locally controlled keys and storage. Some configured features use peers or remote model providers; the node does not claim that every connection or computation is local.
 
 ### Current state
 
-**v1.0.0-beta.** The core architecture is implemented and verified. **17 subsystems** comprise roughly **113 source modules** (~45,800 source code-lines plus ~18,300 test lines). Each subsystem ships its own test suite (**105 test files** in total); the node builds with `bash build.sh` and boots, and the core paths are verified. It is served with a local control CLI client and a premium glassmorphic Web UI dashboard (14 tabs: overview, identity, network, storage, messaging, names, wallet, AI chat, agent memory, learning, GitDec, pooling, guide, settings).
+**v1.0.0-beta.** The repository contains **17 subsystem directories**, **117 non-test Ernos modules**, and **105 Ernos test files**. Verification is evidence-based and changes with the code; see the checked results and release gate in [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md). The node provides a local authenticated CLI and Web dashboard.
+
+> **Public bootstrap is pre-launch (last verified 19 July 2026).** The operated node
+> is live and TCP `9100`/`9101` are externally reachable, but stable DDNS and public
+> forwarding for `9102`–`9104` are deferred. No automatic public default seed is
+> shipped yet, so a fresh installation does not auto-join the public mesh. Until the
+> launch gate is completed, operators must provide an explicit `--seed host:9101` or
+> use a previously verified cached peer. This beta does not claim public-mesh availability.
 
 ---
 
@@ -52,22 +59,22 @@ Every service on the current internet requires you to trust a third party with y
 |-----------|--------------|
 | 🔑 **Self-owned identity** — Ed25519 keys, W3C DIDs, capability tokens | Google/Apple sign-in, OAuth |
 | 🌐 **Encrypted P2P networking** — Noise XX handshake, Kademlia DHT | AWS, Cloudflare, centralised DNS |
-| 💾 **Content-addressed storage** — BLAKE3 hashing, CRDT sync | Google Drive, iCloud, Dropbox |
+| 💾 **Content-addressed storage** — SHA-256 hashing, SQLite persistence, CRDT structures | Local application storage |
 | 💬 **End-to-end encrypted messaging** — direct and group channels | iMessage, WhatsApp, Telegram |
-| 📢 **Federated social publishing** — Nostr + ActivityPub | Twitter/X, Instagram, Facebook |
+| 📢 **Social publishing primitives** — NIP-01 events, ActivityPub-shaped activities, unified feeds | Local and peer social data |
 | 🏠 **Self-hosted services** — HTTP, email, Git, DNS | GitHub, Gmail, GoDaddy |
 | 💰 **Native financial system** — HD wallets, UTXO ledger, DEX, smart contracts | Ethereum, Coinbase, PayPal |
 | 🤖 **Local AI** — GGUF transformer, embeddings, speech-to-text, **Kokoro text-to-speech** (🔊 local neural voice), **FLUX image generation + vision** (the agent generates an image locally, looks at it, and describes it) | OpenAI, Anthropic, Google Cloud AI, Midjourney |
 | 🧠 **Sovereign agent** — ReAct loop with **multi-tool batching** (many tools per model call) and long-horizon chaining, a **71-tool surface**, a captured per-turn reasoning channel with **full untruncated transparency**, tiered/Hebbian memory + per-session RAG, sessions with per-session guidance, workspace project linking, a fail-closed **and self-auditing** observer (steelmans, won't straw-man or lie), clarifying-question + stop-mid-run controls, a self-owned editable prompt, sub-agent delegation/swarms, and grounded psychological/argumentation/architectural frameworks | Cloud agent platforms |
 | 🗂️ **GitDec** — decentralised in-repo issue/PR tracker over Nostr | GitHub Issues/PRs |
-| 📡 **P2P media streaming** — WebRTC, adaptive HLS, codec layer, CDN | YouTube, Twitch, Zoom |
+| 📡 **P2P media primitives** — SDP/STUN/SRTP structures, adaptive HLS, codecs, CDN | Application media transport |
 | 🕵️ **Anonymity layer** — onion routing, mix networks | Tor (external), VPNs |
 | 🔍 **Decentralised search** — crawler, BM25 + PageRank ranking | Google Search |
 | 🤝 **Resource pooling** — bandwidth sharing, compute delegation | AWS Lambda, Cloudflare Workers |
 | 🗳️ **Consensus** — Raft leader election, replicated log | Centralised databases |
 | 🖥️ **Dashboard UI** — glassmorphic SPA with real-time telemetry | Cloud consoles |
 
-**Every feature runs on your hardware, under your keys, with direct connections to the people you choose.**
+Local features run under the node operator's control. Optional remote providers and peer connections are reported as such.
 
 ---
 
@@ -78,6 +85,9 @@ Every service on the current internet requires you to trust a third party with y
 - [Ernos compiler](https://github.com/MettaMazza/Ernos-Programming-Language) (Rust — `cargo build --release`)
 - Clang (C compiler backend)
 - libsodium (`brew install libsodium` on macOS, `apt install libsodium-dev` on Linux)
+- OpenSSL and SQLite development libraries
+- libsecp256k1 (`brew install secp256k1` on macOS, `apt install libsecp256k1-dev` on Linux)
+- stable-diffusion.cpp shared library for the required image runtime; `build.sh` validates its presence
 
 ### Build & Run
 
@@ -99,6 +109,9 @@ ERNOSDECENT_PASSPHRASE="choose-a-strong-passphrase" ./node
 # Open the dashboard
 open http://localhost:8088
 
+# Read the per-installation password generated before the Web listener starts
+tr -d '\r\n' < ~/.ernosdecent/web-password; printf '\n'
+
 # Control the running node from another terminal:
 #   ./decent_cli/decent_cli status
 #   ./decent_cli/decent_cli pool status
@@ -117,9 +130,22 @@ open http://localhost:8088
 
 ### Multi-Node Cluster
 
+**Pre-launch notice:** automatic public bootstrap is not active yet. ErnosDecent does
+not ship an unverifiable external seed. The operated bootstrap node
+must have `network.is_static_host = 1`, a stable `network.public_host` DNS name, and a
+verified public endpoint before that name is added to the shipped default-seed list.
+Until then, every additional node must receive an explicit seed or have a previously
+verified peer in `~/.ernosdecent/peers.txt`. A static host never dials the operated
+default aliases that represent itself, but may still join an explicit or cached peer.
+
+Expose TCP `9101` for DHT bootstrap. Full participation also requires TCP `9100`
+(encrypted P2P), `9102` (relay registration), `9103` (Raft), and `9104` (compute).
+Keep IPC `5000` and Web `8088` loopback-only unless a separate authenticated reverse
+proxy and access policy are deliberately configured.
+
 ```bash
-# Start the seed node (default ports)
-./node &
+# Start the operated seed node (default ports; --host applies to this launch)
+./run_node.sh --host
 
 # Start a second node, bootstrapped to the seed
 ./node --port 9200 --seed 127.0.0.1:9101 &
@@ -128,9 +154,9 @@ open http://localhost:8088
 ./node --port 9400 --seed 127.0.0.1:9101 &
 
 # Verify cluster formation
-echo "STATUS" | nc -w2 127.0.0.1 5000   # Node 1: dht_size >= 1
-echo "STATUS" | nc -w2 127.0.0.1 9300   # Node 2: peers:1, dht_size:1
-echo "STATUS" | nc -w2 127.0.0.1 9500   # Node 3: peers:1, dht_size:1
+{ printf 'AUTH '; tr -d '\r\n' < ~/.ernosdecent/ipc-token; printf ' STATUS'; } | nc -w2 127.0.0.1 5000
+{ printf 'AUTH '; tr -d '\r\n' < ~/.ernosdecent/ipc-token; printf ' STATUS'; } | nc -w2 127.0.0.1 9300
+{ printf 'AUTH '; tr -d '\r\n' < ~/.ernosdecent/ipc-token; printf ' STATUS'; } | nc -w2 127.0.0.1 9500
 ```
 
 **Port layout:** `--port BASE` sets P2P=BASE, DHT=BASE+1, Relay=BASE+2, Raft=BASE+3, IPC=BASE+100, Web=BASE+80.
@@ -138,16 +164,18 @@ echo "STATUS" | nc -w2 127.0.0.1 9500   # Node 3: peers:1, dht_size:1
 ### Run All Tests
 
 ```bash
-# Unit + integration tests (per-subsystem)
-for test in decent_*/test_*.ep; do
-    ernos "$test" && "./${test%.ep}" || echo "FAIL: $test"
-done
+# Rebuild, check every native-target .ep file, compile and run the checked
+# subsystem/integration matrix, run the cognitive-agent suite, exercise both
+# additive C runtimes, validate shell syntax, and reject whitespace errors.
+bash scripts/release_check.sh
 
-# Live E2E tests (requires running daemon)
+# Live E2E tests (requires a running default-port daemon and uses its 0600 IPC token)
 bash test_live_e2e.sh
 
-# Multi-node stress tests (starts 3-node cluster)
+# Multi-node and stress harnesses use disposable state, start only their own
+# nodes, refuse occupied ports, and clean up the processes they own.
 bash test_multinode_live.sh
+bash test_stress_live.sh
 ```
 
 ---
@@ -259,7 +287,7 @@ ErnosDecent/
 
 | Module | What it does |
 |--------|-------------|
-| `content.ep` | Content-addressed storage engine. BLAKE3 hashing, deduplication, SQLite-backed chunk storage, garbage collection, CAR archive export/import, Merkle tree generation. |
+| `content.ep` | SHA-256 content-addressed storage, deduplication, SQLite-backed chunk storage, chunking, and Merkle tree generation. |
 | `crdt.ep` | Conflict-free Replicated Data Types. G-Counter, PN-Counter, LWW-Register, OR-Set, MV-Register — deterministic merging for eventual consistency. |
 
 **Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
@@ -281,7 +309,7 @@ ErnosDecent/
 
 | Module | What it does |
 |--------|-------------|
-| `nostr.ep` | Nostr event creation, stable serialisation, Ed25519 signing/verification, subscription filters. |
+| `nostr.ep` | NIP-01 canonical event hashing, BIP-340 secp256k1 signing/verification, WebSocket relay messages, and subscription filters. Plain `ws` is implemented; `wss` is not. |
 | `activitypub.ep` | ActivityPub actor profiles, activity wrappers (Create, Follow, Accept, Like), inbox/outbox delivery. |
 | `feed.ep` | Unified feed aggregation normalising Nostr events and ActivityPub activities into chronological order. |
 | `publish.ep` | Multi-protocol broadcasting to target feeds with publisher follow flows. |
@@ -305,7 +333,7 @@ ErnosDecent/
 |--------|-------------|
 | `http.ep` | Native HTTP server. Request path parsing, response building, single-connection socket handling. |
 | `static.ep` | Static route mapper for serving content by path. |
-| `email.ep` | SMTP/IMAP protocol hosting. Maps email addresses to DIDs and cryptographically verifies signatures. |
+| `email.ep` | Documented SMTP/IMAP command subsets, DID-backed address routing, and signature verification. It is not a complete SMTP/IMAP implementation. |
 | `git.ep` | Secure P2P git repository hosting. Authorizes collaborator roles and verifies commit signatures. |
 
 **Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
@@ -406,9 +434,9 @@ Agent-parity Phases 1–6 are done and gated. Since then: sessions + guidance, w
 
 | Module | What it does |
 |--------|-------------|
-| `bandwidth.ep` | Bandwidth sharing. Manages bandwidth tiers (free, emergency, premium), uploaded/downloaded byte counters, dynamic contribution scoring, rate limits, and anonymous routing proxy simulation. |
-| `compute.ep` | Compute pooling manager. Job submission queue, worker scheduling, contribution tracking, and redundant execution consensus verification. |
-| `mesh.ep` | Symbiotic mesh coordinate layer. Orchestrates bandwidth sharing, compute delegation, and onion-routed anonymous AI inference execution. |
+| `bandwidth.ep` | Bandwidth sharing with mutex-protected 60-second tier limits, byte counters, contribution scoring, tier-spoof rejection, and a checked TCP routing proxy. |
+| `compute.ep` | Mutex-protected compute manager with concurrent TCP worker assignment, result acknowledgement, contribution tracking, and distinct-worker redundancy checks. |
+| `mesh.ep` | Symbiotic mesh coordinate layer. Orchestrates bandwidth accounting and compute-job coordination; its current collaborative-AI path runs redundant local inference and verifies matching results. It does not onion-route inference. |
 
 **Tests:** ships its own test suite (`test_*.ep`); see "Run All Tests".
 
@@ -496,14 +524,14 @@ See [ERNOS_REFERENCE.md](docs/ERNOS_REFERENCE.md) for the full language specific
 | Test lines | ~18,300 |
 | Agent tools | 71 |
 | Test coverage | each subsystem ships its own suite; node builds and boots, core paths verified |
-| External dependencies | libsodium (plus optional FFI: libespeak-ng, onnxruntime, libopus, libvpx, libsrtp2, whisper.cpp, libstable-diffusion) |
+| External dependencies | Clang, SQLite, libsodium, OpenSSL, libsecp256k1, stable-diffusion.cpp; optional configured backends include espeak-ng, ONNX Runtime, Opus, VPX, SRTP, and whisper.cpp |
 | Target platforms | macOS (ARM64, x86_64) · Linux (x86_64, aarch64) · Windows via WSL2 (runs the Linux build) |
 
 ---
 
 ## Roadmap
 
-v1.0.0-beta is the first public release. The architecture is proven and verified. What comes next:
+This checklist names implemented areas and explicit interoperability boundaries. An unchecked item is not represented as complete elsewhere in this README.
 
 - [x] **Node Daemon** — unified coordinator for all subsystems
 - [x] **Web Dashboard** — glassmorphic SPA with real-time telemetry
@@ -512,15 +540,15 @@ v1.0.0-beta is the first public release. The architecture is proven and verified
 - [x] **Onion Routing** — multi-hop anonymity with mix networks
 - [x] **Distributed Search** — crawl, rank, and query the decentralised web
 - [x] **Resource Pooling** — bandwidth sharing, compute delegation, symbiotic mesh
-- [x] **Email & Git Hosting** — SMTP/IMAP and Git over the P2P layer
+- [x] **Email & Git Hosting Primitives** — documented SMTP/IMAP subsets and Git helpers
 - [x] **Multi-Node Bootstrap** — CLI `--seed`/`--port`, DHT discovery, Raft peer sync
 - [x] **Real UTXO Transfers** — Ed25519-signed transactions, overdraft protection
 - [x] **DHT Key-Value Store** — store/get via IPC and Web UI
 - [x] **Decentralised Name Registry** — register/resolve via IPC and Web UI
 - [x] **Cross-Platform Build** — `build.sh` auto-detects macOS/Linux, Homebrew/system paths
-- [x] **Live E2E Test Suite** — 100+ assertions covering all user-facing features
+- [x] **Live E2E Test Suite** — native integration coverage recorded in the verification record
 - [x] **Multi-Node Stress Tests** — 3-node cluster formation, failure recovery, concurrent ops
-- [ ] **QUIC Transport** — production UDP transport replacing simulated connections
+- [ ] **QUIC Transport** — multiplexed low-latency transport alongside the current TCP/UDP transports
 - [ ] **NAT Traversal** — STUN/TURN integration for direct peer connections
 - [ ] **Double Ratchet** — Signal-protocol-grade forward secrecy for messaging
 - [x] **Windows (via WSL2)** — runs the Linux build unchanged inside WSL2 Ubuntu
@@ -550,7 +578,7 @@ For guides on how to use and understand the ErnosDecent system, refer to:
 - [System Guide Synthesis](docs/system_guide_synthesis.md) — The technical subsystem documentation covering architecture, schemas, and APIs.
 - [GitDec Simple User Guide](docs/gitdec_user_guide.md) — A friendly, clear guide on how to host and collaborate on repositories using GitDec.
 - Subsystem guides: [Network & DHT](docs/network_dht_guide.md) · [Storage & CRDTs](docs/storage_crdt_guide.md) · [Identity Registry](docs/identity_registry_guide.md) · [Ledger & DEX](docs/ledger_dex_guide.md) · [Messaging & Social](docs/messaging_social_guide.md) · [Resource Pooling](docs/resource_pooling_guide.md) · [Turing Grid & Hebbian Memory](docs/turing_hebbian_guide.md) · [Settings](docs/settings_guide.md)
-- [AGENT.md](docs/AGENT.md) — The engineering laws every change to this codebase is held to.
+- [AGENT.md](AGENT.md) — The engineering laws every change to this codebase is held to.
 - [master_prompt.md](master_prompt.md) — A 13-block full-system diagnostic that exercises every agent tool with pass/fail scorecards.
 - [CHANGELOG.md](CHANGELOG.md) — Dated record of all notable changes.
 - [Ernos Reference Manual](docs/ERNOS_REFERENCE.md) — The official reference manual for the Ernos programming language syntax and standard library.

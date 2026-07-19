@@ -35,6 +35,7 @@ set ERR_KEY_NOT_FOUND to 8
 set ERR_KEY_REVOKED to 9
 set ERR_PASSPHRASE_WRONG to 10
 set ERR_FILE_IO to 11
+set ERR_RANDOM_FAILED to 12
 
 # ════════════════════════════════════════════════════════════════
 # State
@@ -78,7 +79,7 @@ define hex_to_raw with hex_str as Str and out_ptr as Int and out_max as Int retu
 # Key Generation
 # ════════════════════════════════════════════════════════════════
 
-define generate_signing_keypair:
+define generate_signing_keypair returning Map:
     set err to init_crypto()
     if err != ERR_NONE:
         set result to create_map()
@@ -119,7 +120,7 @@ define generate_signing_keypair:
     set ok to map_insert(result and "error" and ERR_NONE)
     return result
 
-define generate_encryption_keypair:
+define generate_encryption_keypair returning Map:
     set err to init_crypto()
     if err != ERR_NONE:
         set result to create_map()
@@ -159,7 +160,7 @@ define generate_encryption_keypair:
     set ok to map_insert(result and "error" and ERR_NONE)
     return result
 
-define generate_identity_keypair:
+define generate_identity_keypair returning Map:
     set signing to generate_signing_keypair()
     set sign_err to map_get_val(signing and "error")
     if sign_err != ERR_NONE:
@@ -186,7 +187,7 @@ define generate_identity_keypair:
     set ok to map_insert(result and "error" and ERR_NONE)
     return result
 
-define generate_symmetric_key:
+define generate_symmetric_key returning Map:
     set err to init_crypto()
     if err != ERR_NONE:
         set result to create_map()
@@ -209,7 +210,7 @@ define generate_symmetric_key:
 # Signing & Verification
 # ════════════════════════════════════════════════════════════════
 
-define sign_message with message as Str and secret_key_hex as Str:
+define sign_message with message as Str and secret_key_hex as Str returning Map:
     set err to init_crypto()
     if err != ERR_NONE:
         set result to create_map()
@@ -254,11 +255,16 @@ define sign_message with message as Str and secret_key_hex as Str:
 # Used for the web password, the IPC auth token, and the WS first-frame token.
 # Returns "" only if the crypto subsystem cannot initialize (caller must fail closed).
 define keys_random_hex with n_bytes as Int returning Str:
+    if n_bytes <= 0 or else n_bytes > 1048576:
+        return ""
     set err to init_crypto()
     if err != ERR_NONE:
         return ""
     set buf to alloc_bytes(n_bytes)
     set fn_rand to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    if buf == 0 or else fn_rand == 0:
+        set ok to free_bytes(buf)
+        return ""
     set ok to ep_dlcall2(fn_rand and buf and n_bytes)
     set hexstr to raw_to_hex(buf and n_bytes)
     set ok to free_bytes(buf)
@@ -406,7 +412,7 @@ define verify_signature with message as Str and signature_hex as Str and public_
 # Symmetric Encryption (XSalsa20-Poly1305)
 # ════════════════════════════════════════════════════════════════
 
-define encrypt_symmetric with plaintext as Str and key_hex as Str:
+define encrypt_symmetric with plaintext as Str and key_hex as Str returning Map:
     set err to init_crypto()
     if err != ERR_NONE:
         set result to create_map()
@@ -453,7 +459,7 @@ define encrypt_symmetric with plaintext as Str and key_hex as Str:
     set ok to map_insert(result and "error" and ERR_NONE)
     return result
 
-define decrypt_symmetric with ciphertext_hex as Str and nonce_hex as Str and key_hex as Str:
+define decrypt_symmetric with ciphertext_hex as Str and nonce_hex as Str and key_hex as Str returning Map:
     set err to init_crypto()
     if err != ERR_NONE:
         set result to create_map()
@@ -507,7 +513,7 @@ define decrypt_symmetric with ciphertext_hex as Str and nonce_hex as Str and key
 # Public-Key Encryption (X25519 + XSalsa20-Poly1305)
 # ════════════════════════════════════════════════════════════════
 
-define encrypt_to_recipient with plaintext as Str and recipient_pk_hex as Str and sender_sk_hex as Str:
+define encrypt_to_recipient with plaintext as Str and recipient_pk_hex as Str and sender_sk_hex as Str returning Map:
     set err to init_crypto()
     if err != ERR_NONE:
         set result to create_map()
@@ -561,7 +567,7 @@ define encrypt_to_recipient with plaintext as Str and recipient_pk_hex as Str an
     set ok to map_insert(result and "error" and ERR_NONE)
     return result
 
-define decrypt_from_sender with ciphertext_hex as Str and nonce_hex as Str and sender_pk_hex as Str and recipient_sk_hex as Str:
+define decrypt_from_sender with ciphertext_hex as Str and nonce_hex as Str and sender_pk_hex as Str and recipient_sk_hex as Str returning Map:
     set err to init_crypto()
     if err != ERR_NONE:
         set result to create_map()
@@ -644,7 +650,7 @@ define hkdf_expand with prk_hex as Str and info as Str and output_length as Int 
         set counter to counter + 1
     return substring(result_str and 0 and output_length * 2)
 
-define derive_key with master_key_hex as Str and purpose as Str and key_index as Int:
+define derive_key with master_key_hex as Str and purpose as Str and key_index as Int returning Map:
     set index_str to int_to_string(key_index)
     set info to concat(purpose and ":")
     set info to concat(info and index_str)
@@ -777,7 +783,7 @@ define keys_pbkdf2_hmac_sha256 with passphrase as Str and salt_hex as Str and it
 
     return derived_hex
 
-define keystore_create with passphrase as Str and filepath as Str:
+define keystore_create with passphrase as Str and filepath as Str returning Map:
     set identity to generate_identity_keypair()
     set id_err to map_get_val(identity and "error")
     if id_err != ERR_NONE:
@@ -791,6 +797,11 @@ define keystore_create with passphrase as Str and filepath as Str:
     # Generate 16-byte random salt
     set salt_buf to alloc_bytes(16)
     set fn_rand to ep_dlsym(SODIUM_HANDLE and "randombytes_buf")
+    if salt_buf == 0 or else fn_rand == 0:
+        set ok to free_bytes(salt_buf)
+        set result to create_map()
+        set ok to map_insert(result and "error" and ERR_RANDOM_FAILED)
+        return result
     set ok to ep_dlcall2(fn_rand and salt_buf and 16)
     set salt_hex to raw_to_hex(salt_buf and 16)
     set ok to free_bytes(salt_buf)
@@ -860,7 +871,7 @@ define keystore_create with passphrase as Str and filepath as Str:
     set ok to map_insert(result and "error" and ERR_NONE)
     return result
 
-define keystore_unlock with passphrase as Str and filepath as Str:
+define keystore_unlock with passphrase as Str and filepath as Str returning Map:
     set file_content to file_read(filepath)
     if string_length(file_content) == 0:
         set result to create_map()

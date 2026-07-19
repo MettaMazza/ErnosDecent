@@ -6,13 +6,14 @@
 import "collections"
 import "string"
 import "json"
+import "fs"
 import "../stdlib/http"
 import "./model_registry"
 
-external define ep_net_connect with host and port
-external define ep_net_close with fd
-external define ep_net_send with fd and data returning Int
-external define ep_net_recv with fd and max_len returning Str
+external define ep_net_connect with host as Str and port as Int returning Int
+external define ep_net_close with fd as Int returning Int
+external define ep_net_send with fd as Int and data as Str returning Int
+external define ep_net_recv with fd as Int and max_len as Int returning Str
 
 # ─────────────────────────────────────────────────────────────────────────────
 # http_post_async — ASYNC HTTP POST.
@@ -50,6 +51,11 @@ async define http_post_async with url as Str and headers as Str and body as Str 
     set req to concat(req and concat("Connection: close\r\nContent-Length: " and concat(int_to_string(string_length(body)) and "\r\n\r\n")))
     set req to concat(req and body)
     set sent to ep_net_send(fd and req)
+    if sent != string_length(req):
+        set close_err to ep_net_close(fd)
+        if close_err != 0:
+            return "Error: request send failed and the LLM socket could not be closed"
+        return "Error: request send failed"
     # The tick-loop lives in llm_read_response — a PLAIN function, deliberately. See
     # the COMPILER BUG note on that function: an await inside a repeat-while in an
     # ASYNC define mis-lowers (the wait registration is hoisted before the loop, so
@@ -57,7 +63,9 @@ async define http_post_async with url as Str and headers as Str and body as Str 
     # '[LLM] read timeout (300s)' firing after 1002 ms). Plain functions lower awaits
     # to ep_await_future per call, which pumps the event loop cooperatively.
     set raw to llm_read_response(fd)
-    set ok to ep_net_close(fd)
+    set close_err to ep_net_close(fd)
+    if close_err != 0:
+        return "Error: LLM response received but the socket could not be closed"
     # Strip HTTP headers — return the body (chunked or not), like the old http_post.
     set hsep to string_index_of(raw and "\r\n\r\n")
     if hsep >= 0:
@@ -109,8 +117,11 @@ define llm_read_response with fd as Int returning Str:
 define is_port_open with host as Str and port as Int returning Int:
     set fd to ep_net_connect(host and port)
     if fd > 0:
-        set ok to ep_net_close(fd)
-        return 1
+        set close_err to ep_net_close(fd)
+        if close_err == 0:
+            return 1
+        display f"[-] Port probe connected to {host}:{port} but could not close its socket."
+        return 0 - 1
     return 0
 
 # Fast JSON escaper for the LLM hot path. Delegates to a one-pass C helper (ep_json_escape,
@@ -120,15 +131,15 @@ define is_port_open with host as Str and port as Int returning Int:
 # both cost ~2-4s per LLM call on a 42-63K-char prompt (the dominant per-turn latency) and
 # produced malformed JSON (Ollama: "invalid character '\f'…") when a prompt contained a
 # control byte. This helper is O(n) and escapes every control char (< 32) correctly.
-external define ep_json_escape with s returning Str
+external define ep_json_escape with s as Str returning Str
 external define ep_time_now_ms returning Int
 # Awaitable readable-or-timeout (injected by build.sh). Returns 1 when fd is readable, 0
 # on timeout. Lets the LLM read loop bound how long it waits so a dead server can't hang
 # the single-threaded daemon forever.
-external define async_wait_readable_timeout with fd and timeout_ms returning Int
+external define async_wait_readable_timeout with fd as Int and timeout_ms as Int returning Int
 # SAFETY: global cancel EPOCH (monotonic latch; injected by build.sh). Compared, never
 # consumed — every concurrent run/read sees the same Stop.
-external define ep_cancel_epoch_get with dummy returning Int
+external define ep_cancel_epoch_get with dummy as Int returning Int
 
 define llm_json_escape with s as Str returning Str:
     if string_length(s) == 0:
@@ -229,25 +240,37 @@ define http_dechunk with body as Str returning Str:
 
 define get_system_ram_gb returning Int:
     set ram_gb to 16
-    set sys_res to run_command("sysctl -n hw.memsize 2>/dev/null")
-    if string_length(sys_res) > 0:
-        set bytes to string_to_int(sys_res)
-        if bytes > 0:
-            return bytes / 1073741824
-    set mem_res to run_command("grep MemTotal /proc/meminfo 2>/dev/null")
-    if string_length(mem_res) > 0:
+    set os_name to ep_os_name()
+    if os_name equals "macos":
+        set sys_res to run_command("sysctl -n hw.memsize 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+        set marker to string_index_of(sys_res and "__ERNOS_EXIT__:")
+        if string_contains(sys_res and "__ERNOS_EXIT__:0") == 1 and marker > 0:
+            set bytes to string_to_int(substring(sys_res and 0 and marker))
+            if bytes > 0:
+                return bytes / 1073741824
+        display "[-] LLM router could not determine macOS RAM; using the configured 16 GiB fallback."
+        return ram_gb
+    if os_name equals "linux":
+        set mem_res to run_command("grep MemTotal /proc/meminfo 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+        set marker to string_index_of(mem_res and "__ERNOS_EXIT__:")
+        set mem_body to ""
+        if string_contains(mem_res and "__ERNOS_EXIT__:0") == 1 and marker > 0:
+            set mem_body to substring(mem_res and 0 and marker)
         set clean_digits to ""
-        set len to string_length(mem_res)
+        set len to string_length(mem_body)
         set i to 0
         repeat while i < len:
-            set ch to get_character(mem_res and i)
+            set ch to get_character(mem_body and i)
             if ch >= 48 and ch <= 57:
-                set clean_digits to concat(clean_digits and substring(mem_res and i and 1))
+                set clean_digits to concat(clean_digits and substring(mem_body and i and 1))
             set i to i + 1
         if string_length(clean_digits) > 0:
             set kb to string_to_int(clean_digits)
             if kb > 0:
                 return kb / 1048576
+        display "[-] LLM router could not determine Linux RAM; using the configured 16 GiB fallback."
+        return ram_gb
+    display "[-] LLM router is running on an unknown OS; using the configured 16 GiB RAM fallback."
     return ram_gb
 
 define get_model_context_limit with model_name as Str returning Int:
@@ -651,7 +674,7 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
 
 # Binary-safe file→base64 (C helper injected by build.sh). A PNG has NUL bytes that a
 # normal string read would truncate, so images must go through this.
-external define ep_file_to_base64 with path returning Str
+external define ep_file_to_base64 with path as Str returning Str
 
 # Multimodal VISION query: send an image + a prompt to a vision-capable local model (gemma4
 # is multimodal) and return its description. Uses the OpenAI /v1/chat/completions content-array

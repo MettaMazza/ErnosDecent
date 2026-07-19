@@ -46,15 +46,21 @@ external define tools_set_active_session with sid as Str returning Int
 # P11 (test_all_systems): async-yielding sleep between sub-agent polls, the global
 # cancel flag (honor a user Stop between blocks), and the ms clock for wall time.
 # All are C helpers injected by build.sh; also declared where llm/react_loop use them.
-external define ep_async_sleep_ms with ms returning Int
-external define ep_cancel_get with dummy returning Int
-external define ep_cancel_set with v returning Int
+external define ep_async_sleep_ms with ms as Int returning Int
+external define ep_cancel_get with dummy as Int returning Int
+external define ep_cancel_set with v as Int returning Int
 external define ep_time_now_ms returning Int
 # SAFETY: cancel EPOCH (monotonic latch; compared, never consumed) — see react_loop.ep.
-external define ep_cancel_epoch_get with dummy returning Int
+external define ep_cancel_epoch_get with dummy as Int returning Int
 
 # Single-flight guard for the background validation coordinator — one run at a time.
 set TEST_ALL_RUNNING to create_map()
+
+define tools_trace_emit_checked with db as Int and session_id as Str and event_type as Str and content as Str returning Int:
+    set trace_error to trace_emit(db and session_id and event_type and content)
+    if trace_error != 0:
+        display concat("[-] Tool trace persistence failed: " and event_type)
+    return trace_error
 
 # PLAIN await wrapper — COMPILER BUG guard (see llm_read_response in llm.ep): an await
 # inside a repeat-while in an ASYNC define mis-lowers and spins instead of sleeping.
@@ -76,9 +82,9 @@ async define image_gen_finish with ctx as Map and db as Int and sess as Str and 
     set ok to tools_emit_attachment(sess and path and ctx)
     set desc to query_vision("You just generated this image for the user from their prompt. Look at it and describe, in 2-3 vivid and specific sentences, what it actually shows — composition, subject, colour, mood. Speak as if presenting it to them." and path and vmodel)
     if string_length(desc) > 0:
-        set ok to trace_emit(db and sess and "mid_message" and concat("🎨 Here's the image you asked for. Looking at it: " and desc))
+        set ok to tools_trace_emit_checked(db and sess and "mid_message" and concat("🎨 Here's the image you asked for. Looking at it: " and desc))
     else:
-        set ok to trace_emit(db and sess and "mid_message" and concat("🎨 Here's the image you asked for: " and path))
+        set ok to tools_trace_emit_checked(db and sess and "mid_message" and concat("🎨 Here's the image you asked for: " and path))
     return 0
 
 # Poll the render job row; sleep+re-enqueue while pending, hand off when done.
@@ -86,16 +92,16 @@ async define image_gen_poll with ctx as Map and db as Int and sess as Str and jo
     set st to image_gen_job_result(db and job)
     if string_index_of(st and "pending:") == 0:
         if ep_cancel_epoch_get(0) > epoch:
-            set ok to trace_emit(db and sess and "mid_message" and "🎨 Image generation was stopped (the render thread may still finish and drop its PNG in the workspace).")
+            set ok to tools_trace_emit_checked(db and sess and "mid_message" and "🎨 Image generation was stopped (the render thread may still finish and drop its PNG in the workspace).")
             return 0
         if waited >= 1200000:
-            set ok to trace_emit(db and sess and "mid_message" and "🎨 Image generation timed out after 20 minutes.")
+            set ok to tools_trace_emit_checked(db and sess and "mid_message" and "🎨 Image generation timed out after 20 minutes.")
             return 0
         set ok to await ep_async_sleep_ms(1500)
         set nxt to image_gen_poll(ctx and db and sess and job and vmodel and epoch and waited + 1500)
         return 0
     if string_contains(st and "ERROR:") == 1:
-        set ok to trace_emit(db and sess and "mid_message" and concat("🎨 Image generation failed: " and st))
+        set ok to tools_trace_emit_checked(db and sess and "mid_message" and concat("🎨 Image generation failed: " and st))
         return 0
     set fin to image_gen_finish(ctx and db and sess and st and vmodel)
     return 0
@@ -190,16 +196,21 @@ define tools_validation_fill with state as Map returning Int:
             if string_length(skip_reason) > 0:
                 set ok to map_insert(state and "skip_blocks" and map_get_val(state and "skip_blocks") + 1)
                 set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n⏭️ SKIPPED: {skip_reason}\n\n"))
-                set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) skipped — {skip_reason}")
+                set ok to tools_trace_emit_checked(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) skipped — {skip_reason}")
             else:
-                set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) started (parallel)")
+                set ok to tools_trace_emit_checked(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) started (parallel)")
                 set instr to concat("[AUTOMATED VALIDATION SUB-AGENT] You are executing ONE block of the full-system validation. Execute it exactly, no questions, and END with reply_request containing the scorecard table.\n\n" and map_get_val(bmap and "block"))
                 set tid to orchestrator_spawn(map_get_val(state and "orch") and instr and f"validator-block-{bn}" and map_get_val(state and "model") and map_get_val(state and "memory") and map_get_val(state and "tools") and map_get_val(state and "ctx_int"))
-                set entry to create_map()
-                set ok to map_insert(entry and "tid" and tid)
-                set ok to map_insert(entry and "bn" and bn)
-                set ok to map_insert(entry and "title" and title)
-                set ok to append_list(inflight and entry)
+                if string_index_of(tid and "error:") == 0:
+                    set ok to map_insert(state and "fail_blocks" and map_get_val(state and "fail_blocks") + 1)
+                    set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n❌ FAILED TO DISPATCH: {tid}\n\n"))
+                    set ok to tools_trace_emit_checked(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"❌ test_all_systems: block {bn} dispatch failed — {tid}")
+                else:
+                    set entry to create_map()
+                    set ok to map_insert(entry and "tid" and tid)
+                    set ok to map_insert(entry and "bn" and bn)
+                    set ok to map_insert(entry and "title" and title)
+                    set ok to append_list(inflight and entry)
             set ok to map_insert(state and "next_idx" and idx + 1)
     return 0
 
@@ -224,7 +235,7 @@ define tools_validation_reap with state as Map returning Int:
             else:
                 set ok to map_insert(state and "pass_blocks" and map_get_val(state and "pass_blocks") + 1)
             set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n{result}\n\n"))
-            set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) done")
+            set ok to tools_trace_emit_checked(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) done")
         else if st equals "cancelled" or else st equals "not_found":
             set ok to map_insert(state and "fail_blocks" and map_get_val(state and "fail_blocks") + 1)
             set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n(sub-agent {st})\n\n"))
@@ -237,7 +248,7 @@ define tools_validation_reap with state as Map returning Int:
 # Finish: totals, write + attach the report, announce, release the single-flight guard.
 define tools_validation_finalize with state as Map returning Int:
     if map_get_val(state and "aa_on") == 1:
-        set ok to map_delete(cast_borrow_to_map(map_get_val(state and "ctx_int")) and "child_auto_approve")
+        set ok to map_delete(cast_int_to_map(map_get_val(state and "ctx_int")) and "child_auto_approve")
     set wall to (ep_time_now_ms() - map_get_val(state and "started")) / 1000
     set total to length_list(map_get_val(state and "blocks"))
     set pass_blocks to map_get_val(state and "pass_blocks")
@@ -246,11 +257,14 @@ define tools_validation_finalize with state as Map returning Int:
     set report to concat(map_get_val(state and "report") and f"---\n**Blocks: {total} total — {pass_blocks} clean, {fail_blocks} with failures, {skip_blocks} skipped. Wall time: {wall}s.** Per-call prefill/decode timings are in the node log ([LLM TTFT]).\n")
     set fname to concat("validation_report_" and concat(int_to_string(map_get_val(state and "started")) and ".md"))
     set rpath to workspace_write_file(fname and report)
+    if string_length(rpath) == 0:
+        set ok to map_delete(TEST_ALL_RUNNING and "run")
+        return 1
     set attach_note to ""
     set _ea_ctx to create_map()
     if tools_emit_attachment(map_get_val(state and "sid") and rpath and _ea_ctx) == 0:
         set attach_note to " Report attached."
-    set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems COMPLETE: {total} blocks — {pass_blocks} clean, {fail_blocks} with failures, {skip_blocks} skipped, {wall}s. Report: {rpath}.{attach_note}")
+    set ok to tools_trace_emit_checked(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems COMPLETE: {total} blocks — {pass_blocks} clean, {fail_blocks} with failures, {skip_blocks} skipped, {wall}s. Report: {rpath}.{attach_note}")
     set ok to map_delete(TEST_ALL_RUNNING and "run")
     return 0
 
@@ -318,7 +332,7 @@ define tools_create with role as Str returning Map:
     if is_admin == 1:
         set schemas to concat(schemas and "- codebase_read([path: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Read a file. The result begins with a header '[File: <path> | Lines: N | Size: B bytes]'. Files over 500 lines return ONLY the first 500 lines plus a hint — you MUST call codebase_read_range for the remaining chunks; do not assume the first chunk is the whole file.\n")
-        set schemas to concat(schemas and "  Example: Action: codebase_read([\"docs/AGENT.md\"])\n\n")
+        set schemas to concat(schemas and "  Example: Action: codebase_read([\"AGENT.md\"])\n\n")
 
         set schemas to concat(schemas and "- codebase_read_range([path: Str, start_line: Int, end_line: Int]) -> Str\n")
         set schemas to concat(schemas and "  Description: Read a specific inclusive line range of any file. Returns '[Lines s-e of N total]' and a pre-computed hint for the next range. Use this to page through large files reported by codebase_read or file_info.\n")
@@ -1014,7 +1028,13 @@ define tools_self_write_section with section as Str and text as Str returning In
     set out to concat(out and json_escape_string(skills))
     set out to concat(out and "\"}")
     # Write the LIVE copy to the data dir — never the git-tracked template.
-    set ok to write_file(storage_self_sections_path() and out)
+    set self_path to storage_self_sections_path()
+    if string_length(self_path) == 0:
+        return 1
+    set ok to write_file(self_path and out)
+    if ok == 0:
+        display concat("[-] Failed to persist self-prompt section: " and self_path)
+        return 1
     return 0
 
 # ── Outbound file attachment ────────────────────────────────────────────────
@@ -1052,6 +1072,9 @@ define tools_emit_attachment with session_id as Str and path as Str and ctx as M
     set es to string_replace(key and "'" and "''")
     set ep to string_replace(path and "'" and "''")
     set ok to sql_execute(db and f"INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('{es}', 'attachment', '{ep}', strftime('%s','now'), 0);")
+    if ok != 0:
+        display f"[Attachment] FAILED to queue for delivery: {path}"
+        return 1
     display f"[Attachment] queued for delivery: {path}"
     # Propagate to parent session so Discord bridge / WebUI see sub-agent attachments.
     # When a sub-agent (session_id = task_id like "agent_1") emits an attachment, the
@@ -1061,6 +1084,9 @@ define tools_emit_attachment with session_id as Str and path as Str and ctx as M
         set ea_psid to map_get_val(ctx and "parent_session_id")
         set ea_pes to string_replace(ea_psid and "'" and "''")
         set ok to sql_execute(db and f"INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('{ea_pes}', 'attachment', '{ep}', strftime('%s','now'), 0);")
+        if ok != 0:
+            display f"[Attachment] FAILED to propagate to parent session: {ea_psid}"
+            return 1
         display f"[Attachment] propagated to parent session: {ea_psid}"
     return 0
 
@@ -1362,7 +1388,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
 
     if action_name equals "codebase_read":
         if length_list(args_list) < 1:
-            return "Error: codebase_read requires 1 argument (path). Example: Action: codebase_read([\"docs/AGENT.md\"])"
+            return "Error: codebase_read requires 1 argument (path). Example: Action: codebase_read([\"AGENT.md\"])"
         set path to get_list(args_list and 0)
         # Access gate: when Full-PC access is OFF, reading outside the project is gated.
         # (Sensitive-path reads are handled as a warn+approve via tools_requires_approval.)
@@ -1499,6 +1525,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set cl_size_before to string_length(cl_existing)
         # Write the file
         set ok to write_file(path and content)
+        if ok == 0:
+            return f"Error: failed to write file '{path}'."
         # Changelog: capture after-state and log
         set cl_hash_after to changelog_hash_file(path)
         set cl_size_after to string_length(content)
@@ -1506,6 +1534,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if map_contains(ctx and "session_id") == 1:
             set cl_sess to map_get_val(ctx and "session_id")
         set ok to changelog_log_change(cl_sess and "codebase_write" and path and "write" and cl_hash_before and cl_hash_after and cl_size_before and cl_size_after and f"File '{path}' written.")
+        if ok != 0:
+            return f"Error: file '{path}' was written, but its required changelog record could not be persisted."
         # Auto-attach the file the agent just made to the user's chat (Discord/WebUI),
         # so they don't have to go find it. Approved-write-only, secret-safe (see helper).
         # Only claim it was attached when the emit actually queued it (0), never on a refuse/skip.
@@ -1618,6 +1648,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
 
     if action_name equals "user_knowledge_get":
         set uk_path to storage_user_knowledge_path_for(prompt_persona_current_name())
+        if string_length(uk_path) == 0:
+            return "Error: user-knowledge storage is unavailable."
         if file_exists(uk_path) == 0:
             return "(empty — nothing recorded about this user yet. Use user_knowledge_update to start the file.)"
         set uk_body to string_trim(read_file(uk_path))
@@ -1633,11 +1665,18 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: refusing to blank the user-knowledge file — pass the full consolidated document."
         if string_length(uk_text) > 8000:
             return "Error: document exceeds the 8000-char cap — consolidate (merge duplicates, drop stale entries) and retry."
-        set ok to write_file(storage_user_knowledge_path_for(prompt_persona_current_name()) and uk_text)
+        set uk_path to storage_user_knowledge_path_for(prompt_persona_current_name())
+        if string_length(uk_path) == 0:
+            return "Error: user-knowledge storage is unavailable."
+        set ok to write_file(uk_path and uk_text)
+        if ok == 0:
+            return "Error: user knowledge could not be persisted."
         return "User knowledge updated (this persona's file). It is injected into every prompt from your next turn."
 
     if action_name equals "self_knowledge_get":
         set sk_path to storage_self_knowledge_path_for(prompt_persona_current_name())
+        if string_length(sk_path) == 0:
+            return "Error: self-knowledge storage is unavailable."
         if file_exists(sk_path) == 0:
             return "(empty — nothing recorded about yourself yet. Use self_knowledge_update to start the file.)"
         set sk_body to string_trim(read_file(sk_path))
@@ -1653,7 +1692,12 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: refusing to blank the self-knowledge file — pass the full consolidated document."
         if string_length(sk_text) > 8000:
             return "Error: document exceeds the 8000-char cap — consolidate (merge duplicates, drop stale entries) and retry."
-        set ok to write_file(storage_self_knowledge_path_for(prompt_persona_current_name()) and sk_text)
+        set sk_path to storage_self_knowledge_path_for(prompt_persona_current_name())
+        if string_length(sk_path) == 0:
+            return "Error: self-knowledge storage is unavailable."
+        set ok to write_file(sk_path and sk_text)
+        if ok == 0:
+            return "Error: self knowledge could not be persisted."
         return "Self knowledge updated (this persona's file). It is injected into every prompt from your next turn."
 
     if action_name equals "persona_set":
@@ -1683,6 +1727,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             if string_length(txt) > 4000:
                 return "Error: section text exceeds the 4000-char cap. Keep it concise."
             set ok to tools_self_write_section(sec and txt)
+            if ok != 0:
+                return "Error: the self-prompt section could not be persisted."
             return concat(concat("Updated your [[" and concat(string_upper(sec) and "]] section.")) and " It takes effect on your next turn.")
         return "Error: only 'behavior' and 'skills' are editable. The kernel, rules, and identity are immutable and cannot be changed."
 
@@ -1745,7 +1791,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         spawn image_gen_thread_worker(gi_job and gi_prompt and gi_name and 1024 and 1024 and 28 and 7 and gi_stamp)
         display f"[ImageGen] job {gi_job} dispatched — agent turn returns; result posts async."
         set gi_prompt_esc to string_replace(gi_prompt and "\"" and "'")
-        set ok to trace_emit(gi_db and gi_sess and "image_progress" and concat("{\"status\":\"started\",\"prompt\":\"" and concat(gi_prompt_esc and "\"}")))
+        set ok to tools_trace_emit_checked(gi_db and gi_sess and "image_progress" and concat("{\"status\":\"started\",\"prompt\":\"" and concat(gi_prompt_esc and "\"}")))
         set gi_chain to image_gen_poll(ctx and gi_db and gi_sess and gi_job and gi_vmodel and ep_cancel_epoch_get(0) and 0)
         return "Your image is rendering in the background — it will post to the chat with a description as soon as it's ready (usually 1–3 minutes at this quality). Tell the user it's on the way and FINISH YOUR TURN now; do not wait for it."
 
@@ -1909,6 +1955,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set escaped_doc to string_replace(doc_name and "'" and "''")
             set sql to concat("INSERT INTO reading_progress (document_name, current_chunk, notes, updated_at) VALUES ('" and concat(escaped_doc and concat("', " and concat(int_to_string(chunk_idx) and concat(", '', 0) ON CONFLICT(document_name) DO UPDATE SET current_chunk=" and concat(int_to_string(chunk_idx) and ";"))))))
             set ok to sql_execute(DB and sql)
+            if ok != 0:
+                return f"Error: bookmark persistence failed for '{doc_name}'."
             return f"Bookmark set for '{doc_name}' at chunk {chunk_idx}."
             
         if action equals "get_bookmark":
@@ -1944,6 +1992,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set escaped_new_notes to string_replace(new_notes and "'" and "''")
             set sql_ins to concat("INSERT INTO reading_progress (document_name, current_chunk, notes, updated_at) VALUES ('" and concat(escaped_doc and concat("', 0, '" and concat(escaped_new_notes and concat("', 0) ON CONFLICT(document_name) DO UPDATE SET notes='" and concat(escaped_new_notes and "';"))))))
             set ok to sql_execute(DB and sql_ins)
+            if ok != 0:
+                return f"Error: note persistence failed for '{doc_name}'."
             return f"Note appended for '{doc_name}'."
             
         if action equals "get_notes":
@@ -1987,6 +2037,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
                     set next_bk to start_chunk + 1
                     set sql_upd_raw to concat("INSERT INTO reading_progress (document_name, current_chunk, notes, updated_at) VALUES ('" and concat(escaped_doc and concat("', " and concat(int_to_string(next_bk) and concat(", '', 0) ON CONFLICT(document_name) DO UPDATE SET current_chunk=" and concat(int_to_string(next_bk) and ";"))))))
                     set ok to sql_execute(DB and sql_upd_raw)
+                    if ok != 0:
+                        return f"Error: raw-file reading progress could not be persisted for '{doc_name}'."
                     return concat(f"Auto-reading '{doc_name}' (raw file, page {start_chunk}):\n\n" and concat(range_result and f"\nProgress saved: next page is {next_bk}."))
                 return f"No chunks found for '{doc_name}' at or after chunk {start_chunk}."
                 
@@ -2002,6 +2054,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set next_chunk to start_chunk + chunks_len
             set sql_upd to concat("INSERT INTO reading_progress (document_name, current_chunk, notes, updated_at) VALUES ('" and concat(escaped_doc and concat("', " and concat(int_to_string(next_chunk) and concat(", '', 0) ON CONFLICT(document_name) DO UPDATE SET current_chunk=" and concat(int_to_string(next_chunk) and ";"))))))
             set ok to sql_execute(DB and sql_upd)
+            if ok != 0:
+                return f"Error: reading progress could not be persisted for '{doc_name}'."
             
             set out to concat(out and f"Progress saved: next bookmark is chunk {next_chunk}.")
             return out
@@ -2260,6 +2314,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: node identity not available — cannot author the issue."
         set si_did to ptr_to_str(map_get_val(si_identity and "did"))
         set si_issue to gitdec_create_issue(si_repo and si_did and si_title and si_body)
+        if si_issue == 0:
+            return "Error: issue persistence failed."
         set si_id to map_get_val(si_issue and "id")
         return concat("issue:created,repo:" and concat(si_repo and concat(",id:" and si_id)))
 
@@ -2274,6 +2330,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ws_filename to get_list(args_list and 0)
         set ws_content to get_list(args_list and 1)
         set ws_path to workspace_write_file(ws_filename and ws_content)
+        if string_length(ws_path) == 0:
+            return "Error: workspace write failed."
         # Auto-attach the newly written workspace file to the chat — only claim it when queued.
         set ws_sess to ""
         if map_contains(ctx and "session_id") == 1:
@@ -2512,6 +2570,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         # the agent fan out several sub-agents and keep talking to the user meanwhile.
         display concat("[DELEGATE] delegate_task tool ENTER role=" and concat(dt_role and concat(" instruction=" and dt_instruction)))
         set dt_tid to orchestrator_spawn(dt_orch and dt_instruction and dt_role and dt_model and dt_memory and dt_tools and cast_map_to_int(ctx))
+        if string_index_of(dt_tid and "error:") == 0:
+            return concat("Error: sub-agent dispatch failed: " and dt_tid)
         display concat("[DELEGATE] delegate_task: dispatched (async) tid=" and dt_tid)
         return concat("Dispatched sub-agent '" and concat(dt_role and concat("' as background task '" and concat(dt_tid and "'. It is running now; you do NOT need to wait. Finish your turn — tell the user you've dispatched it. Its result will arrive automatically as a mid-turn update later, and you can report it to the user then. Do NOT call delegate_wait."))))
 
@@ -2588,6 +2648,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set dw_ec to string_replace(dw_msg and "'" and "''")
         set dw_now to ep_time_now_sec()
         set ok to sql_execute(dw_db and f"INSERT INTO trace_whispers (session_id, content, created_at) VALUES ('{dw_es}', '{dw_ec}', {dw_now});")
+        if ok != 0:
+            return f"Error: whisper to sub-agent '{dw_tid}' could not be persisted."
         return f"Whisper sent to sub-agent '{dw_tid}'. It will receive the guidance before its next LLM call."
 
     if action_name equals "delegate_swarm":

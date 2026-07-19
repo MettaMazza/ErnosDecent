@@ -1,0 +1,175 @@
+# ErnosDecent configuration TOML reader.
+# Supports the configuration schema's tables, bare keys, quoted strings,
+# integers, booleans, whitespace, comments, and basic-string escapes.
+
+import "string"
+import "collections"
+
+define toml_create returning Map:
+    return create_map()
+
+define toml_trim with value as Str returning Str:
+    set start to 0
+    set finish to string_length(value)
+    repeat while start < finish and also is_space(get_character(value and start)) == 1:
+        set start to start + 1
+    repeat while finish > start and also is_space(get_character(value and finish - 1)) == 1:
+        set finish to finish - 1
+    return substring(value and start and finish - start)
+
+define toml_set_error with store as Map and message as Str returning Int:
+    if map_contains(store and "__error") == 0:
+        set ok to map_insert(store and "__error" and message)
+        if ok == 0:
+            return 1
+    return 0
+
+define toml_valid_name with value as Str returning Int:
+    if string_length(value) == 0:
+        return 0
+    set i to 0
+    repeat while i < string_length(value):
+        set ch to get_character(value and i)
+        set valid to is_alphanumeric(ch)
+        if ch == 95 or else ch == 45 or else ch == 46:
+            set valid to 1
+        if valid == 0:
+            return 0
+        set i to i + 1
+    return 1
+
+define toml_strip_comment with value as Str returning Str:
+    set in_quote to 0
+    set escaped to 0
+    set i to 0
+    repeat while i < string_length(value):
+        set ch to get_character(value and i)
+        if in_quote == 1:
+            if escaped == 1:
+                set escaped to 0
+            else if ch == 92:
+                set escaped to 1
+            else if ch == 34:
+                set in_quote to 0
+        else if ch == 34:
+            set in_quote to 1
+        else if ch == 35:
+            return toml_trim(substring(value and 0 and i))
+        set i to i + 1
+    return toml_trim(value)
+
+define toml_unescape_basic with value as Str returning Str:
+    set output to ""
+    set i to 0
+    repeat while i < string_length(value):
+        set ch to get_character(value and i)
+        if ch == 92:
+            if i + 1 >= string_length(value):
+                return ""
+            set next to get_character(value and i + 1)
+            if next == 34:
+                set output to concat(output and "\"")
+            else if next == 92:
+                set output to concat(output and "\\")
+            else if next == 110:
+                set output to concat(output and "\n")
+            else if next == 114:
+                set output to concat(output and "\r")
+            else if next == 116:
+                set output to concat(output and "\t")
+            else:
+                return ""
+            set i to i + 2
+        else:
+            set output to concat(output and substring(value and i and 1))
+            set i to i + 1
+    return output
+
+define toml_set with store as Map and section as Str and key as Str and value as Str returning Int:
+    set full_key to key
+    if string_length(section) > 0:
+        set full_key to concat(section and concat("." and key))
+    if map_contains(store and full_key) == 1:
+        return toml_set_error(store and concat("duplicate configuration key: " and full_key))
+    set ok to map_insert(store and full_key and value)
+    if ok == 0:
+        return toml_set_error(store and concat("could not store configuration key: " and full_key))
+    return 0
+
+define toml_parse_line with store as Map and line as Str and current_section as Str and line_number as Int returning Str:
+    set trimmed to toml_strip_comment(line)
+    if string_length(trimmed) == 0:
+        return current_section
+
+    if get_character(trimmed and 0) == 91:
+        set line_len to string_length(trimmed)
+        if line_len < 3 or else get_character(trimmed and line_len - 1) != 93:
+            set err to toml_set_error(store and concat("invalid table header on line " and int_to_string(line_number)))
+            return current_section
+        set section to toml_trim(substring(trimmed and 1 and line_len - 2))
+        if toml_valid_name(section) == 0:
+            set err to toml_set_error(store and concat("invalid table name on line " and int_to_string(line_number)))
+            return current_section
+        return section
+
+    set eq_pos to string_index_of(trimmed and "=")
+    if eq_pos <= 0:
+        set err to toml_set_error(store and concat("invalid assignment on line " and int_to_string(line_number)))
+        return current_section
+    set key to toml_trim(substring(trimmed and 0 and eq_pos))
+    if toml_valid_name(key) == 0:
+        set err to toml_set_error(store and concat("invalid key on line " and int_to_string(line_number)))
+        return current_section
+    set raw_value to toml_trim(substring(trimmed and eq_pos + 1 and string_length(trimmed) - eq_pos - 1))
+    if string_length(raw_value) == 0:
+        set err to toml_set_error(store and concat("missing value on line " and int_to_string(line_number)))
+        return current_section
+
+    set value to raw_value
+    if get_character(raw_value and 0) == 34:
+        set value_len to string_length(raw_value)
+        if value_len < 2 or else get_character(raw_value and value_len - 1) != 34:
+            set err to toml_set_error(store and concat("unterminated string on line " and int_to_string(line_number)))
+            return current_section
+        set encoded to substring(raw_value and 1 and value_len - 2)
+        set value to toml_unescape_basic(encoded)
+        if string_length(encoded) > 0 and also string_length(value) == 0:
+            set err to toml_set_error(store and concat("invalid string escape on line " and int_to_string(line_number)))
+            return current_section
+    set err to toml_set(store and current_section and key and value)
+    return current_section
+
+define toml_parse with content as Str returning Map:
+    set store to toml_create()
+    set current_section to ""
+    set lines to split(content and "\n")
+    set line_count to length_list(lines)
+    set i to 0
+    repeat while i < line_count:
+        set current_section to toml_parse_line(store and ptr_to_str(get_list(lines and i)) and current_section and i + 1)
+        set i to i + 1
+    free_list(lines)
+    return store
+
+define toml_get with store as Map and section as Str and key as Str returning Str:
+    set full_key to key
+    if string_length(section) > 0:
+        set full_key to concat(section and concat("." and key))
+    if map_contains(store and full_key) == 0:
+        return ""
+    return ptr_to_str(map_get_val(store and full_key))
+
+define toml_get_string with store as Map and section as Str and key as Str returning Str:
+    return toml_get(store and section and key)
+
+define toml_get_int with store as Map and section as Str and key as Str returning Int:
+    set value to toml_get(store and section and key)
+    if string_length(value) == 0:
+        return 0
+    return string_to_int(value)
+
+define toml_get_bool with store as Map and section as Str and key as Str returning Int:
+    set value to string_lower(toml_get(store and section and key))
+    if value equals "true":
+        return 1
+    return 0

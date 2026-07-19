@@ -1,16 +1,18 @@
 # 🐙 GitDec — Simple User Guide
 
-Welcome to **GitDec**, a secure, peer-to-peer repository hosting system built directly into **ErnosDecent**. 
+Welcome to **GitDec**, the repository, issue, and pull-request subsystem built into **ErnosDecent**.
 
-Unlike GitHub, which is owned by a single corporation, GitDec runs directly on your machine and communicates over a decentralized peer-to-peer network (Nostr). Your code remains yours, under your keys, and cannot be censored, deleted, or scraped by third parties.
+GitDec stores repositories on the node operator's machine and signs network events with
+the node identity. Public repositories and events can be copied by peers; local control
+does not make public material impossible to delete, censor elsewhere, or scrape.
 
 ---
 
 ## 🚀 How to Get Started
 
 ### 1. Opening GitDec
-1. Start your ErnosDecent node daemon: `./node`
-2. Open the dashboard in your browser: [http://localhost:8080](http://localhost:8080)
+1. Build and start the node with `bash build.sh` and `./run_node.sh`.
+2. Open the dashboard: [http://localhost:8088](http://localhost:8088)
 3. Click the **GitDec P2P** tab in the left-hand navigation menu.
 
 ### 2. Creating a New Repository
@@ -22,7 +24,7 @@ Unlike GitHub, which is owned by a single corporation, GitDec runs directly on y
 If a friend shares their Repository ID with you, you can download it to your node:
 1. Click the **Clone** button next to your repository list.
 2. Enter the **Repository ID** your friend gave you and click **Clone**.
-3. GitDec will query the decentralized network to locate the repository files and sync them to your machine automatically.
+3. GitDec requests repository history from connected peers. With no connected mesh peer, network synchronization is deferred and the repository remains local.
 
 ---
 
@@ -62,10 +64,11 @@ GitDec makes it simple to coordinate development asynchronously:
 Every repository you create or clone is stored on your local disk under:
 `config/gitdec/repos/<repository-id>/`
 
-Inside this folder, you will find:
-- [gitdec.json](file:///Users/mettamazza/Desktop/ErnosDecent./config/gitdec/repos/ErnosDecent/gitdec.json): The repository metadata manifest (name, owner, authorized collaborators, and branch heads).
+Inside this folder, a repository can contain:
+- **gitdec.json**: Repository metadata (name, owner, visibility, collaborators, and branch heads).
 - **objects/**: The database containing actual commit data.
 - **issues.json**: The issues and comments tracker.
 - **pull_requests.json**: The pull requests and reviews tracker.
 
-To update files, simply edit them in this directory. GitDec automatically tracks updates and syncs modifications when you interact with the UI.
+GitDec changes are created through its dashboard/API operations. Editing files directly
+does not by itself broadcast, authenticate, or synchronize a GitDec event.

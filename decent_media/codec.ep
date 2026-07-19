@@ -6,26 +6,26 @@ import "collections"
 import "math"
 
 # FFI Externals
-external define ep_dlopen with lib:
-external define ep_dlsym with handle and name:
-external define ep_dlcall0 with fn:
-external define ep_dlcall1 with fn and a0:
-external define ep_dlcall2 with fn and a0 and a1:
-external define ep_dlcall3 with fn and a0 and a1 and a2:
-external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
-external define ep_dlcall5 with fn and a0 and a1 and a2 and a3 and a4:
-external define ep_dlcall6 with fn and a0 and a1 and a2 and a3 and a4 and a5:
+external define ep_dlopen with lib as Str returning Int:
+external define ep_dlsym with handle as Int and name as Str returning Int:
+external define ep_dlcall0 with fn as Int returning Int:
+external define ep_dlcall1 with fn as Int and a0 as Int returning Int:
+external define ep_dlcall2 with fn as Int and a0 as Int and a1 as Int returning Int:
+external define ep_dlcall3 with fn as Int and a0 as Int and a1 as Int and a2 as Int returning Int:
+external define ep_dlcall4 with fn as Int and a0 as Int and a1 as Int and a2 as Int and a3 as Int returning Int:
+external define ep_dlcall5 with fn as Int and a0 as Int and a1 as Int and a2 as Int and a3 as Int and a4 as Int returning Int:
+external define ep_dlcall6 with fn as Int and a0 as Int and a1 as Int and a2 as Int and a3 as Int and a4 as Int and a5 as Int returning Int:
 # Raw byte-buffer primitives (build.sh-injected C helpers; used by webrtc.ep too).
-external define alloc_bytes with n returning Int:
-external define free_bytes with ptr:
-external define poke_byte with ptr and offset and value:
-external define peek_byte with ptr and offset returning Int:
+external define alloc_bytes with n as Int returning Int:
+external define free_bytes with ptr as Int returning Int:
+external define poke_byte with ptr as Int and offset as Int and value as Int returning Int:
+external define peek_byte with ptr as Int and offset as Int returning Int:
 
 # Global lookup lists for ADPCM
 set ADPCM_STEPS to 0
 set ADPCM_INDEX_ADJUST to 0
 
-define init_adpcm_tables:
+define init_adpcm_tables returning Int:
     if ADPCM_STEPS != 0:
         return 0
         
@@ -163,17 +163,31 @@ define codec_init returning Map:
     set ok to map_insert(ctx and "opus_frame" and 960)
     set ok to map_insert(ctx and "opus_enc" and 0)
     set ok to map_insert(ctx and "opus_dec" and 0)
+    set ok to map_insert(ctx and "opus_enc_destroy_fn" and 0)
+    set ok to map_insert(ctx and "opus_dec_destroy_fn" and 0)
     if has_opus == 1:
         set fn_enc_create to ep_dlsym(lib_opus and "opus_encoder_create")
         set fn_dec_create to ep_dlsym(lib_opus and "opus_decoder_create")
         if fn_enc_create != 0 and also fn_dec_create != 0:
             set enc to ep_dlcall4(fn_enc_create and 48000 and 1 and 2048 and 0)
             set dec to ep_dlcall3(fn_dec_create and 48000 and 1 and 0)
+            set encode_fn to ep_dlsym(lib_opus and "opus_encode")
+            set decode_fn to ep_dlsym(lib_opus and "opus_decode")
+            set enc_destroy_fn to ep_dlsym(lib_opus and "opus_encoder_destroy")
+            set dec_destroy_fn to ep_dlsym(lib_opus and "opus_decoder_destroy")
             set ok to map_insert(ctx and "opus_enc" and enc)
             set ok to map_insert(ctx and "opus_dec" and dec)
-            set ok to map_insert(ctx and "opus_encode_fn" and ep_dlsym(lib_opus and "opus_encode"))
-            set ok to map_insert(ctx and "opus_decode_fn" and ep_dlsym(lib_opus and "opus_decode"))
-            if enc == 0 or else dec == 0:
+            set ok to map_insert(ctx and "opus_encode_fn" and encode_fn)
+            set ok to map_insert(ctx and "opus_decode_fn" and decode_fn)
+            set ok to map_insert(ctx and "opus_enc_destroy_fn" and enc_destroy_fn)
+            set ok to map_insert(ctx and "opus_dec_destroy_fn" and dec_destroy_fn)
+            if enc == 0 or else dec == 0 or else encode_fn == 0 or else decode_fn == 0 or else enc_destroy_fn == 0 or else dec_destroy_fn == 0:
+                if enc != 0 and also enc_destroy_fn != 0:
+                    set ignored_void_result to ep_dlcall1(enc_destroy_fn and enc)
+                if dec != 0 and also dec_destroy_fn != 0:
+                    set ignored_void_result to ep_dlcall1(dec_destroy_fn and dec)
+                set ok to map_insert(ctx and "opus_enc" and 0)
+                set ok to map_insert(ctx and "opus_dec" and 0)
                 set ok to map_insert(ctx and "has_opus" and 0)
         else:
             set ok to map_insert(ctx and "has_opus" and 0)
@@ -200,27 +214,65 @@ define codec_init returning Map:
         set fn_cx to ep_dlsym(lib_vpx and "vpx_codec_vp8_cx")
         set fn_dx to ep_dlsym(lib_vpx and "vpx_codec_vp8_dx")
         if fn_cx != 0 and also fn_dx != 0:
-            set ok to map_insert(ctx and "vpx_cx_iface" and ep_dlcall0(fn_cx))
-            set ok to map_insert(ctx and "vpx_dx_iface" and ep_dlcall0(fn_dx))
-            set ok to map_insert(ctx and "vpx_enc_cfg_default_fn" and ep_dlsym(lib_vpx and "vpx_codec_enc_config_default"))
-            set ok to map_insert(ctx and "vpx_enc_init_fn" and ep_dlsym(lib_vpx and "vpx_codec_enc_init_ver"))
-            set ok to map_insert(ctx and "vpx_img_alloc_fn" and ep_dlsym(lib_vpx and "vpx_img_alloc"))
-            set ok to map_insert(ctx and "vpx_img_free_fn" and ep_dlsym(lib_vpx and "vpx_img_free"))
-            set ok to map_insert(ctx and "vpx_encode_fn" and ep_dlsym(lib_vpx and "vpx_codec_encode"))
-            set ok to map_insert(ctx and "vpx_get_cx_data_fn" and ep_dlsym(lib_vpx and "vpx_codec_get_cx_data"))
-            set ok to map_insert(ctx and "vpx_destroy_fn" and ep_dlsym(lib_vpx and "vpx_codec_destroy"))
-            set ok to map_insert(ctx and "vpx_dec_init_fn" and ep_dlsym(lib_vpx and "vpx_codec_dec_init_ver"))
-            set ok to map_insert(ctx and "vpx_decode_fn" and ep_dlsym(lib_vpx and "vpx_codec_decode"))
-            set ok to map_insert(ctx and "vpx_get_frame_fn" and ep_dlsym(lib_vpx and "vpx_codec_get_frame"))
+            set cx_iface to ep_dlcall0(fn_cx)
+            set dx_iface to ep_dlcall0(fn_dx)
+            set enc_cfg_fn to ep_dlsym(lib_vpx and "vpx_codec_enc_config_default")
+            set enc_init_fn to ep_dlsym(lib_vpx and "vpx_codec_enc_init_ver")
+            set img_alloc_fn to ep_dlsym(lib_vpx and "vpx_img_alloc")
+            set img_free_fn to ep_dlsym(lib_vpx and "vpx_img_free")
+            set encode_fn to ep_dlsym(lib_vpx and "vpx_codec_encode")
+            set get_cx_fn to ep_dlsym(lib_vpx and "vpx_codec_get_cx_data")
+            set destroy_fn to ep_dlsym(lib_vpx and "vpx_codec_destroy")
+            set dec_init_fn to ep_dlsym(lib_vpx and "vpx_codec_dec_init_ver")
+            set decode_fn to ep_dlsym(lib_vpx and "vpx_codec_decode")
+            set get_frame_fn to ep_dlsym(lib_vpx and "vpx_codec_get_frame")
+            set ok to map_insert(ctx and "vpx_cx_iface" and cx_iface)
+            set ok to map_insert(ctx and "vpx_dx_iface" and dx_iface)
+            set ok to map_insert(ctx and "vpx_enc_cfg_default_fn" and enc_cfg_fn)
+            set ok to map_insert(ctx and "vpx_enc_init_fn" and enc_init_fn)
+            set ok to map_insert(ctx and "vpx_img_alloc_fn" and img_alloc_fn)
+            set ok to map_insert(ctx and "vpx_img_free_fn" and img_free_fn)
+            set ok to map_insert(ctx and "vpx_encode_fn" and encode_fn)
+            set ok to map_insert(ctx and "vpx_get_cx_data_fn" and get_cx_fn)
+            set ok to map_insert(ctx and "vpx_destroy_fn" and destroy_fn)
+            set ok to map_insert(ctx and "vpx_dec_init_fn" and dec_init_fn)
+            set ok to map_insert(ctx and "vpx_decode_fn" and decode_fn)
+            set ok to map_insert(ctx and "vpx_get_frame_fn" and get_frame_fn)
+            if cx_iface == 0 or else dx_iface == 0 or else enc_cfg_fn == 0 or else enc_init_fn == 0 or else img_alloc_fn == 0 or else img_free_fn == 0 or else encode_fn == 0 or else get_cx_fn == 0 or else destroy_fn == 0 or else dec_init_fn == 0 or else decode_fn == 0 or else get_frame_fn == 0:
+                set ok to map_insert(ctx and "has_vpx" and 0)
         else:
             set ok to map_insert(ctx and "has_vpx" and 0)
     
-    set dummy to init_adpcm_tables()
+    set adpcm_init_err to init_adpcm_tables()
+    set ok to map_insert(ctx and "adpcm_init_error" and adpcm_init_err)
     return ctx
+
+# Release every native resource owned by a codec context. Returns 0 on success.
+define codec_close with ctx as Map returning Int:
+    set close_error to 0
+    set enc to map_get_val(ctx and "opus_enc")
+    set dec to map_get_val(ctx and "opus_dec")
+    set enc_destroy_fn to map_get_val(ctx and "opus_enc_destroy_fn")
+    set dec_destroy_fn to map_get_val(ctx and "opus_dec_destroy_fn")
+    if enc != 0:
+        if enc_destroy_fn == 0:
+            display "ERROR: codec_close cannot release the Opus encoder because opus_encoder_destroy is unavailable"
+            set close_error to 1
+        else:
+            set ignored_void_result to ep_dlcall1(enc_destroy_fn and enc)
+            set ok to map_insert(ctx and "opus_enc" and 0)
+    if dec != 0:
+        if dec_destroy_fn == 0:
+            display "ERROR: codec_close cannot release the Opus decoder because opus_decoder_destroy is unavailable"
+            set close_error to 1
+        else:
+            set ignored_void_result to ep_dlcall1(dec_destroy_fn and dec)
+            set ok to map_insert(ctx and "opus_dec" and 0)
+    return close_error
 
 # IMA-ADPCM Audio Encoder
 # Write a signed 16-bit PCM sample (two's complement) little-endian into buf[off..off+1].
-define codec_poke_i16 with buf as Int and off as Int and sample as Int:
+define codec_poke_i16 with buf as Int and off as Int and sample as Int returning Int:
     set u to sample
     if u < 0:
         set u to u + 65536
@@ -244,6 +296,9 @@ define codec_opus_encode with ctx as Map and raw_samples as List returning List:
     set encode_fn to map_get_val(ctx and "opus_encode_fn")
     set frame to map_get_val(ctx and "opus_frame")
     set out to create_list()
+    if enc == 0 or else encode_fn == 0 or else frame <= 0:
+        display "ERROR: Opus encoder is not initialized"
+        return out
     set total to length_list(raw_samples)
     set nframes to 0
     if total > 0:
@@ -251,6 +306,13 @@ define codec_opus_encode with ctx as Map and raw_samples as List returning List:
     set ok to append_list(out and nframes)
     set pcm_buf to alloc_bytes(frame * 2)
     set data_buf to alloc_bytes(4000)
+    if pcm_buf == 0 or else data_buf == 0:
+        display "ERROR: Opus encoder buffer allocation failed"
+        if pcm_buf != 0:
+            set ok to free_bytes(pcm_buf)
+        if data_buf != 0:
+            set ok to free_bytes(data_buf)
+        return out
     set fi to 0
     repeat while fi < nframes:
         set s to 0
@@ -261,9 +323,13 @@ define codec_opus_encode with ctx as Map and raw_samples as List returning List:
                 set sample to get_list(raw_samples and idx)
             set ok to codec_poke_i16(pcm_buf and s * 2 and sample)
             set s to s + 1
-        set nbytes to ep_dlcall5(encode_fn and enc and pcm_buf and frame and data_buf and 4000)
+        set nbytes to codec_c_int(ep_dlcall5(encode_fn and enc and pcm_buf and frame and data_buf and 4000))
         if nbytes < 0:
-            set nbytes to 0
+            display concat("ERROR: Opus encoding failed with code " and int_to_string(nbytes))
+            set ok to free_bytes(pcm_buf)
+            set ok to free_bytes(data_buf)
+            set ok to free_list(out)
+            return create_list()
         set ok to append_list(out and nbytes)
         set b to 0
         repeat while b < nbytes:
@@ -280,25 +346,53 @@ define codec_opus_decode with ctx as Map and encoded as List returning List:
     set decode_fn to map_get_val(ctx and "opus_decode_fn")
     set frame to map_get_val(ctx and "opus_frame")
     set decoded to create_list()
+    if dec == 0 or else decode_fn == 0 or else frame <= 0:
+        display "ERROR: Opus decoder is not initialized"
+        return decoded
     set n to length_list(encoded)
     if n == 0:
         return decoded
     set nframes to get_list(encoded and 0)
+    if nframes < 0 or else nframes > n - 1:
+        display "ERROR: malformed Opus frame count"
+        return decoded
     set pos to 1
     set pcm_buf to alloc_bytes(frame * 2)
+    if pcm_buf == 0:
+        display "ERROR: Opus decoder buffer allocation failed"
+        return decoded
     set fi to 0
     repeat while fi < nframes:
+        if pos >= n:
+            display "ERROR: truncated Opus packet length"
+            set ok to free_bytes(pcm_buf)
+            set ok to free_list(decoded)
+            return create_list()
         set len to get_list(encoded and pos)
         set pos to pos + 1
+        if len <= 0 or else len > n - pos:
+            display "ERROR: malformed or truncated Opus packet"
+            set ok to free_bytes(pcm_buf)
+            set ok to free_list(decoded)
+            return create_list()
         set data_buf to alloc_bytes(len + 1)
+        if data_buf == 0:
+            display "ERROR: Opus packet buffer allocation failed"
+            set ok to free_bytes(pcm_buf)
+            set ok to free_list(decoded)
+            return create_list()
         set b to 0
         repeat while b < len:
             set ok to poke_byte(data_buf and b and get_list(encoded and pos + b))
             set b to b + 1
         set pos to pos + len
-        set nsamp to ep_dlcall6(decode_fn and dec and data_buf and len and pcm_buf and frame and 0)
+        set nsamp to codec_c_int(ep_dlcall6(decode_fn and dec and data_buf and len and pcm_buf and frame and 0))
         if nsamp < 0:
-            set nsamp to 0
+            display concat("ERROR: Opus decoding failed with code " and int_to_string(nsamp))
+            set ok to free_bytes(data_buf)
+            set ok to free_bytes(pcm_buf)
+            set ok to free_list(decoded)
+            return create_list()
         set s to 0
         repeat while s < nsamp:
             set ok to append_list(decoded and codec_peek_i16(pcm_buf and s * 2))
@@ -407,6 +501,9 @@ define codec_decode_audio with ctx as Map and encoded_bytes as List returning Li
         
     set predicted_sample to get_list(encoded_bytes and 0)
     set step_index to get_list(encoded_bytes and 1)
+    if step_index < 0 or else step_index > 88:
+        display "ERROR: malformed ADPCM step index"
+        return decoded
     
     set ok to append_list(decoded and predicted_sample)
     
@@ -454,7 +551,7 @@ define codec_decode_audio with ctx as Map and encoded_bytes as List returning Li
 
 # Video Encoder: Run-Length Encoded (RLE) Delta-Compression
 # Write a 32-bit little-endian unsigned value into buf[off..off+3].
-define codec_poke_u32 with buf as Int and off as Int and val as Int:
+define codec_poke_u32 with buf as Int and off as Int and val as Int returning Int:
     set ok to poke_byte(buf and off and val modulo 256)
     set ok to poke_byte(buf and off + 1 and (val / 256) modulo 256)
     set ok to poke_byte(buf and off + 2 and (val / 65536) modulo 256)
@@ -474,10 +571,16 @@ define codec_peek_u64 with buf as Int and off as Int returning Int:
         set i to i - 1
     return v
 
+# Normalize a C `int` returned through the machine-word ep_dlcall ABI.
+define codec_c_int with value as Int returning Int:
+    if value >= 2147483648 and also value <= 4294967295:
+        return value - 4294967296
+    return value
+
 # Real VP8 keyframe encode via libvpx. Input raw_frame is I420 bytes:
 # Y (width*height) then U then V (each (width/2)*(height/2)). Each frame is encoded as
-# a forced keyframe (no inter-frame prediction) — real VP8, simpler/larger than a full
-# GOP, which is the honest Phase-1 scope. Output: [width, height, size, byte...].
+# a forced keyframe (no inter-frame prediction). This operational mode trades bandwidth
+# for independently decodable frames and deterministic recovery. Output: [width, height, size, byte...].
 define codec_encode_video with ctx as Map and raw_frame as List and width as Int and height as Int returning List:
     set has_vpx to map_get_val(ctx and "has_vpx")
     set cx_iface to map_get_val(ctx and "vpx_cx_iface")
@@ -512,11 +615,29 @@ define codec_vp8_encode with ctx as Map and raw_frame as List and width as Int a
     set out to create_list()
     set ok to append_list(out and width)
     set ok to append_list(out and height)
+    if width <= 0 or else height <= 0 or else width modulo 2 != 0 or else height modulo 2 != 0:
+        display "ERROR: VP8 I420 dimensions must be positive even values"
+        set ok to append_list(out and 0)
+        return out
+    set required_bytes to width * height + (width / 2) * (height / 2) * 2
+    if required_bytes <= 0 or else length_list(raw_frame) != required_bytes:
+        display "ERROR: VP8 input does not contain exactly one I420 frame"
+        set ok to append_list(out and 0)
+        return out
+    if cx_iface == 0:
+        display "ERROR: VP8 encoder interface is unavailable"
+        set ok to append_list(out and 0)
+        return out
 
     # configure: enc_config_default then set resolution + a target bitrate
     set cfg to alloc_bytes(504)
+    if cfg == 0:
+        display "ERROR: VP8 encoder configuration allocation failed"
+        set ok to append_list(out and 0)
+        return out
     set rc to ep_dlcall3(map_get_val(ctx and "vpx_enc_cfg_default_fn") and cx_iface and cfg and 0)
     if rc != 0:
+        display concat("ERROR: VP8 default encoder configuration failed with code " and int_to_string(rc))
         set ok to free_bytes(cfg)
         set ok to append_list(out and 0)
         return out
@@ -525,15 +646,40 @@ define codec_vp8_encode with ctx as Map and raw_frame as List and width as Int a
     set ok to codec_poke_u32(cfg and 112 and 256)
 
     set vctx to alloc_bytes(56)
+    if vctx == 0:
+        display "ERROR: VP8 encoder context allocation failed"
+        set ok to free_bytes(cfg)
+        set ok to append_list(out and 0)
+        return out
     set ir to ep_dlcall5(map_get_val(ctx and "vpx_enc_init_fn") and vctx and cx_iface and cfg and 0 and 37)
     if ir != 0:
+        display concat("ERROR: VP8 encoder initialization failed with code " and int_to_string(ir))
         set ok to free_bytes(cfg)
         set ok to free_bytes(vctx)
         set ok to append_list(out and 0)
         return out
 
     set img to alloc_bytes(136)
+    if img == 0:
+        display "ERROR: VP8 image allocation failed"
+        set destroy_err to ep_dlcall1(map_get_val(ctx and "vpx_destroy_fn") and vctx)
+        if destroy_err != 0:
+            display concat("ERROR: VP8 encoder cleanup failed with code " and int_to_string(destroy_err))
+        set ok to free_bytes(cfg)
+        set ok to free_bytes(vctx)
+        set ok to append_list(out and 0)
+        return out
     set imgr to ep_dlcall5(map_get_val(ctx and "vpx_img_alloc_fn") and img and 258 and width and height and 1)
+    if imgr == 0:
+        display "ERROR: libvpx could not allocate the I420 image"
+        set destroy_err to ep_dlcall1(map_get_val(ctx and "vpx_destroy_fn") and vctx)
+        if destroy_err != 0:
+            display concat("ERROR: VP8 encoder cleanup failed with code " and int_to_string(destroy_err))
+        set ok to free_bytes(cfg)
+        set ok to free_bytes(vctx)
+        set ok to free_bytes(img)
+        set ok to append_list(out and 0)
+        return out
     set y_ptr to codec_peek_u64(img and 48)
     set u_ptr to codec_peek_u64(img and 56)
     set v_ptr to codec_peek_u64(img and 64)
@@ -568,36 +714,54 @@ define codec_vp8_encode with ctx as Map and raw_frame as List and width as Int a
     set frame_bytes to create_list()
     if er == 0:
         set iter to alloc_bytes(8)
-        set ok to codec_poke_u32(iter and 0 and 0)
-        set ok to codec_poke_u32(iter and 4 and 0)
-        set looping to 1
-        repeat while looping == 1:
-            set pkt to ep_dlcall2(map_get_val(ctx and "vpx_get_cx_data_fn") and vctx and iter)
-            if pkt == 0:
-                set looping to 0
-            else:
-                set kind to codec_peek_u32(pkt and 0)
-                if kind == 0:
-                    set buf to codec_peek_u64(pkt and 8)
-                    set sz to codec_peek_u64(pkt and 16)
-                    set b to 0
-                    repeat while b < sz:
-                        set ok to append_list(frame_bytes and peek_byte(buf and b))
-                        set b to b + 1
-                    set total_sz to total_sz + sz
-        set ok to free_bytes(iter)
+        if iter == 0:
+            display "ERROR: VP8 packet iterator allocation failed"
+            set er to 1
+        else:
+            set ok to codec_poke_u32(iter and 0 and 0)
+            set ok to codec_poke_u32(iter and 4 and 0)
+            set looping to 1
+            repeat while looping == 1:
+                set pkt to ep_dlcall2(map_get_val(ctx and "vpx_get_cx_data_fn") and vctx and iter)
+                if pkt == 0:
+                    set looping to 0
+                else:
+                    set kind to codec_peek_u32(pkt and 0)
+                    if kind == 0:
+                        set buf to codec_peek_u64(pkt and 8)
+                        set sz to codec_peek_u64(pkt and 16)
+                        if buf == 0 or else sz <= 0:
+                            display "ERROR: libvpx returned an invalid encoded packet"
+                            set er to 1
+                            set looping to 0
+                        else:
+                            set b to 0
+                            repeat while b < sz:
+                                set ok to append_list(frame_bytes and peek_byte(buf and b))
+                                set b to b + 1
+                            set total_sz to total_sz + sz
+            set ok to free_bytes(iter)
+    else:
+        display concat("ERROR: VP8 encoding failed with code " and int_to_string(er))
 
-    set ok to ep_dlcall1(map_get_val(ctx and "vpx_img_free_fn") and img)
-    set ok to ep_dlcall1(map_get_val(ctx and "vpx_destroy_fn") and vctx)
+    set ignored_void_result to ep_dlcall1(map_get_val(ctx and "vpx_img_free_fn") and img)
+    set destroy_err to ep_dlcall1(map_get_val(ctx and "vpx_destroy_fn") and vctx)
     set ok to free_bytes(cfg)
     set ok to free_bytes(vctx)
     set ok to free_bytes(img)
+
+    if destroy_err != 0:
+        display concat("ERROR: VP8 encoder cleanup failed with code " and int_to_string(destroy_err))
+        set er to destroy_err
+    if er != 0:
+        set total_sz to 0
 
     set ok to append_list(out and total_sz)
     set bi to 0
     repeat while bi < total_sz:
         set ok to append_list(out and get_list(frame_bytes and bi))
         set bi to bi + 1
+    set ok to free_list(frame_bytes)
     return out
 
 # Real VP8 decode via libvpx. Input is [width, height, size, byte...]; output is the
@@ -612,14 +776,22 @@ define codec_decode_video with ctx as Map and encoded_frame as List and width as
     if num_elements < 2:
         return decoded
     set i to 2
-    repeat while i < num_elements:
+    repeat while i + 1 < num_elements:
         set run_len to get_list(encoded_frame and i)
         set pixel to get_list(encoded_frame and i + 1)
+        if run_len < 0:
+            display "ERROR: malformed negative RLE run length"
+            set ok to free_list(decoded)
+            return create_list()
         set r to 0
         repeat while r < run_len:
             set ok to append_list(decoded and pixel)
             set r to r + 1
         set i to i + 2
+    if i != num_elements:
+        display "ERROR: truncated RLE video frame"
+        set ok to free_list(decoded)
+        return create_list()
     return decoded
 
 define codec_vp8_decode with ctx as Map and encoded_frame as List returning List:
@@ -629,60 +801,88 @@ define codec_vp8_decode with ctx as Map and encoded_frame as List returning List
     if n < 3:
         return decoded
     set sz to get_list(encoded_frame and 2)
-    if sz <= 0:
+    if sz <= 0 or else sz != n - 3:
+        display "ERROR: malformed or truncated VP8 frame length"
         return decoded
     set data_buf to alloc_bytes(sz)
+    if data_buf == 0:
+        display "ERROR: VP8 input buffer allocation failed"
+        return decoded
     set b to 0
     repeat while b < sz:
         set ok to poke_byte(data_buf and b and get_list(encoded_frame and 3 + b))
         set b to b + 1
 
     set dctx to alloc_bytes(56)
+    if dctx == 0:
+        display "ERROR: VP8 decoder context allocation failed"
+        set ok to free_bytes(data_buf)
+        return decoded
     set ir to ep_dlcall5(map_get_val(ctx and "vpx_dec_init_fn") and dctx and dx_iface and 0 and 0 and 12)
     if ir != 0:
+        display concat("ERROR: VP8 decoder initialization failed with code " and int_to_string(ir))
         set ok to free_bytes(data_buf)
         set ok to free_bytes(dctx)
         return decoded
     set dr to ep_dlcall5(map_get_val(ctx and "vpx_decode_fn") and dctx and data_buf and sz and 0 and 0)
     if dr == 0:
         set iter to alloc_bytes(8)
-        set ok to codec_poke_u32(iter and 0 and 0)
-        set ok to codec_poke_u32(iter and 4 and 0)
-        set img to ep_dlcall2(map_get_val(ctx and "vpx_get_frame_fn") and dctx and iter)
-        if img != 0:
-            set dw to codec_peek_u32(img and 24)
-            set dh to codec_peek_u32(img and 28)
-            set y_ptr to codec_peek_u64(img and 48)
-            set u_ptr to codec_peek_u64(img and 56)
-            set v_ptr to codec_peek_u64(img and 64)
-            set y_st to codec_peek_u32(img and 80)
-            set u_st to codec_peek_u32(img and 84)
-            set v_st to codec_peek_u32(img and 88)
-            set r to 0
-            repeat while r < dh:
-                set c to 0
-                repeat while c < dw:
-                    set ok to append_list(decoded and peek_byte(y_ptr and r * y_st + c))
-                    set c to c + 1
-                set r to r + 1
-            set cw to dw / 2
-            set chh to dh / 2
-            set r to 0
-            repeat while r < chh:
-                set c to 0
-                repeat while c < cw:
-                    set ok to append_list(decoded and peek_byte(u_ptr and r * u_st + c))
-                    set c to c + 1
-                set r to r + 1
-            set r to 0
-            repeat while r < chh:
-                set c to 0
-                repeat while c < cw:
-                    set ok to append_list(decoded and peek_byte(v_ptr and r * v_st + c))
-                    set c to c + 1
-                set r to r + 1
-        set ok to free_bytes(iter)
-    set ok to ep_dlcall1(map_get_val(ctx and "vpx_destroy_fn") and dctx)
+        if iter == 0:
+            display "ERROR: VP8 decoder iterator allocation failed"
+            set dr to 1
+        else:
+            set ok to codec_poke_u32(iter and 0 and 0)
+            set ok to codec_poke_u32(iter and 4 and 0)
+            set img to ep_dlcall2(map_get_val(ctx and "vpx_get_frame_fn") and dctx and iter)
+            if img == 0:
+                display "ERROR: libvpx returned no decoded frame"
+                set dr to 1
+            else:
+                set dw to codec_peek_u32(img and 24)
+                set dh to codec_peek_u32(img and 28)
+                set y_ptr to codec_peek_u64(img and 48)
+                set u_ptr to codec_peek_u64(img and 56)
+                set v_ptr to codec_peek_u64(img and 64)
+                set y_st to codec_peek_u32(img and 80)
+                set u_st to codec_peek_u32(img and 84)
+                set v_st to codec_peek_u32(img and 88)
+                if dw <= 0 or else dh <= 0 or else dw modulo 2 != 0 or else dh modulo 2 != 0 or else y_ptr == 0 or else u_ptr == 0 or else v_ptr == 0 or else y_st < dw or else u_st < dw / 2 or else v_st < dw / 2:
+                    display "ERROR: libvpx returned an invalid I420 frame"
+                    set dr to 1
+                else:
+                    set r to 0
+                    repeat while r < dh:
+                        set c to 0
+                        repeat while c < dw:
+                            set ok to append_list(decoded and peek_byte(y_ptr and r * y_st + c))
+                            set c to c + 1
+                        set r to r + 1
+                    set cw to dw / 2
+                    set chh to dh / 2
+                    set r to 0
+                    repeat while r < chh:
+                        set c to 0
+                        repeat while c < cw:
+                            set ok to append_list(decoded and peek_byte(u_ptr and r * u_st + c))
+                            set c to c + 1
+                        set r to r + 1
+                    set r to 0
+                    repeat while r < chh:
+                        set c to 0
+                        repeat while c < cw:
+                            set ok to append_list(decoded and peek_byte(v_ptr and r * v_st + c))
+                            set c to c + 1
+                        set r to r + 1
+            set ok to free_bytes(iter)
+    else:
+        display concat("ERROR: VP8 decoding failed with code " and int_to_string(dr))
+    set destroy_err to ep_dlcall1(map_get_val(ctx and "vpx_destroy_fn") and dctx)
     set ok to free_bytes(data_buf)
     set ok to free_bytes(dctx)
+    if destroy_err != 0:
+        display concat("ERROR: VP8 decoder cleanup failed with code " and int_to_string(destroy_err))
+        set dr to destroy_err
+    if dr != 0:
+        set ok to free_list(decoded)
+        return create_list()
     return decoded

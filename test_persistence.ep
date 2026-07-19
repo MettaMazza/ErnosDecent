@@ -7,9 +7,9 @@ import "string"
 import "fs"
 import "os"
 import "storage"
-import "config"
+import "./config.ep"
 
-define main:
+define main returning Int:
     display "==================================================="
     display "  ErnosDecent -- Persistence Test Suite"
     display "==================================================="
@@ -110,6 +110,16 @@ define main:
     if err != STORAGE_ERR_NONE:
         display f"  FAIL: content_put returned {err}"
         set t3_ok to 0
+
+    # A well-formed but incorrect digest must never be accepted as a content
+    # address for different bytes.
+    set wrong_hash to "0000000000000000000000000000000000000000000000000000000000000000"
+    set wrong_err to storage_content_put(wrong_hash and test_content and "text/plain")
+    if wrong_err == STORAGE_ERR_NONE or else file_exists(concat(test_dir and concat("/content/" and wrong_hash))) == 1:
+        display "  FAIL: content_put accepted bytes under an incorrect SHA-256 address"
+        set t3_ok to 0
+    else:
+        display "  Incorrect content address rejected"
 
     # Check file exists on disk
     set content_file to concat(test_dir and concat("/content/" and test_hash))
@@ -341,6 +351,13 @@ define main:
         display f"  FAIL: expected 0.0.0.0, got '{listen}'"
         set t8_ok to 0
 
+    set default_public_host to config_get_str(cfg and "network.public_host")
+    if string_length(default_public_host) == 0:
+        display "  Default public_host: auto-detect"
+    else:
+        display f"  FAIL: expected empty public_host, got '{default_public_host}'"
+        set t8_ok to 0
+
     # Generate and load a custom config
     set custom_config to concat(test_dir and "/test_config.toml")
     set ok to config_generate_default(custom_config)
@@ -354,9 +371,44 @@ define main:
         else:
             display f"  FAIL: config from file returned {p2p2}"
             set t8_ok to 0
+        set generated_content to read_file(custom_config)
+        if string_contains(generated_content and "public_host = \"\"") == 0 or else string_contains(generated_content and "seed_addr = \"\"") == 0 or else string_contains(generated_content and "seed_port = 0") == 0:
+            display "  FAIL: generated config omitted bootstrap/public endpoint fields"
+            set t8_ok to 0
+        else:
+            display "  Generated config includes bootstrap/public endpoint fields"
     else:
         display "  FAIL: config file not generated"
         set t8_ok to 0
+
+    # A configured zero is a real value, not a missing-value sentinel.
+    set zero_config to concat(test_dir and "/zero_config.toml")
+    set zero_write to write_file(zero_config and "[network]\nenable_host_election = 0\nis_static_host = 0\n")
+    set cfg_zero to config_load(zero_config)
+    if zero_write == 0 or else config_get_int(cfg_zero and "network.enable_host_election") != 0:
+        display "  FAIL: zero-valued config setting was not preserved"
+        set t8_ok to 0
+    else:
+        display "  Zero-valued config setting preserved"
+
+    # Malformed TOML must be visible to every caller through config.error.
+    set bad_config to concat(test_dir and "/bad_config.toml")
+    set bad_write to write_file(bad_config and "[network\np2p_port = 9999\n")
+    set cfg_bad to config_load(bad_config)
+    if bad_write == 0 or else map_contains(cfg_bad and "config.error") == 0:
+        display "  FAIL: malformed TOML was not reported"
+        set t8_ok to 0
+    else:
+        display "  Malformed TOML reported through config.error"
+
+    set host_config to concat(test_dir and "/host_config.toml")
+    set host_write to write_file(host_config and "[network]\npublic_host = \"seed.example.org\"\nis_static_host = 1\n")
+    set cfg_host to config_load(host_config)
+    if host_write == 0 or else config_get_str(cfg_host and "network.public_host") != "seed.example.org" or else config_get_int(cfg_host and "network.is_static_host") != 1:
+        display "  FAIL: static bootstrap-host configuration was not loaded"
+        set t8_ok to 0
+    else:
+        display "  Static bootstrap-host configuration loaded"
 
     if t8_ok == 1:
         display "  PASS"
@@ -472,6 +524,7 @@ define main:
     display f"  {tests_passed}/{total} persistence tests passed."
     if tests_failed > 0:
         display f"  {tests_failed} FAILED!"
+        return 1
     else:
         display "  ALL PERSISTENCE TESTS PASSED!"
     display "==================================================="

@@ -7,18 +7,15 @@ import "crypto"
 import "fs"
 
 # Externals for libsodium / system libraries
-external define ep_dlopen with lib:
-external define ep_dlsym with handle and name:
-external define ep_dlcall0 with fn:
-external define ep_dlcall1 with fn and a0:
-external define ep_dlcall2 with fn and a0 and a1:
-external define ep_dlcall3 with fn and a0 and a1 and a2:
-external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
-external define ep_dlcall8 with fn and a0 and a1 and a2 and a3 and a4 and a5 and a6 and a7:
-external define ep_dlcall9 with fn and a0 and a1 and a2 and a3 and a4 and a5 and a6 and a7 and a8:
-
-# Global handle for libsodium
-set WEBRTC_SODIUM_HANDLE to 0
+external define ep_dlopen with lib as Str returning Int:
+external define ep_dlsym with handle as Int and name as Str returning Int:
+external define ep_dlcall0 with fn as Int returning Int:
+external define ep_dlcall1 with fn as Int and a0 as Int returning Int:
+external define ep_dlcall2 with fn as Int and a0 as Int and a1 as Int returning Int:
+external define ep_dlcall3 with fn as Int and a0 as Int and a1 as Int and a2 as Int returning Int:
+external define ep_dlcall4 with fn as Int and a0 as Int and a1 as Int and a2 as Int and a3 as Int returning Int:
+external define ep_dlcall8 with fn as Int and a0 as Int and a1 as Int and a2 as Int and a3 as Int and a4 as Int and a5 as Int and a6 as Int and a7 as Int returning Int:
+external define ep_dlcall9 with fn as Int and a0 as Int and a1 as Int and a2 as Int and a3 as Int and a4 as Int and a5 as Int and a6 as Int and a7 as Int and a8 as Int returning Int:
 
 # libsrtp2 (real SRTP: AES-CM-128 + HMAC-SHA1-80) — loaded once, srtp_init() once.
 # Struct offsets/constants ground-truthed from /opt/homebrew/include/srtp2/srtp.h:
@@ -65,18 +62,22 @@ define webrtc_hexval with c as Int returning Int:
         return c - 87
     if c >= 65 and also c <= 70:
         return c - 55
-    return 0
+    return -1
 
-define webrtc_hex_to_buf with hex_str as Str and nbytes as Int and out_buf as Int and out_off as Int:
+define webrtc_hex_to_buf with hex_str as Str and nbytes as Int and out_buf as Int and out_off as Int returning Int:
+    if nbytes < 0 or else out_buf == 0 or else out_off < 0 or else string_length(hex_str) < nbytes * 2:
+        return 1
     set i to 0
     repeat while i < nbytes:
         set hi to webrtc_hexval(char_at(hex_str and i * 2))
         set lo to webrtc_hexval(char_at(hex_str and i * 2 + 1))
+        if hi < 0 or else lo < 0:
+            return 1
         set ok to poke_byte(out_buf and out_off + i and hi * 16 + lo)
         set i to i + 1
     return 0
 
-define webrtc_poke_u32 with buf as Int and off as Int and val as Int:
+define webrtc_poke_u32 with buf as Int and off as Int and val as Int returning Int:
     set ok to poke_byte(buf and off and val modulo 256)
     set ok to poke_byte(buf and off + 1 and (val / 256) modulo 256)
     set ok to poke_byte(buf and off + 2 and (val / 65536) modulo 256)
@@ -86,7 +87,7 @@ define webrtc_poke_u32 with buf as Int and off as Int and val as Int:
 define webrtc_peek_u32 with buf as Int and off as Int returning Int:
     return peek_byte(buf and off) + peek_byte(buf and off + 1) * 256 + peek_byte(buf and off + 2) * 65536 + peek_byte(buf and off + 3) * 16777216
 
-define webrtc_poke_u64 with buf as Int and off as Int and val as Int:
+define webrtc_poke_u64 with buf as Int and off as Int and val as Int returning Int:
     set v to val
     set i to 0
     repeat while i < 8:
@@ -102,6 +103,13 @@ define webrtc_peek_u64 with buf as Int and off as Int returning Int:
         set v to v * 256 + peek_byte(buf and off + i)
         set i to i - 1
     return v
+
+# ep_dlcall uses a machine-word return type; normalize C `int` results that were
+# zero-extended by the ABI so negative OpenSSL results remain negative in Ernos.
+define webrtc_c_int with value as Int returning Int:
+    if value >= 2147483648 and also value <= 4294967295:
+        return value - 4294967296
+    return value
 
 # Build (and cache in srtp_keys) a real libsrtp2 session for the given ssrc role
 # (3 = any_outbound for protect, 2 = any_inbound for unprotect). The 30-byte master
@@ -131,25 +139,47 @@ define webrtc_srtp_session with srtp_keys as Map and ssrc_type as Int and cache_
         set sf to "recv_salt"
     set master_key to map_get_val(srtp_keys and kf)
     set master_salt to map_get_val(srtp_keys and sf)
+    if ssrc_type != 2 and also ssrc_type != 3:
+        return 0
     if string_length(master_key) < 32 or else string_length(master_salt) < 28:
         return 0
     # 30-byte SRTP master key: 16 bytes cipher key + 14 bytes salt
     set keybuf to alloc_bytes(30)
-    set ok to webrtc_hex_to_buf(master_key and 16 and keybuf and 0)
-    set ok to webrtc_hex_to_buf(master_salt and 14 and keybuf and 16)
+    if keybuf == 0:
+        return 0
+    set key_err to webrtc_hex_to_buf(master_key and 16 and keybuf and 0)
+    if key_err == 0:
+        set key_err to webrtc_hex_to_buf(master_salt and 14 and keybuf and 16)
+    if key_err != 0:
+        set ok to free_bytes(keybuf)
+        return 0
     # zeroed policy struct
     set policy to alloc_bytes(128)
+    if policy == 0:
+        set ok to free_bytes(keybuf)
+        return 0
     set z to 0
     repeat while z < 128:
         set ok to poke_byte(policy and z and 0)
         set z to z + 1
-    set ok to ep_dlcall1(ep_dlsym(lib and "srtp_crypto_policy_set_rtp_default") and policy + 8)
-    set ok to ep_dlcall1(ep_dlsym(lib and "srtp_crypto_policy_set_rtcp_default") and policy + 32)
+    set policy_rtp_fn to ep_dlsym(lib and "srtp_crypto_policy_set_rtp_default")
+    set policy_rtcp_fn to ep_dlsym(lib and "srtp_crypto_policy_set_rtcp_default")
+    set create_fn to ep_dlsym(lib and "srtp_create")
+    if policy_rtp_fn == 0 or else policy_rtcp_fn == 0 or else create_fn == 0:
+        set ok to free_bytes(keybuf)
+        set ok to free_bytes(policy)
+        return 0
+    set ignored_void_result to ep_dlcall1(policy_rtp_fn and policy + 8)
+    set ignored_void_result to ep_dlcall1(policy_rtcp_fn and policy + 32)
     set ok to webrtc_poke_u32(policy and 0 and ssrc_type)
     set ok to webrtc_poke_u64(policy and 56 and keybuf)
     set sess_holder to alloc_bytes(8)
+    if sess_holder == 0:
+        set ok to free_bytes(keybuf)
+        set ok to free_bytes(policy)
+        return 0
     set ok to webrtc_poke_u64(sess_holder and 0 and 0)
-    set err to ep_dlcall2(ep_dlsym(lib and "srtp_create") and sess_holder and policy)
+    set err to ep_dlcall2(create_fn and sess_holder and policy)
     set session to 0
     if err == 0:
         set session to webrtc_peek_u64(sess_holder and 0)
@@ -218,43 +248,113 @@ define webrtc_buf_to_hex with buf as Int and off as Int and nbytes as Int return
 define webrtc_dtls_ensure_cert with cert_path as Str and key_path as Str returning Int:
     if file_exists(cert_path) == 1 and also file_exists(key_path) == 1:
         return 1
-    set cmd to concat("openssl req -x509 -newkey rsa:2048 -keyout '" and key_path)
+    set cert_safe to string_replace(cert_path and "'" and "'\\''")
+    set key_safe to string_replace(key_path and "'" and "'\\''")
+    set cmd to concat("openssl req -x509 -newkey rsa:2048 -keyout '" and key_safe)
     set cmd to concat(cmd and "' -out '")
-    set cmd to concat(cmd and cert_path)
-    set cmd to concat(cmd and "' -nodes -subj /CN=ernos -days 3650 >/dev/null 2>&1")
-    set ok to run_command(cmd)
-    if file_exists(cert_path) == 1 and also file_exists(key_path) == 1:
+    set cmd to concat(cmd and cert_safe)
+    set cmd to concat(cmd and "' -nodes -subj /CN=ernos -days 3650 >/dev/null 2>&1 && chmod 600 '")
+    set cmd to concat(cmd and key_safe)
+    set cmd to concat(cmd and "' && chmod 644 '")
+    set cmd to concat(cmd and cert_safe)
+    set cmd to concat(cmd and "'; printf '\n__ERNOS_EXIT__:%s' $?")
+    set result to run_command(cmd)
+    if string_contains(result and "__ERNOS_EXIT__:0") == 1 and also file_exists(cert_path) == 1 and also file_exists(key_path) == 1:
         return 1
+    if file_exists(cert_path) == 1:
+        set cleanup_ok to remove_file(cert_path)
+        if cleanup_ok == 0:
+            display concat("[-] Failed to remove partial DTLS certificate: " and cert_path)
+    if file_exists(key_path) == 1:
+        set cleanup_ok to remove_file(key_path)
+        if cleanup_ok == 0:
+            display concat("[-] Failed to remove partial DTLS key: " and key_path)
     return 0
 
 # Build a DTLS SSL_CTX with the cert/key loaded and the SRTP profile negotiated.
 define webrtc_dtls_ctx with ssl_lib as Int and cert_path as Str and key_path as Str returning Int:
-    set method to ep_dlcall0(ep_dlsym(ssl_lib and "DTLS_method"))
+    set method_fn to ep_dlsym(ssl_lib and "DTLS_method")
+    set ctx_new_fn to ep_dlsym(ssl_lib and "SSL_CTX_new")
+    set cert_fn to ep_dlsym(ssl_lib and "SSL_CTX_use_certificate_file")
+    set key_fn to ep_dlsym(ssl_lib and "SSL_CTX_use_PrivateKey_file")
+    set srtp_fn to ep_dlsym(ssl_lib and "SSL_CTX_set_tlsext_use_srtp")
+    set ctx_free_fn to ep_dlsym(ssl_lib and "SSL_CTX_free")
+    if method_fn == 0 or else ctx_new_fn == 0 or else cert_fn == 0 or else key_fn == 0 or else srtp_fn == 0 or else ctx_free_fn == 0:
+        display "ERROR: required OpenSSL DTLS context symbol is unavailable"
+        return 0
+    set method to ep_dlcall0(method_fn)
     if method == 0:
+        display "ERROR: OpenSSL did not provide a DTLS method"
         return 0
-    set ctx to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_CTX_new") and method)
+    set ctx to ep_dlcall1(ctx_new_fn and method)
     if ctx == 0:
+        display "ERROR: OpenSSL DTLS context allocation failed"
         return 0
-    set ok to ep_dlcall3(ep_dlsym(ssl_lib and "SSL_CTX_use_certificate_file") and ctx and cert_path and 1)
-    set ok to ep_dlcall3(ep_dlsym(ssl_lib and "SSL_CTX_use_PrivateKey_file") and ctx and key_path and 1)
-    set ok to ep_dlcall2(ep_dlsym(ssl_lib and "SSL_CTX_set_tlsext_use_srtp") and ctx and "SRTP_AES128_CM_SHA1_80")
+    set ok to ep_dlcall3(cert_fn and ctx and cert_path and 1)
+    if ok != 1:
+        display concat("ERROR: OpenSSL could not load DTLS certificate " and cert_path)
+        set ignored_void_result to ep_dlcall1(ctx_free_fn and ctx)
+        return 0
+    set ok to ep_dlcall3(key_fn and ctx and key_path and 1)
+    if ok != 1:
+        display concat("ERROR: OpenSSL could not load DTLS private key " and key_path)
+        set ignored_void_result to ep_dlcall1(ctx_free_fn and ctx)
+        return 0
+    set ok to ep_dlcall2(srtp_fn and ctx and "SRTP_AES128_CM_SHA1_80")
+    if ok != 0:
+        display concat("ERROR: OpenSSL could not enable the DTLS-SRTP profile; code " and int_to_string(ok))
+        set ignored_void_result to ep_dlcall1(ctx_free_fn and ctx)
+        return 0
     return ctx
 
+# Release an SSL pair and its contexts. SSL_free also releases BIOs attached by SSL_set_bio.
+define webrtc_dtls_cleanup with ssl_lib as Int and server_ssl as Int and client_ssl as Int and server_ctx as Int and client_ctx as Int returning Int:
+    set ssl_free_fn to ep_dlsym(ssl_lib and "SSL_free")
+    set ctx_free_fn to ep_dlsym(ssl_lib and "SSL_CTX_free")
+    if ssl_free_fn == 0 or else ctx_free_fn == 0:
+        display "ERROR: OpenSSL cleanup symbols are unavailable"
+        return 0
+    if server_ssl != 0:
+        set ignored_void_result to ep_dlcall1(ssl_free_fn and server_ssl)
+    if client_ssl != 0:
+        set ignored_void_result to ep_dlcall1(ssl_free_fn and client_ssl)
+    if server_ctx != 0:
+        set ignored_void_result to ep_dlcall1(ctx_free_fn and server_ctx)
+    if client_ctx != 0:
+        set ignored_void_result to ep_dlcall1(ctx_free_fn and client_ctx)
+    return 1
+
 # Pump all pending DTLS records from `from`'s write-BIO into `to`'s read-BIO.
-define webrtc_dtls_pump with ssl_lib as Int and crypto_lib as Int and from_ssl as Int and to_ssl as Int and scratch as Int and scratch_len as Int:
-    set wbio to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_get_wbio") and from_ssl)
-    set rbio to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_get_rbio") and to_ssl)
+define webrtc_dtls_pump with ssl_lib as Int and crypto_lib as Int and from_ssl as Int and to_ssl as Int and scratch as Int and scratch_len as Int returning Int:
+    if from_ssl == 0 or else to_ssl == 0 or else scratch == 0 or else scratch_len <= 0:
+        display "ERROR: invalid DTLS BIO pump argument"
+        return 0
+    set get_wbio_fn to ep_dlsym(ssl_lib and "SSL_get_wbio")
+    set get_rbio_fn to ep_dlsym(ssl_lib and "SSL_get_rbio")
     set bio_read to ep_dlsym(crypto_lib and "BIO_read")
     set bio_write to ep_dlsym(crypto_lib and "BIO_write")
-    set looping to 1
+    if get_wbio_fn == 0 or else get_rbio_fn == 0 or else bio_read == 0 or else bio_write == 0:
+        display "ERROR: required OpenSSL BIO pump symbol is unavailable"
+        return 0
+    set wbio to ep_dlcall1(get_wbio_fn and from_ssl)
+    set rbio to ep_dlcall1(get_rbio_fn and to_ssl)
+    if wbio == 0 or else rbio == 0:
+        display "ERROR: OpenSSL DTLS connection has no attached BIO"
+        return 0
     set guard to 0
-    repeat while looping == 1 and also guard < 100000:
-        set n to ep_dlcall3(bio_read and wbio and scratch and scratch_len)
+    repeat while guard < 100000:
+        set n to webrtc_c_int(ep_dlcall3(bio_read and wbio and scratch and scratch_len))
         if n <= 0:
-            set looping to 0
-        else:
-            set ok to ep_dlcall3(bio_write and rbio and scratch and n)
+            return 1
+        set written to 0
+        repeat while written < n:
+            set nw to webrtc_c_int(ep_dlcall3(bio_write and rbio and scratch + written and n - written))
+            if nw <= 0:
+                display concat("ERROR: OpenSSL BIO_write failed with code " and concat(int_to_string(nw) and concat(" for " and concat(int_to_string(n - written) and " pending bytes"))))
+                return 0
+            set written to written + nw
         set guard to guard + 1
+    display "ERROR: DTLS BIO pump exceeded its record guard"
     return 0
 
 # Run one real DTLS-SRTP negotiation. Populates keys_client and keys_server with their
@@ -263,44 +363,107 @@ define webrtc_dtls_negotiate with keys_client as Map and keys_server as Map and 
     set ssl_lib to webrtc_ssl_lib()
     set crypto_lib to webrtc_crypto_lib()
     if ssl_lib == 0 or else crypto_lib == 0:
+        display "ERROR: OpenSSL DTLS libraries are unavailable"
         return 0
     if webrtc_dtls_ensure_cert(cert_path and key_path) == 0:
+        display "ERROR: DTLS certificate generation failed"
         return 0
-    set ok to ep_dlcall2(ep_dlsym(ssl_lib and "OPENSSL_init_ssl") and 0 and 0)
+    set init_fn to ep_dlsym(ssl_lib and "OPENSSL_init_ssl")
+    set ssl_new_fn to ep_dlsym(ssl_lib and "SSL_new")
+    set bio_new_fn to ep_dlsym(crypto_lib and "BIO_new")
+    set bio_s_mem_fn to ep_dlsym(crypto_lib and "BIO_s_mem")
+    set bio_free_fn to ep_dlsym(crypto_lib and "BIO_free")
+    set set_bio_fn to ep_dlsym(ssl_lib and "SSL_set_bio")
+    set accept_fn to ep_dlsym(ssl_lib and "SSL_set_accept_state")
+    set connect_fn to ep_dlsym(ssl_lib and "SSL_set_connect_state")
+    set do_hs to ep_dlsym(ssl_lib and "SSL_do_handshake")
+    set export_fn to ep_dlsym(ssl_lib and "SSL_export_keying_material")
+    set ssl_free_fn to ep_dlsym(ssl_lib and "SSL_free")
+    set ctx_free_fn to ep_dlsym(ssl_lib and "SSL_CTX_free")
+    if init_fn == 0 or else ssl_new_fn == 0 or else bio_new_fn == 0 or else bio_s_mem_fn == 0 or else bio_free_fn == 0 or else set_bio_fn == 0 or else accept_fn == 0 or else connect_fn == 0 or else do_hs == 0 or else export_fn == 0 or else ssl_free_fn == 0 or else ctx_free_fn == 0:
+        display "ERROR: required OpenSSL DTLS handshake symbol is unavailable"
+        return 0
+    set init_ok to ep_dlcall2(init_fn and 0 and 0)
+    if init_ok != 1:
+        display concat("ERROR: OpenSSL initialization failed with code " and int_to_string(init_ok))
+        return 0
     set sctx to webrtc_dtls_ctx(ssl_lib and cert_path and key_path)
     set cctx to webrtc_dtls_ctx(ssl_lib and cert_path and key_path)
     if sctx == 0 or else cctx == 0:
+        display "ERROR: OpenSSL DTLS context creation failed"
+        set cleanup_ok to webrtc_dtls_cleanup(ssl_lib and 0 and 0 and sctx and cctx)
         return 0
-    set s to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_new") and sctx)
-    set c to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_new") and cctx)
-    set bio_new to ep_dlsym(crypto_lib and "BIO_new")
-    set bio_s_mem to ep_dlsym(crypto_lib and "BIO_s_mem")
-    set set_bio to ep_dlsym(ssl_lib and "SSL_set_bio")
-    set ok to ep_dlcall3(set_bio and s and ep_dlcall1(bio_new and ep_dlcall0(bio_s_mem)) and ep_dlcall1(bio_new and ep_dlcall0(bio_s_mem)))
-    set ok to ep_dlcall3(set_bio and c and ep_dlcall1(bio_new and ep_dlcall0(bio_s_mem)) and ep_dlcall1(bio_new and ep_dlcall0(bio_s_mem)))
-    set ok to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_set_accept_state") and s)
-    set ok to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_set_connect_state") and c)
-    set do_hs to ep_dlsym(ssl_lib and "SSL_do_handshake")
+    set s to ep_dlcall1(ssl_new_fn and sctx)
+    set c to ep_dlcall1(ssl_new_fn and cctx)
+    if s == 0 or else c == 0:
+        display "ERROR: OpenSSL DTLS connection allocation failed"
+        set cleanup_ok to webrtc_dtls_cleanup(ssl_lib and s and c and sctx and cctx)
+        return 0
+    set bio_method to ep_dlcall0(bio_s_mem_fn)
+    if bio_method == 0:
+        display "ERROR: OpenSSL memory BIO method is unavailable"
+        set cleanup_ok to webrtc_dtls_cleanup(ssl_lib and s and c and sctx and cctx)
+        return 0
+    set s_read_bio to ep_dlcall1(bio_new_fn and bio_method)
+    set s_write_bio to ep_dlcall1(bio_new_fn and bio_method)
+    set c_read_bio to ep_dlcall1(bio_new_fn and bio_method)
+    set c_write_bio to ep_dlcall1(bio_new_fn and bio_method)
+    if s_read_bio == 0 or else s_write_bio == 0 or else c_read_bio == 0 or else c_write_bio == 0:
+        display "ERROR: OpenSSL memory BIO allocation failed"
+        if s_read_bio != 0:
+            set bio_free_ok to ep_dlcall1(bio_free_fn and s_read_bio)
+        if s_write_bio != 0:
+            set bio_free_ok to ep_dlcall1(bio_free_fn and s_write_bio)
+        if c_read_bio != 0:
+            set bio_free_ok to ep_dlcall1(bio_free_fn and c_read_bio)
+        if c_write_bio != 0:
+            set bio_free_ok to ep_dlcall1(bio_free_fn and c_write_bio)
+        set cleanup_ok to webrtc_dtls_cleanup(ssl_lib and s and c and sctx and cctx)
+        return 0
+    set ignored_void_result to ep_dlcall3(set_bio_fn and s and s_read_bio and s_write_bio)
+    set ignored_void_result to ep_dlcall3(set_bio_fn and c and c_read_bio and c_write_bio)
+    set ignored_void_result to ep_dlcall1(accept_fn and s)
+    set ignored_void_result to ep_dlcall1(connect_fn and c)
     set scratch to alloc_bytes(16384)
+    if scratch == 0:
+        display "ERROR: DTLS handshake buffer allocation failed"
+        set cleanup_ok to webrtc_dtls_cleanup(ssl_lib and s and c and sctx and cctx)
+        return 0
     set cf to 0
     set sf to 0
     set iter to 0
     repeat while iter < 200 and also (cf == 0 or else sf == 0):
         if ep_dlcall1(do_hs and c) == 1:
             set cf to 1
-        set ok to webrtc_dtls_pump(ssl_lib and crypto_lib and c and s and scratch and 16384)
+        set pump_ok to webrtc_dtls_pump(ssl_lib and crypto_lib and c and s and scratch and 16384)
+        if pump_ok == 0:
+            set iter to 200
         if ep_dlcall1(do_hs and s) == 1:
             set sf to 1
-        set ok to webrtc_dtls_pump(ssl_lib and crypto_lib and s and c and scratch and 16384)
+        if pump_ok == 1:
+            set pump_ok to webrtc_dtls_pump(ssl_lib and crypto_lib and s and c and scratch and 16384)
+        if pump_ok == 0:
+            set iter to 200
         set iter to iter + 1
     set ok to free_bytes(scratch)
-    if cf == 0 or else sf == 0:
+    if cf == 0 or else sf == 0 or else pump_ok == 0:
+        if pump_ok == 0:
+            display "ERROR: DTLS record transfer between OpenSSL BIOs failed"
+        else:
+            display "ERROR: OpenSSL DTLS handshake did not complete within 200 iterations"
+        set cleanup_ok to webrtc_dtls_cleanup(ssl_lib and s and c and sctx and cctx)
         return 0
     # Export the 60-byte SRTP keying material (identical on both ends).
     set km to alloc_bytes(60)
-    set er to ep_dlcall8(ep_dlsym(ssl_lib and "SSL_export_keying_material") and c and km and 60 and "EXTRACTOR-dtls_srtp" and 19 and 0 and 0 and 0)
+    if km == 0:
+        display "ERROR: DTLS-SRTP keying-material allocation failed"
+        set cleanup_ok to webrtc_dtls_cleanup(ssl_lib and s and c and sctx and cctx)
+        return 0
+    set er to ep_dlcall8(export_fn and c and km and 60 and "EXTRACTOR-dtls_srtp" and 19 and 0 and 0 and 0)
     if er != 1:
+        display concat("ERROR: OpenSSL DTLS-SRTP key export failed with code " and int_to_string(er))
         set ok to free_bytes(km)
+        set cleanup_ok to webrtc_dtls_cleanup(ssl_lib and s and c and sctx and cctx)
         return 0
     # RFC 5764 layout: client_key[0..16) server_key[16..32) client_salt[32..46) server_salt[46..60)
     set client_key to webrtc_buf_to_hex(km and 0 and 16)
@@ -317,28 +480,8 @@ define webrtc_dtls_negotiate with keys_client as Map and keys_server as Map and 
     set ok to map_insert(keys_server and "send_salt" and server_salt)
     set ok to map_insert(keys_server and "recv_key" and client_key)
     set ok to map_insert(keys_server and "recv_salt" and client_salt)
-    set ok to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_free") and s)
-    set ok to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_free") and c)
-    set ok to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_CTX_free") and sctx)
-    set ok to ep_dlcall1(ep_dlsym(ssl_lib and "SSL_CTX_free") and cctx)
-    return 1
-
-define webrtc_load_sodium returning Int:
-    if WEBRTC_SODIUM_HANDLE != 0:
-        return WEBRTC_SODIUM_HANDLE
-    set h to ep_dlopen("libsodium.dylib")
-    if h == 0:
-        set h to ep_dlopen("/opt/homebrew/lib/libsodium.dylib")
-    if h == 0:
-        set h to ep_dlopen("/usr/local/lib/libsodium.dylib")
-    if h == 0:
-        set h to ep_dlopen("libsodium.so")
-    if h == 0:
-        set h to ep_dlopen("libsodium.so.26")
-    if h == 0:
-        set h to ep_dlopen("libsodium.so.23")
-    set WEBRTC_SODIUM_HANDLE to h
-    return h
+    set cleanup_ok to webrtc_dtls_cleanup(ssl_lib and s and c and sctx and cctx)
+    return cleanup_ok
 
 define xor_int with a as Int and b as Int returning Int:
     set res to 0
@@ -384,19 +527,51 @@ define webrtc_create_peer_connection with local_id as Str returning Map:
     
     set ok to map_insert(pc and "ssrc" and ep_random_int(100000 and 999999))
     set ok to map_insert(pc and "seq" and 0)
-    
-    # Setup DH keys for DTLS simulation
-    set sodium to webrtc_load_sodium()
-    if sodium != 0:
-        set fn_keygen to ep_dlsym(sodium and "crypto_box_keypair")
-        if fn_keygen != 0:
-            set pk to alloc_bytes(32)
-            set sk to alloc_bytes(32)
-            set res to ep_dlcall2(fn_keygen and pk and sk)
-            set ok to map_insert(pc and "dh_pub_ptr" and pk)
-            set ok to map_insert(pc and "dh_sec_ptr" and sk)
-            
+    set ok to map_insert(pc and "error" and 0)
     return pc
+
+# Release native SRTP sessions stored in a key map. Returns 0 on success.
+define webrtc_close_srtp_keys with srtp_keys as Map returning Int:
+    set send_session to 0
+    set recv_session to 0
+    if map_contains(srtp_keys and "srtp_send") == 1:
+        set send_session to map_get_val(srtp_keys and "srtp_send")
+    if map_contains(srtp_keys and "srtp_recv") == 1:
+        set recv_session to map_get_val(srtp_keys and "srtp_recv")
+    if send_session == 0 and also recv_session == 0:
+        return 0
+    set lib to webrtc_srtp_lib()
+    if lib == 0:
+        display "ERROR: cannot release SRTP sessions because libsrtp2 is unavailable"
+        return 1
+    set dealloc_fn to ep_dlsym(lib and "srtp_dealloc")
+    if dealloc_fn == 0:
+        display "ERROR: cannot release SRTP sessions because srtp_dealloc is unavailable"
+        return 1
+    set close_error to 0
+    if send_session != 0:
+        set err to ep_dlcall1(dealloc_fn and send_session)
+        if err != 0:
+            display concat("ERROR: SRTP send-session cleanup failed with code " and int_to_string(err))
+            set close_error to err
+        else:
+            set ok to map_insert(srtp_keys and "srtp_send" and 0)
+    if recv_session != 0 and also recv_session != send_session:
+        set err to ep_dlcall1(dealloc_fn and recv_session)
+        if err != 0:
+            display concat("ERROR: SRTP receive-session cleanup failed with code " and int_to_string(err))
+            set close_error to err
+        else:
+            set ok to map_insert(srtp_keys and "srtp_recv" and 0)
+    else if recv_session == send_session and also recv_session != 0 and also close_error == 0:
+        set ok to map_insert(srtp_keys and "srtp_recv" and 0)
+    return close_error
+
+# Release every native resource owned by a peer connection. Returns 0 on success.
+define webrtc_close_peer_connection with pc as Map returning Int:
+    set close_error to webrtc_close_srtp_keys(map_get_val(pc and "srtp_keys"))
+    set ok to map_insert(pc and "state" and "closed")
+    return close_error
 
 define webrtc_generate_local_sdp with pc as Map returning Str:
     set local_id to map_get_val(pc and "local_id")
@@ -467,7 +642,13 @@ define webrtc_set_remote_sdp with pc as Map and sdp as Str returning Int:
 # STUN Protocol Helpers (Binding Request / Response)
 define webrtc_pack_stun_request with transaction_id as List returning Int:
     # Allocates a 20-byte STUN header
+    if length_list(transaction_id) != 12:
+        display "ERROR: STUN transaction ID must contain exactly 12 bytes"
+        return 0
     set buf to alloc_bytes(20)
+    if buf == 0:
+        display "ERROR: STUN request allocation failed"
+        return 0
     # Type: Binding Request (0x0001)
     poke_byte(buf and 0 and 0)
     poke_byte(buf and 1 and 1)
@@ -492,29 +673,43 @@ define webrtc_pack_stun_request with transaction_id as List returning Int:
 define webrtc_parse_stun_response with pkt_ptr as Int and pkt_len as Int returning Map:
     set res to create_map()
     set ok to map_insert(res and "valid" and 0)
-    if pkt_len < 20:
+    set ok to map_insert(res and "error" and 1)
+    if pkt_ptr == 0 or else pkt_len < 20:
         return res
         
     # Verify binding response type (0x0101)
     set t0 to peek_byte(pkt_ptr and 0)
     set t1 to peek_byte(pkt_ptr and 1)
     if t0 != 1 or else t1 != 1:
+        set ok to map_insert(res and "error" and 2)
         return res
         
     # Verify magic cookie (0x2112A442)
     if peek_byte(pkt_ptr and 4) != 33 or else peek_byte(pkt_ptr and 5) != 18 or else peek_byte(pkt_ptr and 6) != 164 or else peek_byte(pkt_ptr and 7) != 66:
+        set ok to map_insert(res and "error" and 3)
         return res
+    set message_len to peek_byte(pkt_ptr and 2) * 256 + peek_byte(pkt_ptr and 3)
+    if message_len > pkt_len - 20 or else message_len modulo 4 != 0:
+        set ok to map_insert(res and "error" and 4)
+        return res
+    set message_end to 20 + message_len
         
     # Transaction ID matching can be done outside, but let's parse XOR-MAPPED-ADDRESS attribute
     # Attributes start at offset 20
     set offset to 20
-    repeat while offset < pkt_len:
+    repeat while offset + 4 <= message_end:
         set attr_type to peek_byte(pkt_ptr and offset) * 256 + peek_byte(pkt_ptr and offset + 1)
         set attr_len to peek_byte(pkt_ptr and offset + 2) * 256 + peek_byte(pkt_ptr and offset + 3)
+        if attr_len > message_end - offset - 4:
+            set ok to map_insert(res and "error" and 5)
+            return res
         
         # XOR-MAPPED-ADDRESS attribute is 0x0020
         # MAPPED-ADDRESS attribute is 0x0001
         if attr_type == 32: # 0x0020
+            if attr_len < 8 or else peek_byte(pkt_ptr and offset + 5) != 1:
+                set ok to map_insert(res and "error" and 6)
+                return res
             set port_xor to peek_byte(pkt_ptr and offset + 6) * 256 + peek_byte(pkt_ptr and offset + 7)
             # XOR port with magic cookie high 16-bits (0x2112)
             set port to xor_int(port_xor and 8466)
@@ -529,69 +724,36 @@ define webrtc_parse_stun_response with pkt_ptr as Int and pkt_len as Int returni
             set ok to map_insert(res and "address" and ip_str)
             set ok to map_insert(res and "port" and port)
             set ok to map_insert(res and "valid" and 1)
+            set ok to map_insert(res and "error" and 0)
             return res
             
-        set offset to offset + 4 + attr_len
-        
+        set padded_len to ((attr_len + 3) / 4) * 4
+        set offset to offset + 4 + padded_len
+    
+    set ok to map_insert(res and "error" and 7)
     return res
-
-# DTLS / SRTP processing
-define webrtc_initiate_dtls_handshake with pc as Map returning Int:
-    set ok to map_insert(pc and "dtls_state" and "handshake_sent")
-    return 0
-
-define webrtc_derive_srtp_keys with pc as Map returning Map:
-    set keys to map_get_val(pc and "srtp_keys")
-    
-    set local_fp to map_get_val(pc and "local_fingerprint")
-    set remote_fp to map_get_val(pc and "remote_fingerprint")
-    if string_length(remote_fp) == 0:
-        set remote_fp to ep_sha256("default_remote")
-        
-    # Symmetrically sort local and remote fingerprints to derive identical keys on both sides
-    set key_material to ""
-    set diff_found to 0
-    set idx to 0
-    set len to string_length(local_fp)
-    
-    repeat while idx < len and also diff_found == 0:
-        set c_local to char_at(local_fp and idx)
-        set c_remote to char_at(remote_fp and idx)
-        if c_local < c_remote:
-            set key_material to concat(local_fp and remote_fp)
-            set diff_found to 1
-        if c_local > c_remote:
-            set key_material to concat(remote_fp and local_fp)
-            set diff_found to 1
-        set idx to idx + 1
-        
-    if diff_found == 0:
-        set key_material to concat(local_fp and remote_fp)
-        
-    # Generate keys symmetrically using sorted hash material
-    set master_key_hex to ep_sha256(key_material)
-    set master_salt_hex to ep_sha256(concat(master_key_hex and "salt"))
-    
-    set ok to map_insert(keys and "master_key" and master_key_hex)
-    set ok to map_insert(keys and "master_salt" and master_salt_hex)
-    
-    set ok to map_insert(pc and "dtls_state" and "connected")
-    set ok to map_insert(pc and "state" and "connected")
-    return keys
 
 define webrtc_encrypt_srtp with payload_ptr as Int and payload_len as Int and srtp_keys as Map and seq as Int and ssrc as Int returning Map:
     # REAL SRTP via libsrtp2: build an RTP packet then srtp_protect() it (AES-CM-128
     # encryption + HMAC-SHA1-80 authentication). Returns { packet_ptr, packet_len, error }.
     # On any libsrtp failure we return an explicit error (no fake-cipher fallback).
     set ret to create_map()
+    if payload_ptr == 0 or else payload_len < 0 or else payload_len > 65523 or else seq < 0 or else seq > 65535 or else ssrc < 0 or else ssrc > 4294967295:
+        set ok to map_insert(ret and "error" and 1)
+        set ok to map_insert(ret and "packet_len" and 0)
+        return ret
     set session to webrtc_srtp_session(srtp_keys and 3 and "srtp_send")
     if session == 0:
-        set ok to map_insert(ret and "error" and 1)
+        set ok to map_insert(ret and "error" and 2)
         set ok to map_insert(ret and "packet_len" and 0)
         return ret
     set rtp_len to 12 + payload_len
     # Allocate room for the SRTP auth trailer (SRTP_MAX_TRAILER_LEN = 144).
     set buf to alloc_bytes(rtp_len + 144)
+    if buf == 0:
+        set ok to map_insert(ret and "error" and 3)
+        set ok to map_insert(ret and "packet_len" and 0)
+        return ret
     set ok to poke_byte(buf and 0 and 128)
     set ok to poke_byte(buf and 1 and 96)
     set ok to poke_byte(buf and 2 and (seq / 256) modulo 256)
@@ -610,8 +772,20 @@ define webrtc_encrypt_srtp with payload_ptr as Int and payload_len as Int and sr
         set ok to poke_byte(buf and 12 + i and peek_byte(payload_ptr and i))
         set i to i + 1
     set len_buf to alloc_bytes(4)
+    if len_buf == 0:
+        set ok to free_bytes(buf)
+        set ok to map_insert(ret and "error" and 3)
+        set ok to map_insert(ret and "packet_len" and 0)
+        return ret
     set ok to webrtc_poke_u32(len_buf and 0 and rtp_len)
-    set err to ep_dlcall3(ep_dlsym(webrtc_srtp_lib() and "srtp_protect") and session and buf and len_buf)
+    set protect_fn to ep_dlsym(webrtc_srtp_lib() and "srtp_protect")
+    if protect_fn == 0:
+        set ok to free_bytes(len_buf)
+        set ok to free_bytes(buf)
+        set ok to map_insert(ret and "error" and 4)
+        set ok to map_insert(ret and "packet_len" and 0)
+        return ret
+    set err to ep_dlcall3(protect_fn and session and buf and len_buf)
     set new_len to webrtc_peek_u32(len_buf and 0)
     set ok to free_bytes(len_buf)
     if err != 0:
@@ -629,30 +803,54 @@ define webrtc_decrypt_srtp with srtp_packet_ptr as Int and srtp_packet_len as In
     # decrypts in place. A forged/tampered packet fails authentication → valid:0.
     set ret to create_map()
     set ok to map_insert(ret and "valid" and 0)
+    set ok to map_insert(ret and "error" and 1)
+    if srtp_packet_ptr == 0 or else srtp_packet_len < 12 or else srtp_packet_len > 65535:
+        return ret
     set session to webrtc_srtp_session(srtp_keys and 2 and "srtp_recv")
     if session == 0:
-        return ret
-    if srtp_packet_len < 12:
+        set ok to map_insert(ret and "error" and 2)
         return ret
     # Copy into a working buffer (unprotect mutates in place + shrinks the length).
     set buf to alloc_bytes(srtp_packet_len)
+    if buf == 0:
+        set ok to map_insert(ret and "error" and 3)
+        return ret
     set i to 0
     repeat while i < srtp_packet_len:
         set ok to poke_byte(buf and i and peek_byte(srtp_packet_ptr and i))
         set i to i + 1
     set len_buf to alloc_bytes(4)
+    if len_buf == 0:
+        set ok to free_bytes(buf)
+        set ok to map_insert(ret and "error" and 3)
+        return ret
     set ok to webrtc_poke_u32(len_buf and 0 and srtp_packet_len)
-    set err to ep_dlcall3(ep_dlsym(webrtc_srtp_lib() and "srtp_unprotect") and session and buf and len_buf)
+    set unprotect_fn to ep_dlsym(webrtc_srtp_lib() and "srtp_unprotect")
+    if unprotect_fn == 0:
+        set ok to free_bytes(len_buf)
+        set ok to free_bytes(buf)
+        set ok to map_insert(ret and "error" and 4)
+        return ret
+    set err to ep_dlcall3(unprotect_fn and session and buf and len_buf)
     set new_len to webrtc_peek_u32(len_buf and 0)
     set ok to free_bytes(len_buf)
     if err != 0:
         set ok to free_bytes(buf)
+        set ok to map_insert(ret and "error" and err)
+        return ret
+    if new_len < 12 or else new_len > srtp_packet_len:
+        set ok to free_bytes(buf)
+        set ok to map_insert(ret and "error" and 5)
         return ret
     # new_len is the recovered RTP packet length (12-byte header + cleartext payload).
     set seq to peek_byte(buf and 2) * 256 + peek_byte(buf and 3)
     set ssrc to peek_byte(buf and 8) * 16777216 + peek_byte(buf and 9) * 65536 + peek_byte(buf and 10) * 256 + peek_byte(buf and 11)
     set payload_len to new_len - 12
     set plain_buf to alloc_bytes(payload_len)
+    if payload_len > 0 and also plain_buf == 0:
+        set ok to free_bytes(buf)
+        set ok to map_insert(ret and "error" and 3)
+        return ret
     set i to 0
     repeat while i < payload_len:
         set ok to poke_byte(plain_buf and i and peek_byte(buf and 12 + i))
@@ -663,4 +861,5 @@ define webrtc_decrypt_srtp with srtp_packet_ptr as Int and srtp_packet_len as In
     set ok to map_insert(ret and "seq" and seq)
     set ok to map_insert(ret and "ssrc" and ssrc)
     set ok to map_insert(ret and "valid" and 1)
+    set ok to map_insert(ret and "error" and 0)
     return ret

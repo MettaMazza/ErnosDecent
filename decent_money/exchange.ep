@@ -10,15 +10,31 @@ import "../storage"
 
 
 # ================================================================
-# Constants and Structs Simulation
+# Constants and data structures
 # ================================================================
 
 set ORDER_BUY to 1
 set ORDER_SELL to 2
+set DEX_ERR_PERSISTENCE to 946
+set DEX_ERR_ROLLBACK to 947
 
 # ================================================================
 # Helpers
 # ================================================================
+
+define dex_rollback_settlement with token_a as Map and buyer as Str and trade_amt as Int and token_b as Map and seller as Str and cost as Int and refund as Int returning Int:
+    set first_error to 0
+    if refund > 0:
+        set refund_err to token_transfer(token_b and buyer and "dex_escrow" and refund)
+        if refund_err != 0:
+            set first_error to refund_err
+    set cost_err to token_transfer(token_b and seller and "dex_escrow" and cost)
+    if cost_err != 0 and also first_error == 0:
+        set first_error to cost_err
+    set asset_err to token_transfer(token_a and buyer and "dex_escrow" and trade_amt)
+    if asset_err != 0 and also first_error == 0:
+        set first_error to asset_err
+    return first_error
 
 define is_sym_less with sym_a as Str and sym_b as Str returning Int:
     if sym_a equals sym_b:
@@ -599,45 +615,66 @@ define dex_match_orders with dex as Map returning Int:
                                 set t_err3 to token_transfer(token_b and "dex_escrow" and buyer and refund)
                             
                             if t_err3 == 0:
-                                # All transfers succeeded! Proceed with updating orderbook state.
+                                # All transfers succeeded. Persist both order changes in one
+                                # SQLite transaction before changing the in-memory orderbook.
                                 set next_buy_amt to buy_amt - trade_amt
                                 set next_sell_amt to sell_amt - trade_amt
+                                set dex_db to storage_get_db()
+                                set begin_err to sql_execute(dex_db and "BEGIN IMMEDIATE;")
+                                set persist_err to begin_err
+                                set buy_persist_err to begin_err
+                                set sell_persist_err to begin_err
+                                if begin_err == 0:
+                                    if next_buy_amt == 0:
+                                        set buy_persist_err to storage_dex_delete_order(buy_oid)
+                                    else:
+                                        set buy_persist_err to storage_dex_save_order(buy_oid and sym_a and sym_b and "buy" and buy_price and next_buy_amt and buyer and buy_created)
+                                    if buy_persist_err == 0:
+                                        if next_sell_amt == 0:
+                                            set sell_persist_err to storage_dex_delete_order(sell_oid)
+                                        else:
+                                            set sell_persist_err to storage_dex_save_order(sell_oid and sym_a and sym_b and "sell" and sell_price and next_sell_amt and seller and sell_created)
+                                if persist_err == 0 and also buy_persist_err == 0 and also sell_persist_err == 0:
+                                    set persist_err to sql_execute(dex_db and "COMMIT;")
+                                if persist_err != 0 or else buy_persist_err != 0 or else sell_persist_err != 0:
+                                    set db_rollback_err to 0
+                                    if begin_err == 0:
+                                        set db_rollback_err to sql_execute(dex_db and "ROLLBACK;")
+                                    set transfer_rollback_err to dex_rollback_settlement(token_a and buyer and trade_amt and token_b and seller and cost and refund)
+                                    free_list(keys)
+                                    if db_rollback_err != 0 or else transfer_rollback_err != 0:
+                                        return DEX_ERR_ROLLBACK
+                                    return DEX_ERR_PERSISTENCE
+
                                 set ok to map_insert(buy_order and "amount" and next_buy_amt)
                                 set ok to map_insert(sell_order and "amount" and next_sell_amt)
-                                
                                 set buy_amt to next_buy_amt
                                 set sell_amt to next_sell_amt
-                                
-                                # Update SQLite persistent storage
-                                if next_buy_amt == 0:
-                                    set ok to storage_dex_delete_order(buy_oid)
-                                else:
-                                    set ok to storage_dex_save_order(buy_oid and sym_a and sym_b and "buy" and buy_price and next_buy_amt and buyer and buy_created)
-                                    
-                                if next_sell_amt == 0:
-                                    set ok to storage_dex_delete_order(sell_oid)
-                                else:
-                                    set ok to storage_dex_save_order(sell_oid and sym_a and sym_b and "sell" and sell_price and next_sell_amt and seller and sell_created)
 
-                                # Remove filled orders
+                                if next_buy_amt == 0:
+                                    set matched to 1
                                 if next_sell_amt == 0:
-                                    remove_list(sells and s_idx)
+                                    set removed_sell to remove_list(sells and s_idx)
                                     # Do not increment s_idx since element was removed
                                 else:
                                     set s_idx to s_idx + 1
                                     
                                 if next_buy_amt == 0:
-                                    remove_list(buys and b_idx)
-                                    set matched to 1
+                                    set removed_buy to remove_list(buys and b_idx)
                                     # Buyer fully filled, stop scanning sells for this buyer
                             else:
                                 # refund failed, rollback cost transfer and token_a transfer
-                                token_transfer(token_b and seller and "dex_escrow" and cost)
-                                token_transfer(token_a and buyer and "dex_escrow" and trade_amt)
+                                set rollback_err to dex_rollback_settlement(token_a and buyer and trade_amt and token_b and seller and cost and 0)
+                                if rollback_err != 0:
+                                    free_list(keys)
+                                    return DEX_ERR_ROLLBACK
                                 set s_idx to s_idx + 1
                         else:
                             # cost transfer failed, rollback token_a transfer
-                            token_transfer(token_a and buyer and "dex_escrow" and trade_amt)
+                            set rollback_err to token_transfer(token_a and buyer and "dex_escrow" and trade_amt)
+                            if rollback_err != 0:
+                                free_list(keys)
+                                return DEX_ERR_ROLLBACK
                             set s_idx to s_idx + 1
                     else:
                         # token_a transfer failed, skip match

@@ -11,6 +11,10 @@ import "string"
 import "fs"
 import "json"
 import "transport"
+import "dht_transport"
+import "../logging"
+
+external define cast_int_to_map with i as Int returning Map
 
 # ================================================================
 # Constants and Error Codes
@@ -23,6 +27,7 @@ set GITDEC_ERR_VERIFICATION_FAILED to 803
 set GITDEC_ERR_INVALID_REF to 804
 set GITDEC_ERR_NOT_FOUND to 805
 set GITDEC_ERR_INVALID_VISIBILITY to 806
+set GITDEC_ERR_IO to 807
 
 # ================================================================
 # Conversion: JSON Nodes to Native Maps/Lists
@@ -128,7 +133,10 @@ define gitdec_serialize_manifest with manifest as Map returning Str:
 define gitdec_save_manifest with filepath as Str and manifest as Map returning Int:
     set json_str to gitdec_serialize_manifest(manifest)
     set ok to write_file(filepath and json_str)
-    return 0
+    if ok == 0:
+        display concat("[-] GitDec manifest write failed: " and filepath)
+        return GITDEC_ERR_IO
+    return GITDEC_ERR_NONE
 
 
 define gitdec_save_issues with filepath as Str and root as Map returning Int:
@@ -179,7 +187,10 @@ define gitdec_save_issues with filepath as Str and root as Map returning Int:
         set i to i + 1
     set json_str to concat(json_str and "  ]\n}\n")
     set ok to write_file(filepath and json_str)
-    return 0
+    if ok == 0:
+        display concat("[-] GitDec issue write failed: " and filepath)
+        return GITDEC_ERR_IO
+    return GITDEC_ERR_NONE
 
 define gitdec_save_prs with filepath as Str and root as Map returning Int:
     set prs_list to map_get_val(root and "pull_requests")
@@ -235,7 +246,10 @@ define gitdec_save_prs with filepath as Str and root as Map returning Int:
         set i to i + 1
     set json_str to concat(json_str and "  ]\n}\n")
     set ok to write_file(filepath and json_str)
-    return 0
+    if ok == 0:
+        display concat("[-] GitDec pull-request write failed: " and filepath)
+        return GITDEC_ERR_IO
+    return GITDEC_ERR_NONE
 
 # ================================================================
 # Initialization & File Utilities
@@ -244,9 +258,18 @@ define gitdec_save_prs with filepath as Str and root as Map returning Int:
 define gitdec_init returning Int:
     if file_exists("config/gitdec") == 0:
         set ok to create_directory("config/gitdec")
+        if ok == 0:
+            display "[-] GitDec could not create config/gitdec."
+            return GITDEC_ERR_IO
     if file_exists("config/gitdec/repos") == 0:
         set ok to create_directory("config/gitdec/repos")
-    return 0
+        if ok == 0:
+            display "[-] GitDec could not create config/gitdec/repos."
+            return GITDEC_ERR_IO
+    if is_directory("config/gitdec/repos") == 0:
+        display "[-] GitDec repository path is not a directory."
+        return GITDEC_ERR_IO
+    return GITDEC_ERR_NONE
 
 define gitdec_load_json with filepath as Str returning Map:
     if file_exists(filepath) == 0:
@@ -264,14 +287,22 @@ define gitdec_load_json with filepath as Str returning Map:
 
 define gitdec_create_repo with repo_id as Str and name as Str and owner_did as Str returning Map:
     set ok to gitdec_init()
+    if ok != GITDEC_ERR_NONE or else gitdec_repo_id_safe(repo_id) == 0:
+        return 0
     
     set repo_dir to path_join("config/gitdec/repos" and repo_id)
     if file_exists(repo_dir) == 0:
         set ok to create_directory(repo_dir)
+        if ok == 0:
+            display concat("[-] GitDec could not create repository: " and repo_id)
+            return 0
         
     set obj_dir to path_join(repo_dir and "objects")
     if file_exists(obj_dir) == 0:
         set ok to create_directory(obj_dir)
+        if ok == 0:
+            display concat("[-] GitDec could not create object directory: " and repo_id)
+            return 0
         
     set manifest_path to path_join(repo_dir and "gitdec.json")
     
@@ -291,9 +322,13 @@ define gitdec_create_repo with repo_id as Str and name as Str and owner_did as S
     set ok to map_insert(manifest and "visibility" and "public")
     
     set ok to gitdec_save_manifest(manifest_path and manifest)
+    if ok != GITDEC_ERR_NONE:
+        return 0
     return manifest
 
 define gitdec_add_collaborator with repo_id as Str and owner_did as Str and collab_did as Str and role as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
     set manifest to gitdec_load_json(manifest_path)
     if manifest == 0:
@@ -306,9 +341,11 @@ define gitdec_add_collaborator with repo_id as Str and owner_did as Str and coll
         
     set ok to map_insert(collaborators and collab_did and role)
     set ok to gitdec_save_manifest(manifest_path and manifest)
-    return GITDEC_ERR_NONE
+    return ok
 
 define gitdec_remove_collaborator with repo_id as Str and owner_did as Str and collab_did as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
     set manifest to gitdec_load_json(manifest_path)
     if manifest == 0:
@@ -323,10 +360,12 @@ define gitdec_remove_collaborator with repo_id as Str and owner_did as Str and c
     set ok to map_delete(collaborators and collab_did)
     set ok to gitdec_save_manifest(manifest_path and manifest)
     free_map(manifest)
-    return GITDEC_ERR_NONE
+    return ok
 
 # Is the repo private? (missing field => public, for backward compatibility.)
 define gitdec_repo_is_private with repo_id as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return 1
     set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
     set manifest to gitdec_load_json(manifest_path)
     if manifest == 0:
@@ -343,6 +382,8 @@ define gitdec_repo_is_private with repo_id as Str returning Int:
 # does NOT retroactively broadcast it — push or re-announce to share it; making it
 # private stops all future Nostr broadcasts for it (it stays on this node).
 define gitdec_set_visibility with repo_id as Str and owner_did as Str and visibility as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     if (visibility equals "public") == 0 and also (visibility equals "private") == 0:
         return GITDEC_ERR_INVALID_VISIBILITY
     set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
@@ -357,9 +398,11 @@ define gitdec_set_visibility with repo_id as Str and owner_did as Str and visibi
     set ok to map_insert(manifest and "visibility" and visibility)
     set ok to gitdec_save_manifest(manifest_path and manifest)
     free_map(manifest)
-    return GITDEC_ERR_NONE
+    return ok
 
 define gitdec_delete_repo with repo_id as Str and caller_did as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
     set manifest to gitdec_load_json(manifest_path)
     if manifest == 0:
@@ -375,8 +418,10 @@ define gitdec_delete_repo with repo_id as Str and caller_did as Str returning In
     
     set repo_dir to path_join("config/gitdec/repos" and repo_id)
     if file_exists(repo_dir) == 1:
-        set cmd to concat("rm -rf " and repo_dir)
-        set ok to run_command(cmd)
+        set ok to gitdec_rm_tree(repo_dir and 0)
+        if ok != GITDEC_ERR_NONE:
+            display concat("[-] GitDec repository deletion failed: " and repo_id)
+            return ok
         
     return GITDEC_ERR_NONE
 
@@ -385,6 +430,10 @@ define gitdec_delete_repo with repo_id as Str and caller_did as Str returning In
 # ================================================================
 
 define gitdec_push_commit with repo_id as Str and pusher_did as Str and branch as Str and commit_hash as Str and payload as Str and signature as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0 or else gitdec_object_hash_safe(commit_hash) == 0:
+        return GITDEC_ERR_INVALID_REF
+    if (ep_sha256(payload) equals commit_hash) == 0:
+        return GITDEC_ERR_INVALID_REF
     set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
     set manifest to gitdec_load_json(manifest_path)
     if manifest == 0:
@@ -412,15 +461,23 @@ define gitdec_push_commit with repo_id as Str and pusher_did as Str and branch a
     # Write git object payload to objects directory
     set obj_path to path_join(concat("config/gitdec/repos/" and repo_id) and concat("objects/" and commit_hash))
     set ok to write_file(obj_path and payload)
+    if ok == 0:
+        return GITDEC_ERR_IO
     
     # Update branch ref head
     set refs to map_get_val(manifest and "ref_heads")
     set ok to map_insert(refs and branch and commit_hash)
     set ok to gitdec_save_manifest(manifest_path and manifest)
-    
-    return GITDEC_ERR_NONE
+    if ok != GITDEC_ERR_NONE:
+        set cleanup_ok to remove_file(obj_path)
+        if cleanup_ok == 0 and also file_exists(obj_path) == 1:
+            display concat("[-] GitDec manifest update failed and the unreferenced object could not be removed: " and commit_hash)
+            return GITDEC_ERR_IO
+    return ok
 
 define gitdec_pull_ref with repo_id as Str and branch as Str returning Str:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return ""
     set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
     set manifest to gitdec_load_json(manifest_path)
     if manifest == 0:
@@ -433,6 +490,8 @@ define gitdec_pull_ref with repo_id as Str and branch as Str returning Str:
     return commit_hash
 
 define gitdec_get_object with repo_id as Str and object_hash as Str returning Str:
+    if gitdec_repo_id_safe(repo_id) == 0 or else gitdec_object_hash_safe(object_hash) == 0:
+        return ""
     set obj_path to path_join(concat("config/gitdec/repos/" and repo_id) and concat("objects/" and object_hash))
     if file_exists(obj_path) == 0:
         return ""
@@ -443,6 +502,8 @@ define gitdec_get_object with repo_id as Str and object_hash as Str returning St
 # caller|repo|source_branch|source_head. Callers broadcast the resulting main
 # push so every node's main advances (no loss / no forgetting).
 define gitdec_merge with repo_id as Str and source_branch as Str and caller_did as Str and signature as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
     set manifest to gitdec_load_json(manifest_path)
     if manifest == 0:
@@ -476,13 +537,15 @@ define gitdec_merge with repo_id as Str and source_branch as Str and caller_did 
 
     set ok to map_insert(refs and "main" and source_head)
     set ok to gitdec_save_manifest(manifest_path and manifest)
-    return GITDEC_ERR_NONE
+    return ok
 
 # ================================================================
 # Issue and Pull Request Tracking
 # ================================================================
 
 define gitdec_create_issue with repo_id as Str and author_did as Str and title as Str and body as Str returning Map:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return 0
     set issues_path to path_join(concat("config/gitdec/repos/" and repo_id) and "issues.json")
     set root to gitdec_load_json(issues_path)
     set issues_list to 0
@@ -507,9 +570,13 @@ define gitdec_create_issue with repo_id as Str and author_did as Str and title a
     
     set ok to append_list(issues_list and issue)
     set ok to gitdec_save_issues(issues_path and root)
+    if ok != GITDEC_ERR_NONE:
+        return 0
     return issue
 
 define gitdec_comment_issue with repo_id as Str and issue_id as Str and author_did as Str and comment_text as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set issues_path to path_join(concat("config/gitdec/repos/" and repo_id) and "issues.json")
     set root to gitdec_load_json(issues_path)
     if root == 0:
@@ -535,12 +602,14 @@ define gitdec_comment_issue with repo_id as Str and issue_id as Str and author_d
         
     if found == 1:
         set ok to gitdec_save_issues(issues_path and root)
-        return GITDEC_ERR_NONE
+        return ok
     return GITDEC_ERR_NOT_FOUND
 
 # Set an issue's status (e.g. "open" -> "closed"). Loads, finds the issue, updates
 # its status, and persists. Returns GITDEC_ERR_NOT_FOUND if the issue is absent.
 define gitdec_set_issue_status with repo_id as Str and issue_id as Str and new_status as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set issues_path to path_join(concat("config/gitdec/repos/" and repo_id) and "issues.json")
     set root to gitdec_load_json(issues_path)
     if root == 0:
@@ -559,10 +628,12 @@ define gitdec_set_issue_status with repo_id as Str and issue_id as Str and new_s
         set i to i + 1
     if found == 1:
         set ok to gitdec_save_issues(issues_path and root)
-        return GITDEC_ERR_NONE
+        return ok
     return GITDEC_ERR_NOT_FOUND
 
 define gitdec_create_pr with repo_id as Str and author_did as Str and title as Str and source as Str and target as Str and desc as Str returning Map:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return 0
     set prs_path to path_join(concat("config/gitdec/repos/" and repo_id) and "pull_requests.json")
     set root to gitdec_load_json(prs_path)
     set prs_list to 0
@@ -587,9 +658,13 @@ define gitdec_create_pr with repo_id as Str and author_did as Str and title as S
     
     set ok to append_list(prs_list and pr)
     set ok to gitdec_save_prs(prs_path and root)
+    if ok != GITDEC_ERR_NONE:
+        return 0
     return pr
 
 define gitdec_review_pr with repo_id as Str and pr_id as Str and reviewer_did as Str and decision as Str and comment_text as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set prs_path to path_join(concat("config/gitdec/repos/" and repo_id) and "pull_requests.json")
     set root to gitdec_load_json(prs_path)
     if root == 0:
@@ -620,7 +695,7 @@ define gitdec_review_pr with repo_id as Str and pr_id as Str and reviewer_did as
         
     if found == 1:
         set ok to gitdec_save_prs(prs_path and root)
-        return GITDEC_ERR_NONE
+        return ok
     return GITDEC_ERR_NOT_FOUND
 
 define gitdec_list_repos returning List:
@@ -629,12 +704,16 @@ define gitdec_list_repos returning List:
     return list_directory("config/gitdec/repos")
 
 define gitdec_list_repo_files with repo_id as Str returning List:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return create_list()
     set repo_dir to path_join("config/gitdec/repos" and repo_id)
     if file_exists(repo_dir) == 0:
         return create_list()
     return list_directory(repo_dir)
 
 define gitdec_get_repo_file with repo_id as Str and filename as Str returning Str:
+    if gitdec_repo_id_safe(repo_id) == 0 or else gitdec_filename_safe(filename) == 0:
+        return ""
     set repo_dir to path_join("config/gitdec/repos" and repo_id)
     set filepath to path_join(repo_dir and filename)
     if file_exists(filepath) == 0:
@@ -642,6 +721,8 @@ define gitdec_get_repo_file with repo_id as Str and filename as Str returning St
     return read_file(filepath)
 
 define gitdec_broadcast_nostr with repo_id as Str and kind as Int and content as Str and secret_key_hex as Str and public_key_hex as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     # Privacy gate: a private repo is never announced to the mesh. All sharing happens
     # via these Nostr broadcasts, so skipping them keeps a private repo local-only.
     if gitdec_repo_is_private(repo_id) == 1:
@@ -665,7 +746,22 @@ define gitdec_broadcast_nostr with repo_id as Str and kind as Int and content as
     set err to map_get_val(conn and "error")
     if err == 0:
         set pub_err to nostr_relay_publish(conn and event)
-        set ok to nostr_relay_close(conn)
+        set close_error to nostr_relay_close(conn)
+        if pub_err != 0:
+            free_map(conn)
+            free_list(r_tag)
+            free_list(tags)
+            return pub_err
+        if close_error != 0:
+            free_map(conn)
+            free_list(r_tag)
+            free_list(tags)
+            return close_error
+    else:
+        free_map(conn)
+        free_list(r_tag)
+        free_list(tags)
+        return err
     free_map(conn)
     free_list(r_tag)
     free_list(tags)
@@ -673,6 +769,8 @@ define gitdec_broadcast_nostr with repo_id as Str and kind as Int and content as
 
 
 define gitdec_sync_issue with repo_id as Str and issue_id as Str and author_did as Str and title as Str and body as Str and status as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set repo_dir to path_join("config/gitdec/repos" and repo_id)
     if file_exists(repo_dir) == 0:
         return GITDEC_ERR_REPO_NOT_FOUND
@@ -711,9 +809,11 @@ define gitdec_sync_issue with repo_id as Str and issue_id as Str and author_did 
         set ok to append_list(issues_list and issue)
         
     set ok to gitdec_save_issues(issues_path and root)
-    return 0
+    return ok
 
 define gitdec_sync_comment with repo_id as Str and issue_id as Str and author_did as Str and comment_text as Str and timestamp as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set repo_dir to path_join("config/gitdec/repos" and repo_id)
     if file_exists(repo_dir) == 0:
         return GITDEC_ERR_REPO_NOT_FOUND
@@ -756,10 +856,12 @@ define gitdec_sync_comment with repo_id as Str and issue_id as Str and author_di
         
     if found == 1:
         set ok to gitdec_save_issues(issues_path and root)
-        return GITDEC_ERR_NONE
+        return ok
     return GITDEC_ERR_NOT_FOUND
 
 define gitdec_sync_pr with repo_id as Str and pr_id as Str and author_did as Str and title as Str and source as Str and target as Str and desc as Str and status as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set repo_dir to path_join("config/gitdec/repos" and repo_id)
     if file_exists(repo_dir) == 0:
         return GITDEC_ERR_REPO_NOT_FOUND
@@ -802,9 +904,11 @@ define gitdec_sync_pr with repo_id as Str and pr_id as Str and author_did as Str
         set ok to append_list(prs_list and pr)
         
     set ok to gitdec_save_prs(prs_path and root)
-    return 0
+    return ok
 
 define gitdec_sync_review with repo_id as Str and pr_id as Str and reviewer_did as Str and decision as Str and comment_text as Str and timestamp as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set repo_dir to path_join("config/gitdec/repos" and repo_id)
     if file_exists(repo_dir) == 0:
         return GITDEC_ERR_REPO_NOT_FOUND
@@ -853,7 +957,7 @@ define gitdec_sync_review with repo_id as Str and pr_id as Str and reviewer_did 
         
     if found == 1:
         set ok to gitdec_save_prs(prs_path and root)
-        return GITDEC_ERR_NONE
+        return ok
     return GITDEC_ERR_NOT_FOUND
 
 define gitdec_cast_map_to_list with m as Map returning List:
@@ -875,12 +979,70 @@ define gitdec_repo_id_safe with repo_id as Str returning Int:
         set i to i + 1
     return 1
 
+define gitdec_object_hash_safe with object_hash as Str returning Int:
+    if string_length(object_hash) != 64:
+        return 0
+    set allowed to "0123456789abcdef"
+    set i to 0
+    repeat while i < 64:
+        if string_index_of(allowed and substring(object_hash and i and 1)) < 0:
+            return 0
+        set i to i + 1
+    return 1
+
+define gitdec_filename_safe with filename as Str returning Int:
+    if string_length(filename) == 0 or else string_length(filename) > 255:
+        return 0
+    if string_contains(filename and "/") == 1 or else string_contains(filename and "\\") == 1 or else string_contains(filename and "..") == 1:
+        return 0
+    return 1
+
+define gitdec_rm_tree with path as Str and depth as Int returning Int:
+    if depth > 8:
+        return GITDEC_ERR_IO
+    if file_exists(path) == 0:
+        return GITDEC_ERR_NONE
+    if is_directory(path) == 1:
+        set entries to list_directory(path)
+        set n to length_list(entries)
+        set i to 0
+        repeat while i < n:
+            set child to get_list(entries and i)
+            set remove_error to gitdec_rm_tree(path_join(path and child) and depth + 1)
+            if remove_error != GITDEC_ERR_NONE:
+                free_list(entries)
+                return remove_error
+            set i to i + 1
+        free_list(entries)
+        set ok to remove_directory(path)
+        if ok == 0:
+            return GITDEC_ERR_IO
+        return GITDEC_ERR_NONE
+    set ok to remove_file(path)
+    if ok == 0:
+        return GITDEC_ERR_IO
+    return GITDEC_ERR_NONE
+
+define gitdec_report_sync_result with result as Int and action as Str returning Int:
+    if result != GITDEC_ERR_NONE:
+        display concat("[-] GitDec network synchronization failed for " and concat(action and concat(" (error " and concat(int_to_string(result) and ")"))))
+    return result
+
 define gitdec_sync_manifest with repo_id as Str and manifest_json as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
+    set init_error to gitdec_init()
+    if init_error != GITDEC_ERR_NONE:
+        return init_error
     set repo_dir to path_join("config/gitdec/repos" and repo_id)
     if file_exists(repo_dir) == 0:
         set ok to create_directory(repo_dir)
+        if ok == 0:
+            return GITDEC_ERR_IO
         set obj_dir to path_join(repo_dir and "objects")
         set ok to create_directory(obj_dir)
+        if ok == 0:
+            return GITDEC_ERR_IO
         
     set manifest_path to path_join(repo_dir and "gitdec.json")
     
@@ -894,9 +1056,11 @@ define gitdec_sync_manifest with repo_id as Str and manifest_json as Str returni
         
     set ok to gitdec_save_manifest(manifest_path and incoming_manifest)
     free_map(incoming_manifest)
-    return GITDEC_ERR_NONE
+    return ok
 
 define gitdec_sync_commit with repo_id as Str and pusher_did as Str and branch as Str and commit_hash as Str and payload as Str and signature as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0 or else gitdec_object_hash_safe(commit_hash) == 0:
+        return GITDEC_ERR_INVALID_REF
     set manifest_path to path_join(concat("config/gitdec/repos/" and repo_id) and "gitdec.json")
     set manifest to gitdec_load_json(manifest_path)
     if manifest == 0:
@@ -927,24 +1091,38 @@ define gitdec_sync_commit with repo_id as Str and pusher_did as Str and branch a
     set obj_dir to path_join(concat("config/gitdec/repos/" and repo_id) and "objects")
     if file_exists(obj_dir) == 0:
         set ok to create_directory(obj_dir)
+        if ok == 0:
+            free_map(manifest)
+            return GITDEC_ERR_IO
         
     set obj_path to path_join(obj_dir and commit_hash)
     set ok to write_file(obj_path and payload)
+    if ok == 0:
+        free_map(manifest)
+        return GITDEC_ERR_IO
     
     set refs to map_get_val(manifest and "ref_heads")
     set ok to map_insert(refs and branch and commit_hash)
     set ok to gitdec_save_manifest(manifest_path and manifest)
     free_map(manifest)
+    if ok != GITDEC_ERR_NONE:
+        return ok
 
     # Auto-update: a freshly-synced commit on a WATCHED repo raises the "update
     # available" flag the WebUI surfaces, and records the latest commit hash.
     if storage_gitdec_get_auto_update(repo_id) == 1:
         set sk to storage_gitdec_set_last_seen(repo_id and commit_hash)
+        if sk != 0:
+            return sk
         set sk to storage_gitdec_set_pending(repo_id and 1)
+        if sk != 0:
+            return sk
 
     return GITDEC_ERR_NONE
 
 define gitdec_request_history with repo_id as Str returning Int:
+    if gitdec_repo_id_safe(repo_id) == 0:
+        return GITDEC_ERR_INVALID_REF
     set conn to nostr_relay_connect("127.0.0.1" and 9102)
     set err to map_get_val(conn and "error")
     if err != 0:
@@ -964,6 +1142,15 @@ define gitdec_request_history with repo_id as Str returning Int:
     set ok to map_insert(filter and "#r" and r_list)
     
     set sub_err to nostr_relay_subscribe(conn and "gitdec_temp_sub" and filter)
+    if sub_err != 0:
+        set close_error to nostr_relay_close(conn)
+        free_map(conn)
+        free_list(kinds)
+        free_list(r_list)
+        free_map(filter)
+        if close_error != 0:
+            return close_error
+        return sub_err
     display f"[+] GitDec historical sync: subscribed to {repo_id}"
     
     set running to 1
@@ -1003,7 +1190,7 @@ define gitdec_request_history with repo_id as Str returning Int:
                                     if event_repo_id equals repo_id:
                                         if kind_val == 20020 and also action equals "update_manifest":
                                             set manifest_json to map_get_val(content_map and "manifest")
-                                            set ok to gitdec_sync_manifest(repo_id and manifest_json)
+                                            set ok to gitdec_report_sync_result(gitdec_sync_manifest(repo_id and manifest_json) and "manifest")
                                             
                                         else if kind_val == 20021 and also action equals "push_commit":
                                             set pusher_did to map_get_val(content_map and "pusher_did")
@@ -1011,21 +1198,21 @@ define gitdec_request_history with repo_id as Str returning Int:
                                             set commit_hash to map_get_val(content_map and "commit_hash")
                                             set payload to map_get_val(content_map and "payload")
                                             set signature to map_get_val(content_map and "signature")
-                                            set ok to gitdec_sync_commit(repo_id and pusher_did and branch and commit_hash and payload and signature)
+                                            set ok to gitdec_report_sync_result(gitdec_sync_commit(repo_id and pusher_did and branch and commit_hash and payload and signature) and "commit")
                                             
                                         else if kind_val == 20022 and also action equals "create_issue":
                                             set issue_id to map_get_val(content_map and "id")
                                             set author_did to map_get_val(content_map and "author_did")
                                             set title to map_get_val(content_map and "title")
                                             set body to map_get_val(content_map and "body")
-                                            set ok to gitdec_sync_issue(repo_id and issue_id and ev_signer_did and title and body and "open")
+                                            set ok to gitdec_report_sync_result(gitdec_sync_issue(repo_id and issue_id and ev_signer_did and title and body and "open") and "issue")
                                             
                                         else if kind_val == 20022 and also action equals "comment_issue":
                                             set issue_id to map_get_val(content_map and "issue_id")
                                             set author_did to map_get_val(content_map and "author_did")
                                             set text to map_get_val(content_map and "text")
                                             set timestamp to map_get_val(content_map and "timestamp")
-                                            set ok to gitdec_sync_comment(repo_id and issue_id and ev_signer_did and text and timestamp)
+                                            set ok to gitdec_report_sync_result(gitdec_sync_comment(repo_id and issue_id and ev_signer_did and text and timestamp) and "comment")
                                             
                                         else if kind_val == 20023 and also action equals "create_pr":
                                             set pr_id to map_get_val(content_map and "id")
@@ -1034,7 +1221,7 @@ define gitdec_request_history with repo_id as Str returning Int:
                                             set source to map_get_val(content_map and "source")
                                             set target to map_get_val(content_map and "target")
                                             set description to map_get_val(content_map and "description")
-                                            set ok to gitdec_sync_pr(repo_id and pr_id and ev_signer_did and title and source and target and description and "open")
+                                            set ok to gitdec_report_sync_result(gitdec_sync_pr(repo_id and pr_id and ev_signer_did and title and source and target and description and "open") and "pull request")
                                             
                                         else if kind_val == 20023 and also action equals "review_pr":
                                             set pr_id to map_get_val(content_map and "pr_id")
@@ -1042,7 +1229,7 @@ define gitdec_request_history with repo_id as Str returning Int:
                                             set decision to map_get_val(content_map and "decision")
                                             set comment to map_get_val(content_map and "comment")
                                             set timestamp to map_get_val(content_map and "timestamp")
-                                            set ok to gitdec_sync_review(repo_id and pr_id and ev_signer_did and decision and comment and timestamp)
+                                            set ok to gitdec_report_sync_result(gitdec_sync_review(repo_id and pr_id and ev_signer_did and decision and comment and timestamp) and "review")
                                             
                                     free_map(content_map)
                                 free_map(event_map)
@@ -1054,7 +1241,9 @@ define gitdec_request_history with repo_id as Str returning Int:
     free_list(kinds)
     free_list(r_list)
     free_map(filter)
-    return 0
+    if ok != 0:
+        return ok
+    return GITDEC_ERR_NONE
 
 # Auto-pull-on-join: at startup, request full history for every repo flagged for
 # auto-update, so a node that just joined the network downloads the latest of
@@ -1066,11 +1255,14 @@ define gitdec_auto_pull_on_join returning Int:
     repeat while i < n:
         set rid to get_list(repos and i)
         set ok to gitdec_request_history(rid)
+        if ok != GITDEC_ERR_NONE:
+            display concat("[-] GitDec auto-pull history request failed for " and rid)
         set i to i + 1
     free_list(repos)
     return 0
 
-define gitdec_listener_loop with dht_node as Int and identity as Map returning Int:
+define gitdec_listener_loop with dht_node as Int returning Int:
+    set dht_map to cast_int_to_map(dht_node)
     sleep_ms(3000)
     set conn to create_map()
     set has_conn to 0
@@ -1089,8 +1281,16 @@ define gitdec_listener_loop with dht_node as Int and identity as Map returning I
             set err to map_get_val(conn and "error")
             if err == 0:
                 set sub_err to nostr_relay_subscribe(conn and "gitdec_sub" and filter)
-                display "[+] GitDec Nostr listener: connected and subscribed."
-                set has_conn to 1
+                if sub_err == 0:
+                    display "[+] GitDec Nostr listener: connected and subscribed."
+                    set has_conn to 1
+                else:
+                    display "[-] GitDec Nostr listener subscription failed."
+                    set close_error to nostr_relay_close(conn)
+                    if close_error != 0:
+                        display "[-] GitDec Nostr listener close also failed."
+                    set has_conn to 0
+                    sleep_ms(10000)
             else:
                 set has_conn to 0
                 sleep_ms(10000)
@@ -1098,6 +1298,8 @@ define gitdec_listener_loop with dht_node as Int and identity as Map returning I
             set msg to nostr_relay_receive(conn)
             if string_length(msg) == 0:
                 set ok to nostr_relay_close(conn)
+                if ok != 0:
+                    display "[-] GitDec Nostr listener connection close failed."
                 free_map(conn)
                 set conn to create_map()
                 set has_conn to 0
@@ -1132,7 +1334,7 @@ define gitdec_listener_loop with dht_node as Int and identity as Map returning I
                                     if kind_val == 20020 and also action equals "update_manifest":
                                         set manifest_json to map_get_val(content_map and "manifest")
                                         set dht_key to concat("repo:" and repo_id)
-                                        set dht_lookup to dht_lookup_value(dht_node and dht_key)
+                                        set dht_lookup to dht_lookup_value(dht_map and dht_key)
                                         set dht_err to map_get_val(dht_lookup and "error")
                                         set authorized to 0
                                         if dht_err == 0:
@@ -1143,11 +1345,11 @@ define gitdec_listener_loop with dht_node as Int and identity as Map returning I
                                                 set authorized to 1
                                         free_map(dht_lookup)
                                         if authorized == 1:
-                                            set ok to gitdec_sync_manifest(repo_id and manifest_json)
+                                            set ok to gitdec_report_sync_result(gitdec_sync_manifest(repo_id and manifest_json) and "manifest")
                                             
                                     else if kind_val == 20020 and also action equals "delete_repo":
                                         set dht_key to concat("repo:" and repo_id)
-                                        set dht_lookup to dht_lookup_value(dht_node and dht_key)
+                                        set dht_lookup to dht_lookup_value(dht_map and dht_key)
                                         set dht_err to map_get_val(dht_lookup and "error")
                                         set authorized to 0
                                         if dht_err == 0:
@@ -1160,8 +1362,9 @@ define gitdec_listener_loop with dht_node as Int and identity as Map returning I
                                         if authorized == 1:
                                             set repo_dir to path_join("config/gitdec/repos" and repo_id)
                                             if file_exists(repo_dir) == 1:
-                                                set cmd to concat("rm -rf " and repo_dir)
-                                                set ok to run_command(cmd)
+                                                set ok to gitdec_rm_tree(repo_dir and 0)
+                                                if ok != GITDEC_ERR_NONE:
+                                                    display concat("[-] GitDec remote repository deletion failed: " and repo_id)
                                             
                                     else if kind_val == 20021 and also action equals "push_commit":
                                         set pusher_did to map_get_val(content_map and "pusher_did")
@@ -1172,21 +1375,21 @@ define gitdec_listener_loop with dht_node as Int and identity as Map returning I
                                         set event_pubkey_hex to map_get_val(event_map and "pubkey")
                                         set event_pubkey_did to create_did_key_from_ed25519(event_pubkey_hex)
                                         if event_pubkey_did equals pusher_did:
-                                            set ok to gitdec_sync_commit(repo_id and pusher_did and branch and commit_hash and payload and signature)
+                                            set ok to gitdec_report_sync_result(gitdec_sync_commit(repo_id and pusher_did and branch and commit_hash and payload and signature) and "commit")
                                             
                                     else if kind_val == 20022 and also action equals "create_issue":
                                         set issue_id to map_get_val(content_map and "id")
                                         set author_did to map_get_val(content_map and "author_did")
                                         set title to map_get_val(content_map and "title")
                                         set body to map_get_val(content_map and "body")
-                                        set ok to gitdec_sync_issue(repo_id and issue_id and ev_signer_did and title and body and "open")
+                                        set ok to gitdec_report_sync_result(gitdec_sync_issue(repo_id and issue_id and ev_signer_did and title and body and "open") and "issue")
                                         
                                     else if action equals "comment_issue":
                                         set issue_id to map_get_val(content_map and "issue_id")
                                         set author_did to map_get_val(content_map and "author_did")
                                         set text to map_get_val(content_map and "text")
                                         set timestamp to map_get_val(content_map and "timestamp")
-                                        set ok to gitdec_sync_comment(repo_id and issue_id and ev_signer_did and text and timestamp)
+                                        set ok to gitdec_report_sync_result(gitdec_sync_comment(repo_id and issue_id and ev_signer_did and text and timestamp) and "comment")
                                         
                                     else if action equals "create_pr":
                                         set pr_id to map_get_val(content_map and "id")
@@ -1195,7 +1398,7 @@ define gitdec_listener_loop with dht_node as Int and identity as Map returning I
                                         set source to map_get_val(content_map and "source")
                                         set target to map_get_val(content_map and "target")
                                         set description to map_get_val(content_map and "description")
-                                        set ok to gitdec_sync_pr(repo_id and pr_id and ev_signer_did and title and source and target and description and "open")
+                                        set ok to gitdec_report_sync_result(gitdec_sync_pr(repo_id and pr_id and ev_signer_did and title and source and target and description and "open") and "pull request")
                                         
                                     else if action equals "review_pr":
                                         set pr_id to map_get_val(content_map and "pr_id")
@@ -1203,7 +1406,7 @@ define gitdec_listener_loop with dht_node as Int and identity as Map returning I
                                         set decision to map_get_val(content_map and "decision")
                                         set comment to map_get_val(content_map and "comment")
                                         set timestamp to map_get_val(content_map and "timestamp")
-                                        set ok to gitdec_sync_review(repo_id and pr_id and ev_signer_did and decision and comment and timestamp)
+                                        set ok to gitdec_report_sync_result(gitdec_sync_review(repo_id and pr_id and ev_signer_did and decision and comment and timestamp) and "review")
                                         
                                     free_map(content_map)
                                 free_map(event_map)

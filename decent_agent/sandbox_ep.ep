@@ -44,30 +44,69 @@ define strip_ansi with s as Str returning Str:
     free_list(out)
     return res
 
+define sandbox_rm_tree with path as Str and depth as Int returning Int:
+    if depth > 4:
+        return 1
+    if file_exists(path) == 0:
+        return 0
+    if is_directory(path) == 1:
+        set entries to list_directory(path)
+        set n to length_list(entries)
+        set i to 0
+        repeat while i < n:
+            set remove_error to sandbox_rm_tree(path_join(path and get_list(entries and i)) and depth + 1)
+            if remove_error != 0:
+                free_list(entries)
+                return 1
+            set i to i + 1
+        free_list(entries)
+        set ok to remove_directory(path)
+        if ok == 0:
+            return 1
+        return 0
+    set ok to remove_file(path)
+    if ok == 0:
+        return 1
+    return 0
+
 define run_ep_code with code as Str returning Str:
     set ts to ep_time_now_ms()
     set dir to concat("/tmp/eprun_" and int_to_string(ts))
     set mk to create_directory(dir)
-    if file_exists(dir) == 0:
+    if mk == 0 or else is_directory(dir) == 0:
         return "Error: could not create sandbox directory."
 
     set wok to write_file(concat(dir and "/prog.ep") and code)
+    if wok == 0:
+        set cleanup_error to sandbox_rm_tree(dir and 0)
+        if cleanup_error != 0:
+            return "Error: could not stage ErnosPlain source and could not remove the partial sandbox."
+        return "Error: could not stage ErnosPlain source in the sandbox."
 
     # Seatbelt profile: permit normally but DENY all network and DENY filesystem writes
     # outside the scratch dir. SCRATCH is passed in via `sandbox-exec -D SCRATCH=...`.
     set prof to "(version 1)\n(allow default)\n(deny network*)\n(deny file-write* (subpath \"/\"))\n(allow file-write* (subpath (param \"SCRATCH\")))\n(allow file-write-data (literal \"/dev/null\")(literal \"/dev/stdout\")(literal \"/dev/stderr\")(literal \"/dev/tty\")(literal \"/dev/dtracehelper\"))\n"
     set pok to write_file(concat(dir and "/sb.sb") and prof)
+    if pok == 0:
+        set cleanup_error to sandbox_rm_tree(dir and 0)
+        if cleanup_error != 0:
+            return "Error: could not stage the sandbox policy and could not remove the partial sandbox."
+        return "Error: could not stage the sandbox policy."
 
     # 1) ErnosPlain transpile (trusted — produces C, does not run learner logic)
-    set ern to run_command(f"cd {dir} && NO_COLOR=1 TERM=dumb $HOME/.local/bin/ernos prog.ep 2>&1")
-    if file_exists(concat(dir and "/prog_compiled.c")) == 0:
-        set rm1 to run_command(f"rm -rf {dir}")
+    set ern to run_command(f"cd {dir} && NO_COLOR=1 TERM=dumb $HOME/.local/bin/ernos prog.ep 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if string_contains(ern and "__ERNOS_EXIT__:0") == 0 or else file_exists(concat(dir and "/prog_compiled.c")) == 0:
+        set rm1 to sandbox_rm_tree(dir and 0)
+        if rm1 != 0:
+            return "Error: ErnosPlain compilation failed and sandbox cleanup also failed."
         return concat("Your ErnosPlain code did not compile:\n\n" and strip_ansi(ern))
 
     # 2) C compile (trusted)
-    set cl to run_command(f"cd {dir} && clang prog_compiled.c -O2 -lpthread -lm -o prog 2>&1")
-    if file_exists(concat(dir and "/prog")) == 0:
-        set rm2 to run_command(f"rm -rf {dir}")
+    set cl to run_command(f"cd {dir} && clang prog_compiled.c -O2 -lpthread -lm -o prog 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    if string_contains(cl and "__ERNOS_EXIT__:0") == 0 or else file_exists(concat(dir and "/prog")) == 0:
+        set rm2 to sandbox_rm_tree(dir and 0)
+        if rm2 != 0:
+            return "Error: native compilation failed and sandbox cleanup also failed."
         return concat("Your code transpiled but the native compile failed:\n\n" and strip_ansi(cl))
 
     # 3) Run the learner binary INSIDE the sandbox: no network, writes confined to the
@@ -75,7 +114,9 @@ define run_ep_code with code as Str returning Str:
     #    exit (142=SIGALRM timeout, 152=CPU, 137=killed).
     set runcmd to f"cd {dir} && ( ulimit -t 6 -f 51200 2>/dev/null; perl -e 'alarm 5; exec @ARGV' -- sandbox-exec -D SCRATCH={dir} -f sb.sb ./prog ) 2>&1; echo __EPRC__$?"
     set raw to run_command(runcmd)
-    set rm3 to run_command(f"rm -rf {dir}")
+    set rm3 to sandbox_rm_tree(dir and 0)
+    if rm3 != 0:
+        return "Error: learner program finished, but the sandbox directory could not be removed."
 
     # Strip ANSI/control chars so the output is valid inside JSON (browser + LLM).
     set raw to strip_ansi(raw)

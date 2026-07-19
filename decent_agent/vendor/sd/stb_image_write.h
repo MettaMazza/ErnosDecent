@@ -764,7 +764,7 @@ static void stbiw__write_hdr_scanline(stbi__write_context *s, int width, int nco
 
 static int stbi_write_hdr_core(stbi__write_context *s, int x, int y, int comp, float *data)
 {
-   if (y <= 0 || x <= 0 || data == NULL)
+   if (s == NULL || s->func == NULL || y <= 0 || x <= 0 || x > 536870911 || data == NULL)
       return 0;
    else {
       // Each component is stored separately. Allocate scratch space for full output scanline.
@@ -772,13 +772,19 @@ static int stbi_write_hdr_core(stbi__write_context *s, int x, int y, int comp, f
       int i, len;
       char buffer[128];
       char header[] = "#?RADIANCE\n# Written by stb_image_write.h\nFORMAT=32-bit_rle_rgbe\n";
+      if (scratch == NULL)
+         return 0;
       s->func(s->context, header, sizeof(header)-1);
 
 #ifdef __STDC_LIB_EXT1__
       len = sprintf_s(buffer, sizeof(buffer), "EXPOSURE=          1.0000000000000\n\n-Y %d +X %d\n", y, x);
 #else
-      len = sprintf(buffer, "EXPOSURE=          1.0000000000000\n\n-Y %d +X %d\n", y, x);
+      len = snprintf(buffer, sizeof(buffer), "EXPOSURE=          1.0000000000000\n\n-Y %d +X %d\n", y, x);
 #endif
+      if (len < 0 || len >= (int) sizeof(buffer)) {
+         STBIW_FREE(scratch);
+         return 0;
+      }
       s->func(s->context, buffer, len);
 
       for(i=0; i < y; i++)

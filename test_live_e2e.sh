@@ -5,6 +5,17 @@
 
 set -o pipefail
 
+IPC_TOKEN_FILE="$HOME/.ernosdecent/ipc-token"
+if [ ! -r "$IPC_TOKEN_FILE" ]; then
+    echo "[FATAL] IPC token is unavailable at $IPC_TOKEN_FILE"
+    exit 1
+fi
+IPC_TOKEN=$(tr -d '\r\n ' < "$IPC_TOKEN_FILE")
+if [ -z "$IPC_TOKEN" ]; then
+    echo "[FATAL] IPC token file is empty"
+    exit 1
+fi
+
 # Netcat wrapper to automatically inject loopback IPC AUTH tokens
 nc() {
     if [ "$1" = "-z" ]; then
@@ -151,11 +162,6 @@ assert_contains "IPC HEALTH returns health:" "$resp" "health:"
 resp=$(echo "BOGUS_COMMAND" | nc -w 2 127.0.0.1 5000 2>/dev/null)
 assert_contains "IPC unknown returns error:unknown_command" "$resp" "error:unknown_command"
 
-# 1.12 AI INFER (last — blocks the single-threaded IPC server while the LLM processes)
-resp=$(echo "AI INFER hello world" | nc -w 120 127.0.0.1 5000 2>/dev/null)
-assert_contains "IPC AI INFER returns ai:" "$resp" "ai:"
-assert_contains "IPC AI INFER returns RESPONSE" "$resp" "RESPONSE"
-
 echo ""
 echo "=== TEST SUITE 2: HTTP Static Serving ==="
 echo ""
@@ -187,23 +193,23 @@ echo "=== TEST SUITE 3: HTTP API Endpoints ==="
 echo ""
 
 # 3.1 GET /api/status
-resp=$(curl -s http://127.0.0.1:8088/api/status)
+resp=$(curl -s -H "X-IPC-Token: $IPC_TOKEN" http://127.0.0.1:8088/api/status)
 assert_contains "API /api/status returns type:status" "$resp" '"type":"status"'
 assert_contains "API /api/status returns did" "$resp" '"did":"'
 assert_contains "API /api/status returns role" "$resp" '"role":"'
 
 # 3.2 GET /api/wallet
-resp=$(curl -s http://127.0.0.1:8088/api/wallet)
+resp=$(curl -s -H "X-IPC-Token: $IPC_TOKEN" http://127.0.0.1:8088/api/wallet)
 assert_contains "API /api/wallet returns type:wallet" "$resp" '"type":"wallet"'
 assert_contains "API /api/wallet returns balance" "$resp" '"balance":"'
 
 # 3.3 GET /api/storage
-resp=$(curl -s http://127.0.0.1:8088/api/storage)
+resp=$(curl -s -H "X-IPC-Token: $IPC_TOKEN" http://127.0.0.1:8088/api/storage)
 assert_contains "API /api/storage returns type:storage" "$resp" '"type":"storage"'
 assert_contains "API /api/storage returns chunk_count" "$resp" '"chunk_count":'
 
 # 3.4 GET /api/pool
-resp=$(curl -s http://127.0.0.1:8088/api/pool)
+resp=$(curl -s -H "X-IPC-Token: $IPC_TOKEN" http://127.0.0.1:8088/api/pool)
 assert_contains "API /api/pool returns type:pool" "$resp" '"type":"pool"'
 assert_contains "API /api/pool returns bandwidth" "$resp" '"bandwidth_up":'
 
@@ -378,9 +384,14 @@ echo ""
 echo "=== TEST SUITE 9: Multi-Node Bootstrap ==="
 echo ""
 
-# Start a second node with --port and --seed
-lsof -ti:9200,9201,9202,9203,9280,9300 2>/dev/null | xargs kill -9 2>/dev/null
-sleep 1
+# Start a second node with --port and --seed, but never take over ports from an
+# unowned process.
+for required_port in 9200 9201 9202 9203 9204 9280 9300; do
+    if lsof -nP -iTCP:"$required_port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "[FATAL] required test port $required_port is already in use; refusing to stop an unowned process"
+        exit 1
+    fi
+done
 ./node --port 9200 --seed 127.0.0.1:9101 &
 NODE2_PID=$!
 
@@ -431,17 +442,17 @@ echo "=== TEST SUITE 10: HTTP API DHT & Name ==="
 echo ""
 
 # 10.1 API /api/status has DID
-api_status=$(curl -s http://127.0.0.1:8088/api/status 2>/dev/null)
+api_status=$(curl -s -H "X-IPC-Token: $IPC_TOKEN" http://127.0.0.1:8088/api/status 2>/dev/null)
 assert_contains "API status has DID" "$api_status" "did"
 assert_contains "API status has role" "$api_status" "role"
 assert_contains "API status has dht_size" "$api_status" "dht_size"
 
 # 10.2 API /api/wallet has balance
-api_wallet=$(curl -s http://127.0.0.1:8088/api/wallet 2>/dev/null)
+api_wallet=$(curl -s -H "X-IPC-Token: $IPC_TOKEN" http://127.0.0.1:8088/api/wallet 2>/dev/null)
 assert_contains "API wallet has balance" "$api_wallet" "balance"
 
 # 10.3 API /api/storage has chunk_count
-api_store=$(curl -s http://127.0.0.1:8088/api/storage 2>/dev/null)
+api_store=$(curl -s -H "X-IPC-Token: $IPC_TOKEN" http://127.0.0.1:8088/api/storage 2>/dev/null)
 assert_contains "API storage has chunk_count" "$api_store" "chunk_count"
 
 echo ""
@@ -463,11 +474,22 @@ assert_contains "Pre-restart name register" "$name_pre" "name:registered"
 did_pre=$(echo "IDENTITY" | nc -w 2 127.0.0.1 5000 2>/dev/null)
 did_val_pre=$(echo "$did_pre" | grep -o 'did:[^,]*' | head -1)
 
-# Kill and restart daemon
+# Stop and restart the daemon through its authenticated control plane. If it
+# does not release the port, fail visibly instead of killing a process by port.
 echo "  [....] Restarting daemon..."
-lsof -ti:5000,8088,9100,9101,9102 2>/dev/null | xargs kill -9 2>/dev/null
-sleep 2
+echo "STOP" | nc -w 2 127.0.0.1 5000 >/dev/null 2>&1
+for i in $(seq 1 10); do
+    if ! lsof -nP -iTCP:5000 -sTCP:LISTEN >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+if lsof -nP -iTCP:5000 -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "[FATAL] daemon did not stop cleanly; refusing a forced port-based kill"
+    exit 1
+fi
 nohup ./node > node_restart_2.log 2>&1 &
+RESTARTED_PID=$!
 sleep 3
 
 # Wait for daemon
@@ -584,6 +606,19 @@ if [ "$ollama_auth" != "401" ]; then
 else
     fail "Ollama with token rejected with 401 Unauthorized"
 fi
+
+echo ""
+echo "=== TEST SUITE 14: Asynchronous AI Dispatch ==="
+echo ""
+
+# AI inference is detached: IPC acknowledges the session and turn immediately;
+# the eventual response is delivered through the trace/session channel.
+ai_accept=$(echo "AI INFER hello world" | nc -w 5 127.0.0.1 5000 2>/dev/null)
+assert_contains "IPC AI INFER is accepted" "$ai_accept" "ai:accepted"
+assert_contains "IPC AI INFER returns session correlation" "$ai_accept" "session:"
+assert_contains "IPC AI INFER returns turn correlation" "$ai_accept" "turn:"
+ai_cancel=$(echo "AI CANCEL" | nc -w 5 127.0.0.1 5000 2>/dev/null)
+assert_contains "IPC AI CANCEL acknowledges detached turn" "$ai_cancel" "ai:cancel_ack"
 
 echo "==========================================================="
 echo "  RESULTS: $PASS/$TOTAL passed, $FAIL failed"

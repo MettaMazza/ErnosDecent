@@ -11,16 +11,16 @@ import "sql"
 define adapter_sql_escape with s as Str returning Str:
     return string_replace(s and "'" and "''")
 
-define adapter_ensure_schema with db as Int:
+define adapter_ensure_schema with db as Int returning Int:
     if db == 0:
         return 1
-    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS adapters (version INTEGER PRIMARY KEY, path TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'registered', healthy INTEGER NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);")
-    return 0
+    return sql_execute(db and "CREATE TABLE IF NOT EXISTS adapters (version INTEGER PRIMARY KEY, path TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'registered', healthy INTEGER NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);")
 
 define adapter_next_version with db as Int returning Int:
     if db == 0:
         return 1
-    set ok to adapter_ensure_schema(db)
+    if adapter_ensure_schema(db) != 0:
+        return 1
     set rows to sql_query(db and "SELECT version FROM adapters ORDER BY version DESC LIMIT 1;")
     if length_list(rows) > 0:
         return string_to_int(get_list(get_list(rows and 0) and 0)) + 1
@@ -29,20 +29,23 @@ define adapter_next_version with db as Int returning Int:
 define adapter_register with db as Int and path as Str and notes as Str returning Int:
     if db == 0:
         return 0
-    set ok to adapter_ensure_schema(db)
+    if adapter_ensure_schema(db) != 0:
+        return 0
     set v to adapter_next_version(db)
     set ep to adapter_sql_escape(path)
     set en to adapter_sql_escape(notes)
     set now to ep_time_now_sec()
     set q to concat("INSERT INTO adapters (version, path, status, healthy, notes, created_at) VALUES (" and int_to_string(v))
     set q to concat(q and concat(", '" and concat(ep and concat("', 'registered', 0, '" and concat(en and concat("', " and concat(int_to_string(now) and ");")))))))
-    set ok to sql_execute(db and q)
+    if sql_execute(db and q) != 0:
+        return 0
     return v
 
 define adapter_current_version with db as Int returning Int:
     if db == 0:
         return 0
-    set ok to adapter_ensure_schema(db)
+    if adapter_ensure_schema(db) != 0:
+        return 0
     set rows to sql_query(db and "SELECT version FROM adapters WHERE status='current' LIMIT 1;")
     if length_list(rows) > 0:
         return string_to_int(get_list(get_list(rows and 0) and 0))
@@ -51,7 +54,8 @@ define adapter_current_version with db as Int returning Int:
 define adapter_current with db as Int returning Str:
     if db == 0:
         return ""
-    set ok to adapter_ensure_schema(db)
+    if adapter_ensure_schema(db) != 0:
+        return ""
     set rows to sql_query(db and "SELECT path FROM adapters WHERE status='current' LIMIT 1;")
     if length_list(rows) > 0:
         return get_list(get_list(rows and 0) and 0)
@@ -61,9 +65,15 @@ define adapter_current with db as Int returning Str:
 define adapter_promote with db as Int and version as Int returning Int:
     if db == 0:
         return 1
-    set ok to adapter_ensure_schema(db)
-    set ok to sql_execute(db and "UPDATE adapters SET status='retired' WHERE status='current';")
-    set ok to sql_execute(db and concat("UPDATE adapters SET status='current' WHERE version=" and concat(int_to_string(version) and ";")))
+    if adapter_ensure_schema(db) != 0:
+        return 1
+    set transaction_sql to concat("BEGIN IMMEDIATE; UPDATE adapters SET status='retired' WHERE status='current'; UPDATE adapters SET status='current' WHERE version=" and concat(int_to_string(version) and "; COMMIT;"))
+    set transaction_error to sql_execute(db and transaction_sql)
+    if transaction_error != 0:
+        set rollback_error to sql_execute(db and "ROLLBACK;")
+        if rollback_error != 0:
+            display f"[-] Adapter promotion rollback failed: {rollback_error}."
+        return transaction_error
     return 0
 
 # Roll back: current -> retired, and the highest version below it -> current.
@@ -71,27 +81,34 @@ define adapter_promote with db as Int and version as Int returning Int:
 define adapter_rollback with db as Int returning Int:
     if db == 0:
         return 0
-    set ok to adapter_ensure_schema(db)
+    if adapter_ensure_schema(db) != 0:
+        return 0
     set cur to adapter_current_version(db)
-    set ok to sql_execute(db and "UPDATE adapters SET status='retired' WHERE status='current';")
     set rows to sql_query(db and concat("SELECT version FROM adapters WHERE version < " and concat(int_to_string(cur) and " ORDER BY version DESC LIMIT 1;")))
     if length_list(rows) > 0:
         set prev to string_to_int(get_list(get_list(rows and 0) and 0))
-        set ok to sql_execute(db and concat("UPDATE adapters SET status='current' WHERE version=" and concat(int_to_string(prev) and ";")))
+        set transaction_sql to concat("BEGIN IMMEDIATE; UPDATE adapters SET status='retired' WHERE status='current'; UPDATE adapters SET status='current' WHERE version=" and concat(int_to_string(prev) and "; COMMIT;"))
+        set transaction_error to sql_execute(db and transaction_sql)
+        if transaction_error != 0:
+            set rollback_error to sql_execute(db and "ROLLBACK;")
+            if rollback_error != 0:
+                display f"[-] Adapter rollback recovery failed: {rollback_error}."
+            return 0
         return prev
     return 0
 
 define adapter_mark_healthy with db as Int and version as Int and healthy as Int returning Int:
     if db == 0:
         return 1
-    set ok to adapter_ensure_schema(db)
-    set ok to sql_execute(db and concat("UPDATE adapters SET healthy=" and concat(int_to_string(healthy) and concat(" WHERE version=" and concat(int_to_string(version) and ";")))))
-    return 0
+    if adapter_ensure_schema(db) != 0:
+        return 1
+    return sql_execute(db and concat("UPDATE adapters SET healthy=" and concat(int_to_string(healthy) and concat(" WHERE version=" and concat(int_to_string(version) and ";")))))
 
 define adapter_list with db as Int returning Str:
     if db == 0:
         return "Error: storage db not available."
-    set ok to adapter_ensure_schema(db)
+    if adapter_ensure_schema(db) != 0:
+        return "Error: adapter schema unavailable."
     set rows to sql_query(db and "SELECT version, status, healthy, path FROM adapters ORDER BY version;")
     set n to length_list(rows)
     if n == 0:

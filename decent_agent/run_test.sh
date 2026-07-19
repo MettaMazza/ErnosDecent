@@ -10,9 +10,22 @@ TEST="${1:?usage: run_test.sh <path/to/test.ep>}"
 T="${TEST%.ep}"
 ERNOS="$HOME/.local/bin/ernos"; command -v ernos >/dev/null 2>&1 && ERNOS=ernos
 
-# 1. Transpile (link will fail — expected; it leaves the _compiled.c behind).
-"$ERNOS" "${T}.ep" >/dev/null 2>&1 || true
-[ -f "${T}_compiled.c" ] || { echo "[-] no C emitted — type error:"; "$ERNOS" check "${T}.ep"; exit 1; }
+# 1. Prove the source type-checks, then transpile. Some agent tests need the helpers
+# below before they can link, so the compiler's initial link failure is printed and
+# accepted only when it emitted the expected C translation unit.
+"$ERNOS" --check "${T}.ep"
+set +e
+TRANSPILE_OUTPUT=$("$ERNOS" "${T}.ep" 2>&1)
+TRANSPILE_STATUS=$?
+set -e
+if [ ! -f "${T}_compiled.c" ]; then
+  echo "$TRANSPILE_OUTPUT"
+  echo "[-] compiler emitted no C translation unit (status $TRANSPILE_STATUS)"
+  exit 1
+fi
+if [ "$TRANSPILE_STATUS" -ne 0 ]; then
+  echo "[*] Initial link stopped before helper injection, as required by this test harness."
+fi
 
 # 2. Inject the runtime helpers (same definitions build.sh uses).
 python3 - "$T" <<'PY'
@@ -42,14 +55,18 @@ case "$(uname -s)" in
     else
       clang "${T}_compiled.c" -o "./${T}" $CFLAGS_COMMON -L/usr/local/lib -lsodium -L/usr/local/opt/openssl/lib -lcrypto
     fi
-    codesign --force -s - "./${T}" 2>/dev/null || true
+    codesign --force -s - "./${T}"
     ;;
   *)
     clang "${T}_compiled.c" -o "./${T}" $CFLAGS_COMMON -lsodium -lcrypto -lm
     ;;
 esac
 
-# 4. Run, then clean up artifacts.
+# 4. Run, preserve its status, then clean up only artifacts created above.
 echo "=== $(basename "$T") ==="
-"./${T}" || true
+set +e
+"./${T}"
+TEST_STATUS=$?
+set -e
 rm -f "${T}_compiled.c" "./${T}"
+exit "$TEST_STATUS"

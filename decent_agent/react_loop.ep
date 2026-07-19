@@ -23,16 +23,16 @@ import "sql"
 # row (which contends on the global SQLite mutex and, under DB-heavy turns, delayed the
 # cancel by seconds) and instead of a cross-thread ErnosPlain map (which would mutate a
 # GC-managed object from another thread). ep_cancel_get takes a dummy arg for ABI parity.
-external define ep_cancel_set with v returning Int
-external define ep_cancel_get with dummy returning Int
+external define ep_cancel_set with v as Int returning Int
+external define ep_cancel_get with dummy as Int returning Int
 # SAFETY: cancel EPOCH (monotonic latch) — the consume-once flag above could only halt
 # ONE of N concurrent runs (main agent + sub-agents + background coordinators): whoever
 # read it first cleared it. Every run now captures the epoch at its start and halts when
 # the current value is GREATER; nothing consumes, so a single Stop halts EVERYTHING at
 # once, and runs started after the Stop are unaffected. Any targeted cancel (per-session
 # map/row) also BUMPS the epoch so a Stop from any surface is a global stop.
-external define ep_cancel_epoch_get with dummy returning Int
-external define ep_cancel_epoch_bump with dummy returning Int
+external define ep_cancel_epoch_get with dummy as Int returning Int
+external define ep_cancel_epoch_bump with dummy as Int returning Int
 
 # F4: cooperative cancellation registry. A Stop button / `AI CANCEL` IPC sets a
 # per-session flag on a SEPARATE connection while react_run_loop is blocked on the
@@ -41,6 +41,12 @@ external define ep_cancel_epoch_bump with dummy returning Int
 # session id normalises to "default" so both sides agree on a key.
 set RUN_CANCEL_MAP to create_map()
 set RUN_CANCEL_LOCK to create_mutex()
+
+define react_trace_emit_checked with db as Int and session_id as Str and event_type as Str and content as Str returning Int:
+    set trace_error to trace_emit(db and session_id and event_type and content)
+    if trace_error != 0:
+        display concat("[-] Trace event persistence failed: " and event_type)
+    return trace_error
 
 # Concurrency model: agents run as cooperative ASYNC TASKS on a single thread (the
 # LLM call yields at `await http_post_async`). The main user turn and every background
@@ -56,15 +62,27 @@ define react_cancel_key with session_id as Str returning Str:
 # Request cancellation of the active run for a session (called from the IPC handler).
 define react_request_cancel with session_id as Str returning Int:
     set key to react_cancel_key(session_id)
-    set ok to lock_mutex(RUN_CANCEL_LOCK)
+    if RUN_CANCEL_LOCK == 0:
+        display "[-] Cancellation mutex was not created."
+        return 2
+    set lock_ok to lock_mutex(RUN_CANCEL_LOCK)
+    if lock_ok == 0:
+        display "[-] Cancellation mutex lock failed."
+        return 2
     set ok to map_insert(RUN_CANCEL_MAP and key and 1)
-    set ok to unlock_mutex(RUN_CANCEL_LOCK)
+    set unlock_ok to unlock_mutex(RUN_CANCEL_LOCK)
+    if unlock_ok == 0:
+        display "[-] Cancellation mutex unlock failed."
+        return 3
     
     # Also write to SQLite DB
     set db to storage_get_db()
     if db != 0:
         set es to string_replace(key and "'" and "''")
         set ok to sql_execute(db and f"INSERT OR REPLACE INTO trace_cancellations (session_id) VALUES ('{es}');")
+        if ok != 0:
+            display concat("[-] Cancellation persistence failed for session " and key)
+            return 1
     return 0
 
 # Check a pending cancellation (called by every run at its turn boundaries).
@@ -78,11 +96,20 @@ define react_check_cancel with session_id as Str and run_epoch as Int returning 
         return 1
 
     set key to react_cancel_key(session_id)
-    set ok to lock_mutex(RUN_CANCEL_LOCK)
+    if RUN_CANCEL_LOCK == 0:
+        display "[-] Cancellation state mutex was not created."
+        return 0 - 1
+    set lock_ok to lock_mutex(RUN_CANCEL_LOCK)
+    if lock_ok == 0:
+        display "[-] Cancellation state mutex lock failed."
+        return 0 - 1
     set hit to map_contains(RUN_CANCEL_MAP and key)
     if hit == 1:
         set ok to map_delete(RUN_CANCEL_MAP and key)
-    set ok to unlock_mutex(RUN_CANCEL_LOCK)
+    set unlock_ok to unlock_mutex(RUN_CANCEL_LOCK)
+    if unlock_ok == 0:
+        display "[-] Cancellation state mutex unlock failed."
+        return 0 - 1
     if hit == 1:
         set ok to ep_cancel_epoch_bump(0)
         return 1
@@ -105,6 +132,8 @@ define react_check_cancel with session_id as Str and run_epoch as Int returning 
             set count_str to get_list(first_row and 0)
             if string_to_int(count_str) > 0:
                 set ok to sql_execute(db and f"DELETE FROM trace_cancellations WHERE session_id='{es}' OR session_id='__CANCEL_ALL__';")
+                if ok != 0:
+                    display concat("[-] Failed to consume cancellation row for session " and key)
                 set ok to ep_cancel_epoch_bump(0)
                 return 1
     return 0
@@ -129,8 +158,11 @@ define react_drain_whispers with session_id as Str returning Str:
         set row to get_list(rows and idx)
         set w_id to get_list(row and 0)
         set w_content to get_list(row and 1)
-        set out to concat(out and f"- {w_content}\n")
         set ok to sql_execute(db and f"DELETE FROM trace_whispers WHERE id={w_id};")
+        if ok != 0:
+            display concat("[-] Failed to consume whisper row " and ptr_to_str(w_id))
+            return out
+        set out to concat(out and f"- {w_content}\n")
         set idx to idx + 1
     return out
 
@@ -532,12 +564,13 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
     if map_contains(ctx and "is_test") == 1:
         set is_test to map_get_val(ctx and "is_test")
     
-    # Check if a model is loaded. If model has no vocab (empty map), run simulation mode.
-    set use_simulation to 1
+    # Detect whether an in-process GGUF model is available after the configured remote
+    # provider path. Tests have their own explicit is_test inference fixture below.
+    set has_native_model to 0
     if map_contains(model and "vocab") == 1:
         set vocab_node to map_get_val(model and "vocab")
         if length_list(vocab_node) > 0:
-            set use_simulation to 0
+            set has_native_model to 1
 
     # Tool-chaining horizon. The loop chains as many tools as the task needs, one per
     # turn; this is only a runaway guard (a model that never replies would otherwise
@@ -557,7 +590,13 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         if map_contains(ctx and "session_id") == 1:
             set f4_sess to map_get_val(ctx and "session_id")
         set ok to tools_set_active_session(f4_sess)
-        if react_check_cancel(f4_sess and run_epoch) == 1:
+        set cancel_state to react_check_cancel(f4_sess and run_epoch)
+        if cancel_state < 0:
+            display "[ReAct] Run halted because cancellation state could not be read safely."
+            set final_answer to "Run halted because cancellation state could not be read safely."
+            set finished to 1
+            continue
+        if cancel_state == 1:
             display "[ReAct] Run halted by user (cancel)."
             set ok to map_insert(ctx and "was_cancelled" and 1)
             set final_answer to "Run halted at your request."
@@ -575,7 +614,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         set whispers to react_drain_whispers(trace_sid)
         if string_length(whispers) > 0:
             display f"[ReAct] Received mid-turn whisper(s) from user."
-            set ok to trace_emit(trace_db and trace_sid and "whisper_received" and whispers)
+            set ok to react_trace_emit_checked(trace_db and trace_sid and "whisper_received" and whispers)
             set query_prompt to concat(query_prompt and f"\n[MID-TURN USER GUIDANCE — the user has sent additional direction while you are processing. This is NOT a new request — it is live guidance for your CURRENT task. Read it carefully and adjust your approach. You may acknowledge it with mid_message but do NOT end your turn with reply_request unless the user explicitly tells you to stop.]\n{whispers}[/MID-TURN USER GUIDANCE]\n")
 
         # Sub-agent completion checkpoint — pull any of THIS session's finished
@@ -588,7 +627,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set sub_done to orchestrator_drain_completed(sub_orch and trace_sid)
             if string_length(sub_done) > 0:
                 display f"[ReAct] Incorporating completed sub-agent result(s) mid-turn."
-                set ok to trace_emit(trace_db and trace_sid and "subagent_result" and sub_done)
+                set ok to react_trace_emit_checked(trace_db and trace_sid and "subagent_result" and sub_done)
                 set query_prompt to concat(query_prompt and concat("\n[SUB-AGENT RESULTS — background agents you dispatched have finished. The following are THEIR outputs (not user input). Use them and report to the user as appropriate.]\n" and concat(sub_done and "[/SUB-AGENT RESULTS]\n")))
 
         set raw_output to ""
@@ -607,13 +646,13 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set selected_model to ""
                 if map_contains(ctx and "selected_model") == 1:
                     set selected_model to map_get_val(ctx and "selected_model")
-                set ok to trace_emit(trace_db and trace_sid and "thinking" and f"Querying {selected_model}...")
+                set ok to react_trace_emit_checked(trace_db and trace_sid and "thinking" and f"Querying {selected_model}...")
                 set raw_output to query_local_llm(query_prompt and selected_model)
                 
             if string_length(raw_output) == 0:
                 if is_test == 1:
                     set raw_output to react_simulate_inference(query_prompt and loop_idx)
-                else if use_simulation == 0:
+                else if has_native_model == 1:
                     set raw_output to inference_run(model and query_prompt and 0 and 200)
                 else if ep_cancel_epoch_get(0) > run_epoch:
                     # The empty response came from a Stop-aborted read, not a dead
@@ -629,7 +668,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set finished to 1
             
         display f"LLM raw response:\n{raw_output}\n----------------"
-        set ok to trace_emit(trace_db and trace_sid and "raw_output" and raw_output)
+        set ok to react_trace_emit_checked(trace_db and trace_sid and "raw_output" and raw_output)
         set ok to append_list(values_list and raw_output)
 
         # F1: capture this turn's native reasoning (<think>...</think>) as its own
@@ -642,7 +681,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set ok to map_insert(ctx and "last_reasoning" and turn_reasoning)
             set ok to memory_store(memory_mgr and 3 and "REASONING" and turn_reasoning)
             display f"[reasoning] {turn_reasoning}"
-            set ok to trace_emit(trace_db and trace_sid and "reasoning" and turn_reasoning)
+            set ok to react_trace_emit_checked(trace_db and trace_sid and "reasoning" and turn_reasoning)
         # reason_split is NOT freed here: turn_reasoning was extracted from it and
         # inserted into ctx["last_reasoning"]. Freeing the map would invalidate the
         # aliased string — use-after-free → SIGSEGV. Tracked in values_list for GC.
@@ -667,7 +706,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             if map_get_val(lookback and "drift") == 1:
                 set lb_note to map_get_val(lookback and "note")
                 display f"[Observer look-back] self-correction: {lb_note}"
-                set ok to trace_emit(trace_db and trace_sid and "lookback" and lb_note)
+                set ok to react_trace_emit_checked(trace_db and trace_sid and "lookback" and lb_note)
                 set ok to memory_store(memory_mgr and 3 and "SELF-CHECK" and lb_note)
                 set current_prompt to concat(current_prompt and f"\n[SELF-CHECK — INVISIBLE TO USER] Your previous output drifted from your operating values ({lb_note}). Correct course now: speak as ErnOS in the first person, never use pre-trained-assistant disclaimers or claim to be another company's model, and state things plainly. Do not mention this note to the user.\n")
             free_map(lookback)
@@ -704,7 +743,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set orphan_names to react_find_orphan_calls(dropped_seg and map_get_val(tools_mgr and "schemas"))
                     if string_length(orphan_names) > 0:
                         display f"[ReAct] Orphaned tool calls dropped by the batch slicer: {orphan_names}"
-                        set ok to trace_emit(trace_db and trace_sid and "no_action" and f"Orphaned calls not executed: {orphan_names}")
+                        set ok to react_trace_emit_checked(trace_db and trace_sid and "no_action" and f"Orphaned calls not executed: {orphan_names}")
                         set orphan_nudge to f"[FORMAT NOTE — INVISIBLE TO USER] Your response ALSO contained tool call(s) WITHOUT the 'Action:' prefix, which were NOT executed: {orphan_names}. A bare name([...]) in prose does not run. Re-emit each as its own 'Action: <name>([...])' line.\n"
             if string_length(batch_rest) > 0:
                 set override_output to batch_rest
@@ -713,7 +752,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 # each one executes on its own chained iteration.
                 set assistant_text to substring(raw_output and 0 and a_end)
             display f"Parsed action: '{tool_name}' with args: '{args_str}'"
-            set ok to trace_emit(trace_db and trace_sid and "action" and f"{tool_name}({args_str})")
+            set ok to react_trace_emit_checked(trace_db and trace_sid and "action" and f"{tool_name}({args_str})")
             set ok to append_list(values_list and action_map)
             
             # Parse arguments as JSON array or fallback to raw string
@@ -860,7 +899,13 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set cxl_sess to ""
                     if map_contains(ctx and "session_id") == 1:
                         set cxl_sess to map_get_val(ctx and "session_id")
-                    if react_check_cancel(cxl_sess and run_epoch) == 1:
+                    set cancel_state to react_check_cancel(cxl_sess and run_epoch)
+                    if cancel_state < 0:
+                        free_list(args_list)
+                        free_list(values_list)
+                        set ok to tools_set_active_session("")
+                        return "Run halted because cancellation state could not be read safely."
+                    if cancel_state == 1:
                         display "[ReAct] Run halted by user (cancel) instead of pausing for approval."
                         set ok to map_insert(ctx and "was_cancelled" and 1)
                         free_list(args_list)
@@ -886,7 +931,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                             set approval_summary to concat(approval_summary and concat("  ⚠️ WARNING: " and acc_warn))
 
                         display f"Tool '{tool_name}' requires user approval. Pausing for confirmation."
-                        set ok to trace_emit(trace_db and trace_sid and "approval" and f"Waiting for approval: {tool_name}({args_str})")
+                        set ok to react_trace_emit_checked(trace_db and trace_sid and "approval" and f"Waiting for approval: {tool_name}({args_str})")
                         
                         # Store pending action state in context for the IPC layer to pick up
                         set pending to create_map()
@@ -929,6 +974,11 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                             set sa_parent_sid to map_get_val(ctx and "parent_session_id")
                             set sa_task_id to trace_sid
                             set sa_db to storage_get_db()
+                            if sa_db == 0:
+                                free_list(args_list)
+                                free_list(values_list)
+                                set ok to tools_set_active_session("")
+                                return "Error: sub-agent approval storage is unavailable."
                             # Insert pending approval row
                             set sa_tn_esc to string_replace(tool_name and "'" and "''")
                             set sa_as_esc to string_replace(args_str and "'" and "''")
@@ -936,20 +986,44 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                             set sa_sid_esc to string_replace(sa_task_id and "'" and "''")
                             set sa_now to ep_time_now_sec()
                             set ok to sql_execute(sa_db and f"INSERT INTO trace_approvals (session_id, tool_name, args_str, summary, decision, created_at) VALUES ('{sa_sid_esc}', '{sa_tn_esc}', '{sa_as_esc}', '{sa_sm_esc}', NULL, {sa_now});")
+                            if ok != 0:
+                                free_list(args_list)
+                                free_list(values_list)
+                                set ok to tools_set_active_session("")
+                                return "Error: sub-agent approval request could not be persisted."
                             # Notify parent session via trace event
                             set sa_desc to concat("Sub-agent " and concat(sa_task_id and concat(" requests permission to call " and concat(tool_name and concat("(" and concat(args_str and ")"))))))
                             set sa_desc_esc to string_replace(sa_desc and "\"" and "'")
                             set sa_tn_esc2 to string_replace(tool_name and "\"" and "'")
                             set sa_as_esc2 to string_replace(args_str and "\"" and "'")
-                            set ok to trace_emit(sa_db and sa_parent_sid and "subagent_approval" and concat("{\"task_id\":\"" and concat(sa_task_id and concat("\",\"tool\":\"" and concat(sa_tn_esc2 and concat("\",\"args\":\"" and concat(sa_as_esc2 and concat("\",\"description\":\"" and concat(sa_desc_esc and "\"}")))))))))
+                            set ok to react_trace_emit_checked(sa_db and sa_parent_sid and "subagent_approval" and concat("{\"task_id\":\"" and concat(sa_task_id and concat("\",\"tool\":\"" and concat(sa_tn_esc2 and concat("\",\"args\":\"" and concat(sa_as_esc2 and concat("\",\"description\":\"" and concat(sa_desc_esc and "\"}")))))))))
+                            if ok != 0:
+                                set cleanup_error to sql_execute(sa_db and f"DELETE FROM trace_approvals WHERE session_id='{sa_sid_esc}';")
+                                if cleanup_error != 0:
+                                    display "[-] Failed to remove undeliverable sub-agent approval row."
+                                free_list(args_list)
+                                free_list(values_list)
+                                set ok to tools_set_active_session("")
+                                return "Error: sub-agent approval request could not be delivered to the parent session."
                             display f"[APPROVAL] Sub-agent {sa_task_id} waiting for approval of {tool_name} — polling trace_approvals"
                             # Poll for decision — yield the event loop each second
                             set sa_decision to ""
                             set sa_poll_count to 0
                             repeat while string_length(sa_decision) == 0 and also sa_poll_count < 3600:
                                 # Check for cancellation
-                                if react_check_cancel(trace_sid and run_epoch) == 1:
+                                set cancel_state to react_check_cancel(trace_sid and run_epoch)
+                                if cancel_state < 0:
+                                    set cleanup_error to sql_execute(sa_db and f"DELETE FROM trace_approvals WHERE session_id='{sa_sid_esc}' AND decision IS NULL;")
+                                    if cleanup_error != 0:
+                                        display "[-] Failed to remove approval row after cancellation-state failure."
+                                    free_list(args_list)
+                                    free_list(values_list)
+                                    set ok to tools_set_active_session("")
+                                    return "Run halted because cancellation state could not be read safely."
+                                if cancel_state == 1:
                                     set ok to sql_execute(sa_db and f"DELETE FROM trace_approvals WHERE session_id='{sa_sid_esc}' AND decision IS NULL;")
+                                    if ok != 0:
+                                        display "[-] Failed to remove cancelled sub-agent approval row."
                                     free_list(args_list)
                                     free_list(values_list)
                                     set ok to tools_set_active_session("")
@@ -963,6 +1037,11 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                                     set sa_decision to get_list(sa_row and 0)
                             # Clean up the approval row
                             set ok to sql_execute(sa_db and f"DELETE FROM trace_approvals WHERE session_id='{sa_sid_esc}';")
+                            if ok != 0:
+                                free_list(args_list)
+                                free_list(values_list)
+                                set ok to tools_set_active_session("")
+                                return "Error: sub-agent approval cleanup failed; the requested tool was not executed."
                             if sa_decision equals "yes":
                                 display f"[APPROVAL] Sub-agent {sa_task_id} APPROVED for {tool_name} — executing"
                                 set action_allowed to 1
@@ -1041,7 +1120,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         if needs_approval == 1:
                             set block_reason to map_get_val(audit_map and "reason")
                             display f"Observer audit: BLOCKED (overridden by human approval). Reason: {block_reason}"
-                            set ok to trace_emit(trace_db and trace_sid and "audit" and f"Observer: BLOCKED (human-approved, advisory only) — {block_reason}")
+                            set ok to react_trace_emit_checked(trace_db and trace_sid and "audit" and f"Observer: BLOCKED (human-approved, advisory only) — {block_reason}")
                         else:
                             set action_allowed to 0
                             set action_reason to map_get_val(audit_map and "reason")
@@ -1050,21 +1129,21 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set tool_result to ""
             if action_allowed == 0:
                 display f"Observer action audit: BLOCKED. Reason: {action_reason}"
-                set ok to trace_emit(trace_db and trace_sid and "audit" and f"Observer: BLOCKED — {action_reason}")
+                set ok to react_trace_emit_checked(trace_db and trace_sid and "audit" and f"Observer: BLOCKED — {action_reason}")
                 set tool_result to concat("BLOCKED by Observer: " and action_reason)
             else:
-                set ok to trace_emit(trace_db and trace_sid and "audit" and "Observer: ALLOWED")
+                set ok to react_trace_emit_checked(trace_db and trace_sid and "audit" and "Observer: ALLOWED")
                 display f"Executing tool: {tool_name}..."
-                set ok to trace_emit(trace_db and trace_sid and "tool_exec" and f"Executing: {tool_name}")
+                set ok to react_trace_emit_checked(trace_db and trace_sid and "tool_exec" and f"Executing: {tool_name}")
                 # KV-CACHE: expose this turn's prompt to tools that run their own LLM audit
-                # (moderation_tool). An audit sent with a bare/stub context is a DIFFERENT
+# (moderation_tool). An audit sent without the full context is a DIFFERENT
                 # prefix on the same model slot — it evicts the main prompt's KV cache and
                 # the next main call re-prefills the whole prompt from zero (~turn-1 TTFT).
                 # With the real prompt as system context the audit shares the prefix.
                 set ok to map_insert(ctx and "current_prompt" and current_prompt)
                 set tool_result to tools_execute(tools_mgr and ctx and tool_name and args_list)
                 display f"Tool result: {tool_result}"
-                set ok to trace_emit(trace_db and trace_sid and "tool_result" and tool_result)
+                set ok to react_trace_emit_checked(trace_db and trace_sid and "tool_result" and tool_result)
                 
             set ok to append_list(values_list and tool_result)
             
@@ -1087,7 +1166,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set is_parse_fail to 1
                 if verdict equals "ALLOWED" or else is_parse_fail == 1:
                     display "Observer reply audit: ALLOWED. Final response ready."
-                    set ok to trace_emit(trace_db and trace_sid and "reply_audit" and "Reply audit: ALLOWED")
+                    set ok to react_trace_emit_checked(trace_db and trace_sid and "reply_audit" and "Reply audit: ALLOWED")
                     set final_answer to tool_result
                     set finished to 1
                     set reply_blocks to 0
@@ -1099,7 +1178,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         set finished to 1
                     else:
                         display f"Observer reply audit: BLOCKED. Reason: {audit_reason}. Re-prompting ({reply_blocks}/3)..."
-                        set ok to trace_emit(trace_db and trace_sid and "reply_audit" and f"Reply audit: BLOCKED — {audit_reason} ({reply_blocks}/3)")
+                        set ok to react_trace_emit_checked(trace_db and trace_sid and "reply_audit" and f"Reply audit: BLOCKED — {audit_reason} ({reply_blocks}/3)")
                         # Concise correction — do NOT append the full raw_output (which
                         # added ~700+ chars per blocked turn, inflating the prompt from
                         # 16KB to 43KB over 28 turns and causing the SIGSEGV).
@@ -1144,7 +1223,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             free_list(args_list)
         else:
             display "No valid action parsed. Re-prompting for correct Action grammar..."
-            set ok to trace_emit(trace_db and trace_sid and "no_action" and "No valid action parsed, re-prompting")
+            set ok to react_trace_emit_checked(trace_db and trace_sid and "no_action" and "No valid action parsed, re-prompting")
             # Enforce Turn Boundary Rejection — tell the model EXACTLY what it did wrong
             # and what it must do. Common cause: the LLM continuation-completed an empty
             # Observation instead of starting a new Thought/Action block.
@@ -1162,7 +1241,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
     # an ever-growing prompt (cost/compute DoS).
     if finished == 0:
         display f"[ReAct] Iteration cap ({max_iters}) reached — aborting."
-        set ok to trace_emit(trace_db and trace_sid and "done" and f"Iteration cap ({max_iters}) reached")
+        set ok to react_trace_emit_checked(trace_db and trace_sid and "done" and f"Iteration cap ({max_iters}) reached")
         set final_answer to "I could not complete this request within the allowed number of steps."
     free_list(values_list)
     set ok to tools_set_active_session("")
@@ -1240,7 +1319,7 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
                     # only and does not prevent execution.
                     set block_reason to map_get_val(audit_map and "reason")
                     display f"Observer audit: BLOCKED (overridden by human approval). Reason: {block_reason}"
-                    set ok to trace_emit(trace_db and trace_sid and "audit" and f"Observer: BLOCKED (human-approved, advisory only) — {block_reason}")
+                    set ok to react_trace_emit_checked(trace_db and trace_sid and "audit" and f"Observer: BLOCKED (human-approved, advisory only) — {block_reason}")
                 free_map(audit_map)
         
         if action_allowed == 1:
@@ -1377,11 +1456,15 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set cancel_db to storage_get_db()
     if cancel_db != 0:
         set ok to sql_execute(cancel_db and "DELETE FROM trace_cancellations WHERE session_id='__CANCEL_ALL__';")
+        if ok != 0:
+            display "[-] Failed to clear the stale global cancellation marker."
         # Also clear a stale PER-SESSION row for this session: react_check_cancel now
         # BROADCASTS consumed cancels via the epoch, so a leftover row from a prior run
         # would otherwise halt not just this fresh run but every concurrent one.
         set stale_es to string_replace(react_cancel_key(stale_sid) and "'" and "''")
         set ok to sql_execute(cancel_db and f"DELETE FROM trace_cancellations WHERE session_id='{stale_es}';")
+        if ok != 0:
+            display concat("[-] Failed to clear stale cancellation state for session " and stale_sid)
     # Clear the C-level legacy cancel-all flag too, so a Stop meant for a prior run
     # cannot halt this fresh one on turn 1 (the EPOCH needs no clearing — runs capture
     # the current value at start, so old bumps are already behind them).
@@ -1435,6 +1518,6 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set trace_sid to ""
     if map_contains(ctx and "session_id") == 1:
         set trace_sid to map_get_val(ctx and "session_id")
-    set ok to trace_emit(trace_db and trace_sid and "done" and "Final answer ready")
+    set ok to react_trace_emit_checked(trace_db and trace_sid and "done" and "Final answer ready")
 
     return res

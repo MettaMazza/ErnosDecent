@@ -31,13 +31,25 @@ set LOG_INITIALIZED to 0
 # ================================================================
 
 define log_init with log_dir as Str and max_size as Int and max_files as Int returning Int:
+    if string_length(log_dir) == 0 or else max_size <= 0 or else max_files <= 0:
+        display "[FATAL] [logging] Invalid logger configuration."
+        return 1
     set LOG_DIR to log_dir
     set LOG_MAX_FILE_SIZE to max_size
     set LOG_MAX_FILES to max_files
 
     # Ensure log directory exists
+    set log_parent to path_dirname(log_dir)
+    if fs_exists(log_parent) == 0:
+        set parent_ok to create_directory(log_parent)
+        if parent_ok == 0:
+            display concat("[FATAL] [logging] Could not create log parent directory: " and log_parent)
+            return 1
     if fs_exists(log_dir) == 0:
-        set ok to run_command(concat("mkdir -p " and log_dir))
+        set ok to create_directory(log_dir)
+        if ok == 0:
+            display concat("[FATAL] [logging] Could not create log directory: " and log_dir)
+            return 1
 
     set LOG_FILE_PATH to concat(log_dir and "/ernosdecent.log")
 
@@ -76,14 +88,23 @@ define log_rotate returning Int:
         if fs_exists(old_path) == 1:
             if new_idx > LOG_MAX_FILES:
                 set ok to fs_delete_file(old_path)
+                if ok == 0:
+                    display concat("[ERROR] [logging] Failed to delete rotated log: " and old_path)
+                    return 1
             else:
                 set ok to fs_move_file(old_path and new_path)
+                if ok == 0:
+                    display concat("[ERROR] [logging] Failed to rotate log: " and old_path)
+                    return 1
         set i to i - 1
 
     # Move current log to .1
     if fs_exists(LOG_FILE_PATH) == 1:
         set first_rotated to concat(LOG_FILE_PATH and ".1")
         set ok to fs_move_file(LOG_FILE_PATH and first_rotated)
+        if ok == 0:
+            display concat("[ERROR] [logging] Failed to rotate active log: " and LOG_FILE_PATH)
+            return 1
 
     set LOG_CURRENT_SIZE to 0
     return 0
@@ -179,8 +200,16 @@ define log_write with level as Int and component as Str and message as Str retur
         # Check rotation
         if LOG_CURRENT_SIZE + line_len > LOG_MAX_FILE_SIZE:
             set ok to log_rotate()
+            if ok != 0:
+                display f"[{level_str}] [{component}] {message}"
+                return ok
         set ok to file_append(safe_path and line)
-        set LOG_CURRENT_SIZE to LOG_CURRENT_SIZE + line_len
+        if ok == 0:
+            display concat("[ERROR] [logging] Failed to append log file: " and safe_path)
+            display f"[{level_str}] [{component}] {message}"
+            return 1
+        else:
+            set LOG_CURRENT_SIZE to LOG_CURRENT_SIZE + line_len
     else:
         # Path could not be made canonical — never spray logs into a stray file;
         # fall back to console so the line is not silently lost.

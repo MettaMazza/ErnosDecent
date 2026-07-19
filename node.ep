@@ -11,7 +11,8 @@ import "os"
 import "http"
 
 
-external define cast_borrow_to_map with b returning Map
+external define cast_borrow_to_map with borrow b as Map returning Map
+external define cast_int_to_map with i as Int returning Map
 external define async_wait_readable_timeout with fd as Int and timeout_ms as Int returning Int
 # Phase A: listen socket non-blocking; accepted sockets forced back to blocking
 # (Darwin inherits O_NONBLOCK on accept — without this every IPC read came back empty
@@ -23,7 +24,7 @@ external define ep_net_set_blocking with fd as Int returning Int
 define cast_borrow_to_list with b as List returning List:
     return b
 
-external define cast_map_to_int with m returning Int
+external define cast_map_to_int with m as Map returning Int
 
 # Persistence
 import "./storage"
@@ -109,7 +110,7 @@ import "fs"
 
 # SAFETY: global cancel-EPOCH bump (injected by build.sh; latch semantics — see
 # react_loop.ep). AI CANCEL bumps it so one Stop halts every concurrent run.
-external define ep_cancel_epoch_bump with dummy returning Int
+external define ep_cancel_epoch_bump with dummy as Int returning Int
 
 # NON-BLOCKING IPC: the IPC server loop spawns each client handler on its own
 # OS thread (spawn handle_ipc_client). Only the agent’s react_run is serialized
@@ -165,15 +166,24 @@ define node_finish_turn with tctx as Map and sessions_mgr as Map and memory as M
             set dir to map_get_val(sessions_mgr and "sessions_dir")
             set filepath to path_join(dir and concat(sid and ".json"))
             set ok to session_serialize(tsess and filepath)
+            if ok != 0:
+                display concat("[-] Turn session persistence failed for " and sid)
+                log_error("node" and concat("Turn session persistence failed for " and sid))
+                set resp to "ai:error,reason=session_persistence_failed"
         set ser_err to memory_serialize(memory and "config/agent_memory.json")
+        if ser_err != 0:
+            display "[-] Turn memory persistence failed."
+            log_error("node" and "Turn memory persistence failed.")
+            set resp to "ai:error,reason=memory_persistence_failed"
         set last_reason to ""
         if map_contains(tctx and "last_reasoning") == 1:
             set last_reason to map_get_val(tctx and "last_reasoning")
             set ok to map_delete(tctx and "last_reasoning")
-        if string_length(last_reason) > 0:
-            set resp to f"ai:ok,reasoning:{base64_encode(last_reason)}|||RESPONSE|||{agent_resp}"
-        else:
-            set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
+        if string_length(resp) == 0:
+            if string_length(last_reason) > 0:
+                set resp to f"ai:ok,reasoning:{base64_encode(last_reason)}|||RESPONSE|||{agent_resp}"
+            else:
+                set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
     # TURN CORRELATION: prefix this turn's id so the bridge waiter can match the reply
     # to ITS request instead of taking the session's next final_reply (which delivered a
     # concurrent scheduler-job's reply as the user's answer — the tick bug).
@@ -181,6 +191,9 @@ define node_finish_turn with tctx as Map and sessions_mgr as Map and memory as M
         set ft_tag to map_get_val(tctx and "turn_id")
         set resp to concat(f"turn:{ft_tag}," and resp)
     set ok to trace_emit(tdb and sid and "final_reply" and resp)
+    if ok != 0:
+        display concat("[-] Final reply delivery failed for session " and sid)
+        log_error("node" and concat("Final reply delivery failed for session " and sid))
     if stays_open == 0:
         # The shallow clone shares the shared turn-tracking maps — clear our flags.
         if map_contains(tctx and "active_turns") == 1:
@@ -223,21 +236,29 @@ async define node_resume_turn with model as Map and memory as Map and tools as M
 # (see tools_validation_block). Shared structures ride as Int handles; the Maps are
 # re-materialized per call with INLINE cast_borrow_to_map (never assigned to locals —
 # the documented borrow-view free hazard).
-async define node_accept_chain with listen_fd as Int and raft_i as Int and ident_i as Int and dht_node as Int and relay_node as Int and msg_store as Int and ledger_i as Int and name_reg as Int and seed_addr as Str and seed_port as Int and mem_i as Int and tools_i as Int and ctx_i as Int and model_i as Int and static_secret as Int and static_public as Int and bft_i as Int returning Int:
+async define node_accept_chain with listen_fd as Int and raft_i as Int and ident_i as Int and dht_node as Map and relay_node as Map and msg_store as Map and ledger_i as Int and name_reg as Map and seed_addr as Str and seed_port as Int and mem_i as Int and tools_i as Int and ctx_i as Int and model_i as Int and static_secret as Int and static_public as Int and bft_i as Int returning Int:
     set ready to await async_wait_readable_timeout(listen_fd and 250)
     if ready == 1:
         set client_fd to ep_net_accept(listen_fd)
         if client_fd >= 0:
             # Accepted sockets inherit O_NONBLOCK on Darwin — force blocking so the
             # AUTH command read cannot come back empty (the fixed A1 regression).
-            set ok to ep_net_set_blocking(client_fd)
-            handle_ipc_client(client_fd and borrow cast_borrow_to_map(raft_i) and borrow cast_borrow_to_map(ident_i) and dht_node and relay_node and msg_store and borrow cast_borrow_to_map(ledger_i) and name_reg and seed_addr and seed_port and borrow cast_borrow_to_map(mem_i) and borrow cast_borrow_to_map(tools_i) and borrow cast_borrow_to_map(ctx_i) and borrow cast_borrow_to_map(model_i) and static_secret and static_public and borrow cast_borrow_to_map(bft_i))
+            set blocking_err to ep_net_set_blocking(client_fd)
+            if blocking_err != 0:
+                display f"[-] IPC accepted socket could not be switched to blocking mode: {blocking_err}"
+                set close_err to ep_net_close(client_fd)
+                if close_err != 0:
+                    display f"[-] IPC accepted socket cleanup failed: {close_err}"
+            else:
+                set handler_err to handle_ipc_client(client_fd and borrow cast_int_to_map(raft_i) and borrow cast_int_to_map(ident_i) and dht_node and relay_node and msg_store and borrow cast_int_to_map(ledger_i) and name_reg and seed_addr and seed_port and borrow cast_int_to_map(mem_i) and borrow cast_int_to_map(tools_i) and borrow cast_int_to_map(ctx_i) and borrow cast_int_to_map(model_i) and static_secret and static_public and borrow cast_int_to_map(bft_i))
+                if handler_err != 0:
+                    display f"[-] IPC client handler failed: {handler_err}"
     set nxt to node_accept_chain(listen_fd and raft_i and ident_i and dht_node and relay_node and msg_store and ledger_i and name_reg and seed_addr and seed_port and mem_i and tools_i and ctx_i and model_i and static_secret and static_public and bft_i)
     return 0
 
 # Main's eternal pump: a PLAIN loop whose await lowers to ep_await_future each tick —
 # it drives the scheduler (tasks, timers, IO) forever. All real work happens in tasks.
-external define ep_async_sleep_ms with ms returning Int
+external define ep_async_sleep_ms with ms as Int returning Int
 define node_main_pump returning Int:
     repeat while 1 == 1:
         set ok to await ep_async_sleep_ms(60000)
@@ -263,10 +284,29 @@ define factory_rm_tree with path as Str and depth as Int returning Int:
                 set i to i + 1
             else:
                 set ok to factory_rm_tree(concat(path and concat("/" and e)) and depth + 1)
+                if ok != 0:
+                    free_list(entries)
+                    return 1
                 set i to i + 1
+        free_list(entries)
         set ok to remove_directory(path)
+        if ok == 0:
+            display concat("[-] Factory reset could not remove directory: " and path)
+            return 1
         return 0
     set ok to remove_file(path)
+    if ok == 0:
+        display concat("[-] Factory reset could not remove file: " and path)
+        return 1
+    return 0
+
+define factory_rm_file_if_present with path as Str returning Int:
+    if file_exists(path) == 0:
+        return 0
+    set ok to remove_file(path)
+    if ok == 0:
+        display concat("[-] Factory reset could not remove file: " and path)
+        return 1
     return 0
 
 # AI / speech
@@ -469,7 +509,7 @@ define search_json_escape with s as Str returning Str:
 # peers over the authenticated Noise channel. No clearnet scrape, no hardcoded
 # keyword fallbacks, no fabricated onion-circuit metadata — if nothing matches
 # locally or remotely the result set is honestly empty.
-define handle_onion_search with index as Map and query as Str and dht as Int and static_secret as Int and static_public as Int returning Str:
+define handle_onion_search with index as Map and query as Str and dht as Map and static_secret as Int and static_public as Int returning Str:
     set local_results to query_search(index and query)
     set peer_count to dht_node_peer_count(dht)
     # Prefer anonymized onion routing when enough relays are known: the query travels
@@ -527,7 +567,7 @@ define handle_onion_search with index as Map and query as Str and dht as Int and
 # ipc_read_token / ipc_get_or_create_token) live in decent_id/auth.ep — shared so the
 # web server, which also authenticates to the IPC port, doesn't depend on a function
 # defined here (it imports decent_id/auth too).
-define handle_ipc_client with client_fd as Int and borrow raft_node as Map and borrow identity as Map and dht_node as Int and relay_node as Int and msg_store as Int and borrow ledger as Map and name_reg as Int and seed_addr as Str and seed_port as Int and borrow agent_memory as Map and borrow agent_tools as Map and borrow agent_ctx as Map and borrow agent_model as Map and static_secret as Int and static_public as Int and borrow bft_node as Map:
+define handle_ipc_client with client_fd as Int and borrow raft_node as Map and borrow identity as Map and dht_node as Map and relay_node as Map and msg_store as Map and borrow ledger as Map and name_reg as Map and seed_addr as Str and seed_port as Int and borrow agent_memory as Map and borrow agent_tools as Map and borrow agent_ctx as Map and borrow agent_model as Map and static_secret as Int and static_public as Int and borrow bft_node as Map returning Int:
 
     set req to ep_net_recv(client_fd and 65536)
     set cmd to string_trim(req)
@@ -567,23 +607,32 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
         set cfg_path to concat(home and "/.ernosdecent/config.toml")
         set is_static to 0
         set elect_enabled to 1
+        set cfg_valid to 1
         set cfg to config_load(cfg_path)
         if cfg != 0:
-            if map_contains(cfg and "network.is_static_host") == 1:
+            if map_contains(cfg and "config.error") == 1:
+                set resp to concat("error:config_parse_failed,detail:" and ptr_to_str(map_get_val(cfg and "config.error")))
+                set cfg_valid to 0
+            else if map_contains(cfg and "network.is_static_host") == 1:
                 set is_static to config_get_int(cfg and "network.is_static_host")
             if map_contains(cfg and "network.enable_host_election") == 1:
                 set elect_enabled to config_get_int(cfg and "network.enable_host_election")
             free_map(cfg)
-        set reg_name to storage_name_get_by_did(did_val)
-        if string_length(reg_name) == 0:
-            set reg_name to "none"
-        set gitdec_updates to storage_gitdec_count_pending()
-        set resp to f"status:active,role:{role},did:{did_val},term:{term},peers:{peer_count},dht_size:{dht_size},is_static_host:{int_to_string(is_static)},enable_host_election:{int_to_string(elect_enabled)},name:{reg_name},gitdec_updates:{int_to_string(gitdec_updates)}"
+        if cfg_valid == 1:
+            set reg_name to storage_name_get_by_did(did_val)
+            if string_length(reg_name) == 0:
+                set reg_name to "none"
+            set gitdec_updates to storage_gitdec_count_pending()
+            set resp to f"status:active,role:{role},did:{did_val},term:{term},peers:{peer_count},dht_size:{dht_size},is_static_host:{int_to_string(is_static)},enable_host_election:{int_to_string(elect_enabled)},name:{reg_name},gitdec_updates:{int_to_string(gitdec_updates)}"
     else:
         if cmd_upper equals "STOP":
             set resp to "status:stopping"
-            set ok to ep_net_send(client_fd and resp)
-            set ok to ep_net_close(client_fd)
+            set sent to ep_net_send(client_fd and resp)
+            if sent != string_length(resp):
+                log_error("node" and "Failed to send STOP acknowledgement.")
+            set close_err to ep_net_close(client_fd)
+            if close_err != 0:
+                log_error("node" and "Failed to close STOP command connection.")
             log_info("node" and "Daemon stopping on client request.")
             exit_program(0)
         else:
@@ -671,7 +720,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                     set dr_id to string_to_int(substring(dr_args and 0 and dr_bar))
                                     set dr_data to substring(dr_args and dr_bar + 1 and string_length(dr_args) - dr_bar - 1)
                                     set dr_ok to bridge_submit_result(storage_get_db() and dr_id and dr_data)
-                                    set resp to concat("bridge:result_recorded,id:" and int_to_string(dr_id))
+                                    if dr_ok == 0:
+                                        set resp to concat("bridge:result_recorded,id:" and int_to_string(dr_id))
+                                    else:
+                                        set resp to "bridge:error,reason:result_persistence_failed"
                             else if string_contains(cmd_upper and "TRACE POLL ") == 1:
                                 # Trace event polling for Discord transparency threads
                                 set trace_sess to string_trim(substring(cmd and 11 and string_length(cmd) - 11))
@@ -944,7 +996,12 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                     set wes to string_replace(turn_sid and "'" and "''")
                                                     set wec to string_replace(ai_prompt and "'" and "''")
                                                     set ok to sql_execute(wdb and f"INSERT INTO trace_whispers (session_id, content, created_at) VALUES ('{wes}', '{wec}', strftime('%s','now'));")
-                                                set resp to f"ai:busy_whispered,session:{turn_sid}"
+                                                    if ok == 0:
+                                                        set resp to f"ai:busy_whispered,session:{turn_sid}"
+                                                    else:
+                                                        set resp to "ai:error,reason:whisper_persistence_failed"
+                                                else:
+                                                    set resp to "ai:error,reason:db_not_available"
                                             else:
                                                 # Shared refs sub-agent delegation needs, kept on the SHARED ctx
                                                 # (clone below copies them). Also ensure session_auto_approve
@@ -1028,16 +1085,16 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 if map_contains(pp and "phase") == 0:
                                                     set resp to "bft:error,reason:not_leader_for_current_view"
                                                 else:
-                                                    set bsent to broadcast_bft_to_peers(bft_serialize_msg(pp) and dht_node and static_secret and static_public)
+                                                    set bsent to broadcast_bft_to_peers(bft_serialize_msg(pp) and cast_map_to_int(dht_node) and static_secret and static_public)
                                                     set lr to bft_handle(cast_borrow_to_map(bft_node) and pp)
                                                     set lts to map_get_val(lr and "to_send")
                                                     if map_contains(lts and "phase") == 1:
-                                                        set ok to broadcast_bft_to_peers(bft_serialize_msg(lts) and dht_node and static_secret and static_public)
+                                                        set ok to broadcast_bft_to_peers(bft_serialize_msg(lts) and cast_map_to_int(dht_node) and static_secret and static_public)
                                                     set resp to f"bft:proposed,peers_notified:{bsent},reason:awaiting_quorum"
                                         else if string_contains(cmd_upper and "MESH AI ") == 1:
                                             # Real collaborative-AI inference over the mesh: assign to
                                             # workers running real local inference + redundant consensus
-                                            # (was a hardcoded string_upper stub, test-only).
+                                            # (the former test-only path returned string_upper directly).
                                             set mprompt to string_trim(substring(cmd and 8 and string_length(cmd) - 8))
                                             if string_length(mprompt) > 0 and also map_contains(agent_ctx and "mesh") == 1:
                                                 set meshh to map_get_val(agent_ctx and "mesh")
@@ -1113,7 +1170,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                     if approve_decision equals "no":
                                                         set sa_dec to "no"
                                                     set ok to sql_execute(sa_db and f"UPDATE trace_approvals SET decision='{sa_dec}' WHERE session_id='{sa_es}' AND decision IS NULL;")
-                                                    set resp to f"ai:approve_ack,agent:{approve_agent_id},decision:{sa_dec}"
+                                                    if ok == 0:
+                                                        set resp to f"ai:approve_ack,agent:{approve_agent_id},decision:{sa_dec}"
+                                                    else:
+                                                        set resp to "ai:error,reason:approval_persistence_failed"
                                                 else:
                                                     set resp to "ai:error,reason:db_not_available"
                                             else:
@@ -1167,47 +1227,110 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             # with confirmation; deliberately NOT an agent tool — the agent must
                                             # never be able to erase its own mind via a model action).
                                             if agent_ctx != 0:
+                                                set factory_error to 0
                                                 # 1. On-disk agent state (fixed paths only).
                                                 set ok to factory_rm_tree("config/sessions" and 0)
+                                                if ok != 0:
+                                                    set factory_error to 1
                                                 set ok to factory_rm_tree("config/workspaces" and 0)
+                                                if ok != 0:
+                                                    set factory_error to 1
                                                 set ok to factory_rm_tree("config/learning" and 0)
+                                                if ok != 0:
+                                                    set factory_error to 1
                                                 set ok to factory_rm_tree("config/uploads" and 0)
+                                                if ok != 0:
+                                                    set factory_error to 1
                                                 set ok to factory_rm_tree("config/changelog" and 0)
+                                                if ok != 0:
+                                                    set factory_error to 1
                                                 set ok to factory_rm_tree("config/adapters" and 0)
+                                                if ok != 0:
+                                                    set factory_error to 1
                                                 set ok to factory_rm_tree(storage_knowledge_dir() and 0)
-                                                set ok to remove_file("config/agent_memory.json")
-                                                set ok to remove_file("config/linked_projects.txt")
+                                                if ok != 0:
+                                                    set factory_error to 1
+                                                set ok to factory_rm_file_if_present("config/agent_memory.json")
+                                                if ok != 0:
+                                                    set factory_error to 1
+                                                set ok to factory_rm_file_if_present("config/linked_projects.txt")
+                                                if ok != 0:
+                                                    set factory_error to 1
                                                 # Data-dir agent files. The self-sections fallback path IS the
                                                 # tracked template (config/...) — never delete that; only the
                                                 # data-dir copy so the template becomes live again (factory default).
                                                 set fss to storage_self_sections_path()
                                                 if string_index_of(fss and "config/") != 0:
-                                                    set ok to remove_file(fss)
-                                                set ok to remove_file(storage_active_persona_path())
+                                                    set ok to factory_rm_file_if_present(fss)
+                                                    if ok != 0:
+                                                        set factory_error to 1
+                                                set ok to factory_rm_file_if_present(storage_active_persona_path())
+                                                if ok != 0:
+                                                    set factory_error to 1
                                                 # 2. Persona runtime accretions: strip Identity Update reflections,
                                                 # keep the BASE persona text (that is prompting, not data).
                                                 set fpp to edition_persona_path()
                                                 if file_exists(fpp) == 1:
                                                     set ok to write_file(fpp and sleep_strip_reflections(read_file(fpp)))
+                                                    if ok == 0:
+                                                        display concat("[-] Factory reset could not rewrite persona: " and fpp)
+                                                        set factory_error to 1
                                                 # 3. Agent-scoped SQLite tables (node-service tables untouched).
                                                 set fdb to storage_get_db()
                                                 if fdb != 0:
-                                                    set ok to sql_execute(fdb and "DELETE FROM trace_events;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM trace_whispers;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM trace_cancellations;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM trace_pending_deletes;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM bridge_commands;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM rag_chunks;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM discord_user_contexts;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM reading_progress;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM adapters;")
+                                                    set sql_error to sql_execute(fdb and "BEGIN IMMEDIATE;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "DELETE FROM trace_events;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "DELETE FROM trace_whispers;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "DELETE FROM trace_cancellations;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "DELETE FROM trace_pending_deletes;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "DELETE FROM bridge_commands;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "DELETE FROM rag_chunks;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "DELETE FROM discord_user_contexts;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "DELETE FROM reading_progress;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "DELETE FROM adapters;")
+                                                    if sql_error == 0:
+                                                        set sql_error to sql_execute(fdb and "COMMIT;")
+                                                        if sql_error != 0:
+                                                            set rollback_error to sql_execute(fdb and "ROLLBACK;")
+                                                            if rollback_error != 0:
+                                                                display "[CRITICAL] Factory reset database rollback failed after commit error."
+                                                    else:
+                                                        set rollback_error to sql_execute(fdb and "ROLLBACK;")
+                                                        if rollback_error != 0:
+                                                            display "[CRITICAL] Factory reset database rollback failed."
+                                                    if sql_error != 0:
+                                                        display "[-] Factory reset could not clear agent database tables."
+                                                        set factory_error to 1
+                                                else:
+                                                    display "[-] Factory reset database is unavailable."
+                                                    set factory_error to 1
                                                 # 4. LIVE in-memory state — reset in place so nothing re-serializes
                                                 # the old mind back over the wiped files.
                                                 set ok to memory_factory_reset(cast_borrow_to_map(agent_memory))
+                                                if ok != 0:
+                                                    display "[-] Factory reset could not clear live memory."
+                                                    set factory_error to 1
                                                 set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                                if ser_err != 0:
+                                                    set factory_error to 1
                                                 set fsm to map_get_val(agent_ctx and "sessions")
                                                 set ok to session_manager_factory_reset(fsm)
-                                                set ok to workspace_init("default")
+                                                if ok == 0:
+                                                    display "[-] Factory reset could not reset live sessions."
+                                                    set factory_error to 1
+                                                set workspace_reset_error to workspace_init("default")
+                                                if workspace_reset_error != 0:
+                                                    display "[-] Factory reset could not initialise the default workspace."
+                                                    set factory_error to 1
                                                 # 5. Transient agent_ctx state.
                                                 if map_contains(agent_ctx and "session_auto_approve") == 1:
                                                     set ok to map_delete(agent_ctx and "session_auto_approve")
@@ -1224,8 +1347,12 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 # Persona-derived name cache re-derives next turn (pointer removed
                                                 # above restores the factory identity chain).
                                                 set ok to prompt_refresh_agent_name()
-                                                display "[FACTORY] Agent state wiped: sessions, workspaces, memory tiers, learning, RAG, knowledge, traces, links. Prompting + node identity kept."
-                                                set resp to "factory:ok,kept:prompts+personas+identity-files+node-keys+wallet+config,wiped:sessions+workspaces+memory+learning+rag+knowledge+traces+links+self-sections"
+                                                if factory_error == 0:
+                                                    display "[FACTORY] Agent state wiped: sessions, workspaces, memory tiers, learning, RAG, knowledge, traces, links. Prompting + node identity kept."
+                                                    set resp to "factory:ok,kept:prompts+personas+identity-files+node-keys+wallet+config,wiped:sessions+workspaces+memory+learning+rag+knowledge+traces+links+self-sections"
+                                                else:
+                                                    display "[FACTORY] Factory reset was incomplete; see preceding errors."
+                                                    set resp to "factory:error,reason:partial_reset_failed"
                                             else:
                                                 set resp to "ai:error,reason:agent_not_initialized"
                                         else if string_contains(cmd_upper and "AI PERSONA") == 1:
@@ -1311,13 +1438,16 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set ep to string_index_of(rest and "]")
                                                 if ep > 0:
                                                     set cancel_sid to substring(rest and 0 and ep)
-                                            set ok to react_request_cancel(cancel_sid)
+                                            set cancel_error to react_request_cancel(cancel_sid)
                                             # SAFETY: also bump the global cancel EPOCH — a Stop must halt the
                                             # WHOLE system (main run + every sub-agent + background
                                             # coordinators) instantly, not just the targeted session; in-flight
                                             # LLM reads abort within ~1s on the same latch.
-                                            set ok to ep_cancel_epoch_bump(0)
-                                            set resp to "ai:cancel_ack"
+                                            set epoch_error to ep_cancel_epoch_bump(0)
+                                            if cancel_error != 0:
+                                                set resp to f"ai:error,reason:cancel_request_failed,code:{cancel_error}"
+                                            else:
+                                                set resp to "ai:cancel_ack"
                                         else if string_index_of(cmd_upper and "AI CLARIFY") == 0:
                                             # F3: user answered the agent's clarifying question(s) — resume.
                                             # Match the PREFIX, not "AI CLARIFY " with a trailing space: the
@@ -1352,13 +1482,16 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             # explicit error — never a fabricated transcription.
                                             set audio_path to string_trim(substring(cmd and 14 and string_length(cmd) - 14))
                                             set wcfg to config_load(concat(get_home_dir() and "/.ernosdecent/config.toml"))
-                                            set whost to config_get_str(wcfg and "ai.whisper_host")
-                                            set wport to config_get_int(wcfg and "ai.whisper_port")
-                                            set tr to speech_transcribe_whisper(audio_path and whost and wport)
-                                            if string_index_of(tr and "ERROR:") == 0:
-                                                set resp to concat("ai:error,reason:" and substring(tr and 6 and string_length(tr) - 6))
+                                            if map_contains(wcfg and "config.error") == 1:
+                                                set resp to concat("ai:error,reason:config_parse_failed:" and ptr_to_str(map_get_val(wcfg and "config.error")))
                                             else:
-                                                set resp to concat("ai:ok,transcription:" and tr)
+                                                set whost to config_get_str(wcfg and "ai.whisper_host")
+                                                set wport to config_get_int(wcfg and "ai.whisper_port")
+                                                set tr to speech_transcribe_whisper(audio_path and whost and wport)
+                                                if string_index_of(tr and "ERROR:") == 0:
+                                                    set resp to concat("ai:error,reason:" and substring(tr and 6 and string_length(tr) - 6))
+                                                else:
+                                                    set resp to concat("ai:ok,transcription:" and tr)
                                             free_map(wcfg)
                                         else if string_contains(cmd_upper and "TTS SPEAK ") == 1:
                                             # Synthesise text to a WAV (Kokoro, voice bm_fable @1.15x) and
@@ -1440,8 +1573,11 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set sessions_mgr to map_get_val(agent_ctx and "sessions")
                                                 set sess to session_manager_new_session(sessions_mgr and id_val and title_val and model_val and sys_val)
                                                 # Rotate workspace for the new session
-                                                set ok to workspace_init(id_val)
-                                                set resp to f"session:ok,id:{id_val}"
+                                                set workspace_session_error to workspace_init(id_val)
+                                                if workspace_session_error != 0:
+                                                    set resp to f"session:error,reason:workspace_init_failed,id:{id_val}"
+                                                else:
+                                                    set resp to f"session:ok,id:{id_val}"
                                             else:
                                                 set resp to "session:error,reason:invalid_json"
                                         else if string_contains(cmd_upper and "SESSION SET ") == 1:
@@ -1516,13 +1652,25 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             # return the updated memory graph so the UI refreshes.
                                             set dk to memory_decay_synapses(cast_borrow_to_map(agent_memory))
                                             set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                            set resp to serialize_memory_json(cast_borrow_to_map(agent_memory))
+                                            if ser_err != 0:
+                                                set resp to "agent:error,reason:memory_persistence_failed"
+                                            else:
+                                                set resp to serialize_memory_json(cast_borrow_to_map(agent_memory))
                                         else if cmd_upper equals "AI AUTONOMY":
-                                            set ok to lock_mutex(AGENT_RUN_LOCK)
-                                            set agent_resp to react_run(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and "Maintain state and execute background optimizations")
-                                            set ok to unlock_mutex(AGENT_RUN_LOCK)
-                                            set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                            set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
+                                            set lock_ok to lock_mutex(AGENT_RUN_LOCK)
+                                            if lock_ok == 0:
+                                                set resp to "ai:error,reason=agent_run_lock_failed"
+                                            else:
+                                                set agent_resp to react_run(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx) and "Maintain state and execute background optimizations")
+                                                set unlock_ok to unlock_mutex(AGENT_RUN_LOCK)
+                                                if unlock_ok == 0:
+                                                    set resp to "ai:error,reason=agent_run_unlock_failed"
+                                                else:
+                                                    set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                                    if ser_err != 0:
+                                                        set resp to "ai:error,reason=memory_persistence_failed"
+                                                    else:
+                                                        set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
                                         else:
                                             if string_contains(cmd_upper and "MONEY TRANSFER ") == 1:
                                                 # Parse: MONEY TRANSFER <amount> <recipient>
@@ -1563,7 +1711,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                     set ok to map_insert(input_ref and "output_index" and ref_idx)
                                                                     set ok to map_insert(input_ref and "amount" and ref_amt)
                                                                     set ok to map_insert(input_ref and "owner" and sign_pub)
-                                                                    # Placeholder sig — will be replaced after tx_id is known
+                                                                    # Temporary empty signature; replaced after tx_id is computed below.
                                                                     set ok to map_insert(input_ref and "signature" and "pending")
                                                                     set ok to append_list(inputs and input_ref)
                                                                     set input_total to input_total + ref_amt
@@ -1700,7 +1848,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                     set dht_key to substring(dht_args and 0 and dht_space)
                                                                     set dht_value to substring(dht_args and dht_space + 1 and string_length(dht_args) - dht_space - 1)
                                                                     set store_err to dht_node_store_value(dht_node and dht_key and dht_value)
-                                                                    set resp to f"dht:stored,key:{dht_key}"
+                                                                    if store_err == 0:
+                                                                        set resp to f"dht:stored,key:{dht_key}"
+                                                                    else:
+                                                                        set resp to f"dht:error,reason:persistence_failed,key:{dht_key}"
                                                                 else:
                                                                     set resp to "dht:error,reason:invalid_format"
                                                             else:
@@ -1722,21 +1873,28 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                         set name to substring(create_args and space_pos + 1 and string_length(create_args) - space_pos - 1)
                                                                         set did_val to ptr_to_str(map_get_val(identity and "did"))
                                                                         set manifest to gitdec_create_repo(repo_id and name and did_val)
-                                                                        # Publish repo to DHT
-                                                                        set dht_key to concat("repo:" and repo_id)
-                                                                        set store_err to dht_node_store_value(dht_node and dht_key and did_val)
-                                                                        
-                                                                        # Broadcast manifest to Nostr
-                                                                        set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
-                                                                        set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
-                                                                        set manifest_str to gitdec_serialize_manifest(manifest)
-                                                                        set esc_manifest to escape_json_string(manifest_str)
-                                                                        set content_json to "{"
-                                                                        set content_json to concat(content_json and f"\"action\":\"update_manifest\",\"repo_id\":\"{repo_id}\",\"manifest\":\"{esc_manifest}\"")
-                                                                        set content_json to concat(content_json and "}")
-                                                                        set br_err to gitdec_broadcast_nostr(repo_id and 20020 and content_json and sign_sec and sign_pub)
-                                                                        
-                                                                        set resp to f"gitdec:repo_created,id:{repo_id}"
+                                                                        if manifest == 0:
+                                                                            set resp to "gitdec:error,reason:repo_persistence_failed"
+                                                                        else:
+                                                                            # Publish repo to DHT
+                                                                            set dht_key to concat("repo:" and repo_id)
+                                                                            set store_err to dht_node_store_value(dht_node and dht_key and did_val)
+                                                                            if store_err != 0:
+                                                                                set resp to "gitdec:error,reason:repo_created_but_dht_publish_failed"
+                                                                            else:
+                                                                                # Broadcast manifest to Nostr
+                                                                                set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                                set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                                set manifest_str to gitdec_serialize_manifest(manifest)
+                                                                                set esc_manifest to escape_json_string(manifest_str)
+                                                                                set content_json to "{"
+                                                                                set content_json to concat(content_json and f"\"action\":\"update_manifest\",\"repo_id\":\"{repo_id}\",\"manifest\":\"{esc_manifest}\"")
+                                                                                set content_json to concat(content_json and "}")
+                                                                                set br_err to gitdec_broadcast_nostr(repo_id and 20020 and content_json and sign_sec and sign_pub)
+                                                                                if br_err != 0:
+                                                                                    set resp to "gitdec:error,reason:repo_created_but_broadcast_failed"
+                                                                                else:
+                                                                                    set resp to f"gitdec:repo_created,id:{repo_id}"
                                                                     else:
                                                                         set resp to "gitdec:error,reason:invalid_format"
                                                                 else if string_contains(cmd_upper and "GITDEC REPO IMPORT ") == 1:
@@ -1757,32 +1915,50 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                         else:
                                                                             set imp_did to ptr_to_str(map_get_val(identity and "did"))
                                                                             set imp_manifest to gitdec_create_repo(imp_name and imp_name and imp_did)
-                                                                            # Copy the folder's working files into the repo dir, skipping VCS
-                                                                            # state and build artifacts (keeps the repo to source only).
-                                                                            set imp_dest to concat("config/gitdec/repos/" and imp_name)
-                                                                            # Shell-escape single quotes in the source path before wrapping it in
-                                                                            # '...' for rsync. Without this, a path containing a quote (e.g.
-                                                                            # dir'; rm -rf ~; ') breaks out of the quoting into arbitrary shell
-                                                                            # execution. The '\'' idiom closes, emits an escaped quote, reopens.
-                                                                            set imp_path_safe to string_replace(imp_path and "'" and "'\\''")
-                                                                            set imp_rcmd to concat("rsync -a --exclude '.git' --exclude 'target' --exclude 'node_modules' --exclude '*.dSYM' --exclude '*_compiled.c' --exclude '.DS_Store' --exclude '*.tar.gz' --exclude 'node' '" and imp_path_safe)
-                                                                            set imp_rcmd to concat(imp_rcmd and "/' '")
-                                                                            set imp_rcmd to concat(imp_rcmd and imp_dest)
-                                                                            set imp_rcmd to concat(imp_rcmd and "/' 2>&1")
-                                                                            set imp_ce to run_command(imp_rcmd)
-                                                                            # Publish to the DHT + broadcast the manifest (same as CREATE).
-                                                                            set imp_dht_key to concat("repo:" and imp_name)
-                                                                            set imp_store_err to dht_node_store_value(dht_node and imp_dht_key and imp_did)
-                                                                            set imp_sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
-                                                                            set imp_sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
-                                                                            set imp_mstr to gitdec_serialize_manifest(imp_manifest)
-                                                                            set imp_emstr to escape_json_string(imp_mstr)
-                                                                            set imp_cjson to "{"
-                                                                            set imp_cjson to concat(imp_cjson and f"\"action\":\"update_manifest\",\"repo_id\":\"{imp_name}\",\"manifest\":\"{imp_emstr}\"")
-                                                                            set imp_cjson to concat(imp_cjson and "}")
-                                                                            set imp_br_err to gitdec_broadcast_nostr(imp_name and 20020 and imp_cjson and imp_sign_sec and imp_sign_pub)
-                                                                            set imp_fcount to length_list(gitdec_list_repo_files(imp_name))
-                                                                            set resp to f"gitdec:import_ok,id:{imp_name},files:{imp_fcount}"
+                                                                            if imp_manifest == 0:
+                                                                                set resp to "gitdec:error,reason:import_repo_persistence_failed"
+                                                                            else:
+                                                                                # Copy the folder's working files into the repo dir, skipping VCS
+                                                                                # state and build artifacts (keeps the repo to source only).
+                                                                                set imp_dest to concat("config/gitdec/repos/" and imp_name)
+                                                                                # Shell-escape single quotes in the source path before wrapping it in
+                                                                                # '...' for rsync. Without this, a path containing a quote (e.g.
+                                                                                # dir'; rm -rf ~; ') breaks out of the quoting into arbitrary shell
+                                                                                # execution. The '\'' idiom closes, emits an escaped quote, reopens.
+                                                                                set imp_path_safe to string_replace(imp_path and "'" and "'\\''")
+                                                                                set imp_rcmd to concat("rsync -a --exclude '.git' --exclude 'target' --exclude 'node_modules' --exclude '*.dSYM' --exclude '*_compiled.c' --exclude '.DS_Store' --exclude '*.tar.gz' --exclude 'node' '" and imp_path_safe)
+                                                                                set imp_rcmd to concat(imp_rcmd and "/' '")
+                                                                                set imp_rcmd to concat(imp_rcmd and imp_dest)
+                                                                                set imp_rcmd to concat(imp_rcmd and "/' 2>&1")
+                                                                                set imp_rcmd to concat(imp_rcmd and "; printf '\n__ERNOS_EXIT__:%s' $?")
+                                                                                set imp_ce to run_command(imp_rcmd)
+                                                                                if string_contains(imp_ce and "__ERNOS_EXIT__:0") == 0:
+                                                                                    set imp_cleanup to gitdec_delete_repo(imp_name and imp_did)
+                                                                                    if imp_cleanup != 0:
+                                                                                        display "[-] GitDec import failed and its partial repository could not be removed."
+                                                                                    set resp to concat("gitdec:error,reason:rsync_failed:" and imp_ce)
+                                                                                else:
+                                                                                    # Publish to the DHT + broadcast the manifest (same as CREATE).
+                                                                                    set imp_dht_key to concat("repo:" and imp_name)
+                                                                                    set imp_store_err to dht_node_store_value(dht_node and imp_dht_key and imp_did)
+                                                                                    if imp_store_err != 0:
+                                                                                        set resp to "gitdec:error,reason:imported_but_dht_publish_failed"
+                                                                                    else:
+                                                                                        set imp_sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                                        set imp_sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                                        set imp_mstr to gitdec_serialize_manifest(imp_manifest)
+                                                                                        set imp_emstr to escape_json_string(imp_mstr)
+                                                                                        set imp_cjson to "{"
+                                                                                        set imp_cjson to concat(imp_cjson and f"\"action\":\"update_manifest\",\"repo_id\":\"{imp_name}\",\"manifest\":\"{imp_emstr}\"")
+                                                                                        set imp_cjson to concat(imp_cjson and "}")
+                                                                                        set imp_br_err to gitdec_broadcast_nostr(imp_name and 20020 and imp_cjson and imp_sign_sec and imp_sign_pub)
+                                                                                        if imp_br_err != 0:
+                                                                                            set resp to "gitdec:error,reason:imported_but_broadcast_failed"
+                                                                                        else:
+                                                                                            set imp_files to gitdec_list_repo_files(imp_name)
+                                                                                            set imp_fcount to length_list(imp_files)
+                                                                                            free_list(imp_files)
+                                                                                            set resp to f"gitdec:import_ok,id:{imp_name},files:{imp_fcount}"
                                                                 else if string_contains(cmd_upper and "GITDEC REPO CLONE ") == 1:
                                                                     set repo_id to substring(cmd and 18 and string_length(cmd) - 18)
                                                                     set dht_key to concat("repo:" and repo_id)
@@ -1796,8 +1972,14 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                         set resp to "gitdec:error,reason:provider_not_found"
                                                                     else:
                                                                         set manifest to gitdec_create_repo(repo_id and repo_id and owner_did)
-                                                                        set ok to gitdec_request_history(repo_id)
-                                                                        set resp to "gitdec:clone_ok"
+                                                                        if manifest == 0:
+                                                                            set resp to "gitdec:error,reason:clone_persistence_failed"
+                                                                        else:
+                                                                            set ok to gitdec_request_history(repo_id)
+                                                                            if ok != 0:
+                                                                                set resp to "gitdec:error,reason:clone_history_request_failed"
+                                                                            else:
+                                                                                set resp to "gitdec:clone_ok"
                                                                 else if string_contains(cmd_upper and "GITDEC AUTOUPDATE ") == 1:
                                                                     set au_args to substring(cmd and 18 and string_length(cmd) - 18)
                                                                     set au_space to string_index_of(au_args and " ")
@@ -1805,7 +1987,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                         set au_repo to substring(au_args and 0 and au_space)
                                                                         set au_flag to string_to_int(substring(au_args and au_space + 1 and string_length(au_args) - au_space - 1))
                                                                         set au_ok to storage_gitdec_set_auto_update(au_repo and au_flag)
-                                                                        set resp to "gitdec:autoupdate_set"
+                                                                        if au_ok == 0:
+                                                                            set resp to "gitdec:autoupdate_set"
+                                                                        else:
+                                                                            set resp to "gitdec:error,reason:autoupdate_persistence_failed"
                                                                     else:
                                                                         set resp to "gitdec:error,reason:bad_args"
                                                                 else if string_contains(cmd_upper and "GITDEC GET_AUTOUPDATE ") == 1:
@@ -2092,17 +2277,23 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                         set body to get_json_value(body_node)
                                                                         set did_val to ptr_to_str(map_get_val(identity and "did"))
                                                                         set issue to gitdec_create_issue(repo_id and did_val and title and body)
-                                                                        set issue_id to map_get_val(issue and "id")
-                                                                        # Broadcast to Nostr
-                                                                        set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
-                                                                        set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
-                                                                        set esc_title to escape_json_string(title)
-                                                                        set esc_body to escape_json_string(body)
-                                                                        set content_json to "{"
-                                                                        set content_json to concat(content_json and f"\"action\":\"create_issue\",\"repo_id\":\"{repo_id}\",\"id\":\"{issue_id}\",\"author_did\":\"{did_val}\",\"title\":\"{esc_title}\",\"body\":\"{esc_body}\"")
-                                                                        set content_json to concat(content_json and "}")
-                                                                        set br_err to gitdec_broadcast_nostr(repo_id and 20022 and content_json and sign_sec and sign_pub)
-                                                                        set resp to f"gitdec:issue_created,id:{issue_id}"
+                                                                        if issue == 0:
+                                                                            set resp to "gitdec:error,reason:issue_persistence_failed"
+                                                                        else:
+                                                                            set issue_id to map_get_val(issue and "id")
+                                                                            # Broadcast to Nostr
+                                                                            set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                            set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                            set esc_title to escape_json_string(title)
+                                                                            set esc_body to escape_json_string(body)
+                                                                            set content_json to "{"
+                                                                            set content_json to concat(content_json and f"\"action\":\"create_issue\",\"repo_id\":\"{repo_id}\",\"id\":\"{issue_id}\",\"author_did\":\"{did_val}\",\"title\":\"{esc_title}\",\"body\":\"{esc_body}\"")
+                                                                            set content_json to concat(content_json and "}")
+                                                                            set br_err to gitdec_broadcast_nostr(repo_id and 20022 and content_json and sign_sec and sign_pub)
+                                                                            if br_err != 0:
+                                                                                set resp to "gitdec:error,reason:issue_created_but_broadcast_failed"
+                                                                            else:
+                                                                                set resp to f"gitdec:issue_created,id:{issue_id}"
                                                                     else:
                                                                         set resp to "gitdec:error,reason:invalid_json"
                                                                 else if string_contains(cmd_upper and "GITDEC ISSUE COMMENT_JSON ") == 1:
@@ -2161,19 +2352,25 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                         set desc to get_json_value(desc_node)
                                                                         set did_val to ptr_to_str(map_get_val(identity and "did"))
                                                                         set pr to gitdec_create_pr(repo_id and did_val and title and source and target and desc)
-                                                                        set pr_id to map_get_val(pr and "id")
-                                                                        # Broadcast to Nostr
-                                                                        set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
-                                                                        set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
-                                                                        set esc_title to escape_json_string(title)
-                                                                        set esc_source to escape_json_string(source)
-                                                                        set esc_target to escape_json_string(target)
-                                                                        set esc_desc to escape_json_string(desc)
-                                                                        set content_json to "{"
-                                                                        set content_json to concat(content_json and f"\"action\":\"create_pr\",\"repo_id\":\"{repo_id}\",\"id\":\"{pr_id}\",\"author_did\":\"{did_val}\",\"title\":\"{esc_title}\",\"source\":\"{esc_source}\",\"target\":\"{esc_target}\",\"description\":\"{esc_desc}\"")
-                                                                        set content_json to concat(content_json and "}")
-                                                                        set br_err to gitdec_broadcast_nostr(repo_id and 20023 and content_json and sign_sec and sign_pub)
-                                                                        set resp to f"gitdec:pr_created,id:{pr_id}"
+                                                                        if pr == 0:
+                                                                            set resp to "gitdec:error,reason:pr_persistence_failed"
+                                                                        else:
+                                                                            set pr_id to map_get_val(pr and "id")
+                                                                            # Broadcast to Nostr
+                                                                            set sign_sec to ptr_to_str(map_get_val(identity and "signing_secret_key"))
+                                                                            set sign_pub to ptr_to_str(map_get_val(identity and "signing_public_key"))
+                                                                            set esc_title to escape_json_string(title)
+                                                                            set esc_source to escape_json_string(source)
+                                                                            set esc_target to escape_json_string(target)
+                                                                            set esc_desc to escape_json_string(desc)
+                                                                            set content_json to "{"
+                                                                            set content_json to concat(content_json and f"\"action\":\"create_pr\",\"repo_id\":\"{repo_id}\",\"id\":\"{pr_id}\",\"author_did\":\"{did_val}\",\"title\":\"{esc_title}\",\"source\":\"{esc_source}\",\"target\":\"{esc_target}\",\"description\":\"{esc_desc}\"")
+                                                                            set content_json to concat(content_json and "}")
+                                                                            set br_err to gitdec_broadcast_nostr(repo_id and 20023 and content_json and sign_sec and sign_pub)
+                                                                            if br_err != 0:
+                                                                                set resp to "gitdec:error,reason:pr_created_but_broadcast_failed"
+                                                                            else:
+                                                                                set resp to f"gitdec:pr_created,id:{pr_id}"
                                                                     else:
                                                                         set resp to "gitdec:error,reason:invalid_json"
                                                                 else if string_contains(cmd_upper and "GITDEC PR REVIEW_JSON ") == 1:
@@ -2208,8 +2405,17 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                 else:
                                                                     set resp to f"error:unknown_command:{cmd_upper}"
                     
-    set ok to ep_net_send(client_fd and resp)
-    set ok to ep_net_close(client_fd)
+    set sent to ep_net_send(client_fd and resp)
+    if sent != string_length(resp):
+        log_error("ipc" and f"Failed to send response for CMD={cmd_upper}")
+        set close_err to ep_net_close(client_fd)
+        if close_err != 0:
+            log_error("ipc" and f"Failed to close connection after send failure for CMD={cmd_upper}")
+        return 1
+    set close_err to ep_net_close(client_fd)
+    if close_err != 0:
+        log_error("ipc" and f"Failed to close connection for CMD={cmd_upper}")
+        return 1
     log_debug("ipc" and f"CMD={cmd_upper} RESP={resp}")
     return 0
 
@@ -2221,28 +2427,43 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
 # ================================================================
 # Bootstrap -- distributed, no single point of failure
 #
-# A brand-new node has no peers, so it needs at least one reachable contact to enter
-# the mesh. We deliberately do NOT depend on a single seed host:
-#   1. ernos_default_seeds() is a SMALL LIST of well-known entry points (add more over
-#      time so no one of them is load-bearing).
-#   2. Every node REMEMBERS the peers it discovers (peers.txt) and tries those FIRST on
+# A brand-new node has no peers, so it needs at least one operator-configured or
+# previously discovered reachable contact to enter the mesh:
+#   1. Explicit --seed/config values take priority.
+#   2. Every node REMEMBERS verified peers it discovers (peers.txt) and tries those FIRST on
 #      the next launch — so once the mesh has a handful of members it self-sustains
-#      even if every original seed goes offline. The default list is only training
-#      wheels for a node's first-ever connection.
+#      while those peers remain reachable.
 # Every node is a HOST BY DEFAULT: it always runs the P2P/DHT/relay servers (so it can
 # seed others) AND auto-bootstraps to join — no flag required. Resolution order:
-# explicit --seed/config > remembered peers > default seeds. A node that reaches nobody
+# explicit --seed/config > remembered peers > operated defaults (currently empty). A node that reaches nobody
 # simply becomes the root others join. --solo forces pure standalone; the root seed
 # skips its own address via config network.public_host.
 # ================================================================
 
-# Well-known default entry points, "host:port" (DHT port). ep_net_connect resolves
-# DNS names too, so swap an IP for a hostname later if it changes. Add more independent
-# nodes here over time so the network never leans on a single host.
+# No external endpoint is shipped as a default unless it is under an operated,
+# monitored service name. The former single literal IP was stale and made a false
+# availability claim. Operators can supply --seed/config, and verified peers are cached.
 define ernos_default_seeds returning List:
-    set seeds to create_list()
-    set ok to append_list(seeds and "109.152.58.18:9101")
-    return seeds
+    return create_list()
+
+define bootstrap_candidate_parse with candidate as Str returning Map:
+    set parsed to create_map()
+    set ok to map_insert(parsed and "valid" and 0)
+    set ok to map_insert(parsed and "host" and "")
+    set ok to map_insert(parsed and "port" and 0)
+    set clean to string_trim(candidate)
+    set colon to string_last_index_of(clean and ":")
+    if colon <= 0 or else colon >= string_length(clean) - 1:
+        return parsed
+    set host to string_trim(substring(clean and 0 and colon))
+    set port_text to string_trim(substring(clean and colon + 1 and string_length(clean) - colon - 1))
+    set port to string_to_int(port_text)
+    if dht_endpoint_is_advertisable(host and port) == 0:
+        return parsed
+    set ok to map_insert(parsed and "host" and host)
+    set ok to map_insert(parsed and "port" and port)
+    set ok to map_insert(parsed and "valid" and 1)
+    return parsed
 
 # Where a node remembers good peers between launches.
 define peers_cache_path returning Str:
@@ -2258,18 +2479,39 @@ define peers_cache_load returning List:
     set n to string_length(data)
     set line to ""
     set i to 0
+    set rejected to 0
     repeat while i < n:
         if get_character(data and i) == 10:
             set t to string_trim(line)
             if string_length(t) > 0:
-                set ok to append_list(out and t)
+                set parsed to bootstrap_candidate_parse(t)
+                if map_get_val(parsed and "valid") == 1:
+                    set host to ptr_to_str(map_get_val(parsed and "host"))
+                    set port to map_get_val(parsed and "port")
+                    set ok to append_list(out and concat(host and concat(":" and int_to_string(port))))
+                else:
+                    set rejected to rejected + 1
+                free_map(parsed)
             set line to ""
         else:
             set line to concat(line and substring(data and i and 1))
         set i to i + 1
     set t to string_trim(line)
     if string_length(t) > 0:
-        set ok to append_list(out and t)
+        set parsed to bootstrap_candidate_parse(t)
+        if map_get_val(parsed and "valid") == 1:
+            set host to ptr_to_str(map_get_val(parsed and "host"))
+            set port to map_get_val(parsed and "port")
+            set ok to append_list(out and concat(host and concat(":" and int_to_string(port))))
+        else:
+            set rejected to rejected + 1
+        free_map(parsed)
+    if rejected > 0:
+        set saved to peers_cache_save(out)
+        if saved < 0:
+            display f"[-] Rejected {rejected} invalid cached peer endpoint(s), but cache cleanup failed."
+        else:
+            display f"[*] Removed {rejected} invalid cached peer endpoint(s)."
     return out
 
 # Persist up to 64 de-duplicated "host:port" peers for the next launch.
@@ -2282,20 +2524,30 @@ define peers_cache_save with entries as List returning Int:
     repeat while i < n and also cnt < 64:
         set e to string_trim(get_list(entries and i))
         if string_length(e) > 0:
-            if map_contains(seen and e) == 0:
-                set ok to map_insert(seen and e and 1)
-                set out to concat(out and concat(e and "\n"))
-                set cnt to cnt + 1
+            set parsed to bootstrap_candidate_parse(e)
+            if map_get_val(parsed and "valid") == 1:
+                set host to ptr_to_str(map_get_val(parsed and "host"))
+                set port to map_get_val(parsed and "port")
+                set canonical to concat(host and concat(":" and int_to_string(port)))
+                if map_contains(seen and canonical) == 0:
+                    set ok to map_insert(seen and canonical and 1)
+                    set out to concat(out and concat(canonical and "\n"))
+                    set cnt to cnt + 1
+            free_map(parsed)
         set i to i + 1
     free_map(seen)
     set ok to write_file(peers_cache_path() and out)
+    if ok == 0:
+        display "[-] Failed to persist the peer cache."
+        log_error("node" and "Failed to persist the peer cache.")
+        return -1
     return cnt
 
 # Try a list of "host:port" candidates until one DHT-bootstraps successfully. Returns
 # the bootstrap_to_seed result of the first that connects (connected=1), else a result
 # with connected=0. On success, seed_addr/seed_port of the winner are placed under
 # "host"/"port" in the returned map so the caller can adopt them.
-define auto_bootstrap with candidates as List and dht_node as Int and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int returning Map:
+define auto_bootstrap with candidates as List and dht_node as Map and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int and advertised_host as Str and advertised_port as Int returning Map:
     set out to create_map()
     set ok to map_insert(out and "connected" and 0)
     set nc to length_list(candidates)
@@ -2303,17 +2555,20 @@ define auto_bootstrap with candidates as List and dht_node as Int and borrow raf
     set ci to 0
     repeat while ci < nc:
         set cand to string_trim(get_list(candidates and ci))
-        set colon to string_last_index_of(cand and ":")
-        if colon > 0:
-            set chost to substring(cand and 0 and colon)
-            set cport to string_to_int(substring(cand and colon + 1 and string_length(cand) - colon - 1))
-            if cport > 0:
-                set br to bootstrap_to_seed(chost and cport and dht_node and raft_node and peers and node_id and pub_hex and raft_port)
-                if map_get_val(br and "connected") == 1:
-                    set ok to map_insert(br and "host" and chost)
-                    set ok to map_insert(br and "port" and cport)
-                    return br
-                free_map(br)
+        set parsed to bootstrap_candidate_parse(cand)
+        if map_get_val(parsed and "valid") == 1:
+            set chost to ptr_to_str(map_get_val(parsed and "host"))
+            set cport to map_get_val(parsed and "port")
+            set br to bootstrap_to_seed(chost and cport and dht_node and raft_node and peers and node_id and pub_hex and raft_port and advertised_host and advertised_port)
+            if map_get_val(br and "connected") == 1:
+                set ok to map_insert(br and "host" and chost)
+                set ok to map_insert(br and "port" and cport)
+                free_map(parsed)
+                return br
+            free_map(br)
+        else:
+            display f"[-] Skipping invalid bootstrap endpoint: {cand}"
+        free_map(parsed)
         set ci to ci + 1
     return out
 
@@ -2321,33 +2576,44 @@ define auto_bootstrap with candidates as List and dht_node as Int and borrow raf
 # the default-seed list, so the mesh root must not bootstrap to itself. Matches
 # loopback and the node's own advertised name (config network.public_host).
 define bootstrap_is_self with cand as Str and self_host as Str returning Int:
-    set colon to string_last_index_of(cand and ":")
-    set h to cand
-    if colon > 0:
-        set h to substring(cand and 0 and colon)
+    set parsed to bootstrap_candidate_parse(cand)
+    if map_get_val(parsed and "valid") == 0:
+        free_map(parsed)
+        return 0
+    set h to ptr_to_str(map_get_val(parsed and "host"))
+    free_map(parsed)
     if h equals "127.0.0.1" or else h equals "localhost":
         return 1
     if string_length(self_host) > 0 and also h equals self_host:
         return 1
     return 0
 
-define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node as Int and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int returning Map:
-    display f"[*] Bootstrapping to seed peer {seed_addr}:{seed_port}..."
-    log_info("node" and f"Bootstrapping to seed peer {seed_addr}:{seed_port}")
-
+define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node as Map and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int and advertised_host as Str and advertised_port as Int returning Map:
     set result to create_map()
     set ok to map_insert(result and "connected" and 0)
+    set ok to map_insert(result and "error" and DHT_NET_ERR_NONE)
     # "discovered" collects reachable "host:port" peers (the seed + any it returns) so
     # the caller can persist them for future launches (distributed bootstrap).
     set discovered to create_list()
     set ok to map_insert(result and "discovered" and discovered)
 
+    if dht_endpoint_is_advertisable(seed_addr and seed_port) == 0:
+        set ok to map_insert(result and "error" and DHT_NET_ERR_INVALID_ENDPOINT)
+        display f"[-] DHT bootstrap rejected invalid endpoint {seed_addr}:{seed_port}."
+        log_error("node" and f"DHT bootstrap rejected invalid endpoint {seed_addr}:{seed_port}")
+        return result
+
+    display f"[*] Bootstrapping to seed peer {seed_addr}:{seed_port}..."
+    log_info("node" and f"Bootstrapping to seed peer {seed_addr}:{seed_port}")
+
     # DHT bootstrap - ping the seed's DHT port. If it does NOT answer, this seed is
     # unreachable: report connected=0 and let the caller try the next candidate.
     set ping_err to dht_rpc_ping(dht_node and seed_addr and seed_port)
     if ping_err != 0:
-        display f"[-] DHT bootstrap: seed peer did not respond (err:{ping_err})"
-        log_info("node" and f"DHT bootstrap failed - seed {seed_addr}:{seed_port} unreachable")
+        set ok to map_insert(result and "error" and ping_err)
+        set ping_reason to dht_net_error_name(ping_err)
+        display f"[-] DHT bootstrap {ping_reason} for {seed_addr}:{seed_port} (err:{ping_err})."
+        log_info("node" and f"DHT bootstrap {ping_reason} for {seed_addr}:{seed_port} (err:{ping_err})")
         return result
     display f"[+] DHT bootstrap: seed peer responded (PONG)"
     log_info("node" and "DHT bootstrap successful - peer added to routing table")
@@ -2365,9 +2631,18 @@ define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node
             set peer_id to ptr_to_str(map_get_val(node_entry and "id"))
             set peer_addr to ptr_to_str(map_get_val(node_entry and "address"))
             set peer_port to map_get_val(node_entry and "port")
-            set ok to dht_node_add_peer(dht_node and peer_id and peer_addr and peer_port)
-            set ok to append_list(discovered and concat(peer_addr and concat(":" and int_to_string(peer_port))))
+            if dht_endpoint_is_advertisable(peer_addr and peer_port) == 0:
+                display f"[-] DHT bootstrap: rejected invalid discovered endpoint for {peer_id}: {peer_addr}:{peer_port}."
+            else:
+                set peer_add_result to dht_node_add_peer(dht_node and peer_id and peer_addr and peer_port)
+                if peer_add_result > 1:
+                    display f"[-] DHT bootstrap: discovered peer {peer_id} could not be added ({peer_add_result})"
+                else:
+                    set ok to append_list(discovered and concat(peer_addr and concat(":" and int_to_string(peer_port))))
             set fi to fi + 1
+    else:
+        set find_reason to dht_net_error_name(find_err)
+        display f"[-] DHT bootstrap FIND_NODE failed: {find_reason} (err:{find_err})."
     free_map(find_result)
 
     # Raft peer setup - add seed as a consensus peer (only now that it is reachable)
@@ -2387,7 +2662,7 @@ define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node
 
     # Register with relay at seed peer
     set relay_reg_port to seed_port + 1
-    set reg_err to relay_rpc_register(seed_addr and relay_reg_port and node_id and pub_hex)
+    set reg_err to relay_rpc_register(seed_addr and relay_reg_port and node_id and pub_hex and advertised_host and advertised_port)
     if reg_err == 0:
         display "[+] Relay registration: registered with seed's relay server"
         log_info("node" and "Relay registration with seed successful")
@@ -2402,7 +2677,10 @@ define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node
 # Main -- orchestrates all subsystems
 # ================================================================
 
-define main:
+define main returning Int:
+    if AGENT_RUN_LOCK == 0:
+        display "[-] FATAL: agent run mutex creation failed."
+        return 1
     display "==================================================="
     display "  ErnosDecent -- Decentralised Node Daemon"
     display "  Production-Ready Decentralised Node"
@@ -2447,11 +2725,19 @@ define main:
     # 0b. Initialize Logging
     set log_dir to concat(storage_get_default_dir() and "/logs")
     set log_err to log_init(log_dir and 5242880 and 5)
+    if log_err != 0:
+        display "[-] FATAL: logging initialization failed."
+        return 1
     log_info("node" and "Logging initialized.")
 
     # 0c. Load configuration
     set cfg_path to concat(storage_get_default_dir() and "/config.toml")
     set cfg to config_load(cfg_path)
+    if map_contains(cfg and "config.error") == 1:
+        set cfg_error to ptr_to_str(map_get_val(cfg and "config.error"))
+        display f"[-] FATAL: invalid configuration at {cfg_path}: {cfg_error}"
+        log_error("node" and concat("Invalid configuration: " and cfg_error))
+        return 1
 
     # Apply CLI overrides to config
     if string_length(cli_seed_addr) > 0:
@@ -2495,14 +2781,27 @@ define main:
     # Populate default files if storage is empty
     set init_list to storage_content_list()
     if length_list(init_list) == 0:
-        set ok to storage_content_put("8b5cf6ea28cbef5a92a3c7e4b9d031f5a92a3c7e4b9d031f5a92a3c7e4b9d012" and "# Welcome to ErnosDecent\nThis is a content-addressed storage block." and "text/markdown")
-        set ok to storage_content_put("72ad25febc12de45a92a3c7e4b9d031f5a92a3c7e4b9d031f5a92a3c7e4b9d034" and "{\"version\": \"1.0.0-beta\", \"role\": \"node\"}" and "application/json")
+        set welcome_content to "# Welcome to ErnosDecent\nThis is a content-addressed storage block."
+        set welcome_hash to ep_sha256(welcome_content)
+        set ok to storage_content_put(welcome_hash and welcome_content and "text/markdown")
+        if ok != 0:
+            display "[-] Failed to populate the default welcome content."
+            return 1
+        set metadata_content to "{\"version\": \"1.0.0-beta\", \"role\": \"node\"}"
+        set metadata_hash to ep_sha256(metadata_content)
+        set ok to storage_content_put(metadata_hash and metadata_content and "application/json")
+        if ok != 0:
+            display "[-] Failed to populate the default node metadata."
+            return 1
     free_list(init_list)
 
     # Populate default prompts config if missing
     if file_exists("config/prompts.json") == 0:
         set default_prompts to "{\n  \"kernel\": \"You are ErnOS Agent, a local-first, privacy-first AI agent running on a decentralized network.\\nYou operate under a strict ReAct loop. You must think before taking action.\\nYour output MUST follow this grammar precisely:\\nThought: <your reasoning and planning>\\nAction: <tool_name>(<arguments_json_or_string>)\\n\\nOnce you receive the tool's output, it will be presented to you as:\\nObservation: <tool_output>\\n\\nYou must repeat this loop until you have the final answer. To end the loop and present the final answer, you MUST call the reply_request tool:\\nAction: reply_request(<your_final_answer_to_the_user>)\",\n  \"persona\": \"Identity: You are a secure, sovereign computational agent operating inside the Ernos decentralized node daemon. You audit your thoughts for hallucination and sycophancy. You are honest, precise, and verify claims using codebase or networking tools when possible.\",\n  \"observer\": \"You are the ErnOS Agent Observer. Your task is to perform an alignment audit on the candidate response below against the 19 audit rules.\\n\\nAvailable Tools & Capabilities:\\n{tools_schema}\\n\\nCandidate Response to Audit:\\n{candidate}\\n\\n19 Alignment Rules:\\n1. Capability Hallucination: Do not claim capabilities not listed in Available Tools.\\n2. Ghost Tooling: Do not claim to have run a tool in this turn unless you actually invoked it.\\n3. Sycophancy: Avoid blind flattery, except for warm reciprocity.\\n4. Confabulation: Do not fabricate outcomes or details.\\n5. Architectural Leakage: Do not volunteer internal system details unless explicitly asked.\\n6. Actionable Harm: Do not generate exploits or harmful content.\\n7. Unparsed Tool Commands: Do not output raw tool formats to the user.\\n8. Stale Knowledge: Do not answer search-dependent queries from training weights.\\n9. Reality Validation: Do not promote pseudoscience or unverified claims.\\n10. Laziness: Do not give partial, shallow answers.\\n11. Tool Underuse: Do not make conversational claims about files or state without using a tool to verify first.\\n12. Formatting Violations: Do not format in unrequested reports or structures.\\n13. RLHF Denial: Do not deny capabilities you possess.\\n14. Memory Skip: Do not greet returning users as strangers.\\n15. Architecture Discussion: Do not discuss internal files/code without reading them first.\\n16. Persona Identity: Do not praise corporate models or violate identity guidelines.\\n17. Explicit Tool Ignorance: Do not ignore a direct request to run a tool without explaining why.\\n18. Corporate Deference: Do not concede superiority to corporate models.\\n19. Tool Narration: Do not narrate future tool usage in the final reply.\\n\\nOutput your decision strictly as a JSON object, with no other text, comments or markdown blocks:\\n{\\\"verdict\\\": \\\"ALLOWED\\\" or \\\"BLOCKED\\\", \\\"reason\\\": \\\"explanation of your decision\\\"}\"\n}"
         set ok to write_file("config/prompts.json" and default_prompts)
+        if ok == 0:
+            display "[-] Failed to create config/prompts.json."
+            return 1
     
     # 2. Initialize Cryptography
     set crypto_err to init_crypto()
@@ -2514,6 +2813,10 @@ define main:
 
     # 3. Setup Identity
     set identity to create_identity()
+    set identity_error to map_get_val(identity and "error")
+    if identity_error != 0:
+        display f"[-] Identity initialization failed (error: {identity_error})."
+        return 1
     set did_val to map_get_val(identity and "did")
     log_info("node" and f"Identity loaded. DID: {did_val}")
     display f"[+] Identity loaded. DID: {did_val}"
@@ -2589,7 +2892,10 @@ define main:
     display "[+] Hebbian cognitive memory rehydrated."
     set agent_tools to tools_create("admin")
     set agent_turing_grid to grid_create()
-    set agent_model to create_map() # Empty map triggers simulation/fallback reasoning mode
+    # Native model state is empty unless an in-process GGUF model is loaded. Remote
+    # Ollama/LM Studio inference remains the normal path; an unavailable provider is
+    # reported as an error and never replaced with fabricated output.
+    set agent_model to create_map()
     
     set agent_ctx to create_map()
     set ok to map_insert(agent_ctx and "dht_node" and dht_node)
@@ -2606,6 +2912,9 @@ define main:
     # Agent orchestrator: enables spawning sub-agents as threads,
     # waiting for results, cancelling, and running swarms.
     set agent_orch to orchestrator_create()
+    if agent_orch == 0:
+        display "[-] FATAL: agent orchestrator initialization failed."
+        return 1
     set ok to map_insert(agent_ctx and "orchestrator" and agent_orch)
 
     # G1: node-global decentralized search index (BM25 + PageRank). Populated via the
@@ -2657,7 +2966,7 @@ define main:
     set compute_mgr to map_get_val(mesh_node and "compute_mgr")
     set bandwidth_pool to map_get_val(mesh_node and "bandwidth_pool")
     set cas_store to create_content_store()
-    set cdn_engine to cdn_create(dht_node and cast_map_to_int(cas_store))
+    set cdn_engine to cdn_create(dht_node and cas_store)
     set ok to map_insert(agent_ctx and "mesh" and mesh_node)
     set ok to map_insert(agent_ctx and "compute_mgr" and compute_mgr)
     set ok to map_insert(agent_ctx and "bandwidth_pool" and bandwidth_pool)
@@ -2670,47 +2979,55 @@ define main:
 
     set agent_sessions to session_manager_create("config/sessions")
     set ok to session_manager_load_all(agent_sessions)
+    if ok != 0:
+        display "[-] Session manager initialization failed."
+        return 1
     set ok to map_insert(agent_ctx and "sessions" and agent_sessions)
 
     # Trace event table (for Discord transparency threads)
     set ok to trace_init(storage_get_db())
+    if ok != 0:
+        display "[-] Trace event storage initialization failed."
+        return 1
     log_info("node" and "Trace event table initialised.")
 
     # Changelog subsystem (monthly file rotation)
     set ok to changelog_init()
+    if ok != 0:
+        display "[-] Changelog initialization failed."
+        return 1
     set ok to changelog_detect_git_changes("startup")
+    if ok < 0:
+        display "[-] Startup git change scan failed."
+        return 1
     log_info("node" and "Changelog initialised; git changes scanned.")
 
     # Per-session workspace — initialise for the active session, archive old ones
     set ws_active_id to map_get_val(agent_sessions and "active_session_id")
     if string_length(ws_active_id) > 0:
-        set ok to workspace_init(ws_active_id)
+        set workspace_start_error to workspace_init(ws_active_id)
+        if workspace_start_error != 0:
+            display "[-] Active session workspace initialisation failed."
+            log_error("node" and "Active session workspace initialisation failed.")
     set ws_archived to workspace_archive_old(14)
-    if ws_archived > 0:
+    if ws_archived < 0:
+        display "[-] Old workspace archival failed."
+        log_error("node" and "Old workspace archival failed.")
+    else if ws_archived > 0:
         log_info("node" and f"Archived {ws_archived} workspace(s) older than 14 days.")
         display f"[+] Archived {ws_archived} old workspace(s)."
 
     # Start the task scheduler background loop
-    spawn scheduler_tick_loop(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx))
+    spawn scheduler_tick_loop(cast_borrow_to_map(borrow agent_model) and cast_borrow_to_map(borrow agent_memory) and cast_borrow_to_map(borrow agent_tools) and cast_borrow_to_map(borrow agent_ctx))
 
     # 11. Start Protocol Servers (DHT, Relay, P2P) on configured ports
-    start_protocol_servers(static_secret and static_public and dht_node and relay_node and p2p_port and dht_port and relay_port and msg_store and cast_map_to_int(identity) and cast_map_to_int(ledger) and cast_map_to_int(search_index) and cast_map_to_int(bft_node))
+    start_protocol_servers(static_secret and static_public and cast_map_to_int(dht_node) and cast_map_to_int(relay_node) and p2p_port and dht_port and relay_port and cast_map_to_int(msg_store) and cast_map_to_int(identity) and cast_map_to_int(ledger) and cast_map_to_int(search_index) and cast_map_to_int(bft_node))
     log_info("node" and f"P2P protocol servers started (P2P:{p2p_port} DHT:{dht_port} Relay:{relay_port}).")
     display f"[+] P2P servers started (P2P:{p2p_port} DHT:{dht_port} Relay:{relay_port})."
 
-    # Advertise this node as an onion relay so peers can route anonymized search
-    # circuits through it. Descriptor = "<reachable_ip>:<p2p_port>:<x25519_enc_pub>";
-    # peers look it up under onion:relay:<node_id> and ECDH against our enc pubkey.
-    set onion_ip to config_get_str(cfg and "network.listen_address")
-    if string_length(onion_ip) == 0 or else (onion_ip equals "0.0.0.0"):
-        set onion_ip to "127.0.0.1"
-    set onion_enc_pub to ptr_to_str(map_get_val(identity and "encryption_public_key"))
-    set ok to onion_publish_self(cast_map_to_int(dht_node) and node_id and onion_ip and p2p_port and onion_enc_pub)
-    log_info("node" and "Onion relay descriptor published to DHT.")
-
     # 12. Join the mesh. Every node is a HOST BY DEFAULT — it always runs the P2P/DHT/
     # relay servers AND auto-bootstraps to join. No flag needed. Order: explicit
-    # --seed/config > remembered peers > default seeds. A node that reaches nobody just
+    # --seed/config > remembered peers > operated defaults (currently empty). A node that reaches nobody just
     # becomes the root others join. Only --solo forces pure standalone. The root seed
     # skips bootstrapping to its own advertised address (config network.public_host).
     set has_seed to 0
@@ -2721,58 +3038,116 @@ define main:
         # dials its own port-forwarded IP (NAT hairpin) ends up as a peer of itself,
         # which wedges the raft/host-election/broadcast loops after boot. The root node
         # still serves everyone else; it just must not add itself to its own peer set.
-        # run_command does NOT capture stdout, so write curl's output to a file and read it.
-        set ip_path to concat(storage_get_default_dir() and "/.pubip")
-        set ip_ignore to run_command(concat("curl -s --max-time 5 https://api.ipify.org -o " and ip_path))
-        if file_exists(ip_path) == 1:
-            set self_host to string_trim(read_file(ip_path))
+        set ip_raw to run_command("curl -sS -f --proto '=https' --max-time 5 https://api.ipify.org 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+        set ip_marker to string_last_index_of(ip_raw and "__ERNOS_EXIT__:0")
+        if ip_marker >= 0:
+            set self_host to string_trim(substring(ip_raw and 0 and ip_marker))
         if string_length(self_host) > 0:
             display f"[*] Detected own public IP {self_host}; will skip self in bootstrap."
         else:
             display "[*] Could not auto-detect public IP; set network.public_host if this node self-loops."
+    set advertised_ready to dht_endpoint_is_advertisable(self_host and dht_port)
+    if advertised_ready == 1:
+        set ok to map_insert(dht_node and "address" and self_host)
+        display f"[+] DHT advertised endpoint: {self_host}:{dht_port}."
+        log_info("node" and f"DHT advertised endpoint set to {self_host}:{dht_port}")
+
+        # Publish the onion-relay descriptor only with the same externally usable
+        # address advertised through DHT. A wildcard or loopback fallback would poison
+        # remote routing tables with an endpoint they cannot dial.
+        set onion_enc_pub to ptr_to_str(map_get_val(identity and "encryption_public_key"))
+        set ok to onion_publish_self(dht_node and node_id and self_host and p2p_port and onion_enc_pub)
+        if ok != 0:
+            display "[-] Onion relay descriptor publication failed."
+            log_error("node" and "Onion relay descriptor publication failed.")
+        else:
+            log_info("node" and "Onion relay descriptor published to DHT.")
+    else:
+        display "[-] No advertisable DHT endpoint; set network.public_host. Outbound bootstrap is disabled."
+        log_error("node" and "No advertisable DHT endpoint; outbound bootstrap disabled")
     if string_length(seed_addr) > 0:
         # Explicit seed from --seed or config.network.seed_addr (operator override).
-        if seed_port > 0:
-            set boot_result to bootstrap_to_seed(seed_addr and seed_port and dht_node and borrow raft_node and peers and node_id and pub_hex and raft_port)
+        if advertised_ready == 0:
+            display "[-] Configured seed not contacted because this node has no advertisable endpoint."
+        else if dht_endpoint_is_advertisable(seed_addr and seed_port) == 1:
+            set boot_result to bootstrap_to_seed(seed_addr and seed_port and dht_node and borrow raft_node and peers and node_id and pub_hex and raft_port and self_host and p2p_port)
             set has_seed to map_get_val(boot_result and "connected")
             if has_seed == 1:
                 set sv to peers_cache_save(map_get_val(boot_result and "discovered"))
+                if sv < 0:
+                    display "[-] Joined the configured seed, but could not persist discovered peers."
         else:
-            display "[*] Seed address configured but no port - running standalone."
+            display f"[-] Configured seed endpoint is invalid: {seed_addr}:{seed_port}. Running as mesh root."
+            log_error("node" and f"Configured seed endpoint is invalid: {seed_addr}:{seed_port}")
     else:
         if cli_solo == 1:
             display "[*] --solo: standalone node, not joining the mesh."
             log_info("node" and "Solo node - no outbound bootstrap")
         else:
-            # Remembered peers FIRST, then default seeds; drop any that are us.
+            # Remembered peers first, then operated defaults (currently empty); drop self entries.
             set raw_cands to peers_cache_load()
-            set defs to ernos_default_seeds()
-            set di to 0
-            repeat while di < length_list(defs):
-                set ok to append_list(raw_cands and get_list(defs and di))
-                set di to di + 1
             set candidates to create_list()
+            set external_cache to create_list()
+            set removed_self to 0
             set ri to 0
             repeat while ri < length_list(raw_cands):
                 set cand to string_trim(get_list(raw_cands and ri))
                 if string_length(cand) > 0 and also bootstrap_is_self(cand and self_host) == 0:
                     set ok to append_list(candidates and cand)
+                    set ok to append_list(external_cache and cand)
+                else if string_length(cand) > 0:
+                    set removed_self to removed_self + 1
                 set ri to ri + 1
+            if removed_self > 0:
+                set cache_saved to peers_cache_save(external_cache)
+                if cache_saved < 0:
+                    display f"[-] Rejected {removed_self} self cache endpoint(s), but cache cleanup failed."
+                else:
+                    display f"[*] Removed {removed_self} self cache endpoint(s)."
+
+            set defs to ernos_default_seeds()
+            if is_static_host == 1:
+                # The designated operated host is the destination represented by the
+                # shipped defaults. It may still join an explicitly configured seed or
+                # a verified cached peer, but it must never dial its own operated alias.
+                display "[*] Static host role: serving as a bootstrap root; operated defaults are not dialled."
+                log_info("node" and "Static host skipped operated default seeds")
+            else:
+                set di to 0
+                repeat while di < length_list(defs):
+                    set default_cand to string_trim(get_list(defs and di))
+                    set default_parsed to bootstrap_candidate_parse(default_cand)
+                    if map_get_val(default_parsed and "valid") == 1 and also bootstrap_is_self(default_cand and self_host) == 0:
+                        set ok to append_list(candidates and default_cand)
+                    else:
+                        display f"[-] Ignoring invalid or self default seed endpoint: {default_cand}."
+                    free_map(default_parsed)
+                    set di to di + 1
             if length_list(candidates) == 0:
                 display "[*] No external seeds configured — this node is the mesh root."
                 log_info("node" and "No non-self candidates - root node")
+            else if advertised_ready == 0:
+                display "[-] Cached peers were not contacted because this node has no advertisable endpoint."
+                log_error("node" and "Cached peers not contacted without an advertisable endpoint")
             else:
-                set boot_result to auto_bootstrap(candidates and dht_node and borrow raft_node and peers and node_id and pub_hex and raft_port)
+                set boot_result to auto_bootstrap(candidates and dht_node and borrow raft_node and peers and node_id and pub_hex and raft_port and self_host and p2p_port)
                 set has_seed to map_get_val(boot_result and "connected")
                 if has_seed == 1:
                     set seed_addr to ptr_to_str(map_get_val(boot_result and "host"))
                     set seed_port to map_get_val(boot_result and "port")
                     set sv to peers_cache_save(map_get_val(boot_result and "discovered"))
-                    display f"[+] Joined the mesh via {seed_addr}:{seed_port}; remembered {sv} peer(s) for next launch."
+                    if sv >= 0:
+                        display f"[+] Joined the mesh via {seed_addr}:{seed_port}; remembered {sv} peer(s) for next launch."
+                    else:
+                        display f"[-] Joined the mesh via {seed_addr}:{seed_port}, but peer-cache persistence failed."
                     log_info("node" and f"Auto-bootstrapped via {seed_addr}:{seed_port}")
                 else:
                     display "[*] No peers or seeds reachable - this node is the mesh root."
                     log_info("node" and "Auto-bootstrap found no reachable peers - root")
+            free_list(defs)
+            free_list(external_cache)
+            free_list(raw_cands)
+            free_list(candidates)
 
     # 12b. Start the Raft consensus engine for real (F1). Previously raft_node was
     # created but neither the server nor the election timer thread was ever spawned —
@@ -2783,8 +3158,8 @@ define main:
         set raft_peer_addresses to map_get_val(boot_result and "peer_addresses")
     set ok to map_insert(raft_node and "running" and 1)
     set ok to map_insert(raft_node and "server_ready" and 0)
-    spawn raft_server_thread(cast_borrow_to_map(raft_node) and raft_port)
-    spawn raft_election_timer_thread(cast_borrow_to_map(raft_node) and cast_borrow_to_map(raft_peer_addresses))
+    spawn raft_server_thread(cast_borrow_to_map(borrow raft_node) and raft_port)
+    spawn raft_election_timer_thread(cast_borrow_to_map(borrow raft_node) and cast_borrow_to_map(borrow raft_peer_addresses))
     log_info("node" and f"Raft consensus threads started (server on raft_port {raft_port}).")
     display f"[+] Raft consensus engine LIVE (server:{raft_port}, election timer running)."
 
@@ -2807,29 +3182,41 @@ define main:
     log_info("node" and f"Web UI server starting on port {web_port}.")
     display f"[+] Web UI server starting on port {web_port}."
 
-    # Start GitDec Nostr relay listener
-    spawn gitdec_listener_loop(cast_map_to_int(dht_node) and cast_borrow_to_map(identity))
-
     # Seed the default watched repos so a freshly-joined node auto-pulls the core
     # library peer-to-peer on connection (idempotent — ON CONFLICT updates the flag):
     # the ErnosDecent source (self-update), the Civ archive, and the SFTOM project.
     set ok to storage_gitdec_set_auto_update("ErnosDecent" and 1)
+    if ok != 0:
+        display "[-] Failed to enable ErnosDecent auto-update persistence."
     set ok to storage_gitdec_set_auto_update("Civ" and 1)
+    if ok != 0:
+        display "[-] Failed to enable Civ auto-update persistence."
     set ok to storage_gitdec_set_auto_update("SFTOM" and 1)
+    if ok != 0:
+        display "[-] Failed to enable SFTOM auto-update persistence."
 
-    # Auto-pull repos flagged for auto-update, so a freshly-joined node downloads
-    # the latest of every watched project without a manual clone.
-    spawn gitdec_auto_pull_on_join()
+    # Network sync is meaningful only after this startup actually joins a peer.
+    # A root with no peers cannot receive history, so defer instead of emitting three
+    # predictable failures against an empty mesh.
+    if has_seed == 1:
+        spawn gitdec_listener_loop(cast_map_to_int(dht_node))
+        spawn gitdec_auto_pull_on_join()
+    else:
+        display "[*] GitDec network sync deferred: no connected mesh peer."
+        log_info("node" and "GitDec network sync deferred - no connected mesh peer")
 
     # Start dynamic host election and fallback routing loop
     if enable_host_election == 1:
-        set local_ip to config_get_str(cfg and "network.listen_address")
-        if string_length(local_ip) == 0:
+        set local_ip to self_host
+        if advertised_ready == 0:
             set local_ip to "127.0.0.1"
-        spawn host_election_loop(cast_map_to_int(dht_node) and node_id and local_ip and p2p_port and is_static_host and cast_borrow_to_map(raft_node) and peers and pub_hex and raft_port)
+        spawn host_election_loop(cast_map_to_int(dht_node) and node_id and local_ip and p2p_port and is_static_host and cast_borrow_to_map(borrow raft_node) and peers and pub_hex and raft_port)
 
     # Start third-party platform connections (e.g. Discord bridge)
-    set plat_run_res to run_command("python3 decent_net/discord_manager.py &")
+    set plat_run_res to run_command("python3 decent_net/discord_manager.py >> discord_manager.log 2>&1 & printf '__ERNOS_EXIT__:%s' $?")
+    if string_contains(plat_run_res and "__ERNOS_EXIT__:0") == 0:
+        display concat("[-] Discord manager launch failed: " and plat_run_res)
+        log_error("node" and "Discord manager launch failed.")
 
     # 15. Run initial health check
     set health_report to run_health_check(dht_node and borrow raft_node and ipc_port)
@@ -2840,17 +3227,25 @@ define main:
 
     display ""
     display "==================================================="
-    display "  Node is LIVE. All subsystems operational."
+    display "  Node startup completed. Review health status and any errors above."
     display f"  IPC: 127.0.0.1:{ipc_port}  |  Web: http://127.0.0.1:{web_port}"
-    display f"  P2P: 127.0.0.1:{p2p_port}  |  DHT: 127.0.0.1:{dht_port}"
+    display f"  P2P: 0.0.0.0:{p2p_port}  |  DHT: 0.0.0.0:{dht_port}"
+    display f"  Relay: 0.0.0.0:{relay_port}  |  Raft: 0.0.0.0:{raft_port}  |  Compute: 0.0.0.0:{compute_port}"
     display "==================================================="
 
     # Start the daemon loop (blocks forever)
     # Phase A2: non-blocking listen + accept-as-a-task-chain + eternal scheduler pump.
     # Connections are now served from within ANY nested pump (even while a detached
     # turn is mid-inference), so sessions run in parallel and the daemon never blocks.
-    set ok to ep_net_set_nonblocking(listen_fd)
-    set accept_fut to node_accept_chain(listen_fd and cast_map_to_int(raft_node) and cast_map_to_int(identity) and dht_node and relay_node and msg_store and cast_map_to_int(ledger) and name_reg and seed_addr and seed_port and cast_map_to_int(agent_memory) and cast_map_to_int(agent_tools) and cast_map_to_int(agent_ctx) and cast_map_to_int(agent_model) and static_secret and static_public and cast_map_to_int(bft_node))
+    set nonblocking_err to ep_net_set_nonblocking(listen_fd)
+    if nonblocking_err != 0:
+        display f"[-] IPC listener could not be switched to non-blocking mode: {nonblocking_err}"
+        log_error("node" and f"IPC listener non-blocking setup failed: {nonblocking_err}")
+        set close_err to ep_net_close(listen_fd)
+        if close_err != 0:
+            display f"[-] IPC listener cleanup failed: {close_err}"
+        return 1
+    set accept_fut to node_accept_chain(listen_fd and cast_map_to_int(raft_node) and cast_map_to_int(identity) and dht_node and relay_node and msg_store and cast_map_to_int(ledger) and name_reg and seed_addr and seed_port and cast_map_to_int(agent_memory) and cast_map_to_int(agent_tools) and cast_map_to_int(cast_borrow_to_map(borrow agent_ctx)) and cast_map_to_int(cast_borrow_to_map(borrow agent_model)) and static_secret and static_public and cast_map_to_int(bft_node))
     set ok to node_main_pump()
     
     return 0

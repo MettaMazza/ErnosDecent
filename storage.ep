@@ -8,6 +8,7 @@ import "string"
 import "collections"
 import "os"
 import "fs"
+import "./decent_id/keys"
 
 # ================================================================
 # Error codes
@@ -40,18 +41,26 @@ define storage_init with data_dir as Str returning Int:
     # Create data directory structure
     if file_exists(data_dir) == 0:
         set ok to create_directory(data_dir)
+        if ok == 0:
+            return STORAGE_ERR_IO
 
     set content_dir to concat(data_dir and "/content")
     if file_exists(content_dir) == 0:
         set ok to create_directory(content_dir)
+        if ok == 0:
+            return STORAGE_ERR_IO
 
     set keys_dir to concat(data_dir and "/keys")
     if file_exists(keys_dir) == 0:
         set ok to create_directory(keys_dir)
+        if ok == 0:
+            return STORAGE_ERR_IO
 
     set logs_dir to concat(data_dir and "/logs")
     if file_exists(logs_dir) == 0:
         set ok to create_directory(logs_dir)
+        if ok == 0:
+            return STORAGE_ERR_IO
 
     # Open SQLite database
     set db_path to concat(data_dir and "/node.db")
@@ -63,11 +72,19 @@ define storage_init with data_dir as Str returning Int:
     # keys/ dir holds key files — make them owner-only (0600 / 0700) so other local
     # users cannot read them.
     set ok to keys_chmod(db_path and 384)
+    if ok != 0:
+        return STORAGE_ERR_IO
     set ok to keys_chmod(keys_dir and 448)
+    if ok != 0:
+        return STORAGE_ERR_IO
     set ok to keys_chmod(content_dir and 448)
+    if ok != 0:
+        return STORAGE_ERR_IO
 
     # Create all tables
     set ok to storage_create_tables()
+    if ok != STORAGE_ERR_NONE:
+        return ok
     return STORAGE_ERR_NONE
 
 define storage_create_tables returning Int:
@@ -188,6 +205,8 @@ define storage_close returning Int:
     if STORAGE_DB != 0:
         set ok to sql_close(STORAGE_DB)
         set STORAGE_DB to 0
+        if ok != 0:
+            return STORAGE_ERR_EXEC_FAILED
     return STORAGE_ERR_NONE
 
 # ================================================================
@@ -218,6 +237,8 @@ define storage_kv_delete with table as Str and key as Str returning Int:
     set escaped_key to string_replace(key and "'" and "''")
     set sql to concat("DELETE FROM " and concat(table and concat(" WHERE key = '" and concat(escaped_key and "';"))))
     set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
     return STORAGE_ERR_NONE
 
 # ================================================================
@@ -248,6 +269,8 @@ define storage_dht_delete with key as Str returning Int:
     set ek to string_replace(key and "'" and "''")
     set sql to concat("DELETE FROM dht_values WHERE key = '" and concat(ek and "';"))
     set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
     return STORAGE_ERR_NONE
 
 define storage_dht_put_peer with node_id as Str and address as Str and port as Int returning Int:
@@ -288,13 +311,24 @@ define storage_hash_valid with hash as Str returning Int:
 define storage_content_put with hash as Str and content as Str and content_type as Str returning Int:
     if storage_hash_valid(hash) == 0:
         return STORAGE_ERR_EXEC_FAILED
+    # A content address is only valid when it is the SHA-256 digest of the exact
+    # bytes being stored. Checking the shape alone permits poisoned blocks under
+    # arbitrary filenames and breaks every caller's integrity guarantee.
+    if (ep_sha256(content) equals hash) == 0:
+        return STORAGE_ERR_EXEC_FAILED
     # Write content to file. write_file returns 1 on success, 0 on failure — so the
     # error case is wr == 0 (a previous wr != 0 check was inverted: it wrote the file
     # but then always returned EXEC_FAILED and skipped the metadata INSERT below).
     set file_path to concat(STORAGE_DATA_DIR and concat("/content/" and hash))
-    set wr to write_file(file_path and content)
-    if wr == 0:
-        return STORAGE_ERR_EXEC_FAILED
+    set file_was_present to file_exists(file_path)
+    if file_was_present == 1:
+        set existing_content to read_file(file_path)
+        if (ep_sha256(existing_content) equals hash) == 0:
+            return STORAGE_ERR_IO
+    else:
+        set wr to write_file(file_path and content)
+        if wr == 0:
+            return STORAGE_ERR_IO
 
     # Record metadata in SQLite
     set now to ep_time_now_sec()
@@ -304,6 +338,12 @@ define storage_content_put with hash as Str and content as Str and content_type 
     set sql to concat("INSERT OR REPLACE INTO content_blocks (hash, content_type, size, created_at) VALUES ('" and concat(eh and concat("', '" and concat(et and concat("', " and concat(int_to_string(size) and concat(", " and concat(int_to_string(now) and ");"))))))))
     set ok to sql_execute(STORAGE_DB and sql)
     if ok != 0:
+        # Do not leave a new unindexed blob behind when metadata persistence
+        # fails. Never remove a valid block that predated this call.
+        if file_was_present == 0:
+            set cleanup_ok to remove_file(file_path)
+            if cleanup_ok == 0:
+                return STORAGE_ERR_IO
         return STORAGE_ERR_EXEC_FAILED
     return STORAGE_ERR_NONE
 
@@ -325,11 +365,29 @@ define storage_content_delete with hash as Str returning Int:
     if storage_hash_valid(hash) == 0:
         return STORAGE_ERR_NONE
     set file_path to concat(STORAGE_DATA_DIR and concat("/content/" and hash))
-    if file_exists(file_path):
-        set ok to remove_file(file_path)
+    set staged_path to concat(file_path and ".deleting")
+    set file_was_present to file_exists(file_path)
+    if file_was_present == 1:
+        # Stage the blob with an atomic same-directory rename. If the metadata
+        # delete fails, restoring the filename makes the operation reversible.
+        if file_exists(staged_path) == 1:
+            return STORAGE_ERR_IO
+        set rename_ok to rename_file(file_path and staged_path)
+        if rename_ok == 0:
+            return STORAGE_ERR_IO
     set eh to string_replace(hash and "'" and "''")
     set sql to concat("DELETE FROM content_blocks WHERE hash = '" and concat(eh and "';"))
     set ok to sql_execute(STORAGE_DB and sql)
+    if ok != 0:
+        if file_was_present == 1:
+            set restore_ok to rename_file(staged_path and file_path)
+            if restore_ok == 0:
+                return STORAGE_ERR_IO
+        return STORAGE_ERR_EXEC_FAILED
+    if file_was_present == 1:
+        set remove_ok to remove_file(staged_path)
+        if remove_ok == 0:
+            return STORAGE_ERR_IO
     return STORAGE_ERR_NONE
 
 define storage_content_list returning List:
@@ -346,10 +404,20 @@ define storage_identity_save with did_str as Str and signing_pub as Str and sign
     # (0600, set in storage_init). Public keys + DID are not secret.
     set id_pass to keys_getenv("ERNOSDECENT_PASSPHRASE")
     set ok to storage_kv_put("identity" and "did" and did_str)
+    if ok != STORAGE_ERR_NONE:
+        return ok
     set ok to storage_kv_put("identity" and "signing_pub" and signing_pub)
+    if ok != STORAGE_ERR_NONE:
+        return ok
     set ok to storage_kv_put("identity" and "signing_sec" and keys_seal_secret(signing_sec and id_pass))
+    if ok != STORAGE_ERR_NONE:
+        return ok
     set ok to storage_kv_put("identity" and "enc_pub" and enc_pub)
+    if ok != STORAGE_ERR_NONE:
+        return ok
     set ok to storage_kv_put("identity" and "enc_sec" and keys_seal_secret(enc_sec and id_pass))
+    if ok != STORAGE_ERR_NONE:
+        return ok
     return STORAGE_ERR_NONE
 
 define storage_identity_load returning Map:
@@ -402,10 +470,14 @@ define storage_ledger_update_balance with address as Str and amount as Int retur
     # Delete existing entry
     set sql_del to concat("DELETE FROM ledger_utxo WHERE address = '" and concat(ea and "';"))
     set ok to sql_execute(STORAGE_DB and sql_del)
+    if ok != 0:
+        return STORAGE_ERR_EXEC_FAILED
     # Insert new balance
     if amount > 0:
         set sql_ins to concat("INSERT INTO ledger_utxo (address, amount) VALUES ('" and concat(ea and concat("', " and concat(int_to_string(amount) and ");"))))
         set ok to sql_execute(STORAGE_DB and sql_ins)
+        if ok != 0:
+            return STORAGE_ERR_EXEC_FAILED
     return STORAGE_ERR_NONE
 
 define storage_ledger_get_balance with address as Str returning Int:
@@ -638,13 +710,25 @@ define storage_knowledge_dir returning Str:
     set kdir to concat(d and "/knowledge")
     if file_exists(kdir) == 0:
         set ok to create_directory(kdir)
+        if ok == 0:
+            display concat("[-] Failed to create knowledge directory: " and kdir)
+            return ""
+    if is_directory(kdir) == 0:
+        display concat("[-] Knowledge path is not a directory: " and kdir)
+        return ""
     return kdir
 
 define storage_user_knowledge_path_for with persona as Str returning Str:
-    return concat(storage_knowledge_dir() and concat("/" and concat(persona and "_user.md")))
+    set dir to storage_knowledge_dir()
+    if string_length(dir) == 0:
+        return ""
+    return concat(dir and concat("/" and concat(persona and "_user.md")))
 
 define storage_self_knowledge_path_for with persona as Str returning Str:
-    return concat(storage_knowledge_dir() and concat("/" and concat(persona and "_self.md")))
+    set dir to storage_knowledge_dir()
+    if string_length(dir) == 0:
+        return ""
+    return concat(dir and concat("/" and concat(persona and "_self.md")))
 
 # Legacy single-file location (pre-persona-scoping) — kept only so existing content
 # migrates into the current persona's file on first read.
@@ -891,4 +975,3 @@ define storage_email_get_all with folder as Str returning List:
         set ok to append_list(list and email_map)
         set i to i + 1
     return list
-

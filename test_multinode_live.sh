@@ -6,6 +6,14 @@
 
 set -o pipefail
 
+test_home=$(mktemp -d -t ernos-multinode-live.XXXXXX)
+export HOME="$test_home"
+IPC_TOKEN=""
+
+NODE1_PID=""
+NODE2_PID=""
+NODE3_PID=""
+
 PASS=0
 FAIL=0
 TOTAL=0
@@ -37,18 +45,19 @@ assert_contains() {
 ipc_cmd() {
     local port="$1"
     local cmd="$2"
-    echo "$cmd" | nc -w 2 127.0.0.1 "$port" 2>/dev/null
+    printf 'AUTH %s %s\n' "$IPC_TOKEN" "$cmd" | nc -w 2 127.0.0.1 "$port" 2>/dev/null
 }
 
 cleanup() {
     echo ""
-    echo "[*] Cleaning up all nodes..."
-    for pid in $NODE1_PID $NODE2_PID $NODE3_PID; do
-        kill "$pid" 2>/dev/null
-        wait "$pid" 2>/dev/null
+    echo "[*] Cleaning up nodes started by this harness..."
+    for node_pid in "$NODE1_PID" "$NODE2_PID" "$NODE3_PID"; do
+        if [ -n "$node_pid" ] && kill -0 "$node_pid" 2>/dev/null; then
+            kill "$node_pid" 2>/dev/null
+            wait "$node_pid" 2>/dev/null
+        fi
     done
-    lsof -ti:5000,8080,9100,9101,9102,9200,9300,9280,9400,9500,9480 2>/dev/null | xargs kill -9 2>/dev/null
-    sleep 1
+    rm -rf "$test_home"
 }
 
 trap cleanup EXIT
@@ -63,12 +72,28 @@ echo ""
 # Setup: Start 3-node cluster
 # ================================================================
 
+for required_port in 5000 8088 9100 9101 9102 9103 9104 9200 9201 9202 9203 9204 9280 9300 9400 9401 9402 9403 9404 9480 9500; do
+    if lsof -nP -iTCP:"$required_port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "[-] FATAL: required test port $required_port is already in use; refusing to stop an unowned process"
+        exit 1
+    fi
+done
+
 echo "[*] Starting Node 1 (seed, default ports)..."
-lsof -ti:5000,8080,9100,9101,9102 2>/dev/null | xargs kill -9 2>/dev/null
-sleep 1
 ./node &
 NODE1_PID=$!
 sleep 3
+
+IPC_TOKEN_FILE="$HOME/.ernosdecent/ipc-token"
+if [ ! -r "$IPC_TOKEN_FILE" ]; then
+    echo "[-] FATAL: Node 1 did not create an IPC token at $IPC_TOKEN_FILE"
+    exit 1
+fi
+IPC_TOKEN=$(tr -d '\r\n ' < "$IPC_TOKEN_FILE")
+if [ -z "$IPC_TOKEN" ]; then
+    echo "[-] FATAL: Node 1 created an empty IPC token"
+    exit 1
+fi
 
 # Verify Node 1 is alive
 n1_status=$(ipc_cmd 5000 "STATUS")
@@ -80,8 +105,6 @@ else
 fi
 
 echo "[*] Starting Node 2 (port 9200, seed -> Node 1)..."
-lsof -ti:9200,9300,9280 2>/dev/null | xargs kill -9 2>/dev/null
-sleep 1
 ./node --port 9200 --seed 127.0.0.1:9101 &
 NODE2_PID=$!
 sleep 3
@@ -95,8 +118,6 @@ else
 fi
 
 echo "[*] Starting Node 3 (port 9400, seed -> Node 1)..."
-lsof -ti:9400,9500,9480 2>/dev/null | xargs kill -9 2>/dev/null
-sleep 1
 ./node --port 9400 --seed 127.0.0.1:9101 &
 NODE3_PID=$!
 sleep 3
@@ -287,6 +308,7 @@ echo ""
 echo "  [....] Killing Node 3 (PID $NODE3_PID)..."
 kill $NODE3_PID 2>/dev/null
 wait $NODE3_PID 2>/dev/null
+NODE3_PID=""
 sleep 2
 
 # 7.2 Node 1 and 2 still alive
@@ -305,8 +327,6 @@ assert_contains "Node 2 DHT works after Node 3 death" "$dht_s_n2" "dht:stored"
 
 # 7.4 Restart Node 3
 echo "  [....] Restarting Node 3..."
-lsof -ti:9400,9500,9480 2>/dev/null | xargs kill -9 2>/dev/null
-sleep 1
 ./node --port 9400 --seed 127.0.0.1:9101 &
 NODE3_PID=$!
 sleep 3

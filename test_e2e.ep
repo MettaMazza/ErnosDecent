@@ -26,7 +26,7 @@ import "decent_name/registry"
 # 6.1: Identity Lifecycle with Persistence
 # ================================================================
 
-define test_6_1:
+define test_6_1 returning Int:
     display "TEST 6.1: Identity lifecycle"
     set t_ok to 1
     set ok to init_crypto()
@@ -71,7 +71,7 @@ define test_6_1:
 # 6.2: Encrypted Messaging End-to-End
 # ================================================================
 
-define test_6_2:
+define test_6_2 returning Int:
     display "TEST 6.2: Encrypted messaging end-to-end"
     set t_ok to 1
     set ok to init_crypto()
@@ -155,7 +155,7 @@ define test_6_2:
 # 6.3: Content Publish → Chunk → Retrieve → Verify
 # ================================================================
 
-define test_6_3:
+define test_6_3 returning Int:
     display "TEST 6.3: Content publish → chunk → retrieve → verify"
     set t_ok to 1
     set ok to init_crypto()
@@ -215,7 +215,7 @@ define test_6_3:
 # 6.4: Financial Transaction with Balance
 # ================================================================
 
-define test_6_4:
+define test_6_4 returning Int:
     display "TEST 6.4: Financial transaction with balance"
     set t_ok to 1
     set ok to init_crypto()
@@ -234,43 +234,67 @@ define test_6_4:
     set recipient_keys to generate_signing_keypair()
     set recipient_pub to ptr_to_str(map_get_val(recipient_keys and "public_key"))
 
+    set genesis_blocks to map_get_val(ledger and "blocks")
+    set genesis_block to get_list(genesis_blocks and 0)
+    set genesis_txs to map_get_val(genesis_block and "transactions")
+    set genesis_tx to get_list(genesis_txs and 0)
+    set genesis_tx_id to ptr_to_str(map_get_val(genesis_tx and "id"))
+
     set inputs to create_list()
     set input1 to create_map()
-    set ok to map_insert(input1 and "tx_id" and "genesis_tx")
+    set ok to map_insert(input1 and "tx_id" and genesis_tx_id)
     set ok to map_insert(input1 and "output_index" and 0)
-    set ok to map_insert(input1 and "amount" and 1000000)
-    set ok to map_insert(input1 and "owner" and genesis_pub)
-    set sig_result to sign_message("genesis_tx:0" and genesis_sec)
-    set input_sig to ptr_to_str(map_get_val(sig_result and "signature"))
-    set ok to map_insert(input1 and "signature" and input_sig)
     set ok to append_list(inputs and input1)
 
     set outputs to create_list()
     set output1 to create_map()
     set ok to map_insert(output1 and "amount" and 500)
     set ok to map_insert(output1 and "recipient" and recipient_pub)
+    set ok to map_insert(output1 and "index" and 0)
     set ok to append_list(outputs and output1)
 
     set output2 to create_map()
     set ok to map_insert(output2 and "amount" and 999490)
     set ok to map_insert(output2 and "recipient" and genesis_pub)
+    set ok to map_insert(output2 and "index" and 1)
     set ok to append_list(outputs and output2)
 
     set tx to ledger_create_tx(inputs and outputs and 10)
+    set tx_id to ptr_to_str(map_get_val(tx and "id"))
+    set sig_result to sign_message(tx_id and genesis_sec)
+    set input_sig to ptr_to_str(map_get_val(sig_result and "signature"))
+    set ok to map_insert(input1 and "signature" and input_sig)
 
     set tx_list to create_list()
     set ok to append_list(tx_list and tx)
 
-    set block_sig to sign_message("block" and genesis_sec)
+    set blocks_before to map_get_val(ledger and "blocks")
+    set prev_block to get_list(blocks_before and length_list(blocks_before) - 1)
+    set prev_hash to ptr_to_str(map_get_val(prev_block and "hash"))
+    set tx_hashes to create_list()
+    set ok to append_list(tx_hashes and ptr_to_str(map_get_val(tx and "id")))
+    set merkle_root to calculate_merkle_root(tx_hashes)
+    free_list(tx_hashes)
+    set expected_state_root to ledger_compute_state_root()
+    set expected_block_hash to ledger_compute_block_hash(merkle_root and prev_hash and expected_state_root)
+    set block_sig to sign_message(expected_block_hash and genesis_sec)
     set block_sig_str to ptr_to_str(map_get_val(block_sig and "signature"))
-    set add_err to ledger_add_block(ledger and tx_list and genesis_pub and block_sig_str)
+    set add_err to ledger_add_block(ledger and tx_list and genesis_pub and block_sig_str and expected_state_root)
     display f"  Block added (error={add_err})"
+    if add_err != LEDGER_ERR_NONE:
+        display f"  FAIL: ledger rejected valid transaction block with error {add_err}"
+        set t_ok to 0
 
     set new_balance to ledger_get_balance(ledger and genesis_pub)
     display f"  Genesis new balance: {new_balance}"
 
     set recipient_balance to ledger_get_balance(ledger and recipient_pub)
     display f"  Recipient balance: {recipient_balance}"
+    # The 10-unit fee is credited to the elected validator. Genesis is also the
+    # validator in this one-node ledger, so its net balance is 999500.
+    if new_balance != 999500 or else recipient_balance != 500:
+        display "  FAIL: post-block balances do not match the committed transaction"
+        set t_ok to 0
 
     # Test ledger serialization round-trip
     set blocks to map_get_val(ledger and "blocks")
@@ -286,6 +310,9 @@ define test_6_4:
         else:
             display "  Block serialize → deserialize round-trip: OK"
         free_map(block_deser)
+    else:
+        display "  FAIL: valid block was not appended to the ledger"
+        set t_ok to 0
 
     if t_ok == 1:
         display "  PASS"
@@ -295,7 +322,7 @@ define test_6_4:
 # 6.5: Social Feed (Nostr + Feed)
 # ================================================================
 
-define test_6_5:
+define test_6_5 returning Int:
     display "TEST 6.5: Social feed (Nostr event → feed)"
     set t_ok to 1
     set ok to init_crypto()
@@ -341,7 +368,7 @@ define test_6_5:
 # 6.6: Name Registration → DHT Resolution
 # ================================================================
 
-define test_6_6:
+define test_6_6 returning Int:
     display "TEST 6.6: Name registration → DHT resolution"
     set t_ok to 1
 
@@ -370,7 +397,7 @@ define test_6_6:
     # Test via registry module (which uses DHT internally)
     set reg to registry_create()
     # Register with empty seed (local-only, no remote DHT call)
-    set reg_err to registry_register(reg and "bob.decent" and "did:key:z6Mk_bob" and dht and "" and 0)
+    set reg_err to registry_register(reg and "bob.decent" and "did:key:z6Mk_bob" and dht and "" and 0 and "" and "")
     set reg_resolved to registry_resolve(reg and "bob.decent" and dht and "" and 0)
     if (reg_resolved equals "did:key:z6Mk_bob") == 0:
         display f"  FAIL: Registry resolve mismatch: {reg_resolved}"
@@ -394,7 +421,7 @@ define test_6_6:
 # 6.7: Relay-Assisted Connection
 # ================================================================
 
-define test_6_7:
+define test_6_7 returning Int:
     display "TEST 6.7: Relay-assisted connection"
     set t_ok to 1
     set ok to init_crypto()
@@ -406,8 +433,8 @@ define test_6_7:
     set bob_keys to generate_signing_keypair()
     set bob_pub to ptr_to_str(map_get_val(bob_keys and "public_key"))
 
-    set r1 to relay_register(relay and "alice" and alice_pub and "127.0.0.1" and 9200)
-    set r2 to relay_register(relay and "bob" and bob_pub and "127.0.0.1" and 9201)
+    set r1 to relay_register(relay and "alice" and alice_pub and "203.0.113.10" and 9200)
+    set r2 to relay_register(relay and "bob" and bob_pub and "203.0.113.11" and 9201)
     if r1 != RELAY_ERR_NONE || r2 != RELAY_ERR_NONE:
         display f"  FAIL: Registration errors r1={r1} r2={r2}"
         set t_ok to 0
@@ -456,7 +483,7 @@ define test_6_7:
     else:
         set target_addr to ptr_to_str(map_get_val(target_info and "address"))
         set target_port to map_get_val(target_info and "port")
-        if (target_addr equals "127.0.0.1") == 0:
+        if (target_addr equals "203.0.113.11") == 0:
             display f"  FAIL: Target address mismatch: {target_addr}"
             set t_ok to 0
         else:
@@ -471,7 +498,7 @@ define test_6_7:
 # 6.8: Search Index → Query → Ranked Results
 # ================================================================
 
-define test_6_8:
+define test_6_8 returning Int:
     display "TEST 6.8: Search index → query → ranked results"
     set t_ok to 1
 
@@ -512,7 +539,7 @@ define test_6_8:
 # 6.9: Content Integrity Tamper Detection
 # ================================================================
 
-define test_6_9:
+define test_6_9 returning Int:
     display "TEST 6.9: Content integrity tamper detection"
     set t_ok to 1
     set ok to init_crypto()
@@ -551,7 +578,7 @@ define test_6_9:
 # 6.10: Multi-Hop Onion Circuit
 # ================================================================
 
-define test_6_10:
+define test_6_10 returning Int:
     display "TEST 6.10: Multi-hop onion circuit"
     set t_ok to 1
     set ok to init_crypto()
@@ -641,7 +668,7 @@ define test_6_10:
 # Main
 # ================================================================
 
-define main:
+define main returning Int:
     display "==================================================="
     display "  ErnosDecent -- Phase 6 E2E Journey Test Suite"
     display "  WITH PERSISTENCE + SERIALIZATION VERIFICATION"
@@ -687,5 +714,6 @@ define main:
         display "  ALL PHASE 6 E2E JOURNEY TESTS PASSED!"
     else:
         display "  SOME TESTS FAILED"
+        return 1
     display "==================================================="
     return 0

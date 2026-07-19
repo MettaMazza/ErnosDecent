@@ -25,23 +25,33 @@ The DHT Key-Value Store panel contains an operations log box at the bottom. It d
 
 ---
 
-## 2. Dynamic Host Nodes & Fallback Tree
+## 2. Bootstrap and Host Election
 
-To maintain high availability and survive network partitions or seed node failures, the system implements a dynamic routing and fallback structure.
+> **Public-bootstrap pre-launch status — 19 July 2026:** TCP `9100` and `9101` on the
+> operated node were independently reachable, while DDNS and public forwarding for
+> `9102` through `9104` remained deferred. Consequently, the repository intentionally
+> ships no automatic public seed. Fresh nodes require an explicit seed or a verified
+> cached peer until the complete launch gate below has been verified.
 
-### A. Fallback Host Architecture
-P2P nodes depend on seed hosts to bootstrap themselves into the gossip network and route traffic across NATs (using relay nodes). Rather than relying on a static, single point of failure, ErnosDecent employs a ranked list of available seed hosts:
-- **Elected Primary Seed Host**: The highest-priority host currently serving as the main entrypoint and relay gateway for network communications.
-- **Dynamic Host Election**: When enabled, the network peers participate in consensus-based leader elections to automatically choose a new host node if the current primary seed goes offline.
-- **Static Host Priority**: When enabled, the local node bypasses the fallback election tree to prioritize a manually configured seed node, ensuring stable connection routing to a known trusted host.
+A node can join an existing mesh only when it knows at least one reachable DHT endpoint. Bootstrap candidates are tried in this order:
 
-### B. Fallback Telemetry Tree Metrics
-The hosts list is presented in a live table ranked by active external connections. High connection numbers indicate high capacity, elevating the host's rank. The table displays:
-- **Rank**: The calculated priority position (e.g., Rank 1 is the primary seed host, Rank 2 is the secondary fallback, etc.).
-- **Node ID / Address**: The target peer's cryptographic node ID and TCP/UDP connection address.
-- **Active Connections**: The count of concurrent external TCP socket connections managed by the host.
-- **Priority Mode**: Indicates whether the host is dynamically elected or running in static preferred host mode.
-- **Last Seen**: The time elapsed since the local node last received a successful ping handshake or keep-alive message from the host, confirming its operational health.
+1. An explicit `--seed host:port` value or `network.seed_addr`/`network.seed_port` configuration.
+2. Previously verified endpoints stored in `~/.ernosdecent/peers.txt`.
 
-### C. Manual Controls
-- **Refresh List Button**: Issues a real-time IPC query to request the latest host election routing tree from the daemon, updating the table with current peer telemetry.
+No external seed is hard-coded. Shipping a literal third-party or residential IP would make an unverifiable availability claim. The operated bootstrap node is configured with `network.is_static_host = 1`; it serves as a root and does not dial the operated default aliases that will represent itself. Explicitly configured and previously verified cached peers remain eligible. When no non-self candidate exists, the node explicitly becomes a mesh root and waits for other nodes to connect.
+
+Each candidate must have a dialable host and a port from 1 through 65535. Wildcard listener addresses such as `0.0.0.0`, `::`, and `[::]` are rejected and removed from the peer cache. A connection is accepted as a DHT bootstrap only after the remote endpoint returns an actual framed `DHT_PONG`; connection, send, receive, invalid-response, close, registration, and invalid-endpoint failures have distinct error codes.
+
+The node advertises `network.public_host`, or its detected public IP, in outbound DHT and relay registration. The configuration loader, generated configuration, saved configuration, and dashboard all preserve `network.public_host`. If neither produces an advertisable address, outbound bootstrap is disabled instead of publishing a wildcard or loopback fallback as a remote endpoint.
+
+Raft host election operates among peers that have already connected. It does not create connectivity, discover an offline seed, or convert an unreachable endpoint into a reachable one. Operators remain responsible for running at least one seed node and exposing TCP `9101` through every host firewall and NAT device. Full mesh service requires TCP `9100` through `9104`; IPC `5000` and Web `8088` remain loopback control surfaces.
+
+A hostname may be added to `ernos_default_seeds()` only after its A/AAAA record resolves to the operated node and an independent external probe receives a valid framed `DHT_PONG` on TCP `9101`. The static root must set that same hostname as `network.public_host`. This prevents both stale residential-IP defaults and DNS-alias self-bootstrap loops.
+
+The public-bootstrap launch gate is complete only when all of the following are true:
+
+1. A stable DDNS hostname follows the operated node's current public address.
+2. TCP `9100` through `9104` are independently reachable from outside the operator LAN.
+3. A remote client receives a valid framed `DHT_PONG` from the hostname on `9101`.
+4. The operated node advertises that hostname and does not add itself as a peer.
+5. Only after steps 1–4 pass is the hostname added to `ernos_default_seeds()`.

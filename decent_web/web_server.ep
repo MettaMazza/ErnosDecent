@@ -10,6 +10,7 @@ import "fs"
 import "http"
 import "static_server"
 import "websocket"
+import "../decent_net/websocket_runtime"
 import "json"
 import "../config.ep"
 import "../decent_agent/edition"
@@ -25,13 +26,74 @@ import "../decent_agent/access"
 # Global cancel-all flag (C-level; injected by build.sh). Set here from the web thread on
 # /api/cancel; read by the ReAct loop at each turn boundary. Setting it is a single word
 # write — no SQLite mutex, no cross-thread GC-object mutation — so Stop is instant.
-external define ep_cancel_set with v returning Int
+external define ep_cancel_set with v as Int returning Int
 # SAFETY: cancel EPOCH bump — halts EVERY concurrent run (main + sub-agents +
 # background coordinators) and aborts in-flight LLM reads within ~1s. Latch, not a
 # consumable flag; see react_loop.ep.
-external define ep_cancel_epoch_bump with dummy returning Int
+external define ep_cancel_epoch_bump with dummy as Int returning Int
 
 set IPC_DAEMON_PORT to 5000
+set WEB_UI_PORT to 8088
+
+# The standard-library send_response currently overwrites the send result with
+# the close result. This checked variant preserves both errors and emits every
+# status used by the dashboard with the correct reason phrase.
+define web_send_response_checked with client_fd as Int and status_code as Int and content_type as Str and body as Str returning Int:
+    set reason to "500 Internal Server Error"
+    if status_code == 200:
+        set reason to "200 OK"
+    else if status_code == 400:
+        set reason to "400 Bad Request"
+    else if status_code == 401:
+        set reason to "401 Unauthorized"
+    else if status_code == 403:
+        set reason to "403 Forbidden"
+    else if status_code == 404:
+        set reason to "404 Not Found"
+    else if status_code == 405:
+        set reason to "405 Method Not Allowed"
+    else if status_code == 429:
+        set reason to "429 Too Many Requests"
+    else if status_code == 502:
+        set reason to "502 Bad Gateway"
+    set safe_content_type to string_replace(content_type and "\r" and "")
+    set safe_content_type to string_replace(safe_content_type and "\n" and "")
+    set response to concat("HTTP/1.1 " and concat(reason and "\r\nContent-Type: "))
+    set response to concat(response and safe_content_type)
+    set response to concat(response and concat("\r\nContent-Length: " and int_to_string(string_length(body))))
+    set response to concat(response and "\r\nConnection: close\r\n\r\n")
+    set response to concat(response and body)
+    set expected_length to string_length(response)
+    set sent_length to net_send(client_fd and response)
+    set close_error to net_close(client_fd)
+    if sent_length != expected_length:
+        display f"[-] HTTP response send failed on fd {client_fd}: sent {sent_length}/{expected_length} bytes."
+        if close_error != 0:
+            display f"[-] HTTP close also failed on fd {client_fd}: {close_error}."
+        return 0 - 1
+    if close_error != 0:
+        display f"[-] HTTP response close failed on fd {client_fd}: {close_error}."
+        return close_error
+    return 0
+
+define web_send_owned_binary_checked with client_fd as Int and header as Str and data_ptr as Int and data_len as Int returning Int:
+    set send_ok to tts_http_send_binary(client_fd and header and data_ptr and data_len)
+    set free_error to free_bytes(data_ptr)
+    set close_error to net_close(client_fd)
+    if send_ok == 0:
+        display f"[-] Binary HTTP response send failed on fd {client_fd}."
+        if free_error != 0:
+            display f"[-] Binary response buffer cleanup also failed: {free_error}."
+        if close_error != 0:
+            display f"[-] Binary response close also failed: {close_error}."
+        return 0 - 1
+    if free_error != 0:
+        display f"[-] Binary response buffer cleanup failed: {free_error}."
+        return free_error
+    if close_error != 0:
+        display f"[-] Binary response close failed: {close_error}."
+        return close_error
+    return 0
 
 define query_daemon_ipc with command as Str returning Str:
     # Connect to the local IPC daemon
@@ -42,7 +104,17 @@ define query_daemon_ipc with command as Str returning Str:
     # accepts the command. Same-user callers can read the token; cross-user/sandboxed
     # processes cannot, closing the unauthenticated-control-plane hole.
     set ipc_tok to ipc_read_token()
-    set ok to ep_net_send(fd and concat("AUTH " and concat(ipc_tok and concat(" " and command))))
+    if string_length(ipc_tok) == 0:
+        set close_result to ep_net_close(fd)
+        if close_result != 0:
+            display f"[-] IPC close after missing token returned {close_result}."
+        return "error:ipc_token_unavailable"
+    set send_result to ep_net_send(fd and concat("AUTH " and concat(ipc_tok and concat(" " and command))))
+    if send_result <= 0:
+        set close_result to ep_net_close(fd)
+        if close_result != 0:
+            display f"[-] IPC close after send failure returned {close_result}."
+        return "error:ipc_send_failed"
     # Loop until EOF to prevent partial TCP reads / truncation
     set resp to ""
     set reading to 1
@@ -52,7 +124,11 @@ define query_daemon_ipc with command as Str returning Str:
             set resp to concat(resp and chunk)
         else:
             set reading to 0
-    set ok to ep_net_close(fd)
+    set close_result to ep_net_close(fd)
+    if close_result != 0:
+        display f"[-] IPC close returned {close_result}."
+    if string_length(resp) == 0:
+        return "error:ipc_empty_response"
     return resp
 
 # Phase A3: detached turns answer via a `final_reply` trace row instead of the socket.
@@ -81,6 +157,8 @@ define web_wait_final_reply with sid as Str and turn_tag as Str returning Str:
                 set rid to get_list(r and 0)
                 set content to get_list(r and 1)
                 set ok to sql_execute(db and f"UPDATE trace_events SET sent=1 WHERE id={rid};")
+                if ok != 0:
+                    return "error:final_reply_delivery_state_persistence_failed"
                 if string_length(want) > 0:
                     if string_index_of(content and want) == 0:
                         set wlen to string_length(want)
@@ -161,6 +239,7 @@ define web_content_type_for with path as Str returning Str:
 define ws_drain_side_channel with client_fd as Int and session_id as Str returning Int:
     set db to storage_get_db()
     if db == 0:
+        display "[-] WebSocket side-channel drain failed: storage unavailable."
         return 1
     set es to string_replace(session_id and "'" and "''")
     set q to concat("SELECT id, event_type, content FROM trace_events WHERE sent=0 AND event_type IN ('attachment','mid_message','image_progress','subagent_spawn','subagent_complete','subagent_approval') AND session_id='" and concat(es and "' ORDER BY id;"))
@@ -177,28 +256,43 @@ define ws_drain_side_channel with client_fd as Int and session_id as Str returni
             if starts_with(web_content_type_for(content) and "image/") == 1:
                 set is_img to 1
             set amsg to concat("{\"type\":\"file_attached\",\"url\":\"/files/" and concat(rid and concat("\",\"name\":\"" and concat(escape_json_string(web_basename(content)) and concat("\",\"is_image\":" and concat(int_to_string(is_img) and "}"))))))
-            set ok to ws_send_text(client_fd and amsg)
+            set ok to websocket_send_server_text(client_fd and amsg)
         else if etype equals "image_progress":
             # Image generation progress — content is raw JSON: {"status":"...", ...}
             set ip_msg to concat("{\"type\":\"image_progress\",\"data\":" and concat(content and "}"))
-            set ok to ws_send_text(client_fd and ip_msg)
+            set ok to websocket_send_server_text(client_fd and ip_msg)
         else if etype equals "subagent_spawn":
             # Sub-agent spawned — content is JSON: {"task_id":"...","role":"...","instruction":"..."}
             set ss_msg to concat("{\"type\":\"subagent_spawn\",\"data\":" and concat(content and "}"))
-            set ok to ws_send_text(client_fd and ss_msg)
+            set ok to websocket_send_server_text(client_fd and ss_msg)
         else if etype equals "subagent_complete":
             # Sub-agent completed — content is JSON: {"task_id":"...","status":"...","result_summary":"..."}
             set sc_msg to concat("{\"type\":\"subagent_complete\",\"data\":" and concat(content and "}"))
-            set ok to ws_send_text(client_fd and sc_msg)
+            set ok to websocket_send_server_text(client_fd and sc_msg)
         else if etype equals "subagent_approval":
             # Sub-agent needs approval — content is JSON: {"task_id":"...","tool":"...","args":"...","description":"..."}
             set sa_msg to concat("{\"type\":\"subagent_approval\",\"data\":" and concat(content and "}"))
-            set ok to ws_send_text(client_fd and sa_msg)
+            set ok to websocket_send_server_text(client_fd and sa_msg)
         else:
             set mmsg to concat("{\"type\":\"mid_message\",\"text\":\"" and concat(escape_json_string(content) and "\"}"))
-            set ok to ws_send_text(client_fd and mmsg)
-        set ok to sql_execute(db and concat("UPDATE trace_events SET sent=1 WHERE id=" and concat(rid and ";")))
+            set ok to websocket_send_server_text(client_fd and mmsg)
+        if ok != 0:
+            set free_error to free_list(rows)
+            if free_error != 0:
+                display f"[-] Side-channel row cleanup also failed: {free_error}."
+            return ok
+        set sql_ok to sql_execute(db and concat("UPDATE trace_events SET sent=1 WHERE id=" and concat(rid and ";")))
+        if sql_ok != 0:
+            display f"[-] Failed to mark side-channel event {rid} as delivered."
+            set free_error to free_list(rows)
+            if free_error != 0:
+                display f"[-] Side-channel row cleanup also failed: {free_error}."
+            return 1
         set i to i + 1
+    set free_error to free_list(rows)
+    if free_error != 0:
+        display f"[-] Side-channel row cleanup failed: {free_error}."
+        return free_error
     return 0
 
 define ws_dispatch_ai_response with client_fd as Int and ai_resp as Str returning Int:
@@ -207,8 +301,12 @@ define ws_dispatch_ai_response with client_fd as Int and ai_resp as Str returnin
         # active" catch-all (which made a failed clarify/approve look like the whole AI
         # was down). The real daemon error string is shown so the failure is debuggable.
         set err_token to concat("Sorry — that request didn't go through: " and ai_resp)
-        ws_send_text(client_fd and concat("{\"type\":\"ai_token\",\"token\":\"" and concat(escape_json_string(err_token) and "\"}")))
-        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+        set send_result to websocket_send_server_text(client_fd and concat("{\"type\":\"ai_token\",\"token\":\"" and concat(escape_json_string(err_token) and "\"}")))
+        if send_result != 0:
+            return send_result
+        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"ai_complete\"}")
+        if send_result != 0:
+            return send_result
         return 0
     if string_contains(ai_resp and "ai:pending_approval") == 1:
         set p_tool to extract_ipc_field(ai_resp and "tool")
@@ -218,7 +316,9 @@ define ws_dispatch_ai_response with client_fd as Int and ai_resp as Str returnin
         set am to concat(am and "\",\"summary\":\"")
         set am to concat(am and escape_json_string(p_summary))
         set am to concat(am and "\"}")
-        ws_send_text(client_fd and am)
+        set send_result to websocket_send_server_text(client_fd and am)
+        if send_result != 0:
+            return send_result
         return 0
     if string_contains(ai_resp and "ai:clarify") == 1:
         # F3: questions is the trailing field and itself contains commas/colons, so
@@ -229,7 +329,9 @@ define ws_dispatch_ai_response with client_fd as Int and ai_resp as Str returnin
         set cm to "{\"type\":\"clarify\",\"questions\":\""
         set cm to concat(cm and escape_json_string(questions))
         set cm to concat(cm and "\"}")
-        ws_send_text(client_fd and cm)
+        set send_result to websocket_send_server_text(client_fd and cm)
+        if send_result != 0:
+            return send_result
         return 0
     # F1: optional base64 reasoning prefix -> forward as a separate collapsible message.
     if string_contains(ai_resp and "reasoning:") == 1:
@@ -241,7 +343,9 @@ define ws_dispatch_ai_response with client_fd as Int and ai_resp as Str returnin
             set rm to "{\"type\":\"reasoning\",\"b64\":\""
             set rm to concat(rm and escape_json_string(rb64))
             set rm to concat(rm and "\"}")
-            ws_send_text(client_fd and rm)
+            set send_result to websocket_send_server_text(client_fd and rm)
+            if send_result != 0:
+                return send_result
     set resp_pos to string_index_of(ai_resp and "|||RESPONSE|||")
     if resp_pos >= 0:
         set skip to resp_pos + 14
@@ -251,8 +355,12 @@ define ws_dispatch_ai_response with client_fd as Int and ai_resp as Str returnin
     set tm to "{\"type\":\"ai_token\",\"token\":\""
     set tm to concat(tm and escape_json_string(ai_text))
     set tm to concat(tm and "\"}")
-    ws_send_text(client_fd and tm)
-    ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+    set send_result to websocket_send_server_text(client_fd and tm)
+    if send_result != 0:
+        return send_result
+    set send_result to websocket_send_server_text(client_fd and "{\"type\":\"ai_complete\"}")
+    if send_result != 0:
+        return send_result
     return 0
 
 define extract_ipc_field with ipc_resp as Str and field_name as Str returning Str:
@@ -349,7 +457,7 @@ define url_is_safe_external with url as Str returning Int:
 define curl_get with url as Str and headers_str as Str returning Str:
     if url_is_safe_external(url) == 0:
         return "{\"error\":\"blocked: disallowed or internal URL (SSRF protection)\"}"
-    set cmd to "curl -s --max-redirs 0"
+    set cmd to "curl -sS -f --proto '=http,https' --max-redirs 0 --connect-timeout 10 --max-time 30"
     set headers_clean to string_replace(headers_str and "\r" and "")
     set parts to string_split(headers_clean and "\n")
     set count to length_list(parts)
@@ -363,58 +471,29 @@ define curl_get with url as Str and headers_str as Str returning Str:
     
     set url_escaped to string_replace(url and "'" and "'\\''")
     set cmd to concat(cmd and concat(" '" and concat(url_escaped and "'")))
-    
-    set res to run_command(cmd)
-    return res
+    set cmd to concat(cmd and "; printf '\n__ERNOS_EXIT__:%s' $?")
+    set raw to run_command(cmd)
+    set marker_pos to string_last_index_of(raw and "__ERNOS_EXIT__:0")
+    if marker_pos < 0:
+        return "{\"error\":\"external request failed\"}"
+    return substring(raw and 0 and marker_pos)
 
 define sanitize_reader_html with raw_html as Str returning Str:
-    set clean to raw_html
-
-    set lower_html to string_lower(clean)
-    set script_pos to string_index_of(lower_html and "<script")
-    repeat while script_pos >= 0:
-        set prefix to substring(clean and 0 and script_pos)
-        set suffix to substring(clean and script_pos + 7 and string_length(clean) - (script_pos + 7))
-        set clean to concat(prefix and concat("<x-script" and suffix))
-        set lower_html to string_lower(clean)
-        set script_pos to string_index_of(lower_html and "<script")
-
-    set lower_html to string_lower(clean)
-    set close_pos to string_index_of(lower_html and "</script>")
-    repeat while close_pos >= 0:
-        set prefix to substring(clean and 0 and close_pos)
-        set suffix to substring(clean and close_pos + 9 and string_length(clean) - (close_pos + 9))
-        set clean to concat(prefix and concat("</x-script>" and suffix))
-        set lower_html to string_lower(clean)
-        set close_pos to string_index_of(lower_html and "</script>")
-
-    set lower_html to string_lower(clean)
-    set iframe_pos to string_index_of(lower_html and "<iframe")
-    repeat while iframe_pos >= 0:
-        set prefix to substring(clean and 0 and iframe_pos)
-        set suffix to substring(clean and iframe_pos + 7 and string_length(clean) - (iframe_pos + 7))
-        set clean to concat(prefix and concat("<x-iframe" and suffix))
-        set lower_html to string_lower(clean)
-        set iframe_pos to string_index_of(lower_html and "<iframe")
-
-    set lower_html to string_lower(clean)
-    set close_pos to string_index_of(lower_html and "</iframe>")
-    repeat while close_pos >= 0:
-        set prefix to substring(clean and 0 and close_pos)
-        set suffix to substring(clean and close_pos + 10 and string_length(clean) - (close_pos + 10))
-        set clean to concat(prefix and concat("</x-iframe>" and suffix))
-        set lower_html to string_lower(clean)
-        set close_pos to string_index_of(lower_html and "</iframe>")
-
-    return clean
+    # The reader renders this document in an iframe with an empty sandbox attribute.
+    # This CSP is a second independent boundary: no scripts, frames, forms, plugins,
+    # navigation helpers, or network-loaded assets can execute from fetched content.
+    # Inline CSS and data images preserve readable page layout without giving the
+    # untrusted document access to the dashboard origin or the network.
+    set policy to "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; media-src data:; font-src data:; style-src 'unsafe-inline'; form-action 'none'; base-uri http: https:; frame-src 'none'; object-src 'none'\">"
+    return concat(policy and raw_html)
 
 define build_status_json with role as Str and did_val as Str and term as Str and peers as Str and dht_size as Str and is_static as Str and elect_enabled as Str and reg_name as Str and gitdec_updates as Str returning Str:
     set j to "{\"type\":\"status\",\"role\":\""
-    set j to concat(j and role)
+    set j to concat(j and escape_json_string(role))
     set j to concat(j and "\",\"term\":")
     set j to concat(j and term)
     set j to concat(j and ",\"did\":\"")
-    set j to concat(j and did_val)
+    set j to concat(j and escape_json_string(did_val))
     set j to concat(j and "\",\"peers\":")
     set j to concat(j and peers)
     set j to concat(j and ",\"dht_size\":")
@@ -424,34 +503,38 @@ define build_status_json with role as Str and did_val as Str and term as Str and
     set j to concat(j and ",\"enable_host_election\":")
     set j to concat(j and elect_enabled)
     set j to concat(j and ",\"name\":\"")
-    set j to concat(j and reg_name)
+    set j to concat(j and escape_json_string(reg_name))
     set j to concat(j and "\",\"gitdec_updates\":")
     set j to concat(j and gitdec_updates)
     set j to concat(j and "}")
     return j
 
-define websocket_session_loop with client_fd as Int and require_token as Int returning Int:
-    # Non-browser clients (no Origin header) must authenticate the WS the same way
-    # they authenticate IPC: the first frame must be {"type":"auth","token":<ipc-token>}.
-    # Browser clients are authenticated by the Origin allowlist instead (they cannot
-    # read the 0600 token file). This stops a non-same-user local process from using
-    # the WS as an unauthenticated bypass around the IPC token gate.
-    if require_token == 1:
-        set auth_frame to ws_read_frame(client_fd)
-        set provided to json_get_string(auth_frame and "token")
-        set expected to ipc_read_token()
-        if string_length(expected) == 0:
-            set ok to net_close(client_fd)
-            return 0
-        if provided equals expected:
-            display "[ws] first-frame token accepted (non-browser client)."
-        else:
-            display "[-] WS first-frame token missing/invalid; closing."
-            set ok to net_close(client_fd)
-            return 0
+define websocket_session_loop with client_fd as Int returning Int:
+    # Every client authenticates before a command is accepted. CLI/test clients may
+    # present the 0600 IPC token. Browser clients present the signed, expiring session
+    # returned by /api/login; Origin alone is never treated as authentication.
+    set auth_frame to websocket_read_client_text(client_fd)
+    set provided to json_get_string(auth_frame and "token")
+    set expected to ipc_read_token()
+    set authenticated to 0
+    if string_length(expected) > 0 and also provided equals expected:
+        set authenticated to 1
+    else:
+        set auth_did to json_get_string(auth_frame and "did")
+        set auth_issued to json_get_string(auth_frame and "issued_at")
+        set auth_expires to json_get_string(auth_frame and "expires_at")
+        set auth_nonce to json_get_string(auth_frame and "nonce")
+        set authenticated to authenticate_session_values(provided and auth_did and auth_issued and auth_expires and auth_nonce and NODE_PUBLIC_KEY)
+    if authenticated == 0:
+        display "[-] WS first-frame authentication failed; closing."
+        return 0 - 1
+    set auth_reply to websocket_send_server_text(client_fd and "{\"type\":\"auth_ok\"}")
+    if auth_reply != 0:
+        display "[-] WS authentication acknowledgement failed."
+        return auth_reply
     display "[*] WebSocket session active."
     repeat while 1 == 1:
-        set payload to ws_read_frame(client_fd)
+        set payload to websocket_read_client_text(client_fd)
         if string_length(payload) == 0:
             display "[*] WebSocket session closed by client."
             return 0
@@ -498,10 +581,14 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     if string_length(gitdec_updates) == 0:
                         set gitdec_updates to "0"
                     set resp to build_status_json(role and did_val and term and peers and dht_size and is_static and elect_enabled and reg_name and gitdec_updates)
-                    ws_send_text(client_fd and resp)
+                    set send_result to websocket_send_server_text(client_fd and resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_agent_memory":
                     set ipc_resp to query_daemon_ipc("AGENT GET MEMORY")
-                    ws_send_text(client_fd and ipc_resp)
+                    set send_result to websocket_send_server_text(client_fd and ipc_resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_ai_models":
                     set ipc_resp to query_daemon_ipc("AI MODELS")
                     if string_contains(ipc_resp and "error:") == 1:
@@ -510,13 +597,19 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set body to "{\"type\":\"ai_models\",\"models\":"
                         set body to concat(body and ipc_resp)
                         set body to concat(body and "}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_turing_grid":
                     set ipc_resp to query_daemon_ipc("AGENT GET GRID")
-                    ws_send_text(client_fd and ipc_resp)
+                    set send_result to websocket_send_server_text(client_fd and ipc_resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "decay_memory":
                     set ipc_resp to query_daemon_ipc("AGENT DECAY MEMORY")
-                    ws_send_text(client_fd and ipc_resp)
+                    set send_result to websocket_send_server_text(client_fd and ipc_resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "run_autonomy_agent":
                     set ipc_resp to query_daemon_ipc("AI AUTONOMY")
                     set resp_pos to string_index_of(ipc_resp and "response:")
@@ -529,8 +622,12 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set token_msg to "{\"type\":\"ai_token\",\"token\":\""
                     set token_msg to concat(token_msg and escaped_ai)
                     set token_msg to concat(token_msg and "\"}")
-                    ws_send_text(client_fd and token_msg)
-                    ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                    set send_result to websocket_send_server_text(client_fd and token_msg)
+                    if send_result != 0:
+                        return send_result
+                    set send_result to websocket_send_server_text(client_fd and "{\"type\":\"ai_complete\"}")
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_identity":
                     set ipc_resp to query_daemon_ipc("IDENTITY")
                     display f"[ws] IPC IDENTITY -> {ipc_resp}"
@@ -549,10 +646,14 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set id_json to concat(id_json and "\",\"name\":\"")
                     set id_json to concat(id_json and reg_name)
                     set id_json to concat(id_json and "\"}")
-                    ws_send_text(client_fd and id_json)
+                    set send_result to websocket_send_server_text(client_fd and id_json)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_storage":
                     set ipc_resp to query_daemon_ipc("STORAGE STATUS")
-                    ws_send_text(client_fd and ipc_resp)
+                    set send_result to websocket_send_server_text(client_fd and ipc_resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_pool":
                     set ipc_resp to query_daemon_ipc("POOL STATUS")
                     display f"[ws] IPC POOL -> {ipc_resp}"
@@ -572,7 +673,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set body to concat(body and "\",\"compute_slots\":")
                     set body to concat(body and compute)
                     set body to concat(body and "}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_network":
                     set ipc_resp to query_daemon_ipc("NET STATUS")
                     display f"[ws] IPC NET -> {ipc_resp}"
@@ -587,7 +690,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set body to concat(body and "\",\"active_circuits\":")
                     set body to concat(body and active_circuits)
                     set body to concat(body and "}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "ai_prompt":
                     set prompt to json_get_string(payload and "prompt")
                     set system_prompt to json_get_string(payload and "system")
@@ -628,9 +733,13 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set ai_cmd to concat(ai_cmd and prompt)
                     set ai_resp to web_resolve_ai_response(query_daemon_ipc(ai_cmd))
                     display f"[ws] IPC AI -> {ai_resp}"
-                    set ok to ws_dispatch_ai_response(client_fd and ai_resp)
+                    set dispatch_error to ws_dispatch_ai_response(client_fd and ai_resp)
+                    if dispatch_error != 0:
+                        return dispatch_error
                     # WebUI parity: deliver any files the agent attached + mid_messages.
-                    set ok to ws_drain_side_channel(client_fd and ws_active_sess)
+                    set drain_error to ws_drain_side_channel(client_fd and ws_active_sess)
+                    if drain_error != 0:
+                        return drain_error
                 else if msg_type equals "run_ep":
                     # Learning playground: compile + run the learner's snippet in the
                     # OS sandbox (no network, scratch-only FS, time/CPU caps) and return
@@ -638,21 +747,29 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set rep_code to json_get_string(payload and "code")
                     set rep_out to run_ep_code(rep_code)
                     set rep_msg to concat("{\"type\":\"run_ep_result\",\"output\":\"" and concat(escape_json_string(rep_out) and "\"}"))
-                    ws_send_text(client_fd and rep_msg)
+                    set send_result to websocket_send_server_text(client_fd and rep_msg)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "lessons_list":
                     set ll_json to tutor_lesson_list_json()
                     set ll_msg to concat("{\"type\":\"lessons_list_result\",\"items\":" and concat(ll_json and "}"))
-                    ws_send_text(client_fd and ll_msg)
+                    set send_result to websocket_send_server_text(client_fd and ll_msg)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_access":
                     set acc_on to access_full_pc_on()
-                    ws_send_text(client_fd and concat("{\"type\":\"access_state\",\"full_pc\":" and concat(int_to_string(acc_on) and "}")))
+                    set send_result to websocket_send_server_text(client_fd and concat("{\"type\":\"access_state\",\"full_pc\":" and concat(int_to_string(acc_on) and "}")))
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "set_access":
                     # The WebUI is the authenticated local operator (Origin/loopback-gated),
                     # so toggling Full-PC access here is admin-authorised.
                     set acc_val to json_get_string(payload and "full_pc")
                     set sok to access_set_full_pc(string_to_int(acc_val))
                     set acc_now to access_full_pc_on()
-                    ws_send_text(client_fd and concat("{\"type\":\"access_state\",\"full_pc\":" and concat(int_to_string(acc_now) and "}")))
+                    set send_result to websocket_send_server_text(client_fd and concat("{\"type\":\"access_state\",\"full_pc\":" and concat(int_to_string(acc_now) and "}")))
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "seed_curriculum":
                     set sc_res to tutor_seed_curriculum()
                     # Also index the ErnosPlain reference corpus so the tutor's
@@ -660,14 +777,18 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set sc_ref to tutor_index_reference()
                     set sc_full to concat(sc_res and concat("  |  " and sc_ref))
                     set sc_msg to concat("{\"type\":\"seed_result\",\"message\":\"" and concat(escape_json_string(sc_full) and "\"}"))
-                    ws_send_text(client_fd and sc_msg)
+                    set send_result to websocket_send_server_text(client_fd and sc_msg)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "clarify_answer":
                     # F3: the user answered the agent's clarifying question(s) (or chose
                     # "work with what we have" -> answers == "__USE_CURRENT__"). Resume.
                     set answers to json_get_string(payload and "answers")
                     set clarify_resp to web_resolve_ai_response(query_daemon_ipc(concat("AI CLARIFY " and answers)))
                     display f"[ws] IPC AI CLARIFY -> {clarify_resp}"
-                    set ok to ws_dispatch_ai_response(client_fd and clarify_resp)
+                    set dispatch_error to ws_dispatch_ai_response(client_fd and clarify_resp)
+                    if dispatch_error != 0:
+                        return dispatch_error
                 else if msg_type equals "tool_approve":
                     # User approved a pending tool — relay to daemon
                     set approve_resp to web_resolve_ai_response(query_daemon_ipc("AI APPROVE"))
@@ -681,11 +802,17 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set approval_msg to concat(approval_msg and "\",\"summary\":\"")
                         set approval_msg to concat(approval_msg and escape_json_string(p_summary))
                         set approval_msg to concat(approval_msg and "\"}")
-                        ws_send_text(client_fd and approval_msg)
+                        set send_result to websocket_send_server_text(client_fd and approval_msg)
+                        if send_result != 0:
+                            return send_result
                     else if string_contains(approve_resp and "error:") == 1:
                         set err_msg to "{\"type\":\"ai_token\",\"token\":\"Error processing approval. \"}"
-                        ws_send_text(client_fd and err_msg)
-                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        set send_result to websocket_send_server_text(client_fd and err_msg)
+                        if send_result != 0:
+                            return send_result
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
                         set resp_pos to string_index_of(approve_resp and "response:")
                         if resp_pos >= 0:
@@ -697,8 +824,12 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set token_msg to "{\"type\":\"ai_token\",\"token\":\""
                         set token_msg to concat(token_msg and escaped_ai)
                         set token_msg to concat(token_msg and "\"}")
-                        ws_send_text(client_fd and token_msg)
-                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        set send_result to websocket_send_server_text(client_fd and token_msg)
+                        if send_result != 0:
+                            return send_result
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "tool_approve_all":
                     # User approved all pending tools — relay to daemon
                     set approve_resp to web_resolve_ai_response(query_daemon_ipc("AI APPROVE_ALL"))
@@ -711,11 +842,17 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set approval_msg to concat(approval_msg and "\",\"summary\":\"")
                         set approval_msg to concat(approval_msg and escape_json_string(p_summary))
                         set approval_msg to concat(approval_msg and "\"}")
-                        ws_send_text(client_fd and approval_msg)
+                        set send_result to websocket_send_server_text(client_fd and approval_msg)
+                        if send_result != 0:
+                            return send_result
                     else if string_contains(approve_resp and "error:") == 1:
                         set err_msg to "{\"type\":\"ai_token\",\"token\":\"Error processing approval. \"}"
-                        ws_send_text(client_fd and err_msg)
-                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        set send_result to websocket_send_server_text(client_fd and err_msg)
+                        if send_result != 0:
+                            return send_result
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
                         set resp_pos to string_index_of(approve_resp and "response:")
                         if resp_pos >= 0:
@@ -727,8 +864,12 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set token_msg to "{\"type\":\"ai_token\",\"token\":\""
                         set token_msg to concat(token_msg and escaped_ai)
                         set token_msg to concat(token_msg and "\"}")
-                        ws_send_text(client_fd and token_msg)
-                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        set send_result to websocket_send_server_text(client_fd and token_msg)
+                        if send_result != 0:
+                            return send_result
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "tool_deny":
                     # User denied a pending tool — relay to daemon
                     set deny_resp to web_resolve_ai_response(query_daemon_ipc("AI DENY"))
@@ -741,11 +882,17 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set approval_msg to concat(approval_msg and "\",\"summary\":\"")
                         set approval_msg to concat(approval_msg and escape_json_string(p_summary))
                         set approval_msg to concat(approval_msg and "\"}")
-                        ws_send_text(client_fd and approval_msg)
+                        set send_result to websocket_send_server_text(client_fd and approval_msg)
+                        if send_result != 0:
+                            return send_result
                     else if string_contains(deny_resp and "error:") == 1:
                         set err_msg to "{\"type\":\"ai_token\",\"token\":\"Tool denied. \"}"
-                        ws_send_text(client_fd and err_msg)
-                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        set send_result to websocket_send_server_text(client_fd and err_msg)
+                        if send_result != 0:
+                            return send_result
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
                         set resp_pos to string_index_of(deny_resp and "response:")
                         if resp_pos >= 0:
@@ -757,8 +904,12 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set token_msg to "{\"type\":\"ai_token\",\"token\":\""
                         set token_msg to concat(token_msg and escaped_ai)
                         set token_msg to concat(token_msg and "\"}")
-                        ws_send_text(client_fd and token_msg)
-                        ws_send_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        set send_result to websocket_send_server_text(client_fd and token_msg)
+                        if send_result != 0:
+                            return send_result
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"ai_complete\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "send_chat":
                     set text to json_get_string(payload and "text")
                     set msg_cmd to concat("MSG SEND " and text)
@@ -768,13 +919,17 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set chat_resp to "{\"type\":\"chat_msg\",\"sender\":\"system\",\"text\":\"Messaging subsystem not available.\"}"
                     else:
                         set chat_resp to "{\"type\":\"chat_msg\",\"sender\":\"system\",\"text\":\"Message sent.\"}"
-                    ws_send_text(client_fd and chat_resp)
+                    set send_result to websocket_send_server_text(client_fd and chat_resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "tts_request":
                     # Synthesise the given text to a WAV (Kokoro, voice bm_fable @1.15x)
                     # and reply with a URL the browser fetches via GET /tts/<file>.wav.
                     set tts_text to json_get_string(payload and "text")
                     if string_length(tts_text) == 0:
-                        ws_send_text(client_fd and "{\"type\":\"tts_error\",\"error\":\"empty text\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"tts_error\",\"error\":\"empty text\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
                         set tts_name to tts_filename_for(tts_text)
                         set tts_path to concat("decent_web/tts/" and tts_name)
@@ -783,9 +938,13 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         if file_exists(tts_path) == 0:
                             set tts_rc to tts_speak(tts_text and tts_path)
                         if tts_rc == 0 and also file_exists(tts_path) == 1:
-                            ws_send_text(client_fd and concat("{\"type\":\"tts_ready\",\"url\":\"" and concat(escape_json_string(tts_url) and "\"}")))
+                            set send_result to websocket_send_server_text(client_fd and concat("{\"type\":\"tts_ready\",\"url\":\"" and concat(escape_json_string(tts_url) and "\"}")))
+                            if send_result != 0:
+                                return send_result
                         else:
-                            ws_send_text(client_fd and concat("{\"type\":\"tts_error\",\"error\":\"" and concat(escape_json_string(concat("TTS failed (rc=" and concat(int_to_string(tts_rc) and ")"))) and "\"}")))
+                            set send_result to websocket_send_server_text(client_fd and concat("{\"type\":\"tts_error\",\"error\":\"" and concat(escape_json_string(concat("TTS failed (rc=" and concat(int_to_string(tts_rc) and ")"))) and "\"}")))
+                            if send_result != 0:
+                                return send_result
                 else if msg_type equals "subagent_whisper":
                     # Send mid-turn guidance to a running sub-agent via trace_whispers.
                     # The sub-agent's react_drain_whispers picks it up on its next turn.
@@ -798,11 +957,20 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                             set sw_ec to string_replace(sw_msg and "'" and "''")
                             set sw_now to ep_time_now_sec()
                             set ok to sql_execute(sw_db and f"INSERT INTO trace_whispers (session_id, content, created_at) VALUES ('{sw_es}', '{sw_ec}', {sw_now});")
-                            ws_send_text(client_fd and concat("{\"type\":\"whisper_ack\",\"task_id\":\"" and concat(escape_json_string(sw_tid) and "\"}")))
+                            if ok == 0:
+                                set send_result to websocket_send_server_text(client_fd and concat("{\"type\":\"whisper_ack\",\"task_id\":\"" and concat(escape_json_string(sw_tid) and "\"}")))
+                            else:
+                                set send_result to websocket_send_server_text(client_fd and "{\"type\":\"whisper_ack\",\"error\":\"persistence_failed\"}")
+                            if send_result != 0:
+                                return send_result
                         else:
-                            ws_send_text(client_fd and "{\"type\":\"whisper_ack\",\"error\":\"db_unavailable\"}")
+                            set send_result to websocket_send_server_text(client_fd and "{\"type\":\"whisper_ack\",\"error\":\"db_unavailable\"}")
+                            if send_result != 0:
+                                return send_result
                     else:
-                        ws_send_text(client_fd and "{\"type\":\"whisper_ack\",\"error\":\"missing_task_id_or_message\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"whisper_ack\",\"error\":\"missing_task_id_or_message\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "subagent_approve":
                     # Approve/deny a sub-agent's pending tool call.
                     # Routes to AI APPROVE [AGENT:<task_id>] [DECISION:<yes|no>] IPC.
@@ -812,9 +980,16 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set sa_cmd to concat("AI APPROVE [AGENT:" and concat(sa_tid and concat("] [DECISION:" and concat(sa_dec and "]"))))
                         set sa_resp to query_daemon_ipc(sa_cmd)
                         display f"[ws] IPC AI APPROVE sub-agent -> {sa_resp}"
-                        ws_send_text(client_fd and concat("{\"type\":\"approve_ack\",\"task_id\":\"" and concat(escape_json_string(sa_tid) and concat("\",\"decision\":\"" and concat(escape_json_string(sa_dec) and "\"}")))))                        
+                        if string_contains(sa_resp and "ai:error") == 1:
+                            set send_result to websocket_send_server_text(client_fd and concat("{\"type\":\"approve_ack\",\"error\":\"" and concat(escape_json_string(sa_resp) and "\"}")))
+                        else:
+                            set send_result to websocket_send_server_text(client_fd and concat("{\"type\":\"approve_ack\",\"task_id\":\"" and concat(escape_json_string(sa_tid) and concat("\",\"decision\":\"" and concat(escape_json_string(sa_dec) and "\"}")))))
+                        if send_result != 0:
+                            return send_result
                     else:
-                        ws_send_text(client_fd and "{\"type\":\"approve_ack\",\"error\":\"missing_task_id\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"approve_ack\",\"error\":\"missing_task_id\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "transfer":
                     set amount to json_get_string(payload and "amount")
                     set to_addr to json_get_string(payload and "to")
@@ -830,7 +1005,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set wr to "{\"type\":\"wallet\",\"balance\":\""
                     set wr to concat(wr and balance)
                     set wr to concat(wr and "\"}")
-                    ws_send_text(client_fd and wr)
+                    set send_result to websocket_send_server_text(client_fd and wr)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "swap":
                     set from_token to json_get_string(payload and "from_token")
                     set to_token to json_get_string(payload and "to_token")
@@ -847,9 +1024,13 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set sr to "{\"type\":\"swap_result\",\"success\":false,\"reason\":\""
                         set sr to concat(sr and swap_reason)
                         set sr to concat(sr and "\"}")
-                        ws_send_text(client_fd and sr)
+                        set send_result to websocket_send_server_text(client_fd and sr)
+                        if send_result != 0:
+                            return send_result
                     else:
-                        ws_send_text(client_fd and "{\"type\":\"swap_result\",\"success\":true}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"swap_result\",\"success\":true}")
+                        if send_result != 0:
+                            return send_result
                     set bal_resp to query_daemon_ipc("WALLET BALANCE")
                     set balance to extract_ipc_field(bal_resp and "wallet_balance")
                     if string_length(balance) == 0:
@@ -857,7 +1038,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set wr to "{\"type\":\"wallet\",\"balance\":\""
                     set wr to concat(wr and balance)
                     set wr to concat(wr and "\"}")
-                    ws_send_text(client_fd and wr)
+                    set send_result to websocket_send_server_text(client_fd and wr)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "dht_store":
                     set dht_key to json_get_string(payload and "key")
                     set dht_value to json_get_string(payload and "value")
@@ -867,9 +1050,11 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set dht_resp to query_daemon_ipc(dht_cmd)
                     display f"[ws] IPC DHT STORE -> {dht_resp}"
                     set body to "{\"type\":\"dht_result\",\"action\":\"store\",\"key\":\""
-                    set body to concat(body and dht_key)
+                    set body to concat(body and escape_json_string(dht_key))
                     set body to concat(body and "\",\"status\":\"stored\"}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "dht_get":
                     set dht_key to json_get_string(payload and "key")
                     set dht_cmd to concat("DHT GET " and dht_key)
@@ -878,15 +1063,17 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set dht_val to extract_ipc_field(dht_resp and "value")
                     if string_length(dht_val) > 0:
                         set body to "{\"type\":\"dht_result\",\"action\":\"get\",\"key\":\""
-                        set body to concat(body and dht_key)
+                        set body to concat(body and escape_json_string(dht_key))
                         set body to concat(body and "\",\"value\":\"")
-                        set body to concat(body and dht_val)
+                        set body to concat(body and escape_json_string(dht_val))
                         set body to concat(body and "\",\"found\":true}")
                     else:
                         set body to "{\"type\":\"dht_result\",\"action\":\"get\",\"key\":\""
-                        set body to concat(body and dht_key)
+                        set body to concat(body and escape_json_string(dht_key))
                         set body to concat(body and "\",\"found\":false}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "name_register":
                     set reg_name to json_get_string(payload and "name")
                     set reg_cmd to concat("NAME REGISTER " and reg_name)
@@ -895,15 +1082,17 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set reg_did to extract_ipc_field(reg_resp and "did")
                     if string_length(reg_did) > 0:
                         set body to "{\"type\":\"name_result\",\"action\":\"register\",\"name\":\""
-                        set body to concat(body and reg_name)
+                        set body to concat(body and escape_json_string(reg_name))
                         set body to concat(body and "\",\"did\":\"")
-                        set body to concat(body and reg_did)
+                        set body to concat(body and escape_json_string(reg_did))
                         set body to concat(body and "\",\"success\":true}")
                     else:
                         set body to "{\"type\":\"name_result\",\"action\":\"register\",\"name\":\""
-                        set body to concat(body and reg_name)
+                        set body to concat(body and escape_json_string(reg_name))
                         set body to concat(body and "\",\"success\":false}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "name_resolve":
                     set res_name to json_get_string(payload and "name")
                     set res_cmd to concat("NAME RESOLVE " and res_name)
@@ -912,24 +1101,25 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set res_did to extract_ipc_field(res_resp and "did")
                     if string_length(res_did) > 0:
                         set body to "{\"type\":\"name_result\",\"action\":\"resolve\",\"name\":\""
-                        set body to concat(body and res_name)
+                        set body to concat(body and escape_json_string(res_name))
                         set body to concat(body and "\",\"did\":\"")
-                        set body to concat(body and res_did)
+                        set body to concat(body and escape_json_string(res_did))
                         set body to concat(body and "\",\"found\":true}")
                     else:
                         set body to "{\"type\":\"name_result\",\"action\":\"resolve\",\"name\":\""
-                        set body to concat(body and res_name)
+                        set body to concat(body and escape_json_string(res_name))
                         set body to concat(body and "\",\"found\":false}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "onion_search":
-                    set engine to json_get_string(payload and "engine")
                     set query to json_get_string(payload and "query")
-                    set search_cmd to concat("ONION SEARCH " and engine)
-                    set search_cmd to concat(search_cmd and " ")
-                    set search_cmd to concat(search_cmd and query)
+                    set search_cmd to concat("ONION SEARCH " and query)
                     set search_resp to query_daemon_ipc(search_cmd)
                     display f"[ws] IPC ONION SEARCH -> {search_resp}"
-                    ws_send_text(client_fd and search_resp)
+                    set send_result to websocket_send_server_text(client_fd and search_resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "onion_view":
                     set view_url to json_get_string(payload and "url")
                     set tab_id to json_get_string(payload and "tabId")
@@ -949,7 +1139,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set body to concat(body and "\",\"html\":\"")
                     set body to concat(body and escaped_html)
                     set body to concat(body and "\"}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_wallet":
                     set bal_resp to query_daemon_ipc("WALLET BALANCE")
                     display f"[ws] IPC WALLET -> {bal_resp}"
@@ -959,14 +1151,18 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set wr to "{\"type\":\"wallet\",\"balance\":\""
                     set wr to concat(wr and balance)
                     set wr to concat(wr and "\"}")
-                    ws_send_text(client_fd and wr)
+                    set send_result to websocket_send_server_text(client_fd and wr)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "session_list":
                     set ipc_resp to query_daemon_ipc("SESSION LIST")
                     set list_json to extract_ipc_json_data(ipc_resp)
                     set body to "{\"type\":\"session_list\",\"sessions\":"
                     set body to concat(body and list_json)
                     set body to concat(body and "}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "session_get_active":
                     set ipc_resp to query_daemon_ipc("SESSION ACTIVE")
                     set sess_id to "default"
@@ -977,7 +1173,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set body to "{\"type\":\"session_active_id\",\"id\":\""
                     set body to concat(body and sess_id)
                     set body to concat(body and "\"}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "session_new":
                     set s_id to json_get_string(payload and "id")
                     set s_title to json_get_string(payload and "title")
@@ -996,7 +1194,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set body to "{\"type\":\"session_new_result\",\"success\":true,\"id\":\""
                     set body to concat(body and s_id)
                     set body to concat(body and "\"}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "session_switch":
                     set s_id to json_get_string(payload and "id")
                     set ipc_resp to query_daemon_ipc(concat("SESSION SET " and s_id))
@@ -1005,7 +1205,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set body to "{\"type\":\"session_active\",\"session\":"
                     set body to concat(body and sess_json)
                     set body to concat(body and "}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "session_update_model":
                     set s_id to json_get_string(payload and "id")
                     set s_model to json_get_string(payload and "model")
@@ -1018,7 +1220,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set body to "{\"type\":\"session_update_model_result\",\"success\":true,\"id\":\""
                     set body to concat(body and s_id)
                     set body to concat(body and "\"}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "session_rename":
                     set s_id to json_get_string(payload and "id")
                     set s_title to json_get_string(payload and "title")
@@ -1031,14 +1235,18 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set body to "{\"type\":\"session_rename_result\",\"success\":true,\"id\":\""
                     set body to concat(body and s_id)
                     set body to concat(body and "\"}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "session_delete":
                     set s_id to json_get_string(payload and "id")
                     set ipc_resp to query_daemon_ipc(concat("SESSION DELETE " and s_id))
                     set body to "{\"type\":\"session_delete_result\",\"success\":true,\"id\":\""
                     set body to concat(body and s_id)
                     set body to concat(body and "\"}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "session_get":
                     set s_id to json_get_string(payload and "id")
                     set get_resp to query_daemon_ipc(concat("SESSION GET " and s_id))
@@ -1046,7 +1254,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set body to "{\"type\":\"session_details\",\"session\":"
                     set body to concat(body and sess_json)
                     set body to concat(body and "}")
-                    ws_send_text(client_fd and body)
+                    set send_result to websocket_send_server_text(client_fd and body)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_platforms":
                     set plat_data to ""
                     if file_exists("config/platforms.json") == 1:
@@ -1056,13 +1266,28 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set resp to "{\"type\":\"platforms\",\"data\":"
                     set resp to concat(resp and plat_data)
                     set resp to concat(resp and "}")
-                    ws_send_text(client_fd and resp)
+                    set send_result to websocket_send_server_text(client_fd and resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "save_platforms":
                     set plat_data to json_get_string(payload and "data")
-                    set ok to write_file("config/platforms.json" and plat_data)
-                    set run_res to run_command("python3 decent_net/discord_manager.py")
+                    set write_ok to write_file("config/platforms.json" and plat_data)
+                    if write_ok == 0:
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"platforms_saved\",\"success\":false,\"error\":\"write_failed\"}")
+                        if send_result != 0:
+                            return send_result
+                        continue
+                    set run_res to run_command("python3 decent_net/discord_manager.py 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+                    if string_contains(run_res and "__ERNOS_EXIT__:0") == 0:
+                        set run_error to escape_json_string(run_res)
+                        set send_result to websocket_send_server_text(client_fd and concat("{\"type\":\"platforms_saved\",\"success\":false,\"error\":\"" and concat(run_error and "\"}")))
+                        if send_result != 0:
+                            return send_result
+                        continue
                     set resp to "{\"type\":\"platforms_saved\",\"success\":true}"
-                    ws_send_text(client_fd and resp)
+                    set send_result to websocket_send_server_text(client_fd and resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_plugins":
                     set plug_data to ""
                     if file_exists("config/plugins.json") == 1:
@@ -1072,12 +1297,21 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set resp to "{\"type\":\"plugins\",\"data\":"
                     set resp to concat(resp and plug_data)
                     set resp to concat(resp and "}")
-                    ws_send_text(client_fd and resp)
+                    set send_result to websocket_send_server_text(client_fd and resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "save_plugins":
                     set plug_data to json_get_string(payload and "data")
-                    set ok to write_file("config/plugins.json" and plug_data)
+                    set write_ok to write_file("config/plugins.json" and plug_data)
+                    if write_ok == 0:
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"plugins_saved\",\"success\":false,\"error\":\"write_failed\"}")
+                        if send_result != 0:
+                            return send_result
+                        continue
                     set resp to "{\"type\":\"plugins_saved\",\"success\":true}"
-                    ws_send_text(client_fd and resp)
+                    set send_result to websocket_send_server_text(client_fd and resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_prompts":
                     set prompt_data to ""
                     if file_exists(edition_prompts_path()) == 1:
@@ -1087,28 +1321,52 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set resp to "{\"type\":\"prompts\",\"data\":"
                     set resp to concat(resp and prompt_data)
                     set resp to concat(resp and "}")
-                    ws_send_text(client_fd and resp)
+                    set send_result to websocket_send_server_text(client_fd and resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "save_prompts":
                     set prompt_data to json_get_string(payload and "data")
-                    set ok to write_file(edition_prompts_path() and prompt_data)
+                    set write_ok to write_file(edition_prompts_path() and prompt_data)
+                    if write_ok == 0:
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"prompts_saved\",\"success\":false,\"error\":\"prompt_write_failed\"}")
+                        if send_result != 0:
+                            return send_result
+                        continue
                     set root to json_parse(prompt_data)
                     if root != 0:
                         set node to get_json_object_value(root and "persona")
                         if node != 0:
                             set persona_val to get_json_value(node)
-                            set ok to write_file(edition_persona_path() and persona_val)
+                            set persona_write_ok to write_file(edition_persona_path() and persona_val)
+                            if persona_write_ok == 0:
+                                set send_result to websocket_send_server_text(client_fd and "{\"type\":\"prompts_saved\",\"success\":false,\"error\":\"persona_write_failed\"}")
+                                if send_result != 0:
+                                    return send_result
+                                continue
                     set resp to "{\"type\":\"prompts_saved\",\"success\":true}"
-                    ws_send_text(client_fd and resp)
+                    set send_result to websocket_send_server_text(client_fd and resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "get_system_config":
                     set home to get_home_dir()
                     set cfg_path to concat(home and "/.ernosdecent/config.toml")
                     set cfg to config_load(cfg_path)
+                    if map_contains(cfg and "config.error") == 1:
+                        set cfg_error to escape_json_string(ptr_to_str(map_get_val(cfg and "config.error")))
+                        set send_error to websocket_send_server_text(client_fd and concat("{\"type\":\"system_config_error\",\"message\":\"" and concat(cfg_error and "\"}")))
+                        set free_error to free_map(cfg)
+                        if send_error != 0:
+                            return send_error
+                        if free_error != 0:
+                            display f"[-] System configuration map cleanup failed: {free_error}."
+                            return free_error
+                        continue
                     
                     set resp to "{\"type\":\"system_config\",\"data\":{"
-                    set resp to concat(resp and concat("\"node_name\":\"" and concat(config_get_str(cfg and "node.name") and "\",")))
-                    set resp to concat(resp and concat("\"node_data_dir\":\"" and concat(config_get_str(cfg and "node.data_dir") and "\",")))
-                    set resp to concat(resp and concat("\"node_log_level\":\"" and concat(config_get_str(cfg and "node.log_level") and "\",")))
-                    set resp to concat(resp and concat("\"network_listen_address\":\"" and concat(config_get_str(cfg and "network.listen_address") and "\",")))
+                    set resp to concat(resp and concat("\"node_name\":\"" and concat(escape_json_string(config_get_str(cfg and "node.name")) and "\",")))
+                    set resp to concat(resp and concat("\"node_data_dir\":\"" and concat(escape_json_string(config_get_str(cfg and "node.data_dir")) and "\",")))
+                    set resp to concat(resp and concat("\"node_log_level\":\"" and concat(escape_json_string(config_get_str(cfg and "node.log_level")) and "\",")))
+                    set resp to concat(resp and concat("\"network_listen_address\":\"" and concat(escape_json_string(config_get_str(cfg and "network.listen_address")) and "\",")))
                     set resp to concat(resp and concat("\"network_p2p_port\":" and concat(int_to_string(config_get_int(cfg and "network.p2p_port")) and ",")))
                     set resp to concat(resp and concat("\"network_dht_port\":" and concat(int_to_string(config_get_int(cfg and "network.dht_port")) and ",")))
                     set resp to concat(resp and concat("\"network_relay_port\":" and concat(int_to_string(config_get_int(cfg and "network.relay_port")) and ",")))
@@ -1116,7 +1374,8 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set resp to concat(resp and concat("\"network_web_port\":" and concat(int_to_string(config_get_int(cfg and "network.web_port")) and ",")))
                     set resp to concat(resp and concat("\"network_max_connections\":" and concat(int_to_string(config_get_int(cfg and "network.max_connections")) and ",")))
                     set resp to concat(resp and concat("\"network_max_message_size\":" and concat(int_to_string(config_get_int(cfg and "network.max_message_size")) and ",")))
-                    set resp to concat(resp and concat("\"network_seed_addr\":\"" and concat(config_get_str(cfg and "network.seed_addr") and "\",")))
+                    set resp to concat(resp and concat("\"network_public_host\":\"" and concat(escape_json_string(config_get_str(cfg and "network.public_host")) and "\",")))
+                    set resp to concat(resp and concat("\"network_seed_addr\":\"" and concat(escape_json_string(config_get_str(cfg and "network.seed_addr")) and "\",")))
                     set resp to concat(resp and concat("\"network_seed_port\":" and concat(int_to_string(config_get_int(cfg and "network.seed_port")) and ",")))
                     set resp to concat(resp and concat("\"network_enable_host_election\":" and concat(int_to_string(config_get_int(cfg and "network.enable_host_election")) and ",")))
                     set resp to concat(resp and concat("\"network_is_static_host\":" and concat(int_to_string(config_get_int(cfg and "network.is_static_host")) and ",")))
@@ -1127,56 +1386,106 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set resp to concat(resp and concat("\"security_ban_threshold\":" and concat(int_to_string(config_get_int(cfg and "security.ban_threshold")) and ",")))
                     set resp to concat(resp and concat("\"security_ban_duration_sec\":" and concat(int_to_string(config_get_int(cfg and "security.ban_duration_sec")) and ",")))
                     set resp to concat(resp and concat("\"storage_max_content_size\":" and concat(int_to_string(config_get_int(cfg and "storage.max_content_size")) and ",")))
-                    set resp to concat(resp and concat("\"storage_dht_ttl_sec\":" and concat(int_to_string(config_get_int(cfg and "storage.dht_ttl_sec")) and "}}}")))
+                    set resp to concat(resp and concat("\"storage_dht_ttl_sec\":" and concat(int_to_string(config_get_int(cfg and "storage.dht_ttl_sec")) and "}}")))
                     
-                    ws_send_text(client_fd and resp)
+                    set send_result to websocket_send_server_text(client_fd and resp)
+                    set free_error to free_map(cfg)
+                    if send_result != 0:
+                        return send_result
+                    if free_error != 0:
+                        display f"[-] System configuration map cleanup failed: {free_error}."
+                        return free_error
                 else if msg_type equals "save_system_config":
                     set sys_data_json to json_get_string(payload and "data")
                     set root to json_parse(sys_data_json)
+                    set save_ok to 0
                     if root != 0:
                         set home to get_home_dir()
                         set cfg_path to concat(home and "/.ernosdecent/config.toml")
                         set cfg to config_load(cfg_path)
+                        if map_contains(cfg and "config.error") == 1:
+                            set cfg_error to escape_json_string(ptr_to_str(map_get_val(cfg and "config.error")))
+                            set send_error to websocket_send_server_text(client_fd and concat("{\"type\":\"system_config_error\",\"message\":\"" and concat(cfg_error and "\"}")))
+                            set free_error to free_map(cfg)
+                            if send_error != 0:
+                                return send_error
+                            if free_error != 0:
+                                display f"[-] System configuration map cleanup failed: {free_error}."
+                                return free_error
+                            continue
+                        set update_ok to 1
+                        if web_server_update_config_str(cfg and root and "node_name" and "node.name") == 0:
                         
-                        set ok to web_server_update_config_str(cfg and root and "node_name" and "node.name")
-                        set ok to web_server_update_config_str(cfg and root and "node_data_dir" and "node.data_dir")
-                        set ok to web_server_update_config_str(cfg and root and "node_log_level" and "node.log_level")
+                            set update_ok to 0
+                        if web_server_update_config_str(cfg and root and "node_data_dir" and "node.data_dir") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_str(cfg and root and "node_log_level" and "node.log_level") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_str(cfg and root and "network_listen_address" and "network.listen_address") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_p2p_port" and "network.p2p_port") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_dht_port" and "network.dht_port") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_relay_port" and "network.relay_port") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_ipc_port" and "network.ipc_port") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_web_port" and "network.web_port") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_max_connections" and "network.max_connections") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_max_message_size" and "network.max_message_size") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_str(cfg and root and "network_public_host" and "network.public_host") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_str(cfg and root and "network_seed_addr" and "network.seed_addr") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_seed_port" and "network.seed_port") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_enable_host_election" and "network.enable_host_election") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "network_is_static_host" and "network.is_static_host") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "consensus_raft_port" and "consensus.raft_port") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "consensus_election_timeout_ms" and "consensus.election_timeout_ms") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "consensus_heartbeat_interval_ms" and "consensus.heartbeat_interval_ms") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "security_rate_limit_per_minute" and "security.rate_limit_per_minute") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "security_ban_threshold" and "security.ban_threshold") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "security_ban_duration_sec" and "security.ban_duration_sec") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "storage_max_content_size" and "storage.max_content_size") == 0:
+                            set update_ok to 0
+                        if web_server_update_config_int(cfg and root and "storage_dht_ttl_sec" and "storage.dht_ttl_sec") == 0:
+                            set update_ok to 0
+                        if update_ok == 1:
+                            set save_ok to config_save(cfg_path and cfg)
+                        set free_error to free_map(cfg)
+                        if free_error != 0:
+                            display f"[-] System configuration map cleanup failed: {free_error}."
+                            set save_ok to 0
                         
-                        set ok to web_server_update_config_str(cfg and root and "network_listen_address" and "network.listen_address")
-                        set ok to web_server_update_config_int(cfg and root and "network_p2p_port" and "network.p2p_port")
-                        set ok to web_server_update_config_int(cfg and root and "network_dht_port" and "network.dht_port")
-                        set ok to web_server_update_config_int(cfg and root and "network_relay_port" and "network.relay_port")
-                        set ok to web_server_update_config_int(cfg and root and "network_ipc_port" and "network.ipc_port")
-                        set ok to web_server_update_config_int(cfg and root and "network_web_port" and "network.web_port")
-                        set ok to web_server_update_config_int(cfg and root and "network_max_connections" and "network.max_connections")
-                        set ok to web_server_update_config_int(cfg and root and "network_max_message_size" and "network.max_message_size")
-                        set ok to web_server_update_config_str(cfg and root and "network_seed_addr" and "network.seed_addr")
-                        set ok to web_server_update_config_int(cfg and root and "network_seed_port" and "network.seed_port")
-                        set ok to web_server_update_config_int(cfg and root and "network_enable_host_election" and "network.enable_host_election")
-                        set ok to web_server_update_config_int(cfg and root and "network_is_static_host" and "network.is_static_host")
-                        
-                        set ok to web_server_update_config_int(cfg and root and "consensus_raft_port" and "consensus.raft_port")
-                        set ok to web_server_update_config_int(cfg and root and "consensus_election_timeout_ms" and "consensus.election_timeout_ms")
-                        set ok to web_server_update_config_int(cfg and root and "consensus_heartbeat_interval_ms" and "consensus.heartbeat_interval_ms")
-                        
-                        set ok to web_server_update_config_int(cfg and root and "security_rate_limit_per_minute" and "security.rate_limit_per_minute")
-                        set ok to web_server_update_config_int(cfg and root and "security_ban_threshold" and "security.ban_threshold")
-                        set ok to web_server_update_config_int(cfg and root and "security_ban_duration_sec" and "security.ban_duration_sec")
-                        
-                        set ok to web_server_update_config_int(cfg and root and "storage_max_content_size" and "storage.max_content_size")
-                        set ok to web_server_update_config_int(cfg and root and "storage_dht_ttl_sec" and "storage.dht_ttl_sec")
-                        
-                        set save_ok to config_save(cfg_path and cfg)
-                        
-                    set resp to "{\"type\":\"system_config_saved\",\"success\":true}"
-                    ws_send_text(client_fd and resp)
+                    if save_ok == 1:
+                        set resp to "{\"type\":\"system_config_saved\",\"success\":true}"
+                    else:
+                        set resp to "{\"type\":\"system_config_saved\",\"success\":false,\"message\":\"Failed to write configuration\"}"
+                    set send_result to websocket_send_server_text(client_fd and resp)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_get_repos":
                     set ipc_resp to query_daemon_ipc("GITDEC REPO LIST")
                     set repos_str to extract_ipc_field(ipc_resp and "repos")
                     set repos_json to "{\"type\":\"gitdec_repos\",\"repos\":\""
                     set repos_json to concat(repos_json and repos_str)
                     set repos_json to concat(repos_json and "\"}")
-                    ws_send_text(client_fd and repos_json)
+                    set send_result to websocket_send_server_text(client_fd and repos_json)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_get_repo_file":
                     set repo_id to json_get_string(payload and "repo_id")
                     set filename to json_get_string(payload and "filename")
@@ -1218,7 +1527,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set file_json to concat(file_json and "\",\"content\":\"")
                     set file_json to concat(file_json and escaped_content)
                     set file_json to concat(file_json and "\"}")
-                    ws_send_text(client_fd and file_json)
+                    set send_result to websocket_send_server_text(client_fd and file_json)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_list_files":
                     set repo_id to json_get_string(payload and "repo_id")
                     set ipc_resp to query_daemon_ipc(f"GITDEC REPO LIST_FILES {repo_id}")
@@ -1233,12 +1544,16 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set files_json to concat(files_json and "\",\"files\":\"")
                     set files_json to concat(files_json and escaped_files)
                     set files_json to concat(files_json and "\"}")
-                    ws_send_text(client_fd and files_json)
+                    set send_result to websocket_send_server_text(client_fd and files_json)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_create_repo":
                     set repo_id to json_get_string(payload and "repo_id")
                     set name to json_get_string(payload and "name")
                     set ipc_resp to query_daemon_ipc(f"GITDEC REPO CREATE {repo_id} {name}")
-                    ws_send_text(client_fd and "{\"type\":\"gitdec_create_ok\"}")
+                    set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_create_ok\"}")
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_set_visibility":
                     set repo_id to json_get_string(payload and "repo_id")
                     set vis to json_get_string(payload and "visibility")
@@ -1249,37 +1564,53 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         set vresp to concat(vresp and "\",\"visibility\":\"")
                         set vresp to concat(vresp and vis)
                         set vresp to concat(vresp and "\"}")
-                        ws_send_text(client_fd and vresp)
+                        set send_result to websocket_send_server_text(client_fd and vresp)
+                        if send_result != 0:
+                            return send_result
                     else:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_visibility_error\",\"message\":\"Only the owner can change visibility\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_visibility_error\",\"message\":\"Only the owner can change visibility\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "gitdec_clone_repo":
                     set repo_id to json_get_string(payload and "repo_id")
                     set ipc_resp to query_daemon_ipc(f"GITDEC REPO CLONE {repo_id}")
                     if string_contains(ipc_resp and "error:") == 1:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_clone_error\",\"message\":\"Clone failed\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_clone_error\",\"message\":\"Clone failed\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_clone_ok\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_clone_ok\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "gitdec_import_repo":
                     set imp_name to json_get_string(payload and "name")
                     set imp_path to json_get_string(payload and "path")
                     set ipc_resp to query_daemon_ipc(f"GITDEC REPO IMPORT {imp_name}|{imp_path}")
                     if string_contains(ipc_resp and "import_ok") == 1:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_import_ok\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_import_ok\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
                         set imp_err_json to concat("{\"type\":\"gitdec_import_error\",\"message\":\"" and concat(escape_json_string(ipc_resp) and "\"}"))
-                        ws_send_text(client_fd and imp_err_json)
+                        set send_result to websocket_send_server_text(client_fd and imp_err_json)
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "gitdec_set_auto_update":
                     set repo_id to json_get_string(payload and "repo_id")
                     set au_enabled to json_get_string(payload and "enabled")
                     set ipc_resp to query_daemon_ipc(f"GITDEC AUTOUPDATE {repo_id} {au_enabled}")
                     if string_contains(ipc_resp and "error") == 1:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_auto_update_error\",\"message\":\"Bad request\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_auto_update_error\",\"message\":\"Bad request\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
                         set au_json to concat("{\"type\":\"gitdec_auto_update_state\",\"repo_id\":\"" and repo_id)
                         set au_json to concat(au_json and "\",\"enabled\":")
                         set au_json to concat(au_json and au_enabled)
                         set au_json to concat(au_json and "}")
-                        ws_send_text(client_fd and au_json)
+                        set send_result to websocket_send_server_text(client_fd and au_json)
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "gitdec_get_auto_update":
                     set repo_id to json_get_string(payload and "repo_id")
                     set ipc_resp to query_daemon_ipc(f"GITDEC GET_AUTOUPDATE {repo_id}")
@@ -1290,36 +1621,52 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set au_gjson to concat(au_gjson and "\",\"enabled\":")
                     set au_gjson to concat(au_gjson and au_state)
                     set au_gjson to concat(au_gjson and "}")
-                    ws_send_text(client_fd and au_gjson)
+                    set send_result to websocket_send_server_text(client_fd and au_gjson)
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_merge":
                     set repo_id to json_get_string(payload and "repo_id")
                     set source_branch to json_get_string(payload and "source_branch")
                     set ipc_resp to query_daemon_ipc(f"GITDEC MERGE {repo_id} {source_branch}")
                     if string_contains(ipc_resp and "error") == 1:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_merge_error\",\"message\":\"Merge failed (unauthorized or branch not found)\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_merge_error\",\"message\":\"Merge failed (unauthorized or branch not found)\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_merge_ok\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_merge_ok\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "gitdec_add_collab":
                     set repo_id to json_get_string(payload and "repo_id")
                     set collab_did to json_get_string(payload and "collab_did")
                     set role to json_get_string(payload and "role")
                     set ipc_resp to query_daemon_ipc(f"GITDEC REPO COLLAB ADD {repo_id} {collab_did} {role}")
-                    ws_send_text(client_fd and "{\"type\":\"gitdec_collab_ok\"}")
+                    set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_collab_ok\"}")
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_remove_collab":
                     set repo_id to json_get_string(payload and "repo_id")
                     set collab_did to json_get_string(payload and "collab_did")
                     set ipc_resp to query_daemon_ipc(f"GITDEC REPO COLLAB REMOVE {repo_id} {collab_did}")
                     if string_contains(ipc_resp and "error") == 1:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_collab_error\",\"message\":\"Unauthorized or not found\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_collab_error\",\"message\":\"Unauthorized or not found\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_collab_ok\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_collab_ok\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "gitdec_delete_repo":
                     set repo_id to json_get_string(payload and "repo_id")
                     set ipc_resp to query_daemon_ipc(f"GITDEC REPO DELETE {repo_id}")
                     if string_contains(ipc_resp and "error") == 1:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_delete_error\",\"message\":\"Unauthorized or not found\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_delete_error\",\"message\":\"Unauthorized or not found\"}")
+                        if send_result != 0:
+                            return send_result
                     else:
-                        ws_send_text(client_fd and "{\"type\":\"gitdec_delete_ok\"}")
+                        set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_delete_ok\"}")
+                        if send_result != 0:
+                            return send_result
                 else if msg_type equals "gitdec_create_issue":
                     set repo_id to json_get_string(payload and "repo_id")
                     set title to json_get_string(payload and "title")
@@ -1332,7 +1679,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set issue_json to concat(issue_json and concat("\",\"body\":\"" and json_escape_string(body)))
                     set issue_json to concat(issue_json and "\"}")
                     set ipc_resp to query_daemon_ipc(concat("GITDEC ISSUE CREATE_JSON " and issue_json))
-                    ws_send_text(client_fd and "{\"type\":\"gitdec_issue_created\"}")
+                    set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_issue_created\"}")
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_comment_issue":
                     set repo_id to json_get_string(payload and "repo_id")
                     set issue_id to json_get_string(payload and "issue_id")
@@ -1342,12 +1691,16 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set comment_json to concat(comment_json and concat("\",\"comment\":\"" and json_escape_string(comment)))
                     set comment_json to concat(comment_json and "\"}")
                     set ipc_resp to query_daemon_ipc(concat("GITDEC ISSUE COMMENT_JSON " and comment_json))
-                    ws_send_text(client_fd and "{\"type\":\"gitdec_comment_ok\"}")
+                    set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_comment_ok\"}")
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_close_issue":
                     set repo_id to json_get_string(payload and "repo_id")
                     set issue_id to json_get_string(payload and "issue_id")
                     set ipc_resp to query_daemon_ipc(concat("GITDEC ISSUE CLOSE " and concat(repo_id and concat("|" and issue_id))))
-                    ws_send_text(client_fd and "{\"type\":\"gitdec_issue_closed\"}")
+                    set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_issue_closed\"}")
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_create_pr":
                     set repo_id to json_get_string(payload and "repo_id")
                     set title to json_get_string(payload and "title")
@@ -1361,7 +1714,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set pr_json to concat(pr_json and concat("\",\"description\":\"" and json_escape_string(desc)))
                     set pr_json to concat(pr_json and "\"}")
                     set ipc_resp to query_daemon_ipc(concat("GITDEC PR CREATE_JSON " and pr_json))
-                    ws_send_text(client_fd and "{\"type\":\"gitdec_pr_created\"}")
+                    set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_pr_created\"}")
+                    if send_result != 0:
+                        return send_result
                 else if msg_type equals "gitdec_review_pr":
                     set repo_id to json_get_string(payload and "repo_id")
                     set pr_id to json_get_string(payload and "pr_id")
@@ -1373,11 +1728,15 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set review_json to concat(review_json and concat("\",\"comment\":\"" and json_escape_string(comment)))
                     set review_json to concat(review_json and "\"}")
                     set ipc_resp to query_daemon_ipc(concat("GITDEC PR REVIEW_JSON " and review_json))
-                    ws_send_text(client_fd and "{\"type\":\"gitdec_review_ok\"}")
+                    set send_result to websocket_send_server_text(client_fd and "{\"type\":\"gitdec_review_ok\"}")
+                    if send_result != 0:
+                        return send_result
                 else:
                     display f"[ws] Unknown message type: {msg_type}"
                     set err to "{\"type\":\"error\",\"message\":\"Unknown message type\"}"
-                    ws_send_text(client_fd and err)
+                    set send_result to websocket_send_server_text(client_fd and err)
+                    if send_result != 0:
+                        return send_result
     return 0
 
 
@@ -1422,6 +1781,42 @@ define get_web_password_file returning Str:
     set home to get_home_dir()
     return concat(home and "/.ernosdecent/web-password")
 
+define ensure_web_password returning Int:
+    set secret_file to get_web_password_file()
+    if file_exists(secret_file) == 1:
+        set saved_pass to string_trim(read_file(secret_file))
+        if string_length(saved_pass) == 0:
+            display f"[-] FATAL: Web UI password file is empty: {secret_file}."
+            return 0
+        set existing_chmod_error to keys_chmod(secret_file and 384)
+        if existing_chmod_error != 0:
+            display f"[-] FATAL: cannot restrict Web UI password permissions at {secret_file}: {existing_chmod_error}."
+            return 0
+        return 1
+
+    # Generate the secret before the listener starts, so a fresh operator can read
+    # the documented password file without first submitting an unknowable value.
+    set gen_pass to keys_random_hex(24)
+    if string_length(gen_pass) == 0:
+        display "[-] FATAL: cannot generate Web UI password (crypto init failed); refusing weak default."
+        return 0
+    set write_ok to write_file(secret_file and gen_pass)
+    if write_ok == 0:
+        display f"[-] FATAL: cannot persist Web UI password at {secret_file}."
+        return 0
+    set chmod_error to keys_chmod(secret_file and 384)
+    if chmod_error != 0:
+        display f"[-] FATAL: cannot restrict Web UI password permissions at {secret_file}: {chmod_error}."
+        set remove_ok to remove_file(secret_file)
+        if remove_ok == 0 and also file_exists(secret_file) == 1:
+            display f"[-] FATAL: insecure Web UI password file could not be removed: {secret_file}."
+        return 0
+    display "==================================================================="
+    display f"[*] Web UI password (shown once) — saved to {secret_file}:"
+    display f"      {gen_pass}"
+    display "==================================================================="
+    return 1
+
 # Login brute-force throttle. State lives in a module-level map (mutation by
 # reference persists across requests in Ernos); counts are stored as strings to
 # avoid storing bare ints in a GC-scanned map. After 5 consecutive failures the
@@ -1455,24 +1850,9 @@ define login_throttle_reset returning Int:
 
 define verify_web_password with passphrase as Str returning Int:
     set secret_file to get_web_password_file()
-    if file_exists(secret_file) == 0:
-        # First run: generate a random 24-byte (48 hex char) password instead of a
-        # known default, persist it 0600, and print it ONCE to the operator console.
-        set gen_pass to keys_random_hex(24)
-        if string_length(gen_pass) == 0:
-            # Crypto unavailable: fail closed rather than fall back to a known default.
-            display "[-] FATAL: cannot generate web password (crypto init failed); refusing weak default."
-            return 0
-        set ok to write_file(secret_file and gen_pass)
-        set ok to keys_chmod(secret_file and 384)
-        display "==================================================================="
-        display f"[*] Web UI password (shown once) — saved to {secret_file}:"
-        display f"      {gen_pass}"
-        display "==================================================================="
-
-    set saved_pass to string_trim(read_file(secret_file))
-    if string_length(saved_pass) == 0:
+    if ensure_web_password() == 0:
         return 0
+    set saved_pass to string_trim(read_file(secret_file))
     if passphrase equals saved_pass:
         return 1
     return 0
@@ -1483,25 +1863,11 @@ define get_system_secret with name as Str returning Str:
         return string_trim(read_file(path1))
     return ""
 
-define authenticate_request with req as Str and pub_key as Str returning Int:
-    set token to extract_header_value(req and "X-Session-Token")
-    if string_length(token) == 0:
-        # Try Authorization header
-        set auth_hdr to extract_header_value(req and "Authorization")
-        if string_length(auth_hdr) > 7:
-            if substring(auth_hdr and 0 and 7) equals "Bearer ":
-                set token to substring(auth_hdr and 7 and string_length(auth_hdr) - 7)
-
-    if string_length(token) == 0:
-        return 0 # No token
-        
-    set did to extract_header_value(req and "X-Session-Did")
-    set issued_str to extract_header_value(req and "X-Session-Issued")
-    set expires_str to extract_header_value(req and "X-Session-Expires")
-    set nonce to extract_header_value(req and "X-Session-Nonce")
-    
+define authenticate_session_values with token as Str and did as Str and issued_str as Str and expires_str as Str and nonce as Str and pub_key as Str returning Int:
+    if string_length(token) == 0 or else string_length(pub_key) == 0:
+        return 0
     if string_length(did) == 0 or else string_length(issued_str) == 0 or else string_length(expires_str) == 0 or else string_length(nonce) == 0:
-        return 0 # Missing validation headers
+        return 0
         
     # Reconstruct payload hash
     set payload_input to concat(did and ":")
@@ -1513,15 +1879,12 @@ define authenticate_request with req as Str and pub_key as Str returning Int:
     
     set payload_hash to ep_sha256(payload_input)
     
-    # Split token to check if file exists
     set dot_pos to string_index_of(token and ".")
     if dot_pos < 0:
         return 0
         
     set ph_from_token to substring(token and 0 and dot_pos)
-    if ph_from_token equals payload_hash:
-        set ok to 1
-    else:
+    if ph_from_token != payload_hash:
         return 0
         
     # Check if the session file exists on disk
@@ -1529,59 +1892,75 @@ define authenticate_request with req as Str and pub_key as Str returning Int:
     set sess_dir to concat(home and "/.ernosdecent/auth_sessions")
     set sess_file to concat(sess_dir and concat("/" and concat(payload_hash and ".json")))
     if file_exists(sess_file) == 0:
-        return 0 # Revoked or rotated out
+        return 0
         
     # Verify signature
     set verify_result to verify_session_token(token and pub_key and payload_hash)
     set err to map_get_val(verify_result and "error")
-    set ok to free_map(verify_result)
+    set free_result to free_map(verify_result)
+    if free_result != 0:
+        display f"[-] Session verification map cleanup returned {free_result}."
     
     # Check expiry
     set expires_at to string_to_int(expires_str)
     set now to ep_time_now_sec()
     
     if err == 0 and also now < expires_at:
-        return 1 # Valid and active
+        return 1
 
     return 0
 
-# Cross-Site WebSocket Hijacking (CSWSH) defense. Browsers ALWAYS send an Origin
-# header on the WS handshake; a malicious page the user visits would carry its own
-# off-box origin. The control plane is loopback-bound, so the only legitimate
-# browser origins are 127.0.0.1/localhost (any port). A missing Origin means a
-# non-browser local client (e.g. the CLI/tests), which is gated by the first-frame
-# token instead. Returns 1 if allowed, 0 if it must be rejected.
+define authenticate_request with req as Str and pub_key as Str returning Int:
+    set token to extract_header_value(req and "X-Session-Token")
+    if string_length(token) == 0:
+        set auth_hdr to extract_header_value(req and "Authorization")
+        if string_length(auth_hdr) > 7:
+            if substring(auth_hdr and 0 and 7) equals "Bearer ":
+                set token to substring(auth_hdr and 7 and string_length(auth_hdr) - 7)
+    set did to extract_header_value(req and "X-Session-Did")
+    set issued_str to extract_header_value(req and "X-Session-Issued")
+    set expires_str to extract_header_value(req and "X-Session-Expires")
+    set nonce to extract_header_value(req and "X-Session-Nonce")
+    return authenticate_session_values(token and did and issued_str and expires_str and nonce and pub_key)
+
+define authenticate_api_request with req as Str returning Int:
+    if authenticate_request(req and NODE_PUBLIC_KEY) == 1:
+        return 1
+    set supplied_ipc to extract_header_value(req and "X-IPC-Token")
+    set expected_ipc to ipc_read_token()
+    if string_length(expected_ipc) > 0 and also supplied_ipc equals expected_ipc:
+        return 1
+    return 0
+
+define web_origin_exact with value as Str returning Int:
+    set allowed_ip to concat("http://127.0.0.1:" and int_to_string(WEB_UI_PORT))
+    set allowed_name to concat("http://localhost:" and int_to_string(WEB_UI_PORT))
+    if value equals allowed_ip or else value equals allowed_name:
+        return 1
+    return 0
+
+# Browsers must originate from this exact dashboard port. Missing Origin remains
+# available to authenticated CLI clients; every upgraded connection still performs
+# mandatory first-frame authentication.
 define ws_origin_allowed with req as Str returning Int:
     set origin to extract_header_value(req and "Origin")
     if string_length(origin) == 0:
         return 1
-    set host to origin
-    set sp to string_index_of(host and "://")
-    if sp >= 0:
-        set host to substring(host and sp + 3 and string_length(host) - sp - 3)
-    set cp to string_index_of(host and ":")
-    if cp >= 0:
-        set host to substring(host and 0 and cp)
-    set slp to string_index_of(host and "/")
-    if slp >= 0:
-        set host to substring(host and 0 and slp)
-    if host equals "127.0.0.1" or else host equals "localhost":
-        return 1
-    return 0
+    return web_origin_exact(origin)
 
-# CSRF guard for /api/* routes. Browsers attach Origin (and/or Referer) on
-# cross-site requests; a malicious page cannot forge a local one. If neither header
-# is present the caller is a non-browser tool (curl/CLI), which is allowed here —
-# those reach the same surface over the token-gated IPC channel anyway. Returns 1
-# if the request may proceed, 0 if it is a cross-origin browser request to block.
+# Browser requests must carry this exact dashboard origin or referer. Non-browser
+# callers may omit them, but the route-level session/IPC authentication still applies.
 define web_csrf_ok with req as Str returning Int:
     set origin to extract_header_value(req and "Origin")
     if string_length(origin) > 0:
         return ws_origin_allowed(req)
     set referer to extract_header_value(req and "Referer")
     if string_length(referer) > 0:
-        set rhost to string_lower(url_extract_host(referer))
-        if rhost equals "127.0.0.1" or else rhost equals "localhost":
+        set allowed_ip to concat("http://127.0.0.1:" and int_to_string(WEB_UI_PORT))
+        set allowed_name to concat("http://localhost:" and int_to_string(WEB_UI_PORT))
+        if string_index_of(referer and concat(allowed_ip and "/")) == 0:
+            return 1
+        if string_index_of(referer and concat(allowed_name and "/")) == 0:
             return 1
         return 0
     return 1
@@ -1594,11 +1973,13 @@ define proxy_request with client_fd as Int and req as Str and target_host as Str
     # the shell command, so an arbitrary value would be a command-injection vector.
     set method_up to string_upper(method)
     if method_up != "GET" and also method_up != "POST" and also method_up != "PUT" and also method_up != "DELETE" and also method_up != "PATCH" and also method_up != "HEAD" and also method_up != "OPTIONS":
-        set ok to send_response(client_fd and 400 and "application/json" and "{\"error\":\"invalid method\"}")
+        set response_result to web_send_response_checked(client_fd and 400 and "application/json" and "{\"error\":\"invalid method\"}")
+        if response_result != 0:
+            return response_result
         return 0
 
     set url to f"http://{target_host}:{target_port}{path_to_forward}"
-    set cmd to concat("curl -s --max-redirs 0 -X " and method_up)
+    set cmd to concat("curl -sS -f --max-redirs 0 --connect-timeout 5 --max-time 30 -X " and method_up)
 
     # Forward Content-Type if present (single-quote-escaped — no shell breakout).
     set ct to extract_header_value(req and "Content-Type")
@@ -1614,20 +1995,33 @@ define proxy_request with client_fd as Int and req as Str and target_host as Str
     # Forward the body if present
     if string_length(body) > 0:
         set body_file to f"config/proxy_body_{int_to_string(ep_time_now_sec())}_{int_to_string(client_fd)}.tmp"
-        set ok to write_file(body_file and body)
+        set body_write_ok to write_file(body_file and body)
+        if body_write_ok == 0:
+            return web_send_response_checked(client_fd and 500 and "application/json" and "{\"error\":\"proxy request body could not be staged\"}")
         set cmd to concat(cmd and concat(" --data-binary " and web_sq(concat("@" and body_file))))
 
     set cmd to concat(cmd and concat(" " and web_sq(url)))
+    set cmd to concat(cmd and "; printf '\n__ERNOS_EXIT__:%s' $?")
     
     # Run the command
-    set resp to run_command(cmd)
+    set raw_resp to run_command(cmd)
     
     # Clean up the temp file if it was created
     if string_length(body) > 0:
-        set ok to fs_delete_file(body_file)
+        set delete_ok to fs_delete_file(body_file)
+        if delete_ok == 0:
+            display f"[-] Proxy request body cleanup failed: {body_file}."
+            return web_send_response_checked(client_fd and 500 and "application/json" and "{\"error\":\"proxy temporary file cleanup failed\"}")
+    set marker_pos to string_last_index_of(raw_resp and "__ERNOS_EXIT__:0")
+    if marker_pos < 0:
+        display concat("[-] Local proxy request failed: " and raw_resp)
+        return web_send_response_checked(client_fd and 502 and "application/json" and "{\"error\":\"upstream request failed\"}")
+    set resp to substring(raw_resp and 0 and marker_pos)
         
     # Send the response back to the client
-    set ok to send_response(client_fd and 200 and "application/json" and resp)
+    set response_result to web_send_response_checked(client_fd and 200 and "application/json" and resp)
+    if response_result != 0:
+        return response_result
     return 0
 
 
@@ -1676,6 +2070,9 @@ define web_safe_basename with name as Str returning Str:
 define handle_web_client_request with client_fd as Int and req as Str returning Int:
     if string_length(req) == 0:
         set ok to net_close(client_fd)
+        if ok != 0:
+            display f"[-] Failed to close empty HTTP connection: {ok}."
+            return ok
         return 0
         
     if string_length(NODE_PUBLIC_KEY) == 0:
@@ -1691,8 +2088,9 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
     if string_contains(req_lower and "upgrade: websocket") == 1:
         if ws_origin_allowed(req) == 0:
             display "[-] WebSocket upgrade REJECTED: disallowed cross-origin (CSWSH)."
-            set ok to send_response(client_fd and 403 and "text/plain" and "Forbidden: cross-origin WebSocket")
-            set ok to net_close(client_fd)
+            set response_result to web_send_response_checked(client_fd and 403 and "text/plain" and "Forbidden: cross-origin WebSocket")
+            if response_result != 0:
+                return response_result
             return 0
         display "[*] WebSocket upgrade header detected. Normalizing headers..."
         # Normalize critical WebSocket headers for strict case-sensitive C parsers in ws_upgrade
@@ -1709,29 +2107,42 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         set req_norm to string_replace(req_norm and "sec-websocket-key" and "Sec-WebSocket-Key")
         set req_norm to string_replace(req_norm and "Sec-Websocket-Key" and "Sec-WebSocket-Key")
         
-        # A present Origin means a browser (authenticated by the Origin allowlist
-        # above); its absence means a non-browser client that must present the token.
-        set ws_origin_hdr to extract_header_value(req and "Origin")
-        set ws_need_token to 1
-        if string_length(ws_origin_hdr) > 0:
-            set ws_need_token to 0
         set ws_ok to ws_upgrade(client_fd and req_norm)
         if ws_ok == 1:
             display "[+] WebSocket upgrade handshake completed successfully."
-            websocket_session_loop(client_fd and ws_need_token)
+            set session_error to websocket_session_loop(client_fd)
+            set close_result to net_close(client_fd)
+            if close_result != 0:
+                display f"[-] WebSocket connection close returned {close_result}."
+                if session_error == 0:
+                    return close_result
+            if session_error != 0:
+                display f"[-] WebSocket session ended with error {session_error}."
+                return session_error
         else:
             display "[-] WebSocket upgrade handshake failed!"
-            set ok to net_close(client_fd)
+            set close_result to net_close(client_fd)
+            if close_result != 0:
+                display f"[-] WebSocket close after upgrade failure returned {close_result}."
+                return close_result
         return 0
 
-    # API endpoints — CSRF guard: block cross-origin browser requests to any /api/*
-    # route (covers wallet/storage/pool/upload/login). Non-browser tools (no Origin/
-    # Referer) pass here and are gated on the token-authenticated IPC channel.
+    # Every API route is protected by exact-origin CSRF validation. Login authenticates
+    # with the operator passphrase; every other route additionally requires a signed
+    # session or the same-user 0600 IPC token.
     if string_index_of(raw_path and "/api/") == 0:
         if web_csrf_ok(req) == 0:
             display "[-] /api request REJECTED: cross-origin (CSRF)."
-            set ok to send_response(client_fd and 403 and "application/json" and "{\"error\":\"forbidden: cross-origin request blocked\"}")
+            set response_result to web_send_response_checked(client_fd and 403 and "application/json" and "{\"error\":\"forbidden: cross-origin request blocked\"}")
+            if response_result != 0:
+                return response_result
             return 0
+        if raw_path != "/api/login":
+            if authenticate_api_request(req) == 0:
+                set response_result to web_send_response_checked(client_fd and 401 and "application/json" and "{\"error\":\"unauthorized\",\"message\":\"Valid session or IPC token required\"}")
+                if response_result != 0:
+                    return response_result
+                return 0
 
     # API endpoints
     if raw_path equals "/api/login":
@@ -1742,7 +2153,9 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                 set pass_node to get_json_object_value(root and "passphrase")
                 if pass_node != 0:
                     if login_throttle_allowed() == 0:
-                        set ok to send_response(client_fd and 429 and "application/json" and "{\"success\":false,\"message\":\"Too many failed attempts. Try again later.\"}")
+                        set response_result to web_send_response_checked(client_fd and 429 and "application/json" and "{\"success\":false,\"message\":\"Too many failed attempts. Try again later.\"}")
+                        if response_result != 0:
+                            return response_result
                         return 0
                     set passphrase to get_json_value(pass_node)
                     set auth_ok to verify_web_password(passphrase)
@@ -1751,7 +2164,9 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                         # Request a session token from the daemon
                         set ipc_resp to query_daemon_ipc("SESSION TOKEN CREATE did:key:webclient 3600")
                         if string_contains(ipc_resp and "token:error") == 1:
-                            set ok to send_response(client_fd and 500 and "application/json" and "{\"success\":false,\"message\":\"Failed to generate session token\"}")
+                            set response_result to web_send_response_checked(client_fd and 500 and "application/json" and "{\"success\":false,\"message\":\"Failed to generate session token\"}")
+                            if response_result != 0:
+                                return response_result
                         else:
                             set tok to extract_ipc_field(ipc_resp and "token")
                             set did_val to extract_ipc_field(ipc_resp and "did")
@@ -1764,7 +2179,12 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                             set home to get_home_dir()
                             set sess_dir to concat(home and "/.ernosdecent/auth_sessions")
                             if file_exists(sess_dir) == 0:
-                                set ok to create_directory(sess_dir)
+                                set directory_ok to create_directory(sess_dir)
+                                if directory_ok == 0:
+                                    set response_result to web_send_response_checked(client_fd and 500 and "application/json" and "{\"success\":false,\"message\":\"Session directory could not be created\"}")
+                                    if response_result != 0:
+                                        return response_result
+                                    return 0
                                 
                             set sess_file to concat(sess_dir and concat("/" and concat(ph and ".json")))
                             set sess_json to "{\"token\":\""
@@ -1780,7 +2200,12 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                             set sess_json to concat(sess_json and "\",\"payload_hash\":\"")
                             set sess_json to concat(sess_json and ph)
                             set sess_json to concat(sess_json and "\"}")
-                            set ok to write_file(sess_file and sess_json)
+                            set session_write_ok to write_file(sess_file and sess_json)
+                            if session_write_ok == 0:
+                                set response_result to web_send_response_checked(client_fd and 500 and "application/json" and "{\"success\":false,\"message\":\"Session token could not be persisted\"}")
+                                if response_result != 0:
+                                    return response_result
+                                return 0
                             
                             set resp_json to "{\"success\":true,\"token\":\""
                             set resp_json to concat(resp_json and tok)
@@ -1795,24 +2220,36 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                             set resp_json to concat(resp_json and "\",\"payload_hash\":\"")
                             set resp_json to concat(resp_json and ph)
                             set resp_json to concat(resp_json and "\"}")
-                            set ok to send_response(client_fd and 200 and "application/json" and resp_json)
+                            set response_result to web_send_response_checked(client_fd and 200 and "application/json" and resp_json)
+                            if response_result != 0:
+                                return response_result
                     else:
                         set throttle_ok to login_throttle_fail()
-                        set ok to send_response(client_fd and 401 and "application/json" and "{\"success\":false,\"message\":\"Invalid passphrase\"}")
+                        set response_result to web_send_response_checked(client_fd and 401 and "application/json" and "{\"success\":false,\"message\":\"Invalid passphrase\"}")
+                        if response_result != 0:
+                            return response_result
                 else:
-                    set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Missing passphrase\"}")
+                    set response_result to web_send_response_checked(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Missing passphrase\"}")
+                    if response_result != 0:
+                        return response_result
             else:
-                set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Invalid JSON body\"}")
+                set response_result to web_send_response_checked(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Invalid JSON body\"}")
+                if response_result != 0:
+                    return response_result
             return 0
         else:
-            set ok to send_response(client_fd and 405 and "application/json" and "{\"success\":false,\"message\":\"Method Not Allowed\"}")
+            set response_result to web_send_response_checked(client_fd and 405 and "application/json" and "{\"success\":false,\"message\":\"Method Not Allowed\"}")
+            if response_result != 0:
+                return response_result
             return 0
 
     if string_index_of(raw_path and "/api/meili") == 0:
         # Enforce authentication
         set auth_ok to authenticate_request(req and NODE_PUBLIC_KEY)
         if auth_ok == 0:
-            set ok to send_response(client_fd and 401 and "application/json" and "{\"error\":\"unauthorized\",\"message\":\"Valid session token required\"}")
+            set response_result to web_send_response_checked(client_fd and 401 and "application/json" and "{\"error\":\"unauthorized\",\"message\":\"Valid session token required\"}")
+            if response_result != 0:
+                return response_result
             return 0
             
         # Extract subpath
@@ -1828,7 +2265,9 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         # Enforce authentication
         set auth_ok to authenticate_request(req and NODE_PUBLIC_KEY)
         if auth_ok == 0:
-            set ok to send_response(client_fd and 401 and "application/json" and "{\"error\":\"unauthorized\",\"message\":\"Valid session token required\"}")
+            set response_result to web_send_response_checked(client_fd and 401 and "application/json" and "{\"error\":\"unauthorized\",\"message\":\"Valid session token required\"}")
+            if response_result != 0:
+                return response_result
             return 0
             
         # Extract subpath
@@ -1870,7 +2309,9 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         if string_length(gitdec_updates) == 0:
             set gitdec_updates to "0"
         set body to build_status_json(role and did_val and term and peers and dht_size and is_static and elect_enabled and reg_name and gitdec_updates)
-        set ok to send_response(client_fd and 200 and "application/json" and body)
+        set response_result to web_send_response_checked(client_fd and 200 and "application/json" and body)
+        if response_result != 0:
+            return response_result
         return 0
 
     if raw_path equals "/api/cancel":
@@ -1889,7 +2330,9 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         # main agent, every sub-agent, and background coordinators, and aborts their
         # in-flight LLM reads within ~1s.
         set ok to ep_cancel_epoch_bump(0)
-        set ok to send_response(client_fd and 200 and "application/json" and "{\"status\":\"ok\",\"cancelled\":true}")
+        set response_result to web_send_response_checked(client_fd and 200 and "application/json" and "{\"status\":\"ok\",\"cancelled\":true}")
+        if response_result != 0:
+            return response_result
         return 0
 
     if raw_path equals "/api/autoapprove":
@@ -1906,11 +2349,17 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                 set aa_state to "ON"
             set aa_resp to query_daemon_ipc(concat("AI AUTOAPPROVE " and aa_state))
             if string_contains(aa_resp and "ai:autoapprove") == 1:
-                set ok to send_response(client_fd and 200 and "application/json" and concat("{\"status\":\"ok\",\"autoapprove\":\"" and concat(string_lower(aa_state) and "\"}")))
+                set response_result to web_send_response_checked(client_fd and 200 and "application/json" and concat("{\"status\":\"ok\",\"autoapprove\":\"" and concat(string_lower(aa_state) and "\"}")))
+                if response_result != 0:
+                    return response_result
             else:
-                set ok to send_response(client_fd and 500 and "application/json" and "{\"status\":\"error\",\"message\":\"toggle failed\"}")
+                set response_result to web_send_response_checked(client_fd and 500 and "application/json" and "{\"status\":\"error\",\"message\":\"toggle failed\"}")
+                if response_result != 0:
+                    return response_result
             return 0
-        set ok to send_response(client_fd and 405 and "application/json" and "{\"status\":\"error\",\"message\":\"POST only\"}")
+        set response_result to web_send_response_checked(client_fd and 405 and "application/json" and "{\"status\":\"error\",\"message\":\"POST only\"}")
+        if response_result != 0:
+            return response_result
         return 0
 
     if raw_path equals "/api/persona":
@@ -1925,16 +2374,24 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                 if pa_node != 0:
                     set pa_name to get_json_value(pa_node)
             if string_length(pa_name) == 0:
-                set ok to send_response(client_fd and 400 and "application/json" and "{\"status\":\"error\",\"message\":\"missing name\"}")
+                set response_result to web_send_response_checked(client_fd and 400 and "application/json" and "{\"status\":\"error\",\"message\":\"missing name\"}")
+                if response_result != 0:
+                    return response_result
                 return 0
             set pa_resp to query_daemon_ipc(concat("AI PERSONA " and pa_name))
             if string_contains(pa_resp and "persona:active") == 1:
-                set ok to send_response(client_fd and 200 and "application/json" and "{\"status\":\"ok\"}")
+                set response_result to web_send_response_checked(client_fd and 200 and "application/json" and "{\"status\":\"ok\"}")
+                if response_result != 0:
+                    return response_result
             else:
-                set ok to send_response(client_fd and 400 and "text/plain" and pa_resp)
+                set response_result to web_send_response_checked(client_fd and 400 and "text/plain" and pa_resp)
+                if response_result != 0:
+                    return response_result
             return 0
         set pa_resp to query_daemon_ipc("AI PERSONA LIST")
-        set ok to send_response(client_fd and 200 and "text/plain" and pa_resp)
+        set response_result to web_send_response_checked(client_fd and 200 and "text/plain" and pa_resp)
+        if response_result != 0:
+            return response_result
         return 0
 
     if raw_path equals "/api/upload":
@@ -1949,51 +2406,72 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                     set content_b64 to get_json_value(cont_node)
 
                     if string_length(filename) == 0:
-                        set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Missing filename.\"}")
+                        set response_result to web_send_response_checked(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Missing filename.\"}")
+                        if response_result != 0:
+                            return response_result
                         return 0
 
-                    if file_exists("config/uploads") == 0:
-                        set ok to create_directory("config/uploads")
-
-                    # The on-disk path is built ONLY from a server-sanitised
-                    # basename, so it cannot traverse directories and carries no
-                    # shell metacharacters. The original filename and extension
-                    # (which may contain anything) are written to a .meta sidecar
-                    # and read by the indexer out-of-band, so no untrusted data
-                    # is ever placed on the shell command line.
-                    # Native ErnosPlain ingestion (no Python sidecar): decode the upload,
-                    # then index it tagged with the ACTIVE SESSION so retrieval is
-                    # session-scoped (a later session won't auto-see this document).
+                    # Preserve the original name as index metadata, but construct the
+                    # disk path exclusively from a sanitised, collision-resistant server
+                    # basename. No client-supplied path separator reaches path_join.
                     set up_text to rag_base64_decode(content_b64)
-                    set up_sess_resp to query_daemon_ipc("SESSION ACTIVE")
-                    set up_session to extract_ipc_field(up_sess_resp and "id")
-                    set up_chunks to rag_index(storage_get_db() and filename and up_text and up_session)
-                    display f"[web] Upload: indexed '{filename}' ({up_chunks} chunks, session={up_session})"
-
-                    # Also save the original file to workspace for direct file access
                     set ws_upload_dir to "config/workspaces/active/uploads"
                     if file_exists(ws_upload_dir) == 0:
-                        set ok to create_directory(ws_upload_dir)
-                    set ws_path to path_join(ws_upload_dir and filename)
-                    set ok to write_file(ws_path and up_text)
-                    display f"[web] Upload: saved '{filename}' to workspace ({ws_path})"
+                        set mkdir_result to create_directory(ws_upload_dir)
+                        if mkdir_result == 0 and also file_exists(ws_upload_dir) == 0:
+                            set response_result to web_send_response_checked(client_fd and 500 and "application/json" and "{\"success\":false,\"message\":\"Upload directory could not be created.\"}")
+                            if response_result != 0:
+                                return response_result
+                            return 0
+                    set safe_filename to web_safe_basename(filename)
+                    set stored_filename to concat(int_to_string(ep_time_now_sec()) and concat("_" and concat(int_to_string(client_fd) and concat("_" and safe_filename))))
+                    set ws_path to path_join(ws_upload_dir and stored_filename)
+                    set write_result to write_file(ws_path and up_text)
+                    if write_result == 0:
+                        set response_result to web_send_response_checked(client_fd and 500 and "application/json" and "{\"success\":false,\"message\":\"Uploaded file could not be written.\"}")
+                        if response_result != 0:
+                            return response_result
+                        return 0
+
+                    set up_sess_resp to query_daemon_ipc("SESSION ACTIVE")
+                    set up_session to extract_ipc_field(up_sess_resp and "id")
+                    if string_length(up_session) == 0:
+                        set delete_result to fs_delete_file(ws_path)
+                        if delete_result == 0 and also file_exists(ws_path) == 1:
+                            display f"[-] Failed to remove unindexed upload after session lookup failure: {ws_path}"
+                        set response_result to web_send_response_checked(client_fd and 500 and "application/json" and "{\"success\":false,\"message\":\"Active session could not be resolved.\"}")
+                        if response_result != 0:
+                            return response_result
+                        return 0
+                    set up_chunks to rag_index(storage_get_db() and filename and up_text and up_session)
+                    display f"[web] Upload: saved {ws_path} and indexed '{filename}' ({up_chunks} chunks, session={up_session})"
 
                     if up_chunks > 0:
                         set resp_body to "{\"success\":true,\"message\":\"Document uploaded and indexed into this session.\"}"
-                        set ok to send_response(client_fd and 200 and "application/json" and resp_body)
+                        set response_result to web_send_response_checked(client_fd and 200 and "application/json" and resp_body)
+                        if response_result != 0:
+                            return response_result
                         return 0
                     else:
                         set resp_body to "{\"success\":false,\"message\":\"Indexing produced no chunks (empty file, or Ollama / nomic-embed-text unavailable).\"}"
-                        set ok to send_response(client_fd and 500 and "application/json" and resp_body)
+                        set response_result to web_send_response_checked(client_fd and 500 and "application/json" and resp_body)
+                        if response_result != 0:
+                            return response_result
                         return 0
                 else:
-                    set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Missing filename or content.\"}")
+                    set response_result to web_send_response_checked(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Missing filename or content.\"}")
+                    if response_result != 0:
+                        return response_result
                     return 0
             else:
-                set ok to send_response(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Invalid JSON body.\"}")
+                set response_result to web_send_response_checked(client_fd and 400 and "application/json" and "{\"success\":false,\"message\":\"Invalid JSON body.\"}")
+                if response_result != 0:
+                    return response_result
                 return 0
         else:
-            set ok to send_response(client_fd and 405 and "application/json" and "{\"success\":false,\"message\":\"Method Not Allowed.\"}")
+            set response_result to web_send_response_checked(client_fd and 405 and "application/json" and "{\"success\":false,\"message\":\"Method Not Allowed.\"}")
+            if response_result != 0:
+                return response_result
             return 0
 
     if raw_path equals "/api/wallet":
@@ -2004,12 +2482,16 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         set body to "{\"type\":\"wallet\",\"balance\":\""
         set body to concat(body and balance_str)
         set body to concat(body and "\"}")
-        set ok to send_response(client_fd and 200 and "application/json" and body)
+        set response_result to web_send_response_checked(client_fd and 200 and "application/json" and body)
+        if response_result != 0:
+            return response_result
         return 0
 
     if raw_path equals "/api/storage":
         set ipc_resp to query_daemon_ipc("STORAGE STATUS")
-        set ok to send_response(client_fd and 200 and "application/json" and ipc_resp)
+        set response_result to web_send_response_checked(client_fd and 200 and "application/json" and ipc_resp)
+        if response_result != 0:
+            return response_result
         return 0
 
     if raw_path equals "/api/pool":
@@ -2030,7 +2512,9 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
         set body to concat(body and "\",\"compute_slots\":")
         set body to concat(body and compute)
         set body to concat(body and "}")
-        set ok to send_response(client_fd and 200 and "application/json" and body)
+        set response_result to web_send_response_checked(client_fd and 200 and "application/json" and body)
+        if response_result != 0:
+            return response_result
         return 0
 
     # Serve synthesised TTS audio as raw bytes. The normal static path uses
@@ -2051,11 +2535,10 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                 set hdr to "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: "
                 set hdr to concat(hdr and int_to_string(wav_len))
                 set hdr to concat(hdr and "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
-                set ok to tts_http_send_binary(client_fd and hdr and wav_ptr and wav_len)
-                set ok to free_bytes(wav_ptr)
-                set ok to net_close(client_fd)
-                return 0
-        set ok to send_response(client_fd and 404 and "text/plain" and "404 Not Found")
+                return web_send_owned_binary_checked(client_fd and hdr and wav_ptr and wav_len)
+        set response_result to web_send_response_checked(client_fd and 404 and "text/plain" and "404 Not Found")
+        if response_result != 0:
+            return response_result
         return 0
 
     # Attachment download route: GET /files/<trace_rowid>. The URL carries the trace_events
@@ -2064,9 +2547,16 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
     # the node queued them (tools_emit_attachment), so only agent-produced/shared files are
     # reachable. This is the WebUI half of the attachment feature (parity with Discord).
     if starts_with(raw_path and "/files/") == 1:
+        if web_csrf_ok(req) == 0 or else authenticate_api_request(req) == 0:
+            set response_result to web_send_response_checked(client_fd and 401 and "text/plain" and "401 Unauthorized")
+            if response_result != 0:
+                return response_result
+            return 0
         set fid to substring(raw_path and 7 and string_length(raw_path) - 7)
         if web_is_all_digits(fid) == 0:
-            set ok to send_response(client_fd and 400 and "text/plain" and "400 Bad Request")
+            set response_result to web_send_response_checked(client_fd and 400 and "text/plain" and "400 Bad Request")
+            if response_result != 0:
+                return response_result
             return 0
         set frows to sql_query(storage_get_db() and concat("SELECT content FROM trace_events WHERE event_type='attachment' AND id=" and concat(fid and " LIMIT 1;")))
         if length_list(frows) > 0:
@@ -2084,11 +2574,10 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                     set fhdr to concat(fhdr and "\r\nContent-Disposition: inline; filename=\"")
                     set fhdr to concat(fhdr and web_basename(fpath))
                     set fhdr to concat(fhdr and "\"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
-                    set ok to tts_http_send_binary(client_fd and fhdr and fptr and flen)
-                    set ok to free_bytes(fptr)
-                    set ok to net_close(client_fd)
-                    return 0
-        set ok to send_response(client_fd and 404 and "text/plain" and "404 Not Found")
+                    return web_send_owned_binary_checked(client_fd and fhdr and fptr and flen)
+        set response_result to web_send_response_checked(client_fd and 404 and "text/plain" and "404 Not Found")
+        if response_result != 0:
+            return response_result
         return 0
 
     # Serve static assets
@@ -2106,21 +2595,32 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
             set index_path to concat(file_path and "/index.html")
             if file_exists(index_path) == 1:
                 set content to read_file(index_path)
-                set ok to send_response(client_fd and 200 and "text/html" and content)
+                set response_result to web_send_response_checked(client_fd and 200 and "text/html" and content)
+                if response_result != 0:
+                    return response_result
             else:
-                set ok to send_response(client_fd and 404 and "text/plain" and "Not Found")
+                set response_result to web_send_response_checked(client_fd and 404 and "text/plain" and "Not Found")
+                if response_result != 0:
+                    return response_result
         else:
             set content to read_file(file_path)
             set ext to path_extension(file_path)
             set mime to get_mime_type(ext)
-            set ok to send_response(client_fd and 200 and mime and content)
+            set response_result to web_send_response_checked(client_fd and 200 and mime and content)
+            if response_result != 0:
+                return response_result
     else:
-        set ok to send_response(client_fd and 404 and "text/plain" and "404 Not Found")
-        
+        set response_result to web_send_response_checked(client_fd and 404 and "text/plain" and "404 Not Found")
+        if response_result != 0:
+            return response_result
     return 0
 
 define run_web_server with port as Int and ipc_port as Int returning Int:
     set IPC_DAEMON_PORT to ipc_port
+    set WEB_UI_PORT to port
+    if ensure_web_password() == 0:
+        display "[-] Web UI server not started because its password could not be secured."
+        return 1
     display f"[*] Web UI server starting on port {port}..."
     set server to start_server(port)
     if server == 0:
@@ -2144,22 +2644,30 @@ define run_web_server with port as Int and ipc_port as Int returning Int:
 
 define web_server_update_config_str with cfg as Map and json_root as Int and json_key as Str and cfg_key as Str returning Int:
     set node to get_json_object_value(json_root and json_key)
-    if node != 0:
-        set val to get_json_value(node)
-        set ok to map_insert(cfg and cfg_key and val)
-    return 0
+    if node == 0:
+        return 1
+    set val to get_json_value(node)
+    set inserted to map_insert(cfg and cfg_key and val)
+    if map_contains(cfg and cfg_key) == 0:
+        return 0
+    return 1
 
 define web_server_update_config_int with cfg as Map and json_root as Int and json_key as Str and cfg_key as Str returning Int:
     set node to get_json_object_value(json_root and json_key)
-    if node != 0:
-        set v_type to get_json_type(node)
-        if v_type == 1:
-            set val to get_json_value(node)
-            set ok to map_insert(cfg and cfg_key and val)
-        else:
-            if v_type == 2:
-                set val_str to get_json_value(node)
-                if string_length(val_str) > 0:
-                    set val to string_to_int(val_str)
-                    set ok to map_insert(cfg and cfg_key and val)
-    return 0
+    if node == 0:
+        return 1
+    set v_type to get_json_type(node)
+    if v_type == 1:
+        set val to get_json_value(node)
+        set inserted to map_insert(cfg and cfg_key and val)
+    else if v_type == 2:
+        set val_str to get_json_value(node)
+        if string_length(val_str) == 0:
+            return 0
+        set val to string_to_int(val_str)
+        set inserted to map_insert(cfg and cfg_key and val)
+    else:
+        return 0
+    if map_contains(cfg and cfg_key) == 0:
+        return 0
+    return 1

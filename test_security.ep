@@ -10,13 +10,13 @@ import "decent_net/transport"
 # Test 7.1: Rate Limiting
 # ================================================================
 
-define test_7_1:
+define test_7_1 returning Int:
     display "TEST 7.1: Rate limiting"
     set t_ok to 1
     set limiter to security_create_rate_limiter()
 
     # First request should be allowed
-    set r1 to security_check_rate_limit(borrow limiter and "192.168.1.1")
+    set r1 to security_check_rate_limit(limiter and "192.168.1.1")
     if r1 != 1:
         display f"  FAIL: First request rejected (got {r1})"
         set t_ok to 0
@@ -24,12 +24,12 @@ define test_7_1:
     # Send 100 requests — all should pass
     set i to 1
     repeat while i < RATE_LIMIT_MAX_REQUESTS:
-        set r to security_check_rate_limit(borrow limiter and "192.168.1.1")
+        set r to security_check_rate_limit(limiter and "192.168.1.1")
         set i to i + 1
     display f"  {RATE_LIMIT_MAX_REQUESTS} requests within limit: OK"
 
     # Request 101 should be rate limited (return 0)
-    set r_over to security_check_rate_limit(borrow limiter and "192.168.1.1")
+    set r_over to security_check_rate_limit(limiter and "192.168.1.1")
     if r_over != 0:
         display f"  FAIL: Request {RATE_LIMIT_MAX_REQUESTS} + 1 not rate limited (got {r_over})"
         set t_ok to 0
@@ -37,7 +37,7 @@ define test_7_1:
         display "  Rate limit triggered at threshold: OK"
 
     # Different IP should still be allowed
-    set r_other to security_check_rate_limit(borrow limiter and "10.0.0.1")
+    set r_other to security_check_rate_limit(limiter and "10.0.0.1")
     if r_other != 1:
         display f"  FAIL: Different IP rejected (got {r_other})"
         set t_ok to 0
@@ -47,10 +47,10 @@ define test_7_1:
     # Push past ban threshold
     set i to 0
     repeat while i < 150:
-        set r to security_check_rate_limit(borrow limiter and "192.168.1.1")
+        set r to security_check_rate_limit(limiter and "192.168.1.1")
         set i to i + 1
 
-    set r_ban to security_check_rate_limit(borrow limiter and "192.168.1.1")
+    set r_ban to security_check_rate_limit(limiter and "192.168.1.1")
     if r_ban != 0 - 1:
         display f"  FAIL: Expected ban (-1), got {r_ban}"
         set t_ok to 0
@@ -65,7 +65,7 @@ define test_7_1:
 # Test 7.2: Ban List
 # ================================================================
 
-define test_7_2:
+define test_7_2 returning Int:
     display "TEST 7.2: Ban list management"
     set t_ok to 1
     set limiter to security_create_rate_limiter()
@@ -115,7 +115,7 @@ define test_7_2:
 # Test 7.3: Max Message Size Enforcement
 # ================================================================
 
-define test_7_3:
+define test_7_3 returning Int:
     display "TEST 7.3: Max message size enforcement"
     set t_ok to 1
 
@@ -149,7 +149,7 @@ define test_7_3:
 # Test 7.4: Input Validation Sweep
 # ================================================================
 
-define test_7_4:
+define test_7_4 returning Int:
     display "TEST 7.4: Input validation sweep"
     set t_ok to 1
 
@@ -232,7 +232,7 @@ define test_7_4:
 # Test 7.5: Security Test with Raft Deserializer
 # ================================================================
 
-define test_7_5:
+define test_7_5 returning Int:
     display "TEST 7.5: Security combined test"
     set t_ok to 1
 
@@ -244,7 +244,7 @@ define test_7_5:
     set rejected_count to 0
     set i to 0
     repeat while i < 50:
-        set allowed to security_check_rate_limit(borrow limiter and "test_client")
+        set allowed to security_check_rate_limit(limiter and "test_client")
         if allowed == 1:
             # Validate some inputs
             set node_ok to security_validate_node_id("node_x")
@@ -271,19 +271,19 @@ define test_7_5:
     return t_ok
 
 # ================================================================
-# Test 7.6: ASAN Clean Run
+# Test 7.6: Security State Lifecycle
 # ================================================================
 
-define test_7_6:
-    display "TEST 7.6: AddressSanitizer verification"
+define test_7_6 returning Int:
+    display "TEST 7.6: Security state lifecycle"
     set t_ok to 1
 
-    # Exercise all security functions to verify no memory issues
+    # Exercise creation, validation, ban, cleanup, and unban state transitions.
     set limiter to security_create_rate_limiter()
     set i to 0
     repeat while i < 20:
         set ip to concat("192.168.1." and int_to_string(i))
-        set r to security_check_rate_limit(borrow limiter and ip)
+        set r to security_check_rate_limit(limiter and ip)
         set ok to security_validate_node_id(ip)
         set ok to security_validate_command(concat("SET k" and int_to_string(i)))
         set ok to security_validate_port(8000 + i)
@@ -298,8 +298,11 @@ define test_7_6:
     set count to security_get_ban_count(borrow limiter)
     display f"  Remaining bans after cleanup: {count}"
 
-    # If we reach here without ASAN errors, pass
-    display "  No memory errors detected"
+    if count != 1:
+        display "  FAIL: expected one remaining ban after cleanup/unban lifecycle"
+        set t_ok to 0
+    else:
+        display "  Ban lifecycle state is consistent"
     if t_ok == 1:
         display "  PASS"
     return t_ok
@@ -308,7 +311,7 @@ define test_7_6:
 # Main
 # ================================================================
 
-define main:
+define main returning Int:
     display "==================================================="
     display "  ErnosDecent -- Phase 7 Security Test Suite"
     display "==================================================="
@@ -335,7 +338,8 @@ define main:
     display f"  {passed}/{total} Security tests passed."
     if passed == total:
         display "  ALL PHASE 7 SECURITY TESTS PASSED!"
-    else:
-        display "  SOME TESTS FAILED"
+        display "==================================================="
+        return 0
+    display "  SOME TESTS FAILED"
     display "==================================================="
-    return 0
+    return 1

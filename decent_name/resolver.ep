@@ -12,13 +12,13 @@ import "../decent_net/transport"
 # DNS Resolver Cache Operations
 # ================================================================
 
-define resolver_create:
+define resolver_create returning Map:
     set res to create_map()
     set cache to create_map()
     set ok to map_insert(res and "cache" and cache)
     return res
 
-define resolver_cache_add with res as Int and name as Str and value as Str and ttl as Int:
+define resolver_cache_add with res as Map and name as Str and value as Str and ttl as Int returning Int:
     set cache to map_get_val(res and "cache")
     set record to create_map()
     set ok to map_insert(record and "value" and value)
@@ -26,7 +26,7 @@ define resolver_cache_add with res as Int and name as Str and value as Str and t
     set ok to map_insert(cache and name and record)
     return 0
 
-define resolver_lookup with res as Int and name as Str returning Str:
+define resolver_lookup with res as Map and name as Str returning Str:
     set cache to map_get_val(res and "cache")
     if map_contains(cache and name) == 1:
         set record to map_get_val(cache and name)
@@ -48,22 +48,31 @@ define resolver_lookup with res as Int and name as Str returning Str:
 
     return ""
 
-define resolver_query_remote with res as Int and address as Str and port as Int and name as Str returning Str:
+define resolver_query_remote with res as Map and address as Str and port as Int and name as Str returning Str:
     # Query a remote node for name resolution via transport layer
     set conn to transport_connect(address and port)
     set conn_err to map_get_val(conn and "error")
     if conn_err != 0:
+        display concat("[-] Remote name resolver connection failed for " and name)
         return ""
 
     # Send name resolve request
-    set ok to transport_send(conn and "NAME_RESOLVE" and name)
+    set send_err to transport_send(conn and "NAME_RESOLVE" and name)
+    if send_err != TRANSPORT_ERR_NONE:
+        set close_err to transport_close(conn)
+        if close_err != TRANSPORT_ERR_NONE:
+            display "[-] Remote name resolver send and close both failed."
+        else:
+            display concat("[-] Remote name resolver send failed for " and name)
+        return ""
 
     # Receive response
     set response to transport_recv(conn)
     set recv_err to map_get_val(response and "error")
-    set ok to transport_close(conn)
+    set close_err to transport_close(conn)
 
-    if recv_err != 0:
+    if recv_err != 0 or else close_err != TRANSPORT_ERR_NONE:
+        display concat("[-] Remote name resolver receive/close failed for " and name)
         return ""
 
     set result to map_get_val(response and "payload")

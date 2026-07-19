@@ -64,11 +64,51 @@ define workspace_count_lines with content as Str returning Int:
     free_list(parts)
     return n
 
+define workspace_component_safe with value as Str returning Int:
+    set n to string_length(value)
+    if n == 0 or else n > 160:
+        return 0
+    set allowed to "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    set i to 0
+    repeat while i < n:
+        if string_index_of(allowed and substring(value and i and 1)) < 0:
+            return 0
+        set i to i + 1
+    return 1
+
+define workspace_rm_tree with path as Str and depth as Int returning Int:
+    if depth > 8:
+        return 1
+    if file_exists(path) == 0:
+        return 0
+    if is_directory(path) == 1:
+        set entries to list_directory(path)
+        set n to length_list(entries)
+        set i to 0
+        repeat while i < n:
+            set remove_error to workspace_rm_tree(path_join(path and get_list(entries and i)) and depth + 1)
+            if remove_error != 0:
+                free_list(entries)
+                return 1
+            set i to i + 1
+        free_list(entries)
+        set ok to remove_directory(path)
+        if ok == 0:
+            return 1
+        return 0
+    set ok to remove_file(path)
+    if ok == 0:
+        return 1
+    return 0
+
 # ================================================================
 # workspace_init — Initialize per-session workspace directory
 # Archives any existing active session before creating new one
 # ================================================================
 define workspace_init with session_id as Str returning Int:
+    if workspace_component_safe(session_id) == 0:
+        display concat("[-] Unsafe workspace session identifier rejected: " and session_id)
+        return 1
     # Check if active workspace exists with a prior session
     set meta_path to path_join("config/workspaces/active" and ".session_meta.json")
     if file_exists(meta_path) == 1:
@@ -86,21 +126,52 @@ define workspace_init with session_id as Str returning Int:
                 set old_epoch to get_json_value(old_created_node)
 
             if string_length(old_session_id) > 0:
+                if workspace_component_safe(old_session_id) == 0:
+                    display "[-] Existing workspace metadata contains an unsafe session identifier."
+                    return 1
                 # Get date string from epoch for archive directory name
-                set date_cmd to f"date -r {old_epoch} +%Y-%m-%d"
+                set date_cmd to f"date -r {old_epoch} +%Y-%m-%d 2>&1; printf '\n__ERNOS_EXIT__:%s' $?"
                 set date_raw to run_command(date_cmd)
-                set date_str to workspace_trim_newline(date_raw)
+                set marker_pos to string_index_of(date_raw and "__ERNOS_EXIT__:0")
+                set date_str to ""
+                if marker_pos >= 0:
+                    set date_str to workspace_trim_newline(substring(date_raw and 0 and marker_pos))
+                else:
+                    display concat("[-] Workspace archive date conversion failed: " and date_raw)
+                if string_length(date_str) == 0:
+                    set date_str to int_to_string(old_epoch)
 
                 # Rename active/ to <old_session_id>_<date>/
                 set archive_name to concat(old_session_id and concat("_" and date_str))
                 set dest_path to path_join("config/workspaces" and archive_name)
-                set mv_cmd to f"mv config/workspaces/active {dest_path}"
-                set mv_res to run_command(mv_cmd)
+                # A daemon restart may rotate the same session more than once on the
+                # same date. Never let mv interpret an existing destination as a
+                # parent directory; choose an unused archive name and use the checked
+                # filesystem primitive directly.
+                set collision_suffix to ep_time_now_sec()
+                set collision_index to 0
+                repeat while file_exists(dest_path) == 1:
+                    set collision_index to collision_index + 1
+                    set unique_suffix to concat(int_to_string(collision_suffix) and concat("_" and int_to_string(collision_index)))
+                    set dest_path to path_join("config/workspaces" and concat(archive_name and concat("_" and unique_suffix)))
+                set move_ok to fs_move_file("config/workspaces/active" and dest_path)
+                if move_ok == 0:
+                    display f"[-] Failed to archive active workspace at {dest_path}."
+                    return 1
 
     # Create required directory structure
-    set ok to create_directory("config/workspaces")
-    set ok to create_directory("config/workspaces/active")
-    set ok to create_directory("config/workspaces/archive")
+    if file_exists("config/workspaces") == 0:
+        set ok to create_directory("config/workspaces")
+        if ok == 0:
+            return 1
+    if file_exists("config/workspaces/active") == 0:
+        set ok to create_directory("config/workspaces/active")
+        if ok == 0:
+            return 1
+    if file_exists("config/workspaces/archive") == 0:
+        set ok to create_directory("config/workspaces/archive")
+        if ok == 0:
+            return 1
 
     # Get current epoch time
     set now_epoch to ep_time_now_sec()
@@ -115,6 +186,8 @@ define workspace_init with session_id as Str returning Int:
     # Write session metadata
     set new_meta_path to path_join("config/workspaces/active" and ".session_meta.json")
     set ok to write_file(new_meta_path and meta_json)
+    if ok == 0:
+        return 1
     return 0
 
 # ================================================================
@@ -128,6 +201,9 @@ define workspace_get_active_path returning Str:
 # Scans config/workspaces/ for a directory starting with session_id
 # ================================================================
 define workspace_get_session_path with session_id as Str returning Str:
+    if workspace_component_safe(session_id) == 0:
+        display concat("[workspace] Unsafe prior-session identifier rejected: " and session_id)
+        return ""
     set entries to list_directory("config/workspaces")
     set len to length_list(entries)
     set i to 0
@@ -150,6 +226,9 @@ define workspace_get_session_path with session_id as Str returning Str:
 define workspace_write_file with filename as Str and content as Str returning Str:
     set full_path to path_join("config/workspaces/active" and filename)
     set ok to write_file(full_path and content)
+    if ok == 0:
+        display f"[-] Workspace write failed: {full_path}."
+        return ""
     return full_path
 
 # ---- Recursive helper to list all workspace files with metadata ----
@@ -388,14 +467,23 @@ define workspace_archive_old with max_age_days as Int returning Int:
                             set created_at to get_json_value(created_node)
                             set age to now - created_at
                             if age > max_age_secs:
+                                if workspace_component_safe(dirname) == 0:
+                                    display concat("[-] Unsafe workspace archive name rejected: " and dirname)
+                                    free_list(entries)
+                                    return -1
                                 # Create tar archive
-                                set tar_cmd to f"tar -czf config/workspaces/archive/{dirname}.tar.gz -C config/workspaces {dirname}"
+                                set tar_cmd to f"tar -czf config/workspaces/archive/{dirname}.tar.gz -C config/workspaces {dirname} 2>&1; printf '\n__ERNOS_EXIT__:%s' $?"
                                 set tar_res to run_command(tar_cmd)
-
-                                # Remove original directory
-                                set rm_cmd to f"rm -rf config/workspaces/{dirname}"
-                                set rm_res to run_command(rm_cmd)
-
+                                if string_contains(tar_res and "__ERNOS_EXIT__:0") == 0:
+                                    display concat("[-] Workspace archive creation failed: " and tar_res)
+                                    free_list(entries)
+                                    return -1
+                                # Remove the original only after the archive exists.
+                                set rm_res to workspace_rm_tree(dir_path and 0)
+                                if rm_res != 0:
+                                    display concat("[-] Archived workspace but could not remove original: " and dirname)
+                                    free_list(entries)
+                                    return -1
                                 set archived_count to archived_count + 1
                 set i to i + 1
     free_list(entries)

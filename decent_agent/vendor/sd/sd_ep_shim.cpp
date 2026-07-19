@@ -11,10 +11,8 @@
  * repeated generations in a session don't reload multi-GB weights; a mutex serialises
  * generation (it is heavy and the underlying ctx is not concurrent-safe).
  */
-/* build.sh defines SD_EP_HAVE_LIB and links libstable-diffusion when the dylib is present
- * (~/.ernosdecent/lib). When it is absent (e.g. a machine that hasn't built it), this file
- * still compiles as a stub so the node/test builds never break — generate_image just
- * reports the model runtime is unavailable. */
+/* build.sh defines SD_EP_HAVE_LIB and links libstable-diffusion. The runtime is required;
+ * compiling this translation unit without it is an error, not a degraded binary. */
 #ifdef SD_EP_HAVE_LIB
 
 #include "stable-diffusion.h"
@@ -45,13 +43,13 @@ static sd_ctx_t* sd_ep_ctx_for(const char* model_path, const char* diffusion_mod
     }
     fprintf(stderr, "[ImageGen shim] ctx cache MISS — loading %s weights (%s)\n",
             flux ? "flux" : "single-file", key);
-    /* Model switch: deliberately DO NOT free_sd_ctx here. The ggml-metal backend aborts in
-     * ggml_metal_device_free (GGML_ASSERT rsets->data count == 0) on teardown — freeing mid-run
-     * would crash the whole node. Switching models is rare, so we leak the old ctx instead of
-     * crashing (correctness over a bit of memory). The default single-model path never hits this. */
+    /* The linked backend cannot safely tear down and replace a live Metal context. Reject
+     * a model switch explicitly; the caller can restart the node with the new configured
+     * model. This preserves the cached context without leaking it or crashing the process. */
     if (g_sd_ctx != NULL) {
-        g_sd_ctx = NULL;
-        g_sd_model[0] = '\0';
+        fprintf(stderr, "[ImageGen shim] model switch rejected; restart required (%s -> %s)\n",
+                g_sd_model, key);
+        return NULL;
     }
     sd_ctx_params_t cp;
     sd_ctx_params_init(&cp);
@@ -163,17 +161,7 @@ extern "C" long long sd_ep_generate(long long model_path_ll,
     return rc;
 }
 
-#else  /* !SD_EP_HAVE_LIB — stub so the build always links */
-
-extern "C" long long sd_ep_generate(long long model_path, long long diffusion_model,
-                   long long clip_l, long long t5xxl, long long vae,
-                   long long prompt, long long negative,
-                   long long width, long long height, long long steps, long long cfg,
-                   long long seed, long long out_png_path) {
-    (void)model_path; (void)diffusion_model; (void)clip_l; (void)t5xxl; (void)vae;
-    (void)prompt; (void)negative; (void)width; (void)height;
-    (void)steps; (void)cfg; (void)seed; (void)out_png_path;
-    return 99;  /* image runtime not built on this machine */
-}
+#else
+#error "SD_EP_HAVE_LIB is required: build.sh must link libstable-diffusion"
 
 #endif

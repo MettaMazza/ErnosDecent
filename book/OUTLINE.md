@@ -129,7 +129,7 @@ Each system chapter is a gentle six-beat arc (mirrors `notes/system-bible.md`):
 - **12. Disappearing into the crowd.** `decent_anon` — onion routing and mix networks.
 
 ### PART FOUR — REMEMBERING: STORAGE, NAMES, FINDING THINGS
-- **13. Keeping things, together.** `decent_store` — content addressing (BLAKE3) and CRDTs (how two
+- **13. Keeping things, together.** `decent_store` — content addressing (SHA-256) and CRDTs (how two
   copies merge with no boss to settle the argument).
 - **14. Names that can't be repossessed.** `decent_name` — decentralized DNS, `.decent`/`.ernos`.
 - **15. Searching a web no one owns.** `decent_search` — crawler, BM25 + PageRank, merged results.

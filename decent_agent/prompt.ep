@@ -38,7 +38,7 @@ define prompt_get_kernel returning Str:
     set kernel to concat(kernel and "Action: reply_request(<your_final_answer_to_the_user>)\n")
     return kernel
 
-define prompt_get_context with memory_mgr as Map:
+define prompt_get_context with memory_mgr as Map returning Str:
     set ctx to "[PERSISTENT MEMORY — accumulated across ALL prior sessions, NOT specific to the current conversation. Do NOT treat these as active context or reference them as current session knowledge.]\n"
     if map_contains(memory_mgr and "lessons_count") == 1:
         set count to map_get_val(memory_mgr and "lessons_count")
@@ -90,12 +90,16 @@ define prompt_persona_name_safe with name as Str returning Int:
 define prompt_persona_ensure_registry returning Int:
     if file_exists(prompt_personas_dir()) == 0:
         set ok to create_directory(prompt_personas_dir())
+        if ok == 0:
+            return 1
     set echo_path to concat(prompt_personas_dir() and "/echo.txt")
     if file_exists(echo_path) == 0:
         if file_exists("config/personal_identity.txt") == 1:
             set legacy to read_file("config/personal_identity.txt")
             if string_length(legacy) > 0:
                 set ok to write_file(echo_path and legacy)
+                if ok == 0:
+                    return 1
     set ernos_path to concat(prompt_personas_dir() and "/ernos.txt")
     if file_exists(ernos_path) == 0:
         set base_persona to ""
@@ -111,6 +115,8 @@ define prompt_persona_ensure_registry returning Int:
                 set base_persona to read_file(edition_persona_path())
         if string_length(base_persona) > 0:
             set ok to write_file(ernos_path and base_persona)
+            if ok == 0:
+                return 1
     return 0
 
 # The active persona's registry name ("" when the pointer is unset).
@@ -121,7 +127,8 @@ define prompt_persona_active returning Str:
     return string_trim(read_file(p))
 
 define prompt_persona_list returning Str:
-    set ok to prompt_persona_ensure_registry()
+    if prompt_persona_ensure_registry() != 0:
+        return "Error: persona registry could not be initialized."
     set active to prompt_persona_active()
     set entries to list_directory(prompt_personas_dir())
     set n to length_list(entries)
@@ -149,25 +156,31 @@ define prompt_persona_list returning Str:
 # Activate a registered persona. Writes the data-dir pointer and invalidates the cached
 # agent name so the very next prompt assembly (and system-role identity) speaks as it.
 define prompt_persona_set with name as Str returning Str:
-    set ok to prompt_persona_ensure_registry()
+    if prompt_persona_ensure_registry() != 0:
+        return "Error: persona registry could not be initialized."
     if prompt_persona_name_safe(name) == 0:
         return "Error: invalid persona name (lowercase letters/digits/_/- only, max 64)."
     set ppath to concat(prompt_personas_dir() and concat("/" and concat(name and ".txt")))
     if file_exists(ppath) == 0:
         return concat("Error: no persona named '" and concat(name and "'. Use persona list to see what is registered."))
     set ok to write_file(storage_active_persona_path() and name)
+    if ok == 0:
+        return "Error: active persona pointer could not be written."
     set ok to prompt_refresh_agent_name()
     return concat("persona:active," and name)
 
 # Register (or overwrite) a persona text under a name. Does NOT activate it.
 define prompt_persona_register with name as Str and text as Str returning Str:
-    set ok to prompt_persona_ensure_registry()
+    if prompt_persona_ensure_registry() != 0:
+        return "Error: persona registry could not be initialized."
     if prompt_persona_name_safe(name) == 0:
         return "Error: invalid persona name (lowercase letters/digits/_/- only, max 64)."
     if string_length(string_trim(text)) == 0:
         return "Error: persona text is empty."
     set ppath to concat(prompt_personas_dir() and concat("/" and concat(name and ".txt")))
     set ok to write_file(ppath and text)
+    if ok == 0:
+        return "Error: persona file could not be written."
     return concat("persona:registered," and name)
 
 define prompt_get_identity returning Str:
@@ -355,6 +368,8 @@ define prompt_persona_current_name returning Str:
 define prompt_get_user_knowledge returning Str:
     set persona to prompt_persona_current_name()
     set kp to storage_user_knowledge_path_for(persona)
+    if string_length(kp) == 0:
+        return "[[USER KNOWLEDGE ERROR — persistent knowledge storage is unavailable.]]\n"
     # One-time migration: content written to the pre-persona-scoping single file moves
     # into the current persona's file on first read.
     if file_exists(kp) == 0:
@@ -363,6 +378,8 @@ define prompt_get_user_knowledge returning Str:
             set legacy to string_trim(read_file(legacy_path))
             if string_length(legacy) > 0:
                 set ok to write_file(kp and legacy)
+                if ok == 0:
+                    display concat("[-] User-knowledge migration failed: " and kp)
     set body to ""
     if file_exists(kp) == 1:
         set body to string_trim(read_file(kp))
@@ -382,6 +399,8 @@ define prompt_get_user_knowledge returning Str:
 define prompt_get_self_knowledge returning Str:
     set persona to prompt_persona_current_name()
     set kp to storage_self_knowledge_path_for(persona)
+    if string_length(kp) == 0:
+        return "[[SELF KNOWLEDGE ERROR — persistent knowledge storage is unavailable.]]\n"
     set body to ""
     if file_exists(kp) == 1:
         set body to string_trim(read_file(kp))
@@ -431,9 +450,8 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
     if tutor_is_active(ctx) == 1:
         set system_prompt to concat(system_prompt and tutor_system_block())
         set system_prompt to concat(system_prompt and "\n")
-        # Authoritative ErnosPlain syntax for the programming track, so the tutor teaches
-        # real syntax instead of guessing. (TODO: gate to the coding track once
-        # multi-subject lessons carry a track; coding is the only track today.)
+        # The installed curriculum is ErnosPlain-only, so tutor mode always includes the
+        # authoritative language primer and never guesses syntax.
         set system_prompt to concat(system_prompt and tutor_ernos_primer())
         set system_prompt to concat(system_prompt and "\n")
     # F2: denial/gate handling rule — always present so the agent never fabricates a

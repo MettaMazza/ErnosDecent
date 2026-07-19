@@ -3,6 +3,30 @@
 All notable changes to ErnosDecent. Dates are absolute. The engine ships on
 `agent-parity` and is merged to `main` and the public `business` overlay.
 
+## 2026-07-19 — AGENT.md adherence and release-gate repair
+
+### Fixed
+
+- Moved the Eleven Laws from `docs/AGENT.md` to the repository-root `AGENT.md` and corrected document links.
+- Made persistence, transport, WebSocket, DHT, identity, money, inference, TTS, media, protocol-server, and node failure paths explicit; added rollback and native-resource cleanup where operations can partially succeed.
+- Replaced cumulative bandwidth throttling with mutex-protected configured-rate windows and rejected caller-supplied tier escalation.
+- Made compute job state concurrency-safe and completed the TCP worker lifecycle: assignment, same-connection result submission, manager validation, acknowledgement, and concurrent connection handling.
+- Removed unused simulated DTLS key derivation; hardened real OpenSSL DTLS-SRTP, libsrtp2, Opus, and VP8 paths against malformed input, allocation failure, ABI error-width mismatches, and leaks.
+- Replaced the compiler-emitted, process-global `gethostbyname()` result with checked `getaddrinfo()` resolution in every generated node and test build; this removes the concurrent resolver corruption proven by UBSan in the stress suite.
+- Routed the cognitive-agent suite through its production-equivalent image, session, blocking, SQLite, and additive-runtime build path so generic test compilation cannot leave declared symbols unresolved.
+- Removed the stale literal bootstrap seed, rejected and purged wildcard cached endpoints, required a real DHT `PONG`, separated connect/send/receive/response errors, and advertised only a configured or detected dialable node address.
+- Made the operated-root role persistent and explicit: static hosts skip their own operated default aliases, launcher options reach the native node, and `network.public_host` now round-trips through generated TOML, load/save, and dashboard configuration. Documented the verified port contract and the DNS/reachability gate for adding a shipped default seed.
+- Marked automatic public bootstrap as pre-launch: TCP `9100`/`9101` were externally reachable on 19 July 2026, while stable DDNS and public forwarding for `9102`–`9104` were explicitly deferred. Fresh nodes continue to require an explicit or cached seed.
+- Generate and secure the per-installation Web UI password before the listener starts, so first-run operators can read the documented file without submitting an unknowable initial value; empty or insecure password files now fail closed.
+- Updated live E2E, multi-node, stress, and upgrade harnesses for authenticated IPC/API access and Web port `8088`; they now stop only processes they launched or use authenticated graceful shutdown instead of killing arbitrary port owners. Multi-node and stress runs use disposable home directories so tests do not alter the operator's wallet, identity, names, DHT, or sessions.
+- Added `scripts/release_check.sh` as the reproducible full local release-validation entrypoint.
+- Corrected emitted SHA-256/MD5 byte assembly to cast bytes to unsigned integers before left shifts, removing a sanitizer-confirmed signed-shift undefined behavior in compiler-generated runtimes.
+- Updated the live E2E AI assertion to the implemented detached-inference contract (`ai:accepted` with session/turn correlation plus explicit cancellation), instead of demanding the obsolete inline `RESPONSE` format.
+
+### Verified
+
+- Checked all 221 native-target Ernos sources, emitted the 4,764-line browser JavaScript artifact, rebuilt the signed macOS node, compiled and ran the 34-target final-tree executable matrix, and executed the runtime, malformed-input, sanitizer, concurrency, and authenticated live-node gates recorded in `docs/IMPLEMENTATION_PLAN.md`.
+
 ## 2026-07-08 (evening) — Eleven root fixes & features from live diagnostics
 
 ### Fixed (every root cause proven from logs/probes before the fix)

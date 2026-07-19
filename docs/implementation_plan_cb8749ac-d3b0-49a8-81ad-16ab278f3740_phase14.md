@@ -1,5 +1,9 @@
 # Phase 14: Node Daemon & Cross-Platform Packaging
 
+> **Archived design record.** This proposal predates authenticated IPC/WebSocket
+> control and the current port layout. Use [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)
+> and the repository README for implemented behavior.
+
 This plan outlines the architecture, design, and integration details for the final phase of ErnosDecent: the coordination daemon (`node.ep`) and the control CLI (`decent_cli/`).
 
 ## Goal Description
@@ -14,7 +18,7 @@ To unify all 13 completed peer-to-peer subsystems into a single running daemon (
 
 We will build the node coordinator at the root of the workspace.
 
-#### [NEW] [node.ep](file:///Users/mettamazza/Desktop/ErnosDecent./node.ep)
+#### [NEW] [node.ep](../node.ep)
 The daemon executable coordinating all subsystems. It does the following:
 1. **Bootstrap Sequence**:
    - Initializes libsodium cryptography (`init_crypto()`).
@@ -29,7 +33,7 @@ The daemon executable coordinating all subsystems. It does the following:
    - Listens on `127.0.0.1:5000` for command connections from `decent_cli`.
    - Reads incoming commands (e.g. `STATUS`, `STOP`, `WALLET_BALANCE`), executes the corresponding subsystem calls, and writes the text/JSON responses back.
 
-#### [NEW] [decent_cli/decent_cli.ep](file:///Users/mettamazza/Desktop/ErnosDecent./decent_cli/decent_cli.ep)
+#### [NEW] [decent_cli/decent_cli.ep](../decent_cli/decent_cli.ep)
 The command-line control interface client:
 1. **Argument Parsing**: Parses CLI args (e.g., `status`, `stop`, `peer add <did>`, `wallet balance`, `mail list`).
 2. **Socket Client**:
@@ -37,7 +41,7 @@ The command-line control interface client:
    - Sends the parsed command text.
    - Receives and formats the daemon's response to `stdout`.
 
-#### [NEW] [decent_cli/test_cli.ep](file:///Users/mettamazza/Desktop/ErnosDecent./decent_cli/test_cli.ep)
+#### [NEW] [decent_cli/test_cli.ep](../decent_cli/test_cli.ep)
 Integration test checking daemon boot and CLI command execution:
 1. Starts the `node.ep` daemon thread.
 2. Simulates CLI calls via the socket IPC interface.

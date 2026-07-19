@@ -1,11 +1,11 @@
 # ErnosDecent -- Nostr Protocol
 # Component: decent_social/nostr.ep
-# Implements: Nostr event creation, serialization, Ed25519 signatures, and filters
-# Status: Production -- OperationTrojanClaude Phase 6
+# Implements: NIP-01 event creation, canonical serialization, BIP-340 signatures, and filters
 
 import "../decent_id/keys"
 import "string"
-import "../stdlib/websocket"
+import "../decent_net/websocket_runtime"
+import "./nostr_runtime"
 import "net"
 
 # ================================================================
@@ -16,6 +16,7 @@ set NOSTR_ERR_NONE to 0
 set NOSTR_ERR_SIGNING_FAILED to 701
 set NOSTR_ERR_VERIFICATION_FAILED to 702
 set NOSTR_ERR_INVALID_EVENT to 703
+set NOSTR_ERR_RELAY_CLOSE_FAILED to 704
 
 # ================================================================
 # Event Serialization, Hashing, and Creation
@@ -41,21 +42,21 @@ define serialize_tags with tags as List returning Str:
     return result
 
 define nostr_hash_event with pubkey as Str and created_at as Int and kind as Int and tags as List and content as Str returning Str:
-    # Serialize event: pubkey:created_at:kind:tags:content
-    set payload to concat(pubkey and ":")
+    # NIP-01 event IDs are SHA-256 over the canonical JSON array
+    # [0,pubkey,created_at,kind,tags,content].
+    set payload to concat("[0,\"" and nostr_json_escape(pubkey))
+    set payload to concat(payload and "\",")
     set payload to concat(payload and int_to_string(created_at))
-    set payload to concat(payload and ":")
+    set payload to concat(payload and ",")
     set payload to concat(payload and int_to_string(kind))
-    set payload to concat(payload and ":")
-    set serialized_tags to serialize_tags(tags)
-    set payload to concat(payload and serialized_tags)
-    set payload to concat(payload and ":")
-    set payload to concat(payload and content)
-
-    # Return SHA-256 hash as event ID
+    set payload to concat(payload and ",")
+    set payload to concat(payload and serialize_tags_to_json(tags))
+    set payload to concat(payload and ",\"")
+    set payload to concat(payload and nostr_json_escape(content))
+    set payload to concat(payload and "\"]")
     return ep_sha256(payload)
 
-define nostr_create_event with pubkey as Str and kind as Int and tags as List and content as Str:
+define nostr_create_event with pubkey as Str and kind as Int and tags as List and content as Str returning Map:
     set event to create_map()
     set created_at to ep_time_now_sec()
     set event_id to nostr_hash_event(pubkey and created_at and kind and tags and content)
@@ -71,30 +72,38 @@ define nostr_create_event with pubkey as Str and kind as Int and tags as List an
     return event
 
 # ================================================================
-# Signing & Verification (Ed25519)
+# Signing & Verification (BIP-340 Schnorr on secp256k1)
 # ================================================================
 
-define nostr_sign_event with event as Int and secret_key_hex as Str returning Int:
-    set event_id to map_get_val(event and "id")
-    set sig_result to sign_message(event_id and secret_key_hex)
-    set err to map_get_val(sig_result and "error")
-    if err != 0:
+define nostr_sign_event with event as Map and secret_key_hex as Str returning Int:
+    set pubkey to ed_nostr_pubkey_from_secret(secret_key_hex)
+    if string_length(pubkey) != 64:
         return NOSTR_ERR_SIGNING_FAILED
-
-    set sig to map_get_val(sig_result and "signature")
+    set created_at to map_get_val(event and "created_at")
+    set kind to map_get_val(event and "kind")
+    set tags to map_get_val(event and "tags")
+    set content to ptr_to_str(map_get_val(event and "content"))
+    set event_id to nostr_hash_event(pubkey and created_at and kind and tags and content)
+    set sig to ed_nostr_sign_hash(event_id and secret_key_hex)
+    if string_length(sig) != 128:
+        return NOSTR_ERR_SIGNING_FAILED
+    set ok to map_insert(event and "pubkey" and pubkey)
+    set ok to map_insert(event and "id" and event_id)
     set ok to map_insert(event and "sig" and sig)
     return NOSTR_ERR_NONE
 
-define nostr_verify_event with event as Int returning Int:
+define nostr_verify_event with event as Map returning Int:
     set event_id to map_get_val(event and "id")
     set pubkey to map_get_val(event and "pubkey")
     set sig to map_get_val(event and "sig")
-    
-    # Verify using keys.ep verify_signature
-    set res to verify_signature(event_id and sig and pubkey)
-    if res == 0:  # ERR_NONE
-        return 1
-    return 0
+    set created_at to map_get_val(event and "created_at")
+    set kind to map_get_val(event and "kind")
+    set tags to map_get_val(event and "tags")
+    set content to ptr_to_str(map_get_val(event and "content"))
+    set expected_id to nostr_hash_event(pubkey and created_at and kind and tags and content)
+    if (event_id equals expected_id) == 0:
+        return 0
+    return ed_nostr_verify_hash(event_id and sig and pubkey)
 
 # ================================================================
 # Filter Matching
@@ -120,7 +129,7 @@ define list_contains_int with list as List and target as Int returning Int:
         set i to i + 1
     return 0
 
-define nostr_match_filter with event as Int and filter as Int returning Int:
+define nostr_match_filter with event as Map and filter as Map returning Int:
     # filter Map keys: "ids", "authors", "kinds", "tag_name", "tag_value"
     # Returns 1 if event matches filter, 0 otherwise
     
@@ -187,8 +196,10 @@ define serialize_tags_to_json with tags as List returning Str:
         set res to concat(res and "[")
         set j to 0
         repeat while j < item_len:
-            set val to get_list(tag_item and j)
-            set res to concat(res and f"\"{val}\"")
+            set val to ptr_to_str(get_list(tag_item and j))
+            set res to concat(res and "\"")
+            set res to concat(res and nostr_json_escape(val))
+            set res to concat(res and "\"")
             if j < item_len - 1:
                 set res to concat(res and ",")
             set j to j + 1
@@ -202,15 +213,50 @@ define serialize_tags_to_json with tags as List returning Str:
 # Escape a string so it is a valid JSON string value. The event "content" field
 # carries a JSON object (full of quotes/braces); without this it breaks the event
 # envelope and the receiver mis-parses it (truncation / injection).
-define nostr_json_escape with input as Str returning Str:
-    set s to string_replace(input and "\\" and "\\\\")
-    set s to string_replace(s and "\"" and "\\\"")
-    set s to string_replace(s and "\n" and "\\n")
-    set s to string_replace(s and "\r" and "\\r")
-    set s to string_replace(s and "\t" and "\\t")
-    return s
+define nostr_hex_digit with value as Int returning Int:
+    if value < 10:
+        return 48 + value
+    return 87 + value
 
-define nostr_event_to_json with event as Int returning Str:
+define nostr_json_escape with input as Str returning Str:
+    set bytes to create_list()
+    set length to string_length(input)
+    set index to 0
+    repeat while index < length:
+        set value to get_character(input and index)
+        if value == 34 or else value == 92:
+            set ok to append_list(bytes and 92)
+            set ok to append_list(bytes and value)
+        else if value == 8:
+            set ok to append_list(bytes and 92)
+            set ok to append_list(bytes and 98)
+        else if value == 9:
+            set ok to append_list(bytes and 92)
+            set ok to append_list(bytes and 116)
+        else if value == 10:
+            set ok to append_list(bytes and 92)
+            set ok to append_list(bytes and 110)
+        else if value == 12:
+            set ok to append_list(bytes and 92)
+            set ok to append_list(bytes and 102)
+        else if value == 13:
+            set ok to append_list(bytes and 92)
+            set ok to append_list(bytes and 114)
+        else if value >= 0 and also value < 32:
+            set ok to append_list(bytes and 92)
+            set ok to append_list(bytes and 117)
+            set ok to append_list(bytes and 48)
+            set ok to append_list(bytes and 48)
+            set ok to append_list(bytes and nostr_hex_digit(value / 16))
+            set ok to append_list(bytes and nostr_hex_digit(value modulo 16))
+        else:
+            set ok to append_list(bytes and value)
+        set index to index + 1
+    set escaped to string_from_list(bytes)
+    free_list(bytes)
+    return escaped
+
+define nostr_event_to_json with event as Map returning Str:
     # Serialize event to Nostr JSON format for wire transmission
     set id_val to ptr_to_str(map_get_val(event and "id"))
     set pubkey to ptr_to_str(map_get_val(event and "pubkey"))
@@ -247,8 +293,26 @@ define nostr_relay_connect with address as Str and port as Int returning Map:
         set ok to map_insert(result and "fd" and 0)
         return result
 
+    set timeout_error to ed_ws_set_timeout(fd and 15000)
+    if timeout_error != 0:
+        set close_error to ep_net_close(fd)
+        if close_error != 0:
+            set ok to map_insert(result and "error" and NOSTR_ERR_RELAY_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and 3)
+        set ok to map_insert(result and "fd" and 0)
+        return result
+
     # Send HTTP upgrade request for WebSocket
-    set ws_key to "dGhlIHNhbXBsZSBub25jZQ=="
+    set ws_key to ed_ws_generate_key()
+    if string_length(ws_key) != 24:
+        set close_error to ep_net_close(fd)
+        if close_error != 0:
+            set ok to map_insert(result and "error" and NOSTR_ERR_RELAY_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and 4)
+        set ok to map_insert(result and "fd" and 0)
+        return result
     set req to "GET / HTTP/1.1\r\n"
     set req to concat(req and f"Host: {address}:{int_to_string(port)}\r\n")
     set req to concat(req and "Upgrade: websocket\r\n")
@@ -257,13 +321,30 @@ define nostr_relay_connect with address as Str and port as Int returning Map:
     set req to concat(req and "Sec-WebSocket-Version: 13\r\n")
     set req to concat(req and "\r\n")
 
-    set ok to ep_net_send(fd and req)
+    set sent to ep_net_send(fd and req)
+    if sent != string_length(req):
+        set close_error to ep_net_close(fd)
+        if close_error != 0:
+            set ok to map_insert(result and "error" and NOSTR_ERR_RELAY_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and 5)
+        set ok to map_insert(result and "fd" and 0)
+        return result
 
     # Read upgrade response
-    set resp to ep_net_recv(fd and 1024)
-    if string_contains(resp and "101") == 0:
-        set ok to ep_net_close(fd)
-        set ok to map_insert(result and "error" and 2)
+    set resp to ep_net_recv(fd and 16384)
+    set expected_accept to websocket_expected_accept(ws_key)
+    set response_upper to string_upper(resp)
+    set valid_status to string_index_of(resp and "HTTP/1.1 101 ") == 0
+    set valid_upgrade to string_contains(response_upper and "UPGRADE: WEBSOCKET\r\n")
+    set valid_connection to string_contains(response_upper and "CONNECTION: UPGRADE\r\n")
+    set valid_accept to string_contains(resp and concat("Sec-WebSocket-Accept: " and concat(expected_accept and "\r\n")))
+    if valid_status == 0 or else valid_upgrade == 0 or else valid_connection == 0 or else valid_accept == 0:
+        set close_error to ep_net_close(fd)
+        if close_error != 0:
+            set ok to map_insert(result and "error" and NOSTR_ERR_RELAY_CLOSE_FAILED)
+        else:
+            set ok to map_insert(result and "error" and 2)
         set ok to map_insert(result and "fd" and 0)
         return result
 
@@ -273,7 +354,7 @@ define nostr_relay_connect with address as Str and port as Int returning Map:
     set ok to map_insert(result and "port" and port)
     return result
 
-define nostr_relay_publish with conn as Map and event as Int returning Int:
+define nostr_relay_publish with conn as Map and event as Map returning Int:
     # Publish a signed Nostr event to a connected relay via WebSocket
     set fd to map_get_val(conn and "fd")
     if fd <= 0:
@@ -283,12 +364,12 @@ define nostr_relay_publish with conn as Map and event as Int returning Int:
     set msg to concat("[\"EVENT\"," and event_json)
     set msg to concat(msg and "]")
 
-    # Send as WebSocket text frame (client must mask frames per RFC 6455)
-    # For simplicity, send unmasked — many relay implementations accept this
-    set ok to ws_send_text(fd and msg)
+    set send_error to websocket_send_client_text(fd and msg)
+    if send_error != 0:
+        return NOSTR_ERR_INVALID_EVENT
     return NOSTR_ERR_NONE
 
-define nostr_relay_subscribe with conn as Map and sub_id as Str and filter as Int returning Int:
+define nostr_relay_subscribe with conn as Map and sub_id as Str and filter as Map returning Int:
     # Send a REQ subscription to the relay
     set fd to map_get_val(conn and "fd")
     if fd <= 0:
@@ -355,7 +436,9 @@ define nostr_relay_subscribe with conn as Map and sub_id as Str and filter as In
     set msg to concat(msg and filter_json)
     set msg to concat(msg and "]")
 
-    set ok to ws_send_text(fd and msg)
+    set send_error to websocket_send_client_text(fd and msg)
+    if send_error != 0:
+        return NOSTR_ERR_INVALID_EVENT
     return NOSTR_ERR_NONE
 
 define nostr_relay_receive with conn as Map returning Str:
@@ -363,12 +446,15 @@ define nostr_relay_receive with conn as Map returning Str:
     set fd to map_get_val(conn and "fd")
     if fd <= 0:
         return ""
-    return ws_read_frame(fd)
+    return websocket_read_server_text(fd)
 
 define nostr_relay_close with conn as Map returning Int:
     # Gracefully close a relay connection
     set fd to map_get_val(conn and "fd")
     if fd <= 0:
         return 1
-    set ok to ws_send_close(fd)
+    set frame_error to websocket_send_client_close(fd)
+    set close_error to ep_net_close(fd)
+    if frame_error != 0 or else close_error != 0:
+        return NOSTR_ERR_INVALID_EVENT
     return NOSTR_ERR_NONE

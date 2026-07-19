@@ -41,7 +41,7 @@ define changelog_json_escape with s as Str returning Str:
                             set ok to append_list(result_list and ch)
         set i to i + 1
     set escaped to string_from_list(result_list)
-    free_list(result_list)
+    set ok to free_list(result_list)
     return escaped
 
 # ---- Trim trailing newline from command output ----
@@ -49,11 +49,16 @@ define changelog_trim_newline with s as Str returning Str:
     set slen to string_length(s)
     if slen == 0:
         return s
-    set last_char to get_character(s and slen - 1)
-    if last_char == 10: # newline
-        return substring(s and 0 and slen - 1)
-    if last_char == 13: # carriage return
-        return substring(s and 0 and slen - 1)
+    set end_pos to slen
+    set trimming to 1
+    repeat while end_pos > 0 and also trimming == 1:
+        set last_char to get_character(s and end_pos - 1)
+        if last_char == 10 or else last_char == 13:
+            set end_pos to end_pos - 1
+        else:
+            set trimming to 0
+    if end_pos != slen:
+        return substring(s and 0 and end_pos)
     return s
 
 # ================================================================
@@ -62,6 +67,9 @@ define changelog_trim_newline with s as Str returning Str:
 define changelog_init returning Int:
     if file_exists("config/changelog") == 0:
         set ok to create_directory("config/changelog")
+        if ok == 0:
+            display "[Changelog] Failed to create config/changelog."
+            return 1
     return 0
 
 # ================================================================
@@ -69,12 +77,24 @@ define changelog_init returning Int:
 # Creates the file with "[]" if it doesn't exist yet
 # ================================================================
 define changelog_get_current_file returning Str:
-    set ym_raw to run_command("date +%Y-%m")
-    set ym to changelog_trim_newline(ym_raw)
+    if changelog_init() != 0:
+        return ""
+    set ym_raw to run_command("date +%Y-%m 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    set marker_pos to string_index_of(ym_raw and "__ERNOS_EXIT__:0")
+    if marker_pos < 0:
+        display concat("[Changelog] Failed to obtain the current month: " and ym_raw)
+        return ""
+    set ym to changelog_trim_newline(substring(ym_raw and 0 and marker_pos))
+    if string_length(ym) != 7:
+        display concat("[Changelog] Invalid current-month value: " and ym)
+        return ""
     set filename to concat("changelog_" and concat(ym and ".json"))
     set filepath to path_join("config/changelog" and filename)
     if file_exists(filepath) == 0:
         set ok to write_file(filepath and "[]")
+        if ok == 0:
+            display concat("[Changelog] Failed to initialize " and filepath)
+            return ""
     return filepath
 
 # ================================================================
@@ -94,11 +114,20 @@ define changelog_hash_file with path as Str returning Str:
 # ================================================================
 define changelog_log_change with session_id as Str and tool as Str and path as Str and action as Str and hash_before as Str and hash_after as Str and size_before as Int and size_after as Int and summary as Str returning Int:
     set changelog_path to changelog_get_current_file()
+    if string_length(changelog_path) == 0:
+        return 1
     set file_content to read_file(changelog_path)
 
     # Get current UTC timestamp
-    set ts_raw to run_command("date -u +%Y-%m-%dT%H:%M:%SZ")
-    set ts to changelog_trim_newline(ts_raw)
+    set ts_raw to run_command("date -u +%Y-%m-%dT%H:%M:%SZ 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    set marker_pos to string_index_of(ts_raw and "__ERNOS_EXIT__:0")
+    if marker_pos < 0:
+        display concat("[Changelog] Failed to obtain a UTC timestamp: " and ts_raw)
+        return 1
+    set ts to changelog_trim_newline(substring(ts_raw and 0 and marker_pos))
+    if string_length(ts) != 20:
+        display concat("[Changelog] Invalid UTC timestamp: " and ts)
+        return 1
 
     # Build the JSON entry manually
     set entry to "{"
@@ -125,6 +154,9 @@ define changelog_log_change with session_id as Str and tool as Str and path as S
         set new_content to concat(trimmed and concat("," and concat(entry and "]")))
 
     set ok to write_file(changelog_path and new_content)
+    if ok == 0:
+        display concat("[Changelog] Failed to update " and changelog_path)
+        return 1
     return 0
 
 # ================================================================
@@ -132,7 +164,12 @@ define changelog_log_change with session_id as Str and tool as Str and path as S
 # Runs git diff, hashes each changed file, logs to changelog
 # ================================================================
 define changelog_detect_git_changes with session_id as Str returning Int:
-    set diff_output to run_command("git diff --name-only HEAD~1..HEAD 2>/dev/null")
+    set diff_raw to run_command("git diff --name-only HEAD~1..HEAD 2>&1; printf '\n__ERNOS_EXIT__:%s' $?")
+    set marker_pos to string_index_of(diff_raw and "__ERNOS_EXIT__:0")
+    if marker_pos < 0:
+        display concat("[Changelog] Git change detection failed: " and diff_raw)
+        return -1
+    set diff_output to substring(diff_raw and 0 and marker_pos)
     set diff_len to string_length(diff_output)
     if diff_len == 0:
         return 0
@@ -150,6 +187,8 @@ define changelog_detect_git_changes with session_id as Str returning Int:
                 set file_hash to changelog_hash_file(file_path)
                 set file_len to string_length(file_path)
                 set ok to changelog_log_change(session_id and "git" and file_path and "commit" and "" and file_hash and 0 and file_len and "Detected via git diff")
+                if ok != 0:
+                    return -1
                 set count to count + 1
             set pos to diff_len
         else:
@@ -159,6 +198,8 @@ define changelog_detect_git_changes with session_id as Str returning Int:
                 set file_hash to changelog_hash_file(file_path)
                 set file_len to string_length(file_path)
                 set ok to changelog_log_change(session_id and "git" and file_path and "commit" and "" and file_hash and 0 and file_len and "Detected via git diff")
+                if ok != 0:
+                    return -1
                 set count to count + 1
             set start to start + line_len + 1
             set pos to start
@@ -170,6 +211,8 @@ define changelog_detect_git_changes with session_id as Str returning Int:
 # ================================================================
 define changelog_get_recent with count as Int returning Str:
     set changelog_path to changelog_get_current_file()
+    if string_length(changelog_path) == 0:
+        return ""
     set file_content to read_file(changelog_path)
     set root to json_parse(file_content)
     if root == 0:

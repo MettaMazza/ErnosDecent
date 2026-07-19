@@ -1,0 +1,54 @@
+# ErnosDecent — authenticated IPC client library
+
+import "collections"
+import "string"
+import "net"
+
+set CLI_ERR_NONE to 0
+set CLI_ERR_INVALID_INPUT to 1
+set CLI_ERR_CONNECT_FAILED to 2
+set CLI_ERR_SEND_FAILED to 3
+set CLI_ERR_EMPTY_RESPONSE to 4
+set CLI_ERR_CLOSE_FAILED to 5
+
+define cli_result with error_code as Int and response as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "error" and error_code)
+    set ok to map_insert(result and "response" and response)
+    return result
+
+define cli_send_command with address as Str and port as Int and token as Str and command as Str returning Map:
+    set clean_token to string_trim(token)
+    set clean_command to string_trim(command)
+    if string_length(address) == 0 or else port <= 0 or else port > 65535:
+        return cli_result(CLI_ERR_INVALID_INPUT and "")
+    if string_length(clean_token) == 0 or else string_length(clean_command) == 0:
+        return cli_result(CLI_ERR_INVALID_INPUT and "")
+
+    set fd to ep_net_connect(address and port)
+    if fd < 0:
+        return cli_result(CLI_ERR_CONNECT_FAILED and "")
+
+    set request to concat("AUTH " and concat(clean_token and concat(" " and clean_command)))
+    set sent to ep_net_send(fd and request)
+    if sent != string_length(request):
+        set close_err to ep_net_close(fd)
+        if close_err != 0:
+            return cli_result(CLI_ERR_CLOSE_FAILED and "")
+        return cli_result(CLI_ERR_SEND_FAILED and "")
+
+    set response to ""
+    set reading to 1
+    repeat while reading == 1:
+        set chunk to ep_net_recv(fd and 65536)
+        if string_length(chunk) == 0:
+            set reading to 0
+        else:
+            set response to concat(response and chunk)
+
+    set close_err to ep_net_close(fd)
+    if close_err != 0:
+        return cli_result(CLI_ERR_CLOSE_FAILED and response)
+    if string_length(response) == 0:
+        return cli_result(CLI_ERR_EMPTY_RESPONSE and "")
+    return cli_result(CLI_ERR_NONE and response)

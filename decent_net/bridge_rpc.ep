@@ -39,17 +39,17 @@ define bridge_json_escape with s as Str returning Str:
         set i to i + 1
     return out
 
-define bridge_ensure_schema with db as Int:
+define bridge_ensure_schema with db as Int returning Int:
     if db == 0:
         return 1
-    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS bridge_commands (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL DEFAULT 'discord', action TEXT NOT NULL, args TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', result TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);")
-    return 0
+    return sql_execute(db and "CREATE TABLE IF NOT EXISTS bridge_commands (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL DEFAULT 'discord', action TEXT NOT NULL, args TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', result TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);")
 
 # Enqueue a command for the bridge; returns the new command id (0 on failure).
 define bridge_enqueue with db as Int and platform as Str and action as Str and args as Str returning Int:
     if db == 0:
         return 0
-    set ok to bridge_ensure_schema(db)
+    if bridge_ensure_schema(db) != 0:
+        return 0
     set ep to bridge_sql_escape(platform)
     set ea to bridge_sql_escape(action)
     set eg to bridge_sql_escape(args)
@@ -57,6 +57,8 @@ define bridge_enqueue with db as Int and platform as Str and action as Str and a
     set q to concat("INSERT INTO bridge_commands (platform, action, args, status, result, created_at) VALUES ('" and ep)
     set q to concat(q and concat("', '" and concat(ea and concat("', '" and concat(eg and concat("', 'pending', '', " and concat(int_to_string(now) and ");")))))))
     set ok to sql_execute(db and q)
+    if ok != 0:
+        return 0
     set rows to sql_query(db and "SELECT id FROM bridge_commands ORDER BY id DESC LIMIT 1;")
     if length_list(rows) > 0:
         return string_to_int(get_list(get_list(rows and 0) and 0))
@@ -66,7 +68,8 @@ define bridge_enqueue with db as Int and platform as Str and action as Str and a
 define bridge_poll with db as Int returning Str:
     if db == 0:
         return "[]"
-    set ok to bridge_ensure_schema(db)
+    if bridge_ensure_schema(db) != 0:
+        return "{\"error\":\"bridge schema unavailable\"}"
     set rows to sql_query(db and "SELECT id, platform, action, args FROM bridge_commands WHERE status='pending' ORDER BY id LIMIT 50;")
     set n to length_list(rows)
     set out to "["
@@ -81,6 +84,8 @@ define bridge_poll with db as Int returning Str:
         set out to concat(out and concat(",\"action\":\"" and concat(bridge_json_escape(get_list(r and 2)) and "\"")))
         set out to concat(out and concat(",\"args\":\"" and concat(bridge_json_escape(get_list(r and 3)) and "\"}")))
         set ok to sql_execute(db and concat("UPDATE bridge_commands SET status='sent' WHERE id=" and concat(id_str and ";")))
+        if ok != 0:
+            return concat("{\"error\":\"bridge delivery state update failed\",\"sqlite_code\":" and concat(int_to_string(ok) and "}"))
         set i to i + 1
     set out to concat(out and "]")
     return out
@@ -89,18 +94,20 @@ define bridge_poll with db as Int returning Str:
 define bridge_submit_result with db as Int and id as Int and data as Str returning Int:
     if db == 0:
         return 1
-    set ok to bridge_ensure_schema(db)
+    if bridge_ensure_schema(db) != 0:
+        return 1
     set ed to bridge_sql_escape(data)
     set q to concat("UPDATE bridge_commands SET status='done', result='" and concat(ed and concat("' WHERE id=" and concat(int_to_string(id) and ";"))))
     set ok to sql_execute(db and q)
-    return 0
+    return ok
 
 # Result for a command: the data if done, "pending:<status>" while in flight,
 # "error:not_found" if the id is unknown.
 define bridge_get_result with db as Int and id as Int returning Str:
     if db == 0:
         return "error:no_db"
-    set ok to bridge_ensure_schema(db)
+    if bridge_ensure_schema(db) != 0:
+        return "error:schema_unavailable"
     set rows to sql_query(db and concat("SELECT status, result FROM bridge_commands WHERE id=" and concat(int_to_string(id) and ";")))
     if length_list(rows) > 0:
         set r to get_list(rows and 0)
@@ -113,7 +120,7 @@ define bridge_get_result with db as Int and id as Int returning Str:
 # Awaitable pure sleep (C helper injected by build.sh). Unlike ep_sleep_ms — which
 # blocks the WHOLE single-threaded async loop — awaiting this yields, so sibling agent
 # tasks keep running while we wait for the bridge process to answer via SQLite.
-external define ep_async_sleep_ms with ms returning Int
+external define ep_async_sleep_ms with ms as Int returning Int
 
 # Poll for a result up to max_tries (50ms apart, async-yielding). Returns the data when
 # ready, or "discord:queued,id:<id>" if the bridge hasn't answered in time. With the

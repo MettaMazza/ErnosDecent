@@ -18,18 +18,20 @@ import "../decent_id/did"
 set REG_ERR_NONE to 0
 set REG_ERR_NAME_TAKEN to 971
 set REG_ERR_NOT_FOUND to 972
+set REG_ERR_STORAGE to 973
+set REG_ERR_DHT_PUBLISH to 974
 
 # ================================================================
 # Registry Operations — in-memory + persistent
 # ================================================================
 
-define registry_create:
+define registry_create returning Map:
     set reg to create_map()
     set names to create_map()
     set ok to map_insert(reg and "names" and names)
     return reg
 
-define registry_register with reg as Int and name as Str and owner_did as Str and dht as Int and seed_addr as Str and seed_port as Int and signing_pub_hex as Str and signing_sec_hex as Str returning Int:
+define registry_register with reg as Map and name as Str and owner_did as Str and dht as Map and seed_addr as Str and seed_port as Int and signing_pub_hex as Str and signing_sec_hex as Str returning Int:
     set names to map_get_val(reg and "names")
 
     # Check in-memory first
@@ -41,7 +43,9 @@ define registry_register with reg as Int and name as Str and owner_did as Str an
             # lookup (storage_name_get_by_did) returns the most recently
             # registered name, so without this bump a freshly re-registered name
             # would stay behind an older one and never show in the UI.
-            set ok to storage_name_register(name and owner_did)
+            set persist_ok to storage_name_register(name and owner_did)
+            if persist_ok != STORAGE_ERR_NONE:
+                return REG_ERR_STORAGE
             return REG_ERR_NONE
         return REG_ERR_NAME_TAKEN
 
@@ -52,22 +56,28 @@ define registry_register with reg as Int and name as Str and owner_did as Str an
         set ok to map_insert(names and name and persisted)
         if persisted equals owner_did:
             # Owned by this DID: bump registered_at so it becomes the current name.
-            set ok to storage_name_register(name and owner_did)
+            set persist_ok to storage_name_register(name and owner_did)
+            if persist_ok != STORAGE_ERR_NONE:
+                return REG_ERR_STORAGE
             return REG_ERR_NONE
         return REG_ERR_NAME_TAKEN
 
     # Register in memory and persist
-    set ok to map_insert(names and name and owner_did)
     set persist_ok to storage_name_register(name and owner_did)
+    if persist_ok != STORAGE_ERR_NONE:
+        return REG_ERR_STORAGE
+    set ok to map_insert(names and name and owner_did)
 
     # Publish to DHT for distributed resolution
     set dht_key to concat("name:" and name)
     if string_length(seed_addr) > 0:
         set dht_err to dht_rpc_store_signed(dht and seed_addr and seed_port and dht_key and owner_did and signing_pub_hex and signing_sec_hex)
+        if dht_err != DHT_NET_ERR_NONE:
+            return REG_ERR_DHT_PUBLISH
 
     return REG_ERR_NONE
 
-define registry_resolve with reg as Int and name as Str and dht as Int and seed_addr as Str and seed_port as Int returning Str:
+define registry_resolve with reg as Map and name as Str and dht as Map and seed_addr as Str and seed_port as Int returning Str:
     set names to map_get_val(reg and "names")
 
     # Check in-memory cache

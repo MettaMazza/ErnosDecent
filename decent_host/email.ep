@@ -1,7 +1,6 @@
 # ErnosDecent — SMTP/IMAP Server and Signature Verification
 # Component: decent_host/email.ep
-# Implements: SMTP/IMAP protocol simulation, inbound routing, and DID signature validation
-# Status: Production — OperationTrojanClaude Phase 13
+# Implements: the documented SMTP/IMAP command subset, inbound routing, and DID signature validation
 
 import "../decent_id/did"
 import "../decent_id/keys"
@@ -19,6 +18,27 @@ set EMAIL_ERR_ACCOUNT_NOT_FOUND to 901
 set EMAIL_ERR_VERIFICATION_FAILED to 902
 set EMAIL_ERR_INVALID_COMMAND to 903
 set EMAIL_ERR_MALFORMED_MESSAGE to 904
+set EMAIL_ERR_NETWORK to 905
+set EMAIL_ERR_PROTOCOL to 906
+
+define email_send_all with fd as Int and data as Str returning Int:
+    set sent to net_send(fd and data)
+    if sent != string_length(data):
+        return EMAIL_ERR_NETWORK
+    return EMAIL_ERR_NONE
+
+define email_close_with_primary with fd as Int and primary_error as Int returning Int:
+    set close_error to net_close(fd)
+    if close_error != 0:
+        return EMAIL_ERR_NETWORK
+    return primary_error
+
+define email_response_has_code with response as Str and code as Str returning Int:
+    if string_length(response) < 3:
+        return 0
+    if substring(response and 0 and 3) equals code:
+        return 1
+    return 0
 
 # ================================================================
 # Data Structures
@@ -136,7 +156,9 @@ define smtp_route_inbound with server as Map and raw_msg as Str returning Int:
     else:
         if map_contains(server and "registry") == 1:
             set reg to map_get_val(server and "registry")
-            set resolved_did to registry_resolve(reg and sender and 0 and "" and 0)
+            set no_dht to create_map()
+            set resolved_did to registry_resolve(reg and sender and no_dht and "" and 0)
+            free_map(no_dht)
             if string_length(resolved_did) > 0:
                 set sender_did to resolved_did
     if string_length(sender_did) == 0:
@@ -209,11 +231,13 @@ define imap_handle_command with server as Map and account as Map and cmd_str as 
 # TCP Server Loops — real networking
 # ================================================================
 
-define smtp_client_handler with server as Map and client_fd as Int:
+define smtp_client_handler with server as Map and client_fd as Int returning Int:
     # Handle a single SMTP client connection
     # Send greeting
     set greeting to "220 ernos.decent SMTP ready\r\n"
-    set ok to net_send(client_fd and greeting)
+    set send_err to email_send_all(client_fd and greeting)
+    if send_err != EMAIL_ERR_NONE:
+        return email_close_with_primary(client_fd and send_err)
 
     # Read/respond loop
     set running to 1
@@ -224,15 +248,19 @@ define smtp_client_handler with server as Map and client_fd as Int:
         else:
             set response to smtp_handle_command(server and cmd)
             set response_line to concat(response and "\r\n")
-            set ok to net_send(client_fd and response_line)
+            set send_err to email_send_all(client_fd and response_line)
+            if send_err != EMAIL_ERR_NONE:
+                set running to 0
 
             # Check for QUIT or DATA end
             set trimmed to string_upper(string_trim(cmd))
             if trimmed equals "QUIT":
                 set running to 0
 
-    set ok to net_close(client_fd)
-    return 0
+    set close_err to net_close(client_fd)
+    if send_err != EMAIL_ERR_NONE or else close_err != 0:
+        return EMAIL_ERR_NETWORK
+    return EMAIL_ERR_NONE
 
 define smtp_serve with server as Map returning Int:
     # Start SMTP server on the configured port, accept connections over TCP
@@ -241,18 +269,24 @@ define smtp_serve with server as Map returning Int:
     if server_fd < 0:
         return 1
 
-    # Accept one connection (for production, would loop)
+    # Handle one connection; the node supervisor invokes this handler per accepted session.
     set client_fd to net_accept(server_fd)
     if client_fd > 0:
-        set ok to smtp_client_handler(server and client_fd)
+        set handler_err to smtp_client_handler(server and client_fd)
+        if handler_err != EMAIL_ERR_NONE:
+            return email_close_with_primary(server_fd and handler_err)
 
-    set ok to net_close(server_fd)
-    return 0
+    set close_err to net_close(server_fd)
+    if close_err != 0:
+        return EMAIL_ERR_NETWORK
+    return EMAIL_ERR_NONE
 
-define imap_client_handler with server as Map and account as Map and client_fd as Int:
+define imap_client_handler with server as Map and account as Map and client_fd as Int returning Int:
     # Handle a single IMAP client connection
     set greeting to "* OK ernos.decent IMAP ready\r\n"
-    set ok to net_send(client_fd and greeting)
+    set send_err to email_send_all(client_fd and greeting)
+    if send_err != EMAIL_ERR_NONE:
+        return email_close_with_primary(client_fd and send_err)
 
     set running to 1
     repeat while running == 1:
@@ -263,14 +297,18 @@ define imap_client_handler with server as Map and account as Map and client_fd a
             set response to imap_handle_command(server and account and cmd)
             set response_line to concat("* " and response)
             set response_line to concat(response_line and "\r\n")
-            set ok to net_send(client_fd and response_line)
+            set send_err to email_send_all(client_fd and response_line)
+            if send_err != EMAIL_ERR_NONE:
+                set running to 0
 
             set trimmed to string_upper(string_trim(cmd))
             if trimmed equals "LOGOUT":
                 set running to 0
 
-    set ok to net_close(client_fd)
-    return 0
+    set close_err to net_close(client_fd)
+    if send_err != EMAIL_ERR_NONE or else close_err != 0:
+        return EMAIL_ERR_NETWORK
+    return EMAIL_ERR_NONE
 
 define imap_serve with server as Map and account as Map returning Int:
     # Start IMAP server on the configured port
@@ -281,10 +319,14 @@ define imap_serve with server as Map and account as Map returning Int:
 
     set client_fd to net_accept(server_fd)
     if client_fd > 0:
-        set ok to imap_client_handler(server and account and client_fd)
+        set handler_err to imap_client_handler(server and account and client_fd)
+        if handler_err != EMAIL_ERR_NONE:
+            return email_close_with_primary(server_fd and handler_err)
 
-    set ok to net_close(server_fd)
-    return 0
+    set close_err to net_close(server_fd)
+    if close_err != 0:
+        return EMAIL_ERR_NETWORK
+    return EMAIL_ERR_NONE
 
 define smtp_send_message with host as Str and port as Int and from_addr as Str and to_addr as Str and body as Str returning Int:
     # Send an email via SMTP over real TCP
@@ -294,33 +336,57 @@ define smtp_send_message with host as Str and port as Int and from_addr as Str a
 
     # Read greeting
     set greeting to net_recv(fd and 1024)
+    if email_response_has_code(greeting and "220") == 0:
+        return email_close_with_primary(fd and EMAIL_ERR_PROTOCOL)
 
     # HELO
-    set ok to net_send(fd and "HELO ernos.decent\r\n")
+    set send_err to email_send_all(fd and "HELO ernos.decent\r\n")
+    if send_err != EMAIL_ERR_NONE:
+        return email_close_with_primary(fd and send_err)
     set resp1 to net_recv(fd and 1024)
+    if email_response_has_code(resp1 and "250") == 0:
+        return email_close_with_primary(fd and EMAIL_ERR_PROTOCOL)
 
     # MAIL FROM
     set mail_cmd to concat("MAIL FROM:<" and from_addr)
     set mail_cmd to concat(mail_cmd and ">\r\n")
-    set ok to net_send(fd and mail_cmd)
+    set send_err to email_send_all(fd and mail_cmd)
+    if send_err != EMAIL_ERR_NONE:
+        return email_close_with_primary(fd and send_err)
     set resp2 to net_recv(fd and 1024)
+    if email_response_has_code(resp2 and "250") == 0:
+        return email_close_with_primary(fd and EMAIL_ERR_PROTOCOL)
 
     # RCPT TO
     set rcpt_cmd to concat("RCPT TO:<" and to_addr)
     set rcpt_cmd to concat(rcpt_cmd and ">\r\n")
-    set ok to net_send(fd and rcpt_cmd)
+    set send_err to email_send_all(fd and rcpt_cmd)
+    if send_err != EMAIL_ERR_NONE:
+        return email_close_with_primary(fd and send_err)
     set resp3 to net_recv(fd and 1024)
+    if email_response_has_code(resp3 and "250") == 0:
+        return email_close_with_primary(fd and EMAIL_ERR_PROTOCOL)
 
     # DATA
-    set ok to net_send(fd and "DATA\r\n")
+    set send_err to email_send_all(fd and "DATA\r\n")
+    if send_err != EMAIL_ERR_NONE:
+        return email_close_with_primary(fd and send_err)
     set resp4 to net_recv(fd and 1024)
+    if email_response_has_code(resp4 and "354") == 0:
+        return email_close_with_primary(fd and EMAIL_ERR_PROTOCOL)
 
     # Send body + terminator
     set data to concat(body and "\r\n.\r\n")
-    set ok to net_send(fd and data)
+    set send_err to email_send_all(fd and data)
+    if send_err != EMAIL_ERR_NONE:
+        return email_close_with_primary(fd and send_err)
     set resp5 to net_recv(fd and 1024)
+    if email_response_has_code(resp5 and "250") == 0:
+        return email_close_with_primary(fd and EMAIL_ERR_PROTOCOL)
 
     # QUIT
-    set ok to net_send(fd and "QUIT\r\n")
-    set ok to net_close(fd)
-    return 0
+    set send_err to email_send_all(fd and "QUIT\r\n")
+    set close_err to net_close(fd)
+    if send_err != EMAIL_ERR_NONE or else close_err != 0:
+        return EMAIL_ERR_NETWORK
+    return EMAIL_ERR_NONE

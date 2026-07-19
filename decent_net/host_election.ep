@@ -12,7 +12,8 @@ import "fs"
 import "transport"
 import "dht"
 
-external define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node as Int and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int returning Map
+external define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node as Map and borrow raft_node as Map and peers as List and node_id as Str and pub_hex as Str and raft_port as Int and advertised_host as Str and advertised_port as Int returning Map
+external define cast_int_to_map with i as Int returning Map
 
 
 # ================================================================
@@ -134,6 +135,7 @@ define sort_hosts_descending with list as List returning Int:
 # ================================================================
 
 define host_election_loop with dht_node as Int and local_id as Str and local_ip as Str and local_port as Int and is_static as Int and raft_node as Map and peers as List and pub_hex as Str and raft_port as Int returning Int:
+    set dht_map to cast_int_to_map(dht_node)
     display "[+] Host Election loop active."
     
     set prev_primary_id to ""
@@ -147,17 +149,21 @@ define host_election_loop with dht_node as Int and local_id as Str and local_ip 
         set elect_enabled to 1
         set cfg to config_load(cfg_path)
         if cfg != 0:
-            if map_contains(cfg and "network.is_static_host") == 1:
+            if map_contains(cfg and "config.error") == 1:
+                display concat("[HOST-ELECTION] Configuration error: " and ptr_to_str(map_get_val(cfg and "config.error")))
+                free_map(cfg)
+                continue
+            else if map_contains(cfg and "network.is_static_host") == 1:
                 set is_static_active to config_get_int(cfg and "network.is_static_host")
             if map_contains(cfg and "network.enable_host_election") == 1:
                 set elect_enabled to config_get_int(cfg and "network.enable_host_election")
             free_map(cfg)
             
         if elect_enabled == 1:
-            set connections_count to dht_node_peer_count(dht_node)
+            set connections_count to dht_node_peer_count(dht_map)
             
             # 1. Fetch current hosts list from DHT
-            set get_res to dht_node_get_value(dht_node and "network:host_nodes")
+            set get_res to dht_node_get_value(dht_map and "network:host_nodes")
             set err to map_get_val(get_res and "error")
             set hosts_list to create_list()
             
@@ -204,7 +210,7 @@ define host_election_loop with dht_node as Int and local_id as Str and local_ip 
             # Sort and persist
             set ok to sort_hosts_descending(new_list)
             set serialized to host_list_serialize(new_list)
-            set store_err to dht_node_store_value(dht_node and "network:host_nodes" and serialized)
+            set store_err to dht_node_store_value(dht_map and "network:host_nodes" and serialized)
             
             # 3. Determine elected Primary Host
             if length_list(new_list) > 0:
@@ -224,7 +230,7 @@ define host_election_loop with dht_node as Int and local_id as Str and local_ip 
                         display f"[Host Election] New Primary Host Node elected: {primary_id} at {primary_addr}:{int_to_string(primary_port)}"
                         # Try bootstrapping
                         # Import dynamically using extern bootstrap_to_seed or invoke directly
-                        set boot_res to bootstrap_to_seed(primary_addr and primary_port and dht_node and borrow raft_node and host_cast_borrow_to_list(peers) and local_id and pub_hex and raft_port)
+                        set boot_res to bootstrap_to_seed(primary_addr and primary_port and dht_map and borrow raft_node and host_cast_borrow_to_list(peers) and local_id and pub_hex and raft_port and local_ip and local_port)
                         set prev_primary_id to primary_id
                         
             free_map(get_res)

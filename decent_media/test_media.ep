@@ -10,19 +10,26 @@ import "../decent_store/content"
 import "../decent_net/dht"
 import "collections"
 import "string"
+import "../storage"
 
-external define get_list_data_ptr with list
+external define get_list_data_ptr with list as List returning Int
 
 define cast_to_int with x as Int returning Int:
     return x
 
-define main:
+define main returning Int:
     display "==================================================="
     display "  ErnosDecent -- decent_media/test_media.ep Suite"
     display "  OperationTrojanClaude Phase 10 Integration Test"
     display "==================================================="
     display ""
-    
+
+    set test_storage_dir to concat("/tmp/ernos_media_test_" and int_to_string(ep_time_now_ms()))
+    set storage_err to storage_init(test_storage_dir)
+    if storage_err != STORAGE_ERR_NONE:
+        display f"FATAL: test storage initialization failed with {storage_err}"
+        return 1
+
     set tests_passed to 0
     set tests_failed to 0
     
@@ -78,6 +85,9 @@ define main:
     set ok to append_list(transaction_id and 12)
     
     set request_ptr to webrtc_pack_stun_request(transaction_id)
+    if request_ptr == 0:
+        display "FATAL: STUN request allocation failed"
+        return 1
     
     # Verify request magic cookie (0x2112A442)
     set cookie_ok to 0
@@ -87,6 +97,11 @@ define main:
     # Construct a simulated STUN Response packet with XOR-MAPPED-ADDRESS
     # Attributes start at offset 20. Let's make a 32-byte packet
     set response_ptr to alloc_bytes(32)
+    if response_ptr == 0:
+        display "FATAL: STUN response allocation failed"
+        set ok to free_bytes(request_ptr)
+        set ok to free_list(transaction_id)
+        return 1
     # Type: 0x0101 (Binding Response)
     poke_byte(response_ptr and 0 and 1)
     poke_byte(response_ptr and 1 and 1)
@@ -130,8 +145,8 @@ define main:
     set parsed_addr to map_get_val(parsed_res and "address")
     set parsed_port to cast_to_int(map_get_val(parsed_res and "port"))
     
-    free_bytes(request_ptr)
-    free_bytes(response_ptr)
+    set ok to free_bytes(request_ptr)
+    set ok to free_bytes(response_ptr)
     set ok to free_list(transaction_id)
     
     set t2_ok to 0
@@ -177,26 +192,33 @@ define main:
     set dec_res to webrtc_decrypt_srtp(packet_ptr and packet_len and keys_bob)
     set dec_valid to cast_to_int(map_get_val(dec_res and "valid"))
     
-    set decrypted_payload to ""
+    set payload_matches to 0
     if dec_valid == 1:
         set dec_ptr to cast_to_int(map_get_val(dec_res and "payload_ptr"))
         set dec_len to cast_to_int(map_get_val(dec_res and "payload_len"))
-        set decrypted_payload to ptr_to_str(dec_ptr)
-        free_bytes(dec_ptr)
+        if dec_ptr != 0 and also dec_len == pay_len:
+            set payload_matches to 1
+            set payload_i to 0
+            repeat while payload_i < pay_len:
+                if peek_byte(dec_ptr and payload_i) != char_at(sample_payload and payload_i):
+                    set payload_matches to 0
+                set payload_i to payload_i + 1
+        if dec_ptr != 0:
+            set ok to free_bytes(dec_ptr)
         
-    free_bytes(packet_ptr)
+    if packet_ptr != 0:
+        set ok to free_bytes(packet_ptr)
     
     set t3_ok to 0
-    if dec_valid == 1:
-        if decrypted_payload equals sample_payload:
-            set t3_ok to 1
+    if dec_valid == 1 and also payload_matches == 1:
+        set t3_ok to 1
             
     if t3_ok == 1:
         display "  PASS"
         set tests_passed to tests_passed + 1
     else:
         display "  FAIL: SRTP Loopback decryption failure"
-        display concat("    Decrypted payload: " and decrypted_payload)
+        display concat("    DTLS status: " and int_to_string(dtls_ok))
         set tests_failed to tests_failed + 1
         
     # ════════════════════════════════════════════════════════════════
@@ -424,6 +446,9 @@ define main:
     # 2. Package and encrypt audio packet
     set aud_payload_len to length_list(enc_audio)
     set aud_payload_ptr to alloc_bytes(aud_payload_len)
+    if aud_payload_ptr == 0:
+        display "FATAL: loopback payload allocation failed"
+        return 1
     set idx to 0
     repeat while idx < aud_payload_len:
         poke_byte(aud_payload_ptr and idx and get_list(enc_audio and idx))
@@ -457,10 +482,11 @@ define main:
             
         set ok to free_list(dec_audio_list)
         set ok to free_list(decoded_audio_frame)
-        free_bytes(bob_dec_ptr)
+        set ok to free_bytes(bob_dec_ptr)
         
-    free_bytes(aud_payload_ptr)
-    free_bytes(aud_pkt_ptr)
+    set ok to free_bytes(aud_payload_ptr)
+    if aud_pkt_ptr != 0:
+        set ok to free_bytes(aud_pkt_ptr)
     set ok to free_list(raw_audio_frame)
     set ok to free_list(raw_video_frame)
     set ok to free_list(enc_audio)
@@ -472,6 +498,23 @@ define main:
     else:
         display "  FAIL: Complete loopback stream reconstruction failed"
         set tests_failed to tests_failed + 1
+
+    set alice_keys_close_err to webrtc_close_srtp_keys(keys_alice)
+    set bob_keys_close_err to webrtc_close_srtp_keys(keys_bob)
+    set alice_pc_close_err to webrtc_close_peer_connection(pc_alice)
+    set bob_pc_close_err to webrtc_close_peer_connection(pc_bob)
+    set codec_close_err to codec_close(codec_ctx)
+    if alice_keys_close_err != 0 or else bob_keys_close_err != 0 or else alice_pc_close_err != 0 or else bob_pc_close_err != 0 or else codec_close_err != 0:
+        display "  FAIL: native media resource cleanup failed"
+        set tests_failed to tests_failed + 1
+    set ok to free_map(parsed_res)
+    set ok to free_map(enc_res)
+    set ok to free_map(dec_res)
+    set ok to free_map(srtp_aud_res)
+    set ok to free_map(bob_dec_res)
+    set ok to free_map(keys_alice)
+    set ok to free_map(keys_bob)
+    set ok to free_map(codec_ctx)
         
     display ""
     display "==================================================="

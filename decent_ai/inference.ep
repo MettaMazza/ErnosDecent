@@ -5,12 +5,12 @@
 import "string"
 import "collections"
 
-external define ep_dlopen with lib:
-external define ep_dlsym with handle and name:
-external define ep_dlcall1 with fn and a0:
-external define ep_dlcall2 with fn and a0 and a1:
-external define ep_dlcall3 with fn and a0 and a1 and a2:
-external define ep_dlcall4 with fn and a0 and a1 and a2 and a3:
+external define ep_dlopen with lib as Str returning Int:
+external define ep_dlsym with handle as Int and name as Str returning Int:
+external define ep_dlcall1 with fn as Int and a0 as Int returning Int:
+external define ep_dlcall2 with fn as Int and a0 as Int and a1 as Int returning Int:
+external define ep_dlcall3 with fn as Int and a0 as Int and a1 as Int and a2 as Int returning Int:
+external define ep_dlcall4 with fn as Int and a0 as Int and a1 as Int and a2 as Int and a3 as Int returning Int:
 
 # ════════════════════════════════════════════════════════════════
 # Float32 to Fixed-Point Conversion Helper
@@ -145,12 +145,31 @@ define dequant_q8_0_block with buf_ptr as Int and blk_off as Int and out_list as
         set qi to qi + 1
     return 0
 
-define read_gguf_string with ptr as Int and offset_ref as List returning Str:
+define inference_range_valid with offset as Int and width as Int and size as Int returning Int:
+    if offset < 0 or else width < 0 or else size < 0:
+        return 0
+    if offset > size:
+        return 0
+    if width > size - offset:
+        return 0
+    return 1
+
+define read_gguf_string with ptr as Int and size as Int and offset_ref as List returning Map:
+    set result to create_map()
     set offset to get_list(offset_ref and 0)
+    if inference_range_valid(offset and 8 and size) == 0:
+        set ok to map_insert(result and "error" and 1)
+        return result
     set len to read_uint64(ptr and offset)
     set offset to offset + 8
+    if len < 0 or else inference_range_valid(offset and len and size) == 0:
+        set ok to map_insert(result and "error" and 1)
+        return result
     
     set str_buf to alloc_bytes(len + 1)
+    if str_buf == 0:
+        set ok to map_insert(result and "error" and 2)
+        return result
     set i to 0
     repeat while i < len:
         poke_byte(str_buf and i and peek_byte(ptr and offset + i))
@@ -161,7 +180,9 @@ define read_gguf_string with ptr as Int and offset_ref as List returning Str:
     free_bytes(str_buf)
     
     set ok to set_list(offset_ref and 0 and offset + len)
-    return res_str
+    set ok to map_insert(result and "value" and res_str)
+    set ok to map_insert(result and "error" and 0)
+    return result
 
 # ════════════════════════════════════════════════════════════════
 # Fixed-Point Math Functions
@@ -347,11 +368,26 @@ define fixed_rmsnorm with vec as List and weight as List returning Int:
 # ════════════════════════════════════════════════════════════════
 
 define inference_load_model with model_path as Str returning Map:
+    set model to create_map()
+    set metadata to create_map()
+    set tensors to create_map()
+    set vocab to create_list()
+
+    set values_list to create_list()
+    set ok to map_insert(model and "values_list" and values_list)
+    set ok to append_list(values_list and metadata)
+    set ok to append_list(values_list and tensors)
+    set ok to append_list(values_list and vocab)
+
     set handle to ep_dlopen("libSystem.B.dylib")
     if handle == 0:
         set handle to ep_dlopen("/usr/lib/libSystem.B.dylib")
     if handle == 0:
         set handle to ep_dlopen("libc.so.6")
+    if handle == 0:
+        set ok to map_insert(model and "error" and "C runtime library unavailable")
+        set ok to map_insert(model and "error_code" and 1001)
+        return model
         
     set fn_fopen to ep_dlsym(handle and "fopen")
     set fn_fread to ep_dlsym(handle and "fread")
@@ -359,34 +395,73 @@ define inference_load_model with model_path as Str returning Map:
     set fn_fseek to ep_dlsym(handle and "fseek")
     set fn_ftell to ep_dlsym(handle and "ftell")
     
-    set model to create_map()
-    set metadata to create_map()
-    set tensors to create_map()
-    set vocab to create_list()
-    
-    set values_list to create_list()
-    set ok to map_insert(model and "values_list" and values_list)
-    set ok to append_list(values_list and metadata)
-    set ok to append_list(values_list and tensors)
-    set ok to append_list(values_list and vocab)
+    if fn_fopen == 0 or else fn_fread == 0 or else fn_fclose == 0 or else fn_fseek == 0 or else fn_ftell == 0:
+        set ok to map_insert(model and "error" and "required C file functions unavailable")
+        set ok to map_insert(model and "error_code" and 1002)
+        return model
     
     set path_ptr to str_to_ptr(model_path)
     set mode_ptr to str_to_ptr("rb")
     set file_ptr to ep_dlcall2(fn_fopen and path_ptr and mode_ptr)
     if file_ptr == 0:
+        set ok to map_insert(model and "error" and concat("model file could not be opened: " and model_path))
+        set ok to map_insert(model and "error_code" and 1003)
         return model
         
-    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 2)
+    set seek_err to ep_dlcall3(fn_fseek and file_ptr and 0 and 2)
+    if seek_err != 0:
+        set close_err to ep_dlcall1(fn_fclose and file_ptr)
+        if close_err != 0:
+            set ok to map_insert(model and "error" and "model file end seek and close failed")
+            set ok to map_insert(model and "error_code" and 1008)
+        else:
+            set ok to map_insert(model and "error" and "model file end seek failed")
+            set ok to map_insert(model and "error_code" and 1004)
+        return model
     set size to ep_dlcall1(fn_ftell and file_ptr)
-    set ok to ep_dlcall3(fn_fseek and file_ptr and 0 and 0)
+    set seek_err to ep_dlcall3(fn_fseek and file_ptr and 0 and 0)
+    if seek_err != 0:
+        set close_err to ep_dlcall1(fn_fclose and file_ptr)
+        if close_err != 0:
+            set ok to map_insert(model and "error" and "model file start seek and close failed")
+            set ok to map_insert(model and "error_code" and 1008)
+        else:
+            set ok to map_insert(model and "error" and "model file start seek failed")
+            set ok to map_insert(model and "error_code" and 1004)
+        return model
     
     if size < 24:
-        set dummy to ep_dlcall1(fn_fclose and file_ptr)
+        set close_err to ep_dlcall1(fn_fclose and file_ptr)
+        if close_err != 0:
+            set ok to map_insert(model and "error" and "short model file also failed to close")
+            set ok to map_insert(model and "error_code" and 1008)
+        else:
+            set ok to map_insert(model and "error" and "model file is shorter than the GGUF header")
+            set ok to map_insert(model and "error_code" and 1005)
         return model
         
     set buf_ptr to alloc_bytes(size)
+    if buf_ptr == 0:
+        set close_err to ep_dlcall1(fn_fclose and file_ptr)
+        if close_err != 0:
+            set ok to map_insert(model and "error" and "model allocation and file close failed")
+            set ok to map_insert(model and "error_code" and 1008)
+        else:
+            set ok to map_insert(model and "error" and "model buffer allocation failed")
+            set ok to map_insert(model and "error_code" and 1006)
+        return model
     set read_bytes to ep_dlcall4(fn_fread and buf_ptr and 1 and size and file_ptr)
-    set dummy to ep_dlcall1(fn_fclose and file_ptr)
+    set close_err to ep_dlcall1(fn_fclose and file_ptr)
+    if read_bytes != size:
+        set free_err to free_bytes(buf_ptr)
+        set ok to map_insert(model and "error" and "model file read was incomplete")
+        set ok to map_insert(model and "error_code" and 1007)
+        return model
+    if close_err != 0:
+        set free_err to free_bytes(buf_ptr)
+        set ok to map_insert(model and "error" and "model file close failed")
+        set ok to map_insert(model and "error_code" and 1008)
+        return model
     
     set m0 to peek_byte(buf_ptr and 0)
     set m1 to peek_byte(buf_ptr and 1)
@@ -394,67 +469,144 @@ define inference_load_model with model_path as Str returning Map:
     set m3 to peek_byte(buf_ptr and 3)
     
     if m0 != 71 or else m1 != 71 or else m2 != 85 or else m3 != 70:
-        set dummy to free_bytes(buf_ptr)
+        set free_err to free_bytes(buf_ptr)
+        set ok to map_insert(model and "error" and "model file does not contain a GGUF header")
+        set ok to map_insert(model and "error_code" and 1009)
         return model
         
     set version to read_uint32(buf_ptr and 4)
     set tensor_count to read_uint64(buf_ptr and 8)
     set metadata_kv_count to read_uint64(buf_ptr and 16)
+    if version < 2 or else version > 3:
+        set free_err to free_bytes(buf_ptr)
+        set ok to map_insert(model and "error" and concat("unsupported GGUF version " and int_to_string(version)))
+        set ok to map_insert(model and "error_code" and 1010)
+        return model
+    if tensor_count < 0 or else metadata_kv_count < 0 or else tensor_count > size / 24 or else metadata_kv_count > size / 12:
+        set free_err to free_bytes(buf_ptr)
+        set ok to map_insert(model and "error" and "GGUF header counts exceed the file bounds")
+        set ok to map_insert(model and "error_code" and 1011)
+        return model
     
     set offset_ref to create_list()
     set ok to append_list(offset_ref and 24)
     
     set kv_idx to 0
     repeat while kv_idx < metadata_kv_count:
-        set key to read_gguf_string(buf_ptr and offset_ref)
-        set val_type to read_uint32(buf_ptr and get_list(offset_ref and 0))
-        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+        set key_result to read_gguf_string(buf_ptr and size and offset_ref)
+        if map_get_val(key_result and "error") != 0:
+            set free_err to free_bytes(buf_ptr)
+            set ok to map_insert(model and "error" and "GGUF metadata key exceeds the file bounds")
+            set ok to map_insert(model and "error_code" and 1012)
+            return model
+        set key to map_get_val(key_result and "value")
+        set metadata_offset to get_list(offset_ref and 0)
+        if inference_range_valid(metadata_offset and 4 and size) == 0:
+            set free_err to free_bytes(buf_ptr)
+            set ok to map_insert(model and "error" and "GGUF metadata type exceeds the file bounds")
+            set ok to map_insert(model and "error_code" and 1012)
+            return model
+        set val_type to read_uint32(buf_ptr and metadata_offset)
+        set ok to set_list(offset_ref and 0 and metadata_offset + 4)
         
         if val_type == 8:
-            set val_str to read_gguf_string(buf_ptr and offset_ref)
+            set val_result to read_gguf_string(buf_ptr and size and offset_ref)
+            if map_get_val(val_result and "error") != 0:
+                set free_err to free_bytes(buf_ptr)
+                set ok to map_insert(model and "error" and "GGUF metadata string exceeds the file bounds")
+                set ok to map_insert(model and "error_code" and 1012)
+                return model
+            set val_str to map_get_val(val_result and "value")
             set ok to map_insert(metadata and key and val_str)
             set ok to append_list(values_list and val_str)
             set ok to append_list(values_list and key)
         else:
             if val_type == 4 or else val_type == 5:
-                set val_int to read_uint32(buf_ptr and get_list(offset_ref and 0))
-                set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+                set value_offset to get_list(offset_ref and 0)
+                if inference_range_valid(value_offset and 4 and size) == 0:
+                    set free_err to free_bytes(buf_ptr)
+                    set ok to map_insert(model and "error" and "GGUF 32-bit metadata value exceeds the file bounds")
+                    set ok to map_insert(model and "error_code" and 1012)
+                    return model
+                set val_int to read_uint32(buf_ptr and value_offset)
+                set ok to set_list(offset_ref and 0 and value_offset + 4)
                 set ok to map_insert(metadata and key and val_int)
                 set ok to append_list(values_list and key)
             else:
                 if val_type == 10 or else val_type == 11:
-                    set val_int2 to read_uint64(buf_ptr and get_list(offset_ref and 0))
-                    set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 8)
+                    set value_offset to get_list(offset_ref and 0)
+                    if inference_range_valid(value_offset and 8 and size) == 0:
+                        set free_err to free_bytes(buf_ptr)
+                        set ok to map_insert(model and "error" and "GGUF 64-bit metadata value exceeds the file bounds")
+                        set ok to map_insert(model and "error_code" and 1012)
+                        return model
+                    set val_int2 to read_uint64(buf_ptr and value_offset)
+                    set ok to set_list(offset_ref and 0 and value_offset + 8)
                     set ok to map_insert(metadata and key and val_int2)
                     set ok to append_list(values_list and key)
                 else:
                     if val_type == 9:
-                        set sub_type to read_uint32(buf_ptr and get_list(offset_ref and 0))
-                        set arr_len to read_uint64(buf_ptr and get_list(offset_ref and 0) + 4)
-                        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 12)
+                        set array_offset to get_list(offset_ref and 0)
+                        if inference_range_valid(array_offset and 12 and size) == 0:
+                            set free_err to free_bytes(buf_ptr)
+                            set ok to map_insert(model and "error" and "GGUF metadata array header exceeds the file bounds")
+                            set ok to map_insert(model and "error_code" and 1012)
+                            return model
+                        set sub_type to read_uint32(buf_ptr and array_offset)
+                        set arr_len to read_uint64(buf_ptr and array_offset + 4)
+                        set ok to set_list(offset_ref and 0 and array_offset + 12)
+                        if arr_len < 0 or else arr_len > size:
+                            set free_err to free_bytes(buf_ptr)
+                            set ok to map_insert(model and "error" and "GGUF metadata array length exceeds the file bounds")
+                            set ok to map_insert(model and "error_code" and 1012)
+                            return model
                         
                         set is_tokens to string_contains(key and "tokenizer.ggml.tokens")
                         
                         set arr_idx to 0
                         repeat while arr_idx < arr_len:
                             if sub_type == 8:
-                                set item_str to read_gguf_string(buf_ptr and offset_ref)
+                                set item_result to read_gguf_string(buf_ptr and size and offset_ref)
+                                if map_get_val(item_result and "error") != 0:
+                                    set free_err to free_bytes(buf_ptr)
+                                    set ok to map_insert(model and "error" and "GGUF string array item exceeds the file bounds")
+                                    set ok to map_insert(model and "error_code" and 1012)
+                                    return model
+                                set item_str to map_get_val(item_result and "value")
                                 if is_tokens == 1:
                                     set ok to append_list(vocab and item_str)
                                     set ok to append_list(values_list and item_str)
                             else:
                                 if sub_type == 4 or else sub_type == 5:
-                                    set item_int to read_uint32(buf_ptr and get_list(offset_ref and 0))
-                                    set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+                                    set item_offset to get_list(offset_ref and 0)
+                                    if inference_range_valid(item_offset and 4 and size) == 0:
+                                        set free_err to free_bytes(buf_ptr)
+                                        set ok to map_insert(model and "error" and "GGUF 32-bit array item exceeds the file bounds")
+                                        set ok to map_insert(model and "error_code" and 1012)
+                                        return model
+                                    set item_int to read_uint32(buf_ptr and item_offset)
+                                    set ok to set_list(offset_ref and 0 and item_offset + 4)
                                 else:
                                     if sub_type == 10 or else sub_type == 11:
-                                        set item_int2 to read_uint64(buf_ptr and get_list(offset_ref and 0))
-                                        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 8)
+                                        set item_offset to get_list(offset_ref and 0)
+                                        if inference_range_valid(item_offset and 8 and size) == 0:
+                                            set free_err to free_bytes(buf_ptr)
+                                            set ok to map_insert(model and "error" and "GGUF 64-bit array item exceeds the file bounds")
+                                            set ok to map_insert(model and "error_code" and 1012)
+                                            return model
+                                        set item_int2 to read_uint64(buf_ptr and item_offset)
+                                        set ok to set_list(offset_ref and 0 and item_offset + 8)
                                     else:
-                                        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+                                        set free_err to free_bytes(buf_ptr)
+                                        set ok to map_insert(model and "error" and concat("unsupported GGUF metadata array type " and int_to_string(sub_type)))
+                                        set ok to map_insert(model and "error_code" and 1013)
+                                        return model
                             set arr_idx to arr_idx + 1
                     else:
-                        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+                        set free_err to free_bytes(buf_ptr)
+                        set ok to map_insert(model and "error" and concat("unsupported GGUF metadata type " and int_to_string(val_type)))
+                        set ok to map_insert(model and "error_code" and 1013)
+                        return model
         set kv_idx to kv_idx + 1
         
     set tensor_infos to create_list()
@@ -462,23 +614,57 @@ define inference_load_model with model_path as Str returning Map:
     
     set t_idx to 0
     repeat while t_idx < tensor_count:
-        set t_name to read_gguf_string(buf_ptr and offset_ref)
-        set t_n_dims to read_uint32(buf_ptr and get_list(offset_ref and 0))
-        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 4)
+        set name_result to read_gguf_string(buf_ptr and size and offset_ref)
+        if map_get_val(name_result and "error") != 0:
+            set free_err to free_bytes(buf_ptr)
+            set ok to map_insert(model and "error" and "GGUF tensor name exceeds the file bounds")
+            set ok to map_insert(model and "error_code" and 1014)
+            return model
+        set t_name to map_get_val(name_result and "value")
+        set tensor_offset to get_list(offset_ref and 0)
+        if inference_range_valid(tensor_offset and 4 and size) == 0:
+            set free_err to free_bytes(buf_ptr)
+            set ok to map_insert(model and "error" and "GGUF tensor dimension count exceeds the file bounds")
+            set ok to map_insert(model and "error_code" and 1014)
+            return model
+        set t_n_dims to read_uint32(buf_ptr and tensor_offset)
+        set ok to set_list(offset_ref and 0 and tensor_offset + 4)
+        if t_n_dims < 1 or else t_n_dims > 4:
+            set free_err to free_bytes(buf_ptr)
+            set ok to map_insert(model and "error" and concat("invalid GGUF tensor dimension count " and int_to_string(t_n_dims)))
+            set ok to map_insert(model and "error_code" and 1014)
+            return model
         
         set t_dims to create_list()
         set ok to append_list(values_list and t_dims)
         
         set d_idx to 0
         repeat while d_idx < t_n_dims:
-            set dim_val to read_uint64(buf_ptr and get_list(offset_ref and 0))
+            set dim_offset to get_list(offset_ref and 0)
+            if inference_range_valid(dim_offset and 8 and size) == 0:
+                set free_err to free_bytes(buf_ptr)
+                set ok to map_insert(model and "error" and "GGUF tensor dimensions exceed the file bounds")
+                set ok to map_insert(model and "error_code" and 1014)
+                return model
+            set dim_val to read_uint64(buf_ptr and dim_offset)
+            if dim_val <= 0:
+                set free_err to free_bytes(buf_ptr)
+                set ok to map_insert(model and "error" and "GGUF tensor dimension must be positive")
+                set ok to map_insert(model and "error_code" and 1014)
+                return model
             set ok to append_list(t_dims and dim_val)
-            set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 8)
+            set ok to set_list(offset_ref and 0 and dim_offset + 8)
             set d_idx to d_idx + 1
             
-        set t_type to read_uint32(buf_ptr and get_list(offset_ref and 0))
-        set t_offset to read_uint64(buf_ptr and get_list(offset_ref and 0) + 4)
-        set ok to set_list(offset_ref and 0 and get_list(offset_ref and 0) + 12)
+        set tensor_meta_offset to get_list(offset_ref and 0)
+        if inference_range_valid(tensor_meta_offset and 12 and size) == 0:
+            set free_err to free_bytes(buf_ptr)
+            set ok to map_insert(model and "error" and "GGUF tensor metadata exceeds the file bounds")
+            set ok to map_insert(model and "error_code" and 1014)
+            return model
+        set t_type to read_uint32(buf_ptr and tensor_meta_offset)
+        set t_offset to read_uint64(buf_ptr and tensor_meta_offset + 4)
+        set ok to set_list(offset_ref and 0 and tensor_meta_offset + 12)
         
         set t_info to create_map()
         set ok to map_insert(t_info and "name" and t_name)
@@ -497,6 +683,11 @@ define inference_load_model with model_path as Str returning Map:
     set data_start_offset to current_offset
     if remainder != 0:
         set data_start_offset to current_offset + (alignment - remainder)
+    if data_start_offset < current_offset or else data_start_offset > size:
+        set free_err to free_bytes(buf_ptr)
+        set ok to map_insert(model and "error" and "GGUF tensor data offset exceeds the file bounds")
+        set ok to map_insert(model and "error_code" and 1015)
+        return model
         
     set t_info_len to length_list(tensor_infos)
     set t_load_idx to 0
@@ -507,12 +698,23 @@ define inference_load_model with model_path as Str returning Map:
         set t_offsetToData to map_get_val(t_info and "offset")
         
         set t_abs_offset to data_start_offset + t_offsetToData
+        if t_offsetToData < 0 or else t_abs_offset < data_start_offset or else t_abs_offset > size:
+            set free_err to free_bytes(buf_ptr)
+            set ok to map_insert(model and "error" and concat("GGUF tensor offset exceeds the file bounds: " and t_name))
+            set ok to map_insert(model and "error_code" and 1015)
+            return model
         
         set total_elements to 1
         set dims_len to length_list(t_dims)
         set dim_i to 0
         repeat while dim_i < dims_len:
-            set total_elements to total_elements * get_list(t_dims and dim_i)
+            set dimension to get_list(t_dims and dim_i)
+            if total_elements > size or else dimension > size or else total_elements > size / dimension:
+                set free_err to free_bytes(buf_ptr)
+                set ok to map_insert(model and "error" and concat("GGUF tensor element count exceeds safe bounds: " and t_name))
+                set ok to map_insert(model and "error_code" and 1015)
+                return model
+            set total_elements to total_elements * dimension
             set dim_i to dim_i + 1
             
         set t_type to map_get_val(t_info and "type")
@@ -524,18 +726,34 @@ define inference_load_model with model_path as Str returning Map:
         # than silently misreading bytes as F32 (Law 8) — real quantized models run
         # via the llama.cpp backend, not this small-model reference engine.
         if t_type == 0:
+            if total_elements > (size - t_abs_offset) / 4:
+                set free_err to free_bytes(buf_ptr)
+                set ok to map_insert(model and "error" and concat("GGUF F32 tensor exceeds the file bounds: " and t_name))
+                set ok to map_insert(model and "error_code" and 1015)
+                return model
             set elem_i to 0
             repeat while elem_i < total_elements:
                 set raw_u32 to read_uint32(buf_ptr and t_abs_offset + elem_i * 4)
                 set ok to append_list(t_data_list and float32_to_fixed(raw_u32))
                 set elem_i to elem_i + 1
         else if t_type == 1:
+            if total_elements > (size - t_abs_offset) / 2:
+                set free_err to free_bytes(buf_ptr)
+                set ok to map_insert(model and "error" and concat("GGUF F16 tensor exceeds the file bounds: " and t_name))
+                set ok to map_insert(model and "error_code" and 1015)
+                return model
             set elem_i to 0
             repeat while elem_i < total_elements:
                 set raw_u16 to read_uint16(buf_ptr and t_abs_offset + elem_i * 2)
                 set ok to append_list(t_data_list and fp16_to_fixed(raw_u16))
                 set elem_i to elem_i + 1
         else if t_type == 8:
+            set block_count to (total_elements + 31) / 32
+            if block_count > (size - t_abs_offset) / 34:
+                set free_err to free_bytes(buf_ptr)
+                set ok to map_insert(model and "error" and concat("GGUF Q8_0 tensor exceeds the file bounds: " and t_name))
+                set ok to map_insert(model and "error_code" and 1015)
+                return model
             set elems_done to 0
             set blk to 0
             repeat while elems_done < total_elements:
@@ -549,7 +767,7 @@ define inference_load_model with model_path as Str returning Map:
         else:
             set ok to map_insert(model and "error" and concat("unsupported GGUF tensor type " and int_to_string(t_type)))
             set ok to map_insert(model and "error_code" and 1)
-            set dummy to free_bytes(buf_ptr)
+            set free_err to free_bytes(buf_ptr)
             return model
             
         set tensor_map to create_map()
@@ -566,8 +784,10 @@ define inference_load_model with model_path as Str returning Map:
     set ok to map_insert(model and "tensors" and tensors)
     set ok to map_insert(model and "vocab" and vocab)
     
-    set dummy to free_bytes(buf_ptr)
-    set dummy to free_list(offset_ref)
+    set free_err to free_bytes(buf_ptr)
+    set free_err to free_list(offset_ref)
+    set ok to map_insert(model and "error" and "")
+    set ok to map_insert(model and "error_code" and 0)
     
     return model
 

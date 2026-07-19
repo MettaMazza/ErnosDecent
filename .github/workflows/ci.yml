@@ -20,12 +20,24 @@ jobs:
           sudo mv ernos /usr/local/bin/
 
       - name: Install libsodium
-        run: brew install libsodium
+        run: brew install libsodium secp256k1 cmake
+
+      - name: Build required image runtime
+        run: |
+          git clone --recursive https://github.com/leejet/stable-diffusion.cpp.git /tmp/stable-diffusion.cpp
+          git -C /tmp/stable-diffusion.cpp checkout bb84971129d2a094ab8051c6feed5406d3b4409d
+          git -C /tmp/stable-diffusion.cpp submodule update --init --recursive
+          cmake -S /tmp/stable-diffusion.cpp -B /tmp/stable-diffusion.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_BUILD_EXAMPLES=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DSD_METAL=ON
+          cmake --build /tmp/stable-diffusion.cpp/build --config Release --parallel 3
+          mkdir -p "$HOME/.ernosdecent/lib"
+          cp /tmp/stable-diffusion.cpp/build/bin/libstable-diffusion.dylib "$HOME/.ernosdecent/lib/"
 
       # ---- Compile Phase ----
 
       - name: Compile node daemon
-        run: ernos node.ep
+        run: bash build.sh
 
       - name: Compile all subsystem test suites
         run: |
@@ -54,21 +66,21 @@ jobs:
             decent_pool/test_pool.ep \
             decent_host/test_host.ep; do
               echo "=== Compiling $test_file ==="
-              ernos "$test_file"
+              bash scripts/compile_ep.sh "$test_file"
           done
 
       - name: Compile integration and E2E tests
         run: |
           set -e
-          ernos test_e2e.ep
-          ernos test_multinode.ep
-          ernos test_networking.ep
-          ernos test_persistence.ep
-          ernos test_security.ep
-          ernos test_stress.ep
-          ernos test_platform.ep
-          ernos test_raft_tcp.ep
-          ernos decent_cli/test_cli.ep
+          bash scripts/compile_ep.sh test_e2e.ep
+          bash scripts/compile_ep.sh test_multinode.ep
+          bash scripts/compile_ep.sh test_networking.ep
+          bash scripts/compile_ep.sh test_persistence.ep
+          bash scripts/compile_ep.sh test_security.ep
+          bash scripts/compile_ep.sh test_stress.ep
+          bash scripts/compile_ep.sh test_platform.ep
+          bash scripts/compile_ep.sh test_raft_tcp.ep
+          bash scripts/compile_ep.sh decent_cli/test_cli.ep
 
       # ---- Run Phase ----
 
@@ -101,12 +113,16 @@ jobs:
             decent_host/test_host; do
               echo ""
               echo "=== Running $test_bin ==="
-              OUTPUT=$(./$test_bin 2>&1)
+              if OUTPUT=$(python3 scripts/run_with_timeout.py 120 "./$test_bin" 2>&1); then
+                BIN_FAILED=0
+              else
+                BIN_FAILED=1
+              fi
               echo "$OUTPUT"
               P=$(echo "$OUTPUT" | grep -c "PASS" || true)
               F=$(echo "$OUTPUT" | grep -c "FAIL:" || true)
               PASS=$((PASS + P))
-              FAIL=$((FAIL + F))
+              FAIL=$((FAIL + F + BIN_FAILED))
           done
           echo ""
           echo "=== SUBSYSTEM TOTAL: $PASS passed, $FAIL failed ==="
@@ -116,32 +132,32 @@ jobs:
 
       - name: Run E2E journey tests
         run: |
-          timeout 60 ./test_e2e 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_e2e 2>&1
           echo "E2E: OK"
 
       - name: Run multi-node integration tests
         run: |
-          timeout 60 ./test_multinode 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_multinode 2>&1
           echo "Multi-node: OK"
 
       - name: Run networking tests
         run: |
-          timeout 60 ./test_networking 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_networking 2>&1
           echo "Networking: OK"
 
       - name: Run persistence tests
         run: |
-          timeout 60 ./test_persistence 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_persistence 2>&1
           echo "Persistence: OK"
 
       - name: Run security tests
         run: |
-          timeout 60 ./test_security 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_security 2>&1
           echo "Security: OK"
 
       - name: Run CLI integration test
         run: |
-          timeout 60 decent_cli/test_cli 2>&1
+          bash scripts/run_test_checked.sh 60 decent_cli/test_cli 2>&1
           echo "CLI: OK"
 
       - name: Run platform detection test
@@ -150,11 +166,11 @@ jobs:
 
       - name: Run Raft consensus tests (TCP)
         run: |
-          timeout 60 ./test_raft_tcp 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_raft_tcp 2>&1
 
       - name: Run stress tests
         run: |
-          timeout 120 ./test_stress 2>&1
+          bash scripts/run_test_checked.sh 120 ./test_stress 2>&1
 
       # ---- Verify Web UI Assets ----
 
@@ -179,12 +195,24 @@ jobs:
           sudo mv ernos /usr/local/bin/
 
       - name: Install libsodium
-        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libsecp256k1-dev libssl-dev libsqlite3-dev cmake ninja-build
+
+      - name: Build required image runtime
+        run: |
+          git clone --recursive https://github.com/leejet/stable-diffusion.cpp.git /tmp/stable-diffusion.cpp
+          git -C /tmp/stable-diffusion.cpp checkout bb84971129d2a094ab8051c6feed5406d3b4409d
+          git -C /tmp/stable-diffusion.cpp submodule update --init --recursive
+          cmake -S /tmp/stable-diffusion.cpp -B /tmp/stable-diffusion.cpp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_BUILD_EXAMPLES=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF
+          cmake --build /tmp/stable-diffusion.cpp/build --parallel 3
+          mkdir -p "$HOME/.ernosdecent/lib"
+          cp /tmp/stable-diffusion.cpp/build/bin/libstable-diffusion.so "$HOME/.ernosdecent/lib/"
 
       # ---- Compile Phase ----
 
       - name: Compile node daemon
-        run: ernos node.ep
+        run: bash build.sh
 
       - name: Compile all subsystem test suites
         run: |
@@ -213,21 +241,21 @@ jobs:
             decent_pool/test_pool.ep \
             decent_host/test_host.ep; do
               echo "=== Compiling $test_file ==="
-              ernos "$test_file"
+              bash scripts/compile_ep.sh "$test_file"
           done
 
       - name: Compile integration and E2E tests
         run: |
           set -e
-          ernos test_e2e.ep
-          ernos test_multinode.ep
-          ernos test_networking.ep
-          ernos test_persistence.ep
-          ernos test_security.ep
-          ernos test_stress.ep
-          ernos test_platform.ep
-          ernos test_raft_tcp.ep
-          ernos decent_cli/test_cli.ep
+          bash scripts/compile_ep.sh test_e2e.ep
+          bash scripts/compile_ep.sh test_multinode.ep
+          bash scripts/compile_ep.sh test_networking.ep
+          bash scripts/compile_ep.sh test_persistence.ep
+          bash scripts/compile_ep.sh test_security.ep
+          bash scripts/compile_ep.sh test_stress.ep
+          bash scripts/compile_ep.sh test_platform.ep
+          bash scripts/compile_ep.sh test_raft_tcp.ep
+          bash scripts/compile_ep.sh decent_cli/test_cli.ep
 
       # ---- Run Phase ----
 
@@ -260,12 +288,16 @@ jobs:
             decent_host/test_host; do
               echo ""
               echo "=== Running $test_bin ==="
-              OUTPUT=$(./$test_bin 2>&1)
+              if OUTPUT=$(python3 scripts/run_with_timeout.py 120 "./$test_bin" 2>&1); then
+                BIN_FAILED=0
+              else
+                BIN_FAILED=1
+              fi
               echo "$OUTPUT"
               P=$(echo "$OUTPUT" | grep -c "PASS" || true)
               F=$(echo "$OUTPUT" | grep -c "FAIL:" || true)
               PASS=$((PASS + P))
-              FAIL=$((FAIL + F))
+              FAIL=$((FAIL + F + BIN_FAILED))
           done
           echo ""
           echo "=== SUBSYSTEM TOTAL: $PASS passed, $FAIL failed ==="
@@ -275,32 +307,32 @@ jobs:
 
       - name: Run E2E journey tests
         run: |
-          timeout 60 ./test_e2e 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_e2e 2>&1
           echo "E2E: OK"
 
       - name: Run multi-node integration tests
         run: |
-          timeout 60 ./test_multinode 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_multinode 2>&1
           echo "Multi-node: OK"
 
       - name: Run networking tests
         run: |
-          timeout 60 ./test_networking 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_networking 2>&1
           echo "Networking: OK"
 
       - name: Run persistence tests
         run: |
-          timeout 60 ./test_persistence 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_persistence 2>&1
           echo "Persistence: OK"
 
       - name: Run security tests
         run: |
-          timeout 60 ./test_security 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_security 2>&1
           echo "Security: OK"
 
       - name: Run CLI integration test
         run: |
-          timeout 60 decent_cli/test_cli 2>&1
+          bash scripts/run_test_checked.sh 60 decent_cli/test_cli 2>&1
           echo "CLI: OK"
 
       - name: Run platform detection test
@@ -309,11 +341,11 @@ jobs:
 
       - name: Run Raft consensus tests (TCP)
         run: |
-          timeout 60 ./test_raft_tcp 2>&1
+          bash scripts/run_test_checked.sh 60 ./test_raft_tcp 2>&1
 
       - name: Run stress tests
         run: |
-          timeout 120 ./test_stress 2>&1
+          bash scripts/run_test_checked.sh 120 ./test_stress 2>&1
 
       # ---- Verify Web UI Assets ----
 

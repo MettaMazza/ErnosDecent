@@ -15,27 +15,33 @@ define pass_if with label as Str and cond as Int returning Int:
 
 # Concurrency worker: hammer rag_get_vec over overlapping ids, allocating between
 # calls to pressure the GC, then signal completion.
-define cache_worker with done_ch:
+define cache_worker with done_ch as Int returning Int:
     set r to 0
+    set worker_ok to 1
     repeat while r < 2000:
         set id to int_to_string(r - ((r / 10) * 10))   # ids "0".."9"
-        set v to rag_get_vec(id and "[11,22,33,44,55,66,77,88]")
+        set vr to rag_get_vec(id and "[11,22,33,44,55,66,77,88]")
+        if map_get_val(vr and "error") != 0:
+            set worker_ok to 0
+            set r to 2000
         set junk to concat("w" and int_to_string(r))   # GC pressure
         set r to r + 1
-    send 1 to done_ch
+    send worker_ok to done_ch
     return 0
 
-define main:
+define main returning Int:
     set passes to 0
     set total to 0
 
     # 1. Parse + cache: first call parses, length correct.
-    set v1 to rag_get_vec("c1" and "[10,20,30,40,50]")
+    set vr1 to rag_get_vec("c1" and "[10,20,30,40,50]")
+    set v1 to map_get_val(vr1 and "vector")
     set total to total + 1
-    set passes to passes + pass_if("parses vector to right length" and (length_list(v1) == 5))
+    set passes to passes + pass_if("parses vector to right length" and (map_get_val(vr1 and "error") == 0 and also length_list(v1) == 5))
 
     # 2. Cache hit: second call returns consistent values.
-    set v2 to rag_get_vec("c1" and "[10,20,30,40,50]")
+    set vr2 to rag_get_vec("c1" and "[10,20,30,40,50]")
+    set v2 to map_get_val(vr2 and "vector")
     set total to total + 1
     set passes to passes + pass_if("cache hit consistent len" and (length_list(v2) == 5))
     set total to total + 1
@@ -44,7 +50,8 @@ define main:
     set passes to passes + pass_if("cache hit consistent value[4]" and (get_list(v1 and 4) == get_list(v2 and 4)))
 
     # 3. Distinct id -> distinct vector/length.
-    set v3 to rag_get_vec("c2" and "[7,8]")
+    set vr3 to rag_get_vec("c2" and "[7,8]")
+    set v3 to map_get_val(vr3 and "vector")
     set total to total + 1
     set passes to passes + pass_if("distinct id distinct length" and (length_list(v3) == 2))
 
@@ -56,14 +63,17 @@ define main:
         spawn cache_worker(done)
         set s to s + 1
     set joined to 0
+    set worker_passes to 0
     repeat while joined < k:
         set x to receive from done
+        set worker_passes to worker_passes + x
         set joined to joined + 1
     set total to total + 1
-    set passes to passes + pass_if("all concurrent workers completed (no crash/race)" and (joined == 8))
+    set passes to passes + pass_if("all concurrent workers completed without cache errors" and (joined == 8 and also worker_passes == 8))
 
     # 5. Cache still correct after the concurrent storm.
-    set v4 to rag_get_vec("3" and "[11,22,33,44,55,66,77,88]")
+    set vr4 to rag_get_vec("3" and "[11,22,33,44,55,66,77,88]")
+    set v4 to map_get_val(vr4 and "vector")
     set total to total + 1
     set passes to passes + pass_if("cache correct after concurrency" and (length_list(v4) == 8))
 

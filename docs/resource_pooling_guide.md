@@ -1,30 +1,34 @@
 # Resource Pooling User Guide
 
-This guide details how your node contributes bandwidth and computational power to the decentralized peer-to-peer network, and how telemetry tracks your contributions.
+This guide describes the resource-pooling behavior implemented by the current node.
 
----
+## Bandwidth pooling
 
-## 1. Decentralized Resource Sharing Architecture
+The bandwidth pool records bytes relayed for each registered peer. Uploads increase the contribution score; downloads reduce it by half their byte count. A peer is promoted from `free` to `premium` after its contribution score reaches 52,428,800 bytes. The configured tiers are:
 
-The ErnosDecent mesh network is built on reciprocal cooperation. To avoid reliance on centralized cloud providers, the network leverages the spare bandwidth and compute capacity of its individual node operators. By contributing local resources, you earn routing priority, higher transfer speeds, and elevated slots for decentralized AI and ledger execution.
+| Tier | Limit | Priority |
+|---|---:|---:|
+| `free` | 100 kbps | 0 |
+| `emergency` | 1,000 kbps | 2 |
+| `premium` | 10,000 kbps | 1 |
 
----
+Download limits are enforced over a mutex-protected 60-second accounting window. The allowance is derived directly from the tier's configured decimal kbps value. A caller cannot claim a tier different from the tier assigned to its peer record.
 
-## 2. Bandwidth Pooling
+`bandwidth_route_proxy` opens a real TCP connection to the requested destination, forwards one framed request, receives one framed reply, closes the connection, and records the transferred bytes. Connection, send, receive, accounting, rate-limit, and close failures are returned explicitly. It is a TCP application relay, not a VPN, QUIC proxy, or general IP router.
 
-Bandwidth sharing helps route and serve network payloads (messages, Git repository data, and onion-routed web traffic) for other peers.
+## Compute pooling
 
-- **Shared Upload**: The amount of outbound data your node has served to route traffic, seed content-addressed payloads, sync Git repositories, or relay messages for firewalled peer nodes.
-- **Shared Download**: The amount of inbound data your node has consumed from the network to sync files, pull repositories, or receive messages.
-- **Bandwidth Tier**: A categorization of your node based on your sharing contribution. Nodes that maintain a high upload-to-download ratio are placed in higher tiers (e.g., Premium or Super-Node), giving them priority routing status and faster response times from other peers.
-- **Contribution Multiplier**: A dynamic score reflecting your node's net positive contributions. A higher multiplier increases your node's request prioritization and gossip routing speeds across the global network tree.
+The compute manager maintains a mutex-protected job map, pending queue, worker assignments, submissions, and completed-task contribution counts. Each job requires two distinct assigned workers. Matching submissions complete the job; divergent submissions mark it disputed.
 
----
+Remote workers use the TCP compute protocol:
 
-## 3. Compute Pooling Allocation
+1. A worker sends `COMPUTE_REQUEST` with its worker ID.
+2. The manager replies with `COMPUTE_ASSIGN` and `job_id:input`, or `COMPUTE_NO_JOBS`.
+3. The worker sends `COMPUTE_RESULT` on the same connection.
+4. The manager validates the job and worker assignment, records the result, and returns `COMPUTE_ACK` with the exact status code.
 
-Compute pooling allows you to delegate CPU/GPU cycles to execute tasks for the cooperative network, such as verifying blocks, interpreting smart contracts, or performing background cognitive loop runs.
+The server accepts workers continuously and handles their result-bearing connections concurrently. The protocol uses the existing framed TCP transport and its timeouts.
 
-- **Active Delegation Slots**: The number of concurrent worker slots your node has made available to the network. These slots are consumed by other nodes to offload smart contract calls, verify transactions, or delegate reasoning loops.
-- **Consensus Score**: A trust metric representing the accuracy and reliability of your node's consensus outputs. It rises when your node correctly validates UTXO ledger state mutations and successfully participates in Raft elections, and falls if your node proposes invalid block commits or fails heartbeat deadlines.
-- **Compute Contributed Today**: A live progress meter representing the cumulative computational work units (in cycles or task completions) that your node has successfully processed and contributed to the network within the current 24-hour cycle.
+## Exact boundary
+
+`mesh_execute_collaborative_ai` currently performs both redundant inference calls on the coordinator under two assigned worker identities. It verifies their results through the same compute consensus manager, but it does not automatically dispatch those inference calls to remote TCP workers. The remote worker protocol is operational and tested separately. No UI metric should describe coordinator-local inference as remote compute contribution.
