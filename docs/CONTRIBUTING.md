@@ -42,11 +42,11 @@ cargo build --release
 **System Dependencies:**
 ```bash
 # macOS
-brew install libsodium
+brew install libsodium libsrtp secp256k1 openssl sqlite cmake
 xcode-select --install    # For Clang
 
 # Linux (Debian/Ubuntu)
-sudo apt install clang libsodium-dev
+sudo apt install clang libsodium-dev libsrtp2-dev libsecp256k1-dev libssl-dev libsqlite3-dev cmake ninja-build
 ```
 
 ### 2. Clone ErnosDecent

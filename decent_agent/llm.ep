@@ -885,7 +885,7 @@ define detect_repetition_loop with s as Str returning Int:
     return 0
 
 # ── Operator-configurable DEFAULT model ──────────────────────────────────────
-# config/default_model.txt (one line, an Ollama/LM Studio tag e.g. "gemma4:26b")
+# config/default_model.txt (one line, a served model name or Ollama/LM Studio tag)
 # overrides the built-in gemma-4-31b default WITHOUT a rebuild — read per call so a
 # swap takes effect on the next message. Delete the file (or empty it) to revert.
 define llm_default_model returning Str:
@@ -895,37 +895,36 @@ define llm_default_model returning Str:
             return dm
     return "gemma-4-31b"
 
-define llm_default_configured returning Int:
-    if file_exists("config/default_model.txt") == 1:
-        if string_length(string_trim(read_file("config/default_model.txt"))) > 0:
-            return 1
+# The bundled run_node.sh serves gemma-4-31b on the parallel llama.cpp endpoint at
+# :8080. That exact configured model must retain the native fast path. Other configured
+# tags go to the tag-aware Ollama/LM Studio endpoints first because a llama.cpp server
+# ignores the requested model name and answers with whichever weights it loaded.
+define llm_default_prefers_llamacpp returning Int:
+    if llm_default_model() equals "gemma-4-31b":
+        return 1
     return 0
 
-# Ordered backend ports for the DEFAULT cascade. With a configured default (an
-# Ollama/LM Studio tag), Ollama comes FIRST: llama.cpp (:8080/:8081) serves whatever
-# single model it was started with and IGNORES the model field, so routing a configured
-# tag there would silently hit the wrong weights — and contend with the operator's own
-# use of them (the "my 31b is busy" case). :8080/:8081 stay as LAST-RESORT fallbacks
-# (degraded to the loaded model, never broken). Unconfigured: original order, :8080
-# (the parallel server) first.
+# Ordered backend ports for the DEFAULT cascade. The exact gemma-4-31b default uses
+# :8080 first because run_node.sh owns that model/server pairing. Other configured tags
+# use Ollama/LM Studio first; :8080/:8081 remain availability fallbacks.
 define llm_default_ports returning List:
     set ports to create_list()
-    if llm_default_configured() == 1:
-        set ok to append_list(ports and 11434)
-        set ok to append_list(ports and 1234)
+    if llm_default_prefers_llamacpp() == 1:
         set ok to append_list(ports and 8080)
         set ok to append_list(ports and 8081)
+        set ok to append_list(ports and 11434)
+        set ok to append_list(ports and 1234)
     else:
-        set ok to append_list(ports and 8080)
-        set ok to append_list(ports and 8081)
         set ok to append_list(ports and 11434)
         set ok to append_list(ports and 1234)
+        set ok to append_list(ports and 8080)
+        set ok to append_list(ports and 8081)
     return ports
 
 define query_local_llm_raw with prompt as Str and selected_model as Str returning Str:
     if string_length(selected_model) > 0:
         # Structured router path first (model_registry). On any miss, fall through to
-        # the original cascade below — fully preserved, including the gemma4:26b default.
+        # the configured default cascade below.
         set routed to query_via_router(prompt and selected_model)
         if string_length(routed) > 0:
             return routed
@@ -959,9 +958,9 @@ define query_local_llm_raw with prompt as Str and selected_model as Str returnin
 
         display f"[LLM] Selected model '{selected_model}' failed or offline. Falling through to cascade."
 
-    # Default cascade — model + backend order from the operator-configurable default
-    # (config/default_model.txt). Configured: Ollama first with that tag. Unconfigured:
-    # llama.cpp (:8080, the parallel server) first with gemma-4-31b.
+    # Default cascade — model + backend order from the operator-configurable default.
+    # gemma-4-31b uses the matching parallel llama.cpp server first; other configured
+    # tags use the tag-aware backends first.
     set dp to llm_default_ports()
     set dm to llm_default_model()
     set dn to length_list(dp)

@@ -18,8 +18,8 @@ if ! mkdir -p "$(dirname "$LOG")"; then
   exit 1
 fi
 
-# Pin the LLM model resident so Ollama does not idle-unload it between messages. A cold
-# reload of gemma4's 262144-token context takes ~15s, during which calls return
+# Pin the full default LLM resident so Ollama remains a warm fallback when llama.cpp is
+# unavailable. A cold reload of gemma4's context takes ~15s, during which calls return
 # "No LLM model responded" — the intermittent "agent not responding" Maria saw. Two parts:
 #  1. Set the server default (applies to every future model load, survives reloads/crashes).
 #     The GUI Ollama picks this up on its next start.
@@ -39,7 +39,7 @@ if ! launchctl unsetenv OLLAMA_NUM_PARALLEL 2>/dev/null; then
 fi
 (
   if ! curl -fsS http://127.0.0.1:11434/api/chat \
-    -d '{"model":"gemma4:26b","messages":[{"role":"user","content":"warmup"}],"keep_alive":-1,"stream":false}' \
+    -d '{"model":"gemma-4-31b","messages":[{"role":"user","content":"warmup"}],"keep_alive":-1,"stream":false}' \
     >/dev/null 2>"${HOME}/.ernosdecent/ollama-warmup.err"; then
     echo "[run_node] warning: Ollama warmup request failed; see ~/.ernosdecent/ollama-warmup.err" >&2
   fi

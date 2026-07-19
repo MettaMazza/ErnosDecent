@@ -22,6 +22,9 @@ All notable changes to ErnosDecent. Dates are absolute. The engine ships on
 - Added `scripts/release_check.sh` as the reproducible full local release-validation entrypoint.
 - Corrected emitted SHA-256/MD5 byte assembly to cast bytes to unsigned integers before left shifts, removing a sanitizer-confirmed signed-shift undefined behavior in compiler-generated runtimes.
 - Updated the live E2E AI assertion to the implemented detached-inference contract (`ai:accepted` with session/turn correlation plus explicit cancellation), instead of demanding the obsolete inline `RESPONSE` format.
+- Restored the full `gemma-4-31b` default and its matching parallel llama.cpp `:8080` fast path. The temporary `gemma4:26b` override had forced default turns through Ollama first; the Observer remains unchanged and follows the same backend order as the main call for cache reuse.
+- Made generated binary-safe network-send patching structural and idempotent across old and new Ernos compiler output, preventing duplicate runtime symbols when parameter names or compiler-provided helpers differ.
+- Pinned CI to a reproducible Ernos compiler source revision with its adjacent standard library, and declared libsrtp2 on both runners so real DTLS-SRTP tests exercise the required native dependency.
 
 ### Verified
 

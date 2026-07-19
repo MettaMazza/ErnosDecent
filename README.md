@@ -85,6 +85,7 @@ Local features run under the node operator's control. Optional remote providers 
 - [Ernos compiler](https://github.com/MettaMazza/Ernos-Programming-Language) (Rust — `cargo build --release`)
 - Clang (C compiler backend)
 - libsodium (`brew install libsodium` on macOS, `apt install libsodium-dev` on Linux)
+- libsrtp2 (`brew install libsrtp` on macOS, `apt install libsrtp2-dev` on Linux)
 - OpenSSL and SQLite development libraries
 - libsecp256k1 (`brew install secp256k1` on macOS, `apt install libsecp256k1-dev` on Linux)
 - stable-diffusion.cpp shared library for the required image runtime; `build.sh` validates its presence
@@ -119,7 +120,8 @@ tr -d '\r\n' < ~/.ernosdecent/web-password; printf '\n'
 
 > **Local AI (optional):** the agent uses your local LLM if one is running —
 > llama.cpp on **8080/8081**, Ollama on 11434, or LM Studio on 1234 (auto-discovered;
-> default model **gemma-4-31b** via Ollama). `run_node.sh` additionally serves the same
+> default model **gemma-4-31b** via the parallel llama.cpp server on **:8080**, with
+> Ollama and LM Studio as fallbacks). `run_node.sh` additionally serves the same
 > gemma-4-31b weights WITH their vision projector on **:8091** (Ollama's tag ships
 > without it) so the agent can see the images it generates. Speech-to-text uses a
 > **whisper.cpp** server (default port **8090**, set via the `[ai]` section of
@@ -379,7 +381,7 @@ Speech-to-text and Kokoro text-to-speech both ship; TTS was verified end-to-end 
 | `session.ep` | Persistent sessions: transcripts, per-session guidance prompt, compression, active-session tracking; a new session clears the active workspace link. |
 | `workspace.ep` / `workspace_links.ep` | Per-session workspace files + a project-link registry: register external project dirs, set one active per session, resolve bare relative paths against it. |
 | `memory.ep` / `sleep.ep` / `synaptic_tool.ep` | Tiered cognitive memory: scratchpad, lessons (semantic recall), timeline, Hebbian knowledge graph, consolidation/"sleep" sweep. |
-| `llm.ep` | Model client + router: auto-discovers llama.cpp (8080/8081), Ollama (11434), LM Studio (1234); default gemma-4-31b; async-timeout-bounded reads; `query_vision` multimodal path (:8091). |
+| `llm.ep` | Model client + router: auto-discovers llama.cpp (8080/8081), Ollama (11434), LM Studio (1234); default gemma-4-31b uses the matching parallel llama.cpp server on :8080 first; async-timeout-bounded reads; `query_vision` multimodal path (:8091). |
 | `image_gen.ep` + `vendor/sd/sd_ep_shim.cpp` | Local image generation via libstable-diffusion FFI: FLUX 4-input mode (gguf transformer + diffusers CLIP/VAE + gguf T5) or single-file SD/SDXL; `config/image.json`; 1024×1024; the agent then vision-describes its own output. |
 | `observer.ep` / `observer_rules.ep` / `observer_parser.ep` | Safety supervisor: fail-closed LLM audit gate for dangerous tools (human approval overrides to advisory), fail-open reply audit + mid_message look-back, deterministic moderation classifier, explicit parsed-vs-default verdicts. |
 | `access.ep` / `awareness.ep` | Tiered Full-PC access with an unsafe-action gate (sensitive = warn/re-ask, secrets = hard-block) + situational awareness / tool-routing / act-vs-ask decision policy. |
