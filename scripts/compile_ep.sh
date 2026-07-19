@@ -52,12 +52,12 @@ if [ "$compiler_status" -eq 0 ]; then
     cat "$compiler_log"
 else
     cat "$compiler_log" >&2
-    if ! grep -qE "ep_net_send_raw|ed_ws_|cast_(borrow_to_map|int_to_map|map_to_int)|async_wait_readable_timeout|ep_cancel_epoch_get|ep_file_to_base64|ep_json_escape" "$compiler_log"; then
+    if ! grep -qE "ep_net_send_raw|ed_ws_|cast_(borrow_to_map|int_to_map|map_to_int)|async_wait_readable_timeout|ep_cancel_epoch_get|ep_file_to_base64|ep_json_escape|ep_llm_slot_index" "$compiler_log"; then
         echo "compile error: Ernos failed for a reason other than a required ErnosDecent runtime bridge" >&2
         exit "$compiler_status"
     fi
 
-    if grep -qE "cast_(borrow_to_map|int_to_map|map_to_int)|async_wait_readable_timeout|ep_cancel_epoch_get|ep_file_to_base64|ep_json_escape" "$compiler_log"; then
+    if grep -qE "cast_(borrow_to_map|int_to_map|map_to_int)|async_wait_readable_timeout|ep_cancel_epoch_get|ep_file_to_base64|ep_json_escape|ep_llm_slot_index" "$compiler_log"; then
         bash build.sh --inject-additive-runtime "$compiled_c"
     fi
     runtime_sources=(runtime/ernosdecent_runtime.c runtime/websocket_runtime.c runtime/nostr_runtime.c)

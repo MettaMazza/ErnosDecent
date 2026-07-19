@@ -133,6 +133,9 @@ define is_port_open with host as Str and port as Int returning Int:
 # control byte. This helper is O(n) and escapes every control char (< 32) correctly.
 external define ep_json_escape with s as Str returning Str
 external define ep_time_now_ms returning Int
+# Stable session hash supplied by the generated runtime. Returns an index in
+# [0, slot_count), or -1 when no agent session is active.
+external define ep_llm_slot_index with slot_count as Int returning Int
 # Awaitable readable-or-timeout (injected by build.sh). Returns 1 when fd is readable, 0
 # on timeout. Lets the LLM read loop bound how long it waits so a dead server can't hang
 # the single-threaded daemon forever.
@@ -384,6 +387,53 @@ define llm_log_call_metrics with tag as Str and decoded as Str and total_ms as I
         display f"[LLM TTFT] {tag}: total {total_ms} ms, prompt {pt} tok, output 0 tok (all prefill)"
     return 0
 
+# Pin every request made by one active agent session to the same llama.cpp KV-cache
+# slot. The server's /slots response is read for each call instead of assuming that an
+# arbitrary process already listening on :8080 has run_node.sh's configured four slots.
+# This management read does not submit inference or modify a slot. Using the actual ID
+# from the response also remains correct if llama.cpp ever exposes non-contiguous IDs.
+#
+# Main generation and the immediately-following Observer audit therefore share their
+# long stable prefix in one slot. Other node sessions use their own stable hash; with
+# more live sessions than server slots, collisions are unavoidable. No Observer rule,
+# prompt, output bound, or verdict changes.
+define llm_slot_fragment with url as Str returning Str:
+    if (url equals "http://127.0.0.1:8080/v1/chat/completions") == 0:
+        return ""
+
+    set slots_response to http_get("http://127.0.0.1:8080/slots" and "Accept: application/json")
+    if string_length(slots_response) == 0 or else slots_response equals "Error: connection failed":
+        display "[-] LLM cache affinity unavailable: llama.cpp /slots did not respond; request will be sent without id_slot."
+        return ""
+    set slots_json to http_dechunk(slots_response)
+    set slots_root to json_parse(slots_json)
+    if slots_root == 0 or else get_json_type(slots_root) != 3:
+        display "[-] LLM cache affinity unavailable: llama.cpp /slots returned malformed JSON; request will be sent without id_slot."
+        return ""
+    set slots to get_json_value(slots_root)
+    set slot_count to length_list(slots)
+    if slot_count <= 0:
+        display "[-] LLM cache affinity unavailable: llama.cpp reported zero slots; request will be sent without id_slot."
+        return ""
+    set slot_index to ep_llm_slot_index(slot_count)
+    if slot_index < 0 or else slot_index >= slot_count:
+        display "[-] LLM cache affinity unavailable: no active agent session; request will be sent without id_slot."
+        return ""
+    set slot_node to get_list(slots and slot_index)
+    if slot_node == 0 or else get_json_type(slot_node) != 4:
+        display "[-] LLM cache affinity unavailable: selected /slots entry is not an object; request will be sent without id_slot."
+        return ""
+    set slot_id_node to get_json_object_value(slot_node and "id")
+    if slot_id_node == 0 or else get_json_type(slot_id_node) != 1:
+        display "[-] LLM cache affinity unavailable: selected /slots entry has no integer id; request will be sent without id_slot."
+        return ""
+    set slot_id to get_json_value(slot_id_node)
+    if slot_id < 0:
+        display "[-] LLM cache affinity unavailable: selected /slots entry has a negative id; request will be sent without id_slot."
+        return ""
+    display f"[LLM CACHE] session affinity pinned to llama.cpp slot {slot_id} of {slot_count}."
+    return concat(", \"id_slot\": " and int_to_string(slot_id))
+
 # ── Split-message chat completion for observer audits ─────────────────────────
 # Sends system_content as a "system" role message (reference context) and
 # user_content as a "user" role message (the current audit instruction).
@@ -419,6 +469,7 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
     else:
         set body to concat(body and "\"}]")
         set body to concat(body and llm_bound_fragment())
+        set body to concat(body and llm_slot_fragment(url))
         # llama.cpp's OpenAI endpoint (the :8080 parallel server) ALSO supports
         # response_format json_object — WITHOUT it the audit came back as freeform
         # 'Thought:/Action:' mimicry (observed live on :8080): reply audits then fail
@@ -622,6 +673,7 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
     else:
         set body to concat(body and "\"}]")
         set body to concat(body and llm_bound_fragment())
+        set body to concat(body and llm_slot_fragment(url))
         set body to concat(body and "}")
     
     display f"[LLM DEBUG] POST {url} model={model_name} body_len={string_length(body)}"

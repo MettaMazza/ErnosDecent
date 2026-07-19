@@ -14,8 +14,39 @@ import "./orchestrator"
 import "../logging"
 import "../decent_id/auth"
 import "../config.ep"
+import "../storage"
 
 external define cast_borrow_to_map with borrow b as Map returning Map
+
+# Scheduler persistence is shared by the IPC/tool thread and the background tick
+# thread. Every read-modify-write transaction must hold this mutex; locking only
+# the individual read and write calls permits a stale snapshot to overwrite a
+# concurrent mutation.
+set SCHEDULER_STORE_LOCK to create_mutex()
+
+define scheduler_jobs_path returning Str:
+    set data_dir to storage_get_data_dir()
+    if string_length(data_dir) == 0:
+        set data_dir to storage_get_default_dir()
+    return concat(data_dir and "/scheduler_jobs.json")
+
+define scheduler_store_lock returning Int:
+    if SCHEDULER_STORE_LOCK == 0:
+        display "[-] Scheduler store mutex is unavailable."
+        return 0
+    set lock_ok to lock_mutex(SCHEDULER_STORE_LOCK)
+    if lock_ok == 0:
+        display "[-] Scheduler store mutex lock failed."
+    return lock_ok
+
+define scheduler_store_unlock returning Int:
+    if SCHEDULER_STORE_LOCK == 0:
+        display "[-] Scheduler store mutex is unavailable during unlock."
+        return 0
+    set unlock_ok to unlock_mutex(SCHEDULER_STORE_LOCK)
+    if unlock_ok == 0:
+        display "[-] Scheduler store mutex unlock failed."
+    return unlock_ok
 
 # Submit a scheduled job's instruction to the LOCAL IPC daemon as a client, instead of
 # calling react_run() directly. The scheduler runs on its own spawned OS thread; react_run
@@ -97,15 +128,26 @@ define scheduler_json_escape with s as Str returning Str:
     free_list(result_list)
     return escaped
 
-# Load jobs list
-define scheduler_load returning List:
+# Load jobs list. Caller must hold SCHEDULER_STORE_LOCK.
+define scheduler_load_unlocked returning List:
     set jobs_list to create_list()
     set has_autonomy to 0
     set has_token_rot to 0
     set has_cert_rot to 0
+    set jobs_path to scheduler_jobs_path()
+    set source_path to jobs_path
+    set migrate_legacy to 0
 
-    if file_exists("config/scheduler_jobs.json") == 1:
-        set content to read_file("config/scheduler_jobs.json")
+    # Migrate the former repository-local file only for the real default node data
+    # directory. Test/alternate storage roots must never ingest live node state.
+    if file_exists(jobs_path) == 0:
+        set data_dir to storage_get_data_dir()
+        if data_dir equals storage_get_default_dir() and also file_exists("config/scheduler_jobs.json") == 1:
+            set source_path to "config/scheduler_jobs.json"
+            set migrate_legacy to 1
+
+    if file_exists(source_path) == 1:
+        set content to read_file(source_path)
         set root to json_parse(content)
         if root != 0:
             set raw_list to get_json_value(root)
@@ -185,15 +227,18 @@ define scheduler_load returning List:
         set ok to append_list(jobs_list and cert_rot_job)
         set modified to 1
 
-    if modified == 1:
-        set ok to scheduler_save(jobs_list)
+    if modified == 1 or else migrate_legacy == 1:
+        set ok to scheduler_save_unlocked(jobs_list)
         if ok != 0:
             display "[-] Scheduler defaults are active in memory but were not persisted."
+        else:
+            if migrate_legacy == 1:
+                log_info("scheduler" and concat("Migrated scheduler jobs to " and jobs_path))
 
     return jobs_list
 
-# Save jobs list
-define scheduler_save with jobs_list as List returning Int:
+# Save jobs list atomically. Caller must hold SCHEDULER_STORE_LOCK.
+define scheduler_save_unlocked with jobs_list as List returning Int:
     set json_str to "[\n"
     set len to length_list(jobs_list)
     set i to 0
@@ -222,11 +267,42 @@ define scheduler_save with jobs_list as List returning Int:
             set json_str to concat(json_str and "  }\n")
         set i to i + 1
     set json_str to concat(json_str and "]")
-    set ok to write_file("config/scheduler_jobs.json" and json_str)
+    set jobs_path to scheduler_jobs_path()
+    set staged_path to concat(jobs_path and ".tmp")
+    set ok to write_file(staged_path and json_str)
     if ok == 0:
-        display "[-] Scheduler job persistence failed."
+        display concat("[-] Scheduler job staging write failed: " and staged_path)
+        return 1
+    set rename_ok to rename_file(staged_path and jobs_path)
+    if rename_ok == 0:
+        display concat("[-] Scheduler atomic commit failed: " and jobs_path)
+        set cleanup_ok to remove_file(staged_path)
+        if cleanup_ok == 0:
+            display concat("[-] Scheduler staging cleanup failed: " and staged_path)
         return 1
     return 0
+
+# Safe read-only/public wrappers. Mutating callers use the unlocked variants while
+# holding the mutex across their complete read-modify-write transaction.
+define scheduler_load returning List:
+    set lock_ok to scheduler_store_lock()
+    if lock_ok == 0:
+        return create_list()
+    set jobs_list to scheduler_load_unlocked()
+    set unlock_ok to scheduler_store_unlock()
+    if unlock_ok == 0:
+        display "[-] Scheduler read completed but mutex release failed."
+    return jobs_list
+
+define scheduler_save with jobs_list as List returning Int:
+    set lock_ok to scheduler_store_lock()
+    if lock_ok == 0:
+        return 1
+    set save_ok to scheduler_save_unlocked(jobs_list)
+    set unlock_ok to scheduler_store_unlock()
+    if unlock_ok == 0:
+        return 1
+    return save_ok
 
 # Check if job is due
 define scheduler_is_due with job as Map and now_epoch as Int and last_activity as Int returning Int:
@@ -329,34 +405,41 @@ define scheduler_execute_job with job_id as Str and instruction as Str and model
             set agent_resp to scheduler_submit_via_ipc(instruction)
             log_info("scheduler" and concat("Job completed, response: " and agent_resp))
     
-    # Reload jobs, record last_run, and save
-    set jobs_list to scheduler_load()
-    set len to length_list(jobs_list)
-    set i to 0
-    set found to 0
-    repeat while i < len:
-        set job_map to get_list(jobs_list and i)
-        set id_val to cast_int_to_str(map_get_val(job_map and "id"))
-        if id_val equals job_id:
-            set now_epoch to ep_time_now_sec()
-            set ok to map_insert(job_map and "last_run" and int_to_string(now_epoch))
-            set found to 1
-        set i to i + 1
-    if found == 1:
-        set ok to scheduler_save(jobs_list)
-        if ok != 0:
-            free_list(jobs_list)
-            return 1
-    
-    free_list(jobs_list)
+    # Reload jobs, record last_run, and save as one transaction.
+    set persistence_error to 0
+    set store_lock_ok to scheduler_store_lock()
+    if store_lock_ok == 0:
+        log_error("scheduler" and concat("Could not lock scheduler state after job " and job_id))
+        set persistence_error to 1
+    else:
+        set jobs_list to scheduler_load_unlocked()
+        set len to length_list(jobs_list)
+        set i to 0
+        set found to 0
+        repeat while i < len:
+            set job_map to get_list(jobs_list and i)
+            set id_val to cast_int_to_str(map_get_val(job_map and "id"))
+            if id_val equals job_id:
+                set now_epoch to ep_time_now_sec()
+                set ok to map_insert(job_map and "last_run" and int_to_string(now_epoch))
+                set found to 1
+            set i to i + 1
+        if found == 1:
+            set save_ok to scheduler_save_unlocked(jobs_list)
+            if save_ok != 0:
+                set persistence_error to 1
+        free_list(jobs_list)
+        set unlock_ok to scheduler_store_unlock()
+        if unlock_ok == 0:
+            set persistence_error to 1
     
     set active_jobs to 0
     if map_contains(ctx and "active_jobs") == 1:
         set active_jobs to map_get_val(ctx and "active_jobs")
     if active_jobs > 0:
         set ok to map_insert(ctx and "active_jobs" and active_jobs - 1)
-        
-    return 0
+
+    return persistence_error
 
 define get_total_ram_gb returning Int:
     set ram_gb to 8
@@ -451,37 +534,44 @@ define scheduler_tick_loop with model as Map and memory as Map and tools as Map 
             set last_activity_str to cast_int_to_str(map_get_val(ctx and "last_user_activity"))
             set last_activity to string_to_int(last_activity_str)
             
-        set jobs_list to scheduler_load()
-        set len to length_list(jobs_list)
-        set i to 0
-        repeat while i < len:
-            set job_map to get_list(jobs_list and i)
-            set is_due to scheduler_is_due(job_map and now_epoch and last_activity)
-            if is_due == 1:
-                set active_jobs to 0
-                if map_contains(ctx and "active_jobs") == 1:
-                    set active_jobs to map_get_val(ctx and "active_jobs")
-                
-                set run_job to 1
-                if profile equals "low" and active_jobs >= 1:
-                    set run_job to 0
+        set store_lock_ok to scheduler_store_lock()
+        if store_lock_ok == 0:
+            log_error("scheduler" and "Skipping scheduler tick because the store lock failed.")
+        else:
+            set jobs_list to scheduler_load_unlocked()
+            set len to length_list(jobs_list)
+            set i to 0
+            repeat while i < len:
+                set job_map to get_list(jobs_list and i)
+                set is_due to scheduler_is_due(job_map and now_epoch and last_activity)
+                if is_due == 1:
+                    set active_jobs to 0
+                    if map_contains(ctx and "active_jobs") == 1:
+                        set active_jobs to map_get_val(ctx and "active_jobs")
                     
-                if run_job == 1:
-                    set job_id to cast_int_to_str(map_get_val(job_map and "id"))
-                    set inst_val to cast_int_to_str(map_get_val(job_map and "instruction"))
-                    
-                    # Mark as running/last_run immediately in this thread to avoid multiple dispatches
-                    set ok to map_insert(job_map and "last_run" and int_to_string(now_epoch))
-                    set ok to scheduler_save(jobs_list)
-                    if ok == 0:
-                        set ok to map_insert(ctx and "active_jobs" and active_jobs + 1)
-                        # Spawn job execution thread only after its running state is durable.
-                        spawn scheduler_execute_job(job_id and inst_val and cast_borrow_to_map(borrow model) and cast_borrow_to_map(borrow memory) and cast_borrow_to_map(borrow tools) and cast_borrow_to_map(borrow ctx))
-                    else:
-                        log_error("scheduler" and concat("Failed to persist dispatch state for job " and job_id))
-            set i to i + 1
+                    set run_job to 1
+                    if profile equals "low" and active_jobs >= 1:
+                        set run_job to 0
 
-        free_list(jobs_list)
+                    if run_job == 1:
+                        set job_id to cast_int_to_str(map_get_val(job_map and "id"))
+                        set inst_val to cast_int_to_str(map_get_val(job_map and "instruction"))
+
+                        # Mark as running/last_run immediately in this thread to avoid multiple dispatches.
+                        set ok to map_insert(job_map and "last_run" and int_to_string(now_epoch))
+                        set save_ok to scheduler_save_unlocked(jobs_list)
+                        if save_ok == 0:
+                            set ok to map_insert(ctx and "active_jobs" and active_jobs + 1)
+                            # Spawn job execution thread only after its running state is durable.
+                            spawn scheduler_execute_job(job_id and inst_val and cast_borrow_to_map(borrow model) and cast_borrow_to_map(borrow memory) and cast_borrow_to_map(borrow tools) and cast_borrow_to_map(borrow ctx))
+                        else:
+                            log_error("scheduler" and concat("Failed to persist dispatch state for job " and job_id))
+                set i to i + 1
+
+            free_list(jobs_list)
+            set unlock_ok to scheduler_store_unlock()
+            if unlock_ok == 0:
+                log_error("scheduler" and "Scheduler tick completed but the store unlock failed.")
 
         # NOTE: proactive idle re-prompting was removed with the move to the async
         # single-thread model — re-invoking react_run from this scheduler thread would

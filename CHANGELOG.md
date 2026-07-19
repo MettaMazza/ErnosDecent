@@ -23,7 +23,11 @@ All notable changes to ErnosDecent. Dates are absolute. The engine ships on
 - Corrected emitted SHA-256/MD5 byte assembly to cast bytes to unsigned integers before left shifts, removing a sanitizer-confirmed signed-shift undefined behavior in compiler-generated runtimes.
 - Updated the live E2E AI assertion to the implemented detached-inference contract (`ai:accepted` with session/turn correlation plus explicit cancellation), instead of demanding the obsolete inline `RESPONSE` format.
 - Restored the full `gemma-4-31b` default and its matching parallel llama.cpp `:8080` fast path. The temporary `gemma4:26b` override had forced default turns through Ollama first; the Observer remains unchanged and follows the same backend order as the main call for cache reuse.
+- Pinned each active agent session's main and Observer calls to one live-discovered llama.cpp slot. This prevents automatic slot selection by unrelated node sessions from evicting their shared prompt-prefix KV cache; no Observer prompt, rule, verdict, or token bound was reduced.
+- Replaced the launcher's text-generating Ollama warmup with a timeout-bounded load-only preload. The former background `"warmup"` completion could generate for minutes and contend with the primary llama.cpp server after node startup.
+- Moved scheduler state from the shared repository config path into the active node data directory, made commits atomic, and mutex-protected complete read-modify-write transactions. Test storage is now isolated from the running host, eliminating lost schedule updates during concurrent verification.
 - Made generated binary-safe network-send patching structural and idempotent across old and new Ernos compiler output, preventing duplicate runtime symbols when parameter names or compiler-provided helpers differ.
+- Repaired the compiler-emitted main-thread GC stack boundary using the real pthread stack range on macOS and Linux, and corrected the IMA-ADPCM table's global ownership. Linux AddressSanitizer reproduced both the out-of-range conservative stack scan and freed-table read, then completed the full media suite cleanly after the fixes.
 - Pinned CI to a reproducible Ernos compiler source revision with its adjacent standard library, and declared libsrtp2 on both runners so real DTLS-SRTP tests exercise the required native dependency.
 
 ### Verified

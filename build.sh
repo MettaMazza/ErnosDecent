@@ -40,6 +40,20 @@ long long cast_map_to_int(long long m) {
     return m;
 }
 
+/* Per-thread LLM cache-affinity identity. The generated node/test session setter
+   copies the active session here; generic binaries correctly remain unpinned. */
+__thread char ep_llm_session_id[256] = \"\";
+long long ep_llm_slot_index(long long slot_count) {
+    if (slot_count <= 0 || ep_llm_session_id[0] == 0) return -1;
+    const unsigned char* p = (const unsigned char*)ep_llm_session_id;
+    unsigned long long hash = 1469598103934665603ULL;
+    while (*p) {
+        hash ^= (unsigned long long)*p++;
+        hash *= 1099511628211ULL;
+    }
+    return (long long)(hash % (unsigned long long)slot_count);
+}
+
 /* Global cancel-all flag (see node build notes). */
 volatile long long ep_cancel_all_flag = 0;
 long long ep_cancel_set(long long v) {
@@ -397,6 +411,7 @@ content = content.replace('long long ep_mutex_unlock(long long);', '')
 # NOTE: cast_borrow_to_map/cast_map_to_int (and cancel/json/async) are injected by the
 # SHARED inject_additive_helpers() below, so they are NOT defined here (would double-define).
 inject = '''
+extern __thread char ep_llm_session_id[256];
 __thread char ep_active_session_id[256] = \"\";
 
 long long tools_set_active_session(long long sid_ptr) {
@@ -407,6 +422,8 @@ long long tools_set_active_session(long long sid_ptr) {
     } else {
         ep_active_session_id[0] = '\\\\0';
     }
+    strncpy(ep_llm_session_id, ep_active_session_id, sizeof(ep_llm_session_id) - 1);
+    ep_llm_session_id[sizeof(ep_llm_session_id) - 1] = 0;
     return 0;
 }
 '''
@@ -1111,6 +1128,8 @@ long long tools_set_active_session(long long sid_ptr) {
     } else {
         ep_active_session_id[0] = '\\\\0';
     }
+    strncpy(ep_llm_session_id, ep_active_session_id, sizeof(ep_llm_session_id) - 1);
+    ep_llm_session_id[sizeof(ep_llm_session_id) - 1] = 0;
     return 0;
 }
 

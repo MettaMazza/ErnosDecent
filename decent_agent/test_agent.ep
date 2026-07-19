@@ -408,9 +408,14 @@ define main returning Int:
     display "TEST 10: Task Scheduler Actions & Due Logic"
     set t10_ok to 1
 
-    # Remove test task JSON if it exists to start fresh
-    if file_exists("config/scheduler_jobs.json") == 1:
-        set cp_cmd_res to run_command("rm -f config/scheduler_jobs.json")
+    # Remove only this test run's isolated scheduler state. The live node uses its
+    # own storage data directory and must remain untouched while tests execute.
+    set test_scheduler_path to scheduler_jobs_path()
+    if file_exists(test_scheduler_path) == 1:
+        set remove_ok to remove_file(test_scheduler_path)
+        if remove_ok == 0:
+            display f"  FAIL: Could not reset isolated scheduler state: {test_scheduler_path}"
+            set t10_ok to 0
 
     # Create a job
     set args_create to create_list()
@@ -444,13 +449,6 @@ define main returning Int:
     set id_pos to string_index_of(list_res and "[job_")
     if id_pos > 0:
         set job_id to substring(list_res and id_pos + 1 and 14)
-        display f"DEBUG TEST_AGENT: job_id='{job_id}', length={int_to_string(string_length(job_id))}"
-        set id_len to string_length(job_id)
-        set id_idx to 0
-        repeat while id_idx < id_len:
-            set c_code to get_character(job_id and id_idx)
-            display f"  char {int_to_string(id_idx)}: code={int_to_string(c_code)} ({char_from_code(c_code)})"
-            set id_idx to id_idx + 1
         set args_toggle to create_list()
         set ok to append_list(args_toggle and job_id)
         set toggle_res to operate_scheduler("toggle" and args_toggle)
@@ -684,6 +682,34 @@ define main returning Int:
         set t13_ok to 0
 
     if t13_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 14: Stable per-session llama.cpp slot affinity
+    # ===========================================================
+    display "TEST 14: Stable per-session llama.cpp slot affinity"
+    set t14_ok to 1
+    set ok to tools_set_active_session("discord:cache-affinity-test")
+    set slot_a to ep_llm_slot_index(4)
+    set slot_b to ep_llm_slot_index(4)
+    if slot_a < 0 or else slot_a >= 4:
+        display f"  FAIL: Session slot {slot_a} is outside [0, 4)"
+        set t14_ok to 0
+    if slot_a != slot_b:
+        display f"  FAIL: Same session changed slots from {slot_a} to {slot_b}"
+        set t14_ok to 0
+    if ep_llm_slot_index(0) != 0 - 1:
+        display "  FAIL: Zero-slot server did not return -1"
+        set t14_ok to 0
+    set ok to tools_set_active_session("")
+    if ep_llm_slot_index(4) != 0 - 1:
+        display "  FAIL: Missing active session did not return -1"
+        set t14_ok to 0
+    if t14_ok == 1:
+        display f"  Stable session affinity selected slot {slot_a}"
         display "  PASS"
         set tests_passed to tests_passed + 1
     else:

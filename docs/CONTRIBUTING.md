@@ -42,7 +42,7 @@ cargo build --release
 **System Dependencies:**
 ```bash
 # macOS
-brew install libsodium libsrtp secp256k1 openssl sqlite cmake
+brew install libsodium srtp secp256k1 openssl sqlite cmake
 xcode-select --install    # For Clang
 
 # Linux (Debian/Ubuntu)

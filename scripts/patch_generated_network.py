@@ -10,6 +10,11 @@ The compiler's bundled SHA-256/MD5 byte assembly also left-shifts promoted signe
 ints. Bytes with the high bit set trigger undefined behavior before assignment to
 the unsigned destination. Cast every byte before shifting.
 
+The compiler also records the address of init_ep_args()'s temporary argc parameter
+as the main thread's stack boundary. That frame is gone after initialization, so a
+later conservative minor-GC scan can cross outside the mapped stack and segfault.
+Resolve the real pthread stack boundary on each supported native platform.
+
 Older compiler builds do not emit the native binary-safe ep_net_send_raw helper;
 newer builds do, but may use different parameter names. Detect definitions by C
 shape and native-section position rather than spelling so the patch stays
@@ -24,6 +29,7 @@ import sys
 MARKER = "/* ERNOSDECENT_THREAD_SAFE_DNS */"
 SHIFT_MARKER = "/* ERNOSDECENT_UNSIGNED_BYTE_SHIFTS */"
 RAW_SEND_MARKER = "/* ERNOSDECENT_NATIVE_RAW_SEND */"
+STACK_BOTTOM_MARKER = "/* ERNOSDECENT_PLATFORM_STACK_BOTTOM */"
 FUNCTION_SEND = re.compile(
     r"\blong\s+long\s+ep_net_send\s*\([^;{}]*\)\s*\{",
     re.DOTALL,
@@ -84,6 +90,48 @@ UNSAFE_RESOLUTION = re.compile(
     r"    memcpy\(&serv_addr\.sin_addr\.s_addr, server->h_addr_list\[0\], server->h_length\);\n",
     re.DOTALL,
 )
+UNSAFE_MAIN_STACK_REGISTRATION = "    ep_gc_register_thread((void*)&argc);"
+SAFE_MAIN_STACK_REGISTRATION = "    ep_gc_register_thread(ep_gc_platform_stack_bottom());"
+INIT_ARGS_DEFINITION = "void init_ep_args(int argc, char** argv) {"
+STACK_BOTTOM_IMPLEMENTATION = r'''/* ERNOSDECENT_PLATFORM_STACK_BOTTOM */
+#if defined(__linux__)
+/* GNU extension; declare explicitly because the compiler runtime's system headers
+   may have been parsed before _GNU_SOURCE was enabled. */
+extern int pthread_getattr_np(pthread_t thread, pthread_attr_t* attr);
+#endif
+
+static void* ep_gc_platform_stack_bottom(void) {
+#if defined(__APPLE__)
+    void* high = pthread_get_stackaddr_np(pthread_self());
+    if (high) return high;
+#elif defined(__linux__)
+    pthread_attr_t attr;
+    void* base = NULL;
+    size_t size = 0;
+    int attr_err = pthread_getattr_np(pthread_self(), &attr);
+    if (attr_err == 0) {
+        int stack_err = pthread_attr_getstack(&attr, &base, &size);
+        int destroy_err = pthread_attr_destroy(&attr);
+        if (stack_err == 0 && destroy_err == 0 && base && size > 0) {
+            return (void*)((char*)base + size);
+        }
+        fprintf(stderr,
+            "Runtime Error: could not resolve the main pthread stack boundary "
+            "(getstack=%d, destroy=%d)\n", stack_err, destroy_err);
+        abort();
+    }
+    fprintf(stderr,
+        "Runtime Error: could not inspect the main pthread attributes (error=%d)\n",
+        attr_err);
+    abort();
+#else
+#error "ErnosDecent native runtime supports stack-boundary discovery on macOS and Linux"
+#endif
+    fprintf(stderr, "Runtime Error: main pthread stack boundary is unavailable\n");
+    abort();
+}
+
+'''
 
 
 def replace_resolution(match: re.Match[str]) -> str:
@@ -135,6 +183,34 @@ def main() -> int:
     if "gethostbyname(host)" in patched:
         print("network runtime patch: unsafe resolver site remains", file=sys.stderr)
         return 1
+
+    if STACK_BOTTOM_MARKER in patched:
+        if UNSAFE_MAIN_STACK_REGISTRATION in patched:
+            print("GC stack-boundary patch: mixed patched/unsafe state", file=sys.stderr)
+            return 1
+        if patched.count(STACK_BOTTOM_MARKER) != 1 or patched.count(SAFE_MAIN_STACK_REGISTRATION) != 1:
+            print("GC stack-boundary patch: malformed existing repair", file=sys.stderr)
+            return 1
+        stack_replacements = 0
+    else:
+        init_count = patched.count(INIT_ARGS_DEFINITION)
+        registration_count = patched.count(UNSAFE_MAIN_STACK_REGISTRATION)
+        if init_count != 1 or registration_count != 1:
+            print(
+                "GC stack-boundary patch: expected one init_ep_args definition and "
+                f"one unsafe main registration, found {init_count} and {registration_count}",
+                file=sys.stderr,
+            )
+            return 1
+        patched = patched.replace(
+            INIT_ARGS_DEFINITION,
+            STACK_BOTTOM_IMPLEMENTATION + INIT_ARGS_DEFINITION,
+        )
+        patched = patched.replace(
+            UNSAFE_MAIN_STACK_REGISTRATION,
+            SAFE_MAIN_STACK_REGISTRATION,
+        )
+        stack_replacements = 1
 
     if SHIFT_MARKER in patched:
         if UNSAFE_SHA256_WORD in patched or UNSAFE_MD5_WORD in patched:
@@ -205,7 +281,8 @@ def main() -> int:
     generated_path.write_text(patched)
     print(
         f"Patched {dns_replacements} DNS resolver site(s) and "
-        f"{shift_replacements} unsigned byte-shift site(s); injected "
+        f"{shift_replacements} unsigned byte-shift site(s), repaired "
+        f"{stack_replacements} GC stack boundary site(s); injected "
         f"{raw_send_replacements} native raw-send helper(s) in {generated_path}"
     )
     return 0

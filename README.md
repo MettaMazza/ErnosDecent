@@ -85,7 +85,7 @@ Local features run under the node operator's control. Optional remote providers 
 - [Ernos compiler](https://github.com/MettaMazza/Ernos-Programming-Language) (Rust — `cargo build --release`)
 - Clang (C compiler backend)
 - libsodium (`brew install libsodium` on macOS, `apt install libsodium-dev` on Linux)
-- libsrtp2 (`brew install libsrtp` on macOS, `apt install libsrtp2-dev` on Linux)
+- libsrtp2 (`brew install srtp` on macOS, `apt install libsrtp2-dev` on Linux)
 - OpenSSL and SQLite development libraries
 - libsecp256k1 (`brew install secp256k1` on macOS, `apt install libsecp256k1-dev` on Linux)
 - stable-diffusion.cpp shared library for the required image runtime; `build.sh` validates its presence
@@ -120,8 +120,9 @@ tr -d '\r\n' < ~/.ernosdecent/web-password; printf '\n'
 
 > **Local AI (optional):** the agent uses your local LLM if one is running —
 > llama.cpp on **8080/8081**, Ollama on 11434, or LM Studio on 1234 (auto-discovered;
-> default model **gemma-4-31b** via the parallel llama.cpp server on **:8080**, with
-> Ollama and LM Studio as fallbacks). `run_node.sh` additionally serves the same
+> default model **gemma-4-31b** via the parallel llama.cpp server on **:8080**;
+> main and Observer calls share stable per-session KV-cache slot affinity; Ollama and
+> LM Studio remain fallbacks). `run_node.sh` additionally serves the same
 > gemma-4-31b weights WITH their vision projector on **:8091** (Ollama's tag ships
 > without it) so the agent can see the images it generates. Speech-to-text uses a
 > **whisper.cpp** server (default port **8090**, set via the `[ai]` section of

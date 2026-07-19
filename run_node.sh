@@ -23,8 +23,9 @@ fi
 # "No LLM model responded" — the intermittent "agent not responding" Maria saw. Two parts:
 #  1. Set the server default (applies to every future model load, survives reloads/crashes).
 #     The GUI Ollama picks this up on its next start.
-#  2. Pin the currently-loaded model NOW via the NATIVE /api/chat endpoint — the OpenAI
-#     /v1 endpoint the node uses IGNORES keep_alive, so we pin it here directly.
+#  2. Pin the currently-loaded model NOW via Ollama's native load-only /api/generate
+#     request. Supplying no prompt preloads without starting an unbounded generation;
+#     the OpenAI /v1 endpoint the node uses ignores keep_alive.
 if ! launchctl setenv OLLAMA_KEEP_ALIVE -1 2>/dev/null; then
   echo "[run_node] warning: could not set OLLAMA_KEEP_ALIVE through launchctl" >&2
 fi
@@ -38,8 +39,8 @@ if ! launchctl unsetenv OLLAMA_NUM_PARALLEL 2>/dev/null; then
   echo "[run_node] warning: could not clear OLLAMA_NUM_PARALLEL through launchctl" >&2
 fi
 (
-  if ! curl -fsS http://127.0.0.1:11434/api/chat \
-    -d '{"model":"gemma-4-31b","messages":[{"role":"user","content":"warmup"}],"keep_alive":-1,"stream":false}' \
+  if ! curl -fsS --max-time 180 http://127.0.0.1:11434/api/generate \
+    -d '{"model":"gemma-4-31b","keep_alive":-1,"stream":false}' \
     >/dev/null 2>"${HOME}/.ernosdecent/ollama-warmup.err"; then
     echo "[run_node] warning: Ollama warmup request failed; see ~/.ernosdecent/ollama-warmup.err" >&2
   fi
@@ -80,7 +81,7 @@ if [ "${GEMMA4_MAIN_LLAMACPP:-1}" = "1" ]; then
     if ! curl -s -m 2 http://127.0.0.1:8080/health 2>/dev/null | grep -q '"status":"ok"'; then
       echo "[run_node] starting gemma-4-31b MAIN server on :8080 (llama.cpp, -np 4 PARALLEL, -b/-ub 2048, fa on)"
       "$LLS" --model "$GEMMA4_MAIN_BLOB" --host 127.0.0.1 --port 8080 \
-        --alias gemma-4-31b -c 131072 -np 4 -b 2048 -ub 2048 -ngl 999 -fa on \
+        --alias gemma-4-31b -c 131072 -np 4 --slots -b 2048 -ub 2048 -ngl 999 -fa on \
         > "${HOME}/.ernosdecent/gemma4main.log" 2>&1 &
       echo "[run_node] (gemma :8080 loading in background; agent uses Ollama until it is ready)"
     fi

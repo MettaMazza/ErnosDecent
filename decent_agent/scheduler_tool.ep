@@ -57,15 +57,13 @@ define operate_scheduler with action_name as Str and args_list as List returning
         set stype_val to cast_int_to_str(get_list(args_list and 2))
         set sval_val to cast_int_to_str(get_list(args_list and 3))
         
-        display f"DEBUG CREATE: name_val='{name_val}', len={int_to_string(string_length(name_val))}"
-        display f"DEBUG CREATE: inst_val='{inst_val}', len={int_to_string(string_length(inst_val))}"
-        display f"DEBUG CREATE: stype_val='{stype_val}', len={int_to_string(string_length(stype_val))}"
-        display f"DEBUG CREATE: sval_val='{sval_val}', len={int_to_string(string_length(sval_val))}"
-        
         if stype_val equals "once" == 0 and also stype_val equals "interval" == 0 and also stype_val equals "idle" == 0:
             return f"Error: Invalid schedule_type '{stype_val}'. Valid types: once, interval, idle."
             
-        set jobs_list to scheduler_load()
+        set lock_ok to scheduler_store_lock()
+        if lock_ok == 0:
+            return "Error: scheduler store lock failed."
+        set jobs_list to scheduler_load_unlocked()
         
         # Check if name already exists
         set len to length_list(jobs_list)
@@ -75,6 +73,9 @@ define operate_scheduler with action_name as Str and args_list as List returning
             set name_check to cast_int_to_str(map_get_val(job_map and "name"))
             if name_check equals name_val:
                 free_list(jobs_list)
+                set unlock_ok to scheduler_store_unlock()
+                if unlock_ok == 0:
+                    return "Error: scheduler store unlock failed after duplicate check."
                 return f"Error: A scheduled task named '{name_val}' already exists."
             set i to i + 1
             
@@ -91,8 +92,11 @@ define operate_scheduler with action_name as Str and args_list as List returning
         set ok to map_insert(new_job and "enabled" and "1")
         
         set ok to append_list(jobs_list and new_job)
-        set ok to scheduler_save(jobs_list)
+        set ok to scheduler_save_unlocked(jobs_list)
         free_list(jobs_list)
+        set unlock_ok to scheduler_store_unlock()
+        if unlock_ok == 0:
+            return f"Error: job '{name_val}' was processed but the scheduler store unlock failed."
         if ok != 0:
             return f"Error: failed to persist job '{name_val}'."
         
@@ -135,7 +139,10 @@ define operate_scheduler with action_name as Str and args_list as List returning
             return "Error: delete action requires job_id."
         set target_id to cast_int_to_str(get_list(args_list and 0))
         
-        set jobs_list to scheduler_load()
+        set lock_ok to scheduler_store_lock()
+        if lock_ok == 0:
+            return "Error: scheduler store lock failed."
+        set jobs_list to scheduler_load_unlocked()
         set len to length_list(jobs_list)
         set new_list to create_list()
         set found to 0
@@ -150,15 +157,21 @@ define operate_scheduler with action_name as Str and args_list as List returning
             set i to i + 1
             
         if found == 1:
-            set ok to scheduler_save(new_list)
+            set ok to scheduler_save_unlocked(new_list)
             free_list(jobs_list)
             free_list(new_list)
+            set unlock_ok to scheduler_store_unlock()
+            if unlock_ok == 0:
+                return f"Error: deletion of job '{target_id}' was processed but the scheduler store unlock failed."
             if ok != 0:
                 return f"Error: failed to persist deletion of job '{target_id}'."
             return f"Successfully deleted job '{target_id}'."
         else:
             free_list(jobs_list)
             free_list(new_list)
+            set unlock_ok to scheduler_store_unlock()
+            if unlock_ok == 0:
+                return "Error: scheduler store unlock failed after deletion lookup."
             return f"Error: Job ID '{target_id}' not found."
             
     if action equals "toggle":
@@ -166,7 +179,10 @@ define operate_scheduler with action_name as Str and args_list as List returning
             return "Error: toggle action requires job_id."
         set target_id to cast_int_to_str(get_list(args_list and 0))
         
-        set jobs_list to scheduler_load()
+        set lock_ok to scheduler_store_lock()
+        if lock_ok == 0:
+            return "Error: scheduler store lock failed."
+        set jobs_list to scheduler_load_unlocked()
         set len to length_list(jobs_list)
         set found to 0
         set i to 0
@@ -183,13 +199,19 @@ define operate_scheduler with action_name as Str and args_list as List returning
             set i to i + 1
             
         if found == 1:
-            set ok to scheduler_save(jobs_list)
+            set ok to scheduler_save_unlocked(jobs_list)
             free_list(jobs_list)
+            set unlock_ok to scheduler_store_unlock()
+            if unlock_ok == 0:
+                return f"Error: toggle of job '{target_id}' was processed but the scheduler store unlock failed."
             if ok != 0:
                 return f"Error: failed to persist toggle of job '{target_id}'."
             return f"Successfully toggled job '{target_id}'."
         else:
             free_list(jobs_list)
+            set unlock_ok to scheduler_store_unlock()
+            if unlock_ok == 0:
+                return "Error: scheduler store unlock failed after toggle lookup."
             return f"Error: Job ID '{target_id}' not found."
             
     if action equals "run_now":
