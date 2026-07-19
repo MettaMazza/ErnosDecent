@@ -287,7 +287,7 @@ define setup_3node_cluster with base_port as Int returning Map:
     set ok to append_list(peers3 and str_to_ptr("node1"))
     set ok to append_list(peers3 and str_to_ptr("node2"))
     set n3 to raft_create_node("node3" and peers3)
-    election_init_node(borrow n3 and 1500)
+    election_init_node(borrow n3 and 2500)
     set pa3 to create_map()
     set ok to map_insert(pa3 and "node1" and concat("127.0.0.1:" and int_to_string(base_port)))
     set ok to map_insert(pa3 and "node2" and concat("127.0.0.1:" and int_to_string(base_port + 1)))
@@ -315,7 +315,27 @@ define test_5_5 returning Int:
     spawn raft_server_thread(r1 and base_port)
     spawn raft_server_thread(r2 and base_port + 1)
     spawn raft_server_thread(r3 and base_port + 2)
-    set ok to ep_sleep_ms(200)
+
+    # Do not start election timers until all three TCP listeners report ready.
+    # Hosted runners can take longer than a fixed startup sleep under load.
+    set ready_wait_ms to 0
+    set all_servers_ready to 0
+    repeat while ready_wait_ms < 5000 and all_servers_ready == 0:
+        set ready1 to map_get_val(r1 and "server_ready")
+        set ready2 to map_get_val(r2 and "server_ready")
+        set ready3 to map_get_val(r3 and "server_ready")
+        if ready1 == 1 and also ready2 == 1 and also ready3 == 1:
+            set all_servers_ready to 1
+        else:
+            set ok to ep_sleep_ms(50)
+            set ready_wait_ms to ready_wait_ms + 50
+
+    if all_servers_ready == 0:
+        display "  FAIL: Raft TCP servers did not become ready"
+        set ok to map_insert(r1 and "running" and 0)
+        set ok to map_insert(r2 and "running" and 0)
+        set ok to map_insert(r3 and "running" and 0)
+        return 0
 
     set rp1 to map_get_val(r1 and "peer_addresses")
     set rp2 to map_get_val(r2 and "peer_addresses")
@@ -324,19 +344,55 @@ define test_5_5 returning Int:
     spawn raft_election_timer_thread(r2 and rp2)
     spawn raft_election_timer_thread(r3 and rp3)
 
-    # Wait for election
-    set ok to ep_sleep_ms(3000)
+    # Wait up to ten seconds for one observable leader instead of assuming a
+    # particular runner will elect node1 inside one fixed sleep.
+    set election_wait_ms to 0
+    set observed_leader to 0
+    repeat while election_wait_ms < 10000 and observed_leader == 0:
+        set ok to ep_sleep_ms(100)
+        set election_wait_ms to election_wait_ms + 100
+        set role1 to ptr_to_str(map_get_val(r1 and "role"))
+        set role2 to ptr_to_str(map_get_val(r2 and "role"))
+        set role3 to ptr_to_str(map_get_val(r3 and "role"))
+        if role1 equals RAFT_ROLE_LEADER:
+            set observed_leader to 1
+        if role2 equals RAFT_ROLE_LEADER:
+            set observed_leader to 1
+        if role3 equals RAFT_ROLE_LEADER:
+            set observed_leader to 1
 
     set role1 to ptr_to_str(map_get_val(r1 and "role"))
-    if (role1 equals RAFT_ROLE_LEADER) == 0:
-        display "  FAIL: node1 not elected leader"
+    set role2 to ptr_to_str(map_get_val(r2 and "role"))
+    set role3 to ptr_to_str(map_get_val(r3 and "role"))
+    set leader_count to 0
+    set leader_id to ""
+    set leader_node to r1
+    set leader_port to base_port
+    if role1 equals RAFT_ROLE_LEADER:
+        set leader_count to leader_count + 1
+        set leader_id to "node1"
+        set leader_node to r1
+        set leader_port to base_port
+    if role2 equals RAFT_ROLE_LEADER:
+        set leader_count to leader_count + 1
+        set leader_id to "node2"
+        set leader_node to r2
+        set leader_port to base_port + 1
+    if role3 equals RAFT_ROLE_LEADER:
+        set leader_count to leader_count + 1
+        set leader_id to "node3"
+        set leader_node to r3
+        set leader_port to base_port + 2
+
+    if leader_count != 1:
+        display f"  FAIL: expected one elected leader, got {leader_count}"
         set ok to map_insert(r1 and "running" and 0)
         set ok to map_insert(r2 and "running" and 0)
         set ok to map_insert(r3 and "running" and 0)
         return 0
 
-    set leader_term to map_get_val(r1 and "current_term")
-    display f"  Leader: node1 (term {leader_term})"
+    set leader_term to map_get_val(leader_node and "current_term")
+    display f"  Leader: {leader_id} (term {leader_term})"
 
     # Submit 20 proposals rapidly via TCP
     set i to 0
@@ -346,7 +402,7 @@ define test_5_5 returning Int:
         set cmd to concat(cmd and "=value")
         set cmd to concat(cmd and int_to_string(i))
         set wire to raft_serialize_client_propose(cmd)
-        set resp to raft_send_rpc("127.0.0.1" and base_port and wire)
+        set resp to raft_send_rpc("127.0.0.1" and leader_port and wire)
         set rpc_err to map_get_val(resp and "error")
         if rpc_err == RAFT_TRANSPORT_ERR_NONE:
             set propose_ok to propose_ok + 1
@@ -365,15 +421,16 @@ define test_5_5 returning Int:
     set log3 to length_list(map_get_val(r3 and "log"))
     display f"  Log lengths: node1={log1} node2={log2} node3={log3}"
 
-    if log1 < 15:
-        display f"  FAIL: Leader log too short ({log1})"
+    set leader_log to length_list(map_get_val(leader_node and "log"))
+    if leader_log < 15:
+        display f"  FAIL: Leader log too short ({leader_log})"
         set t_ok to 0
 
-    set commit1 to map_get_val(r1 and "commit_index")
-    display f"  Leader commit_index: {commit1}"
+    set leader_commit to map_get_val(leader_node and "commit_index")
+    display f"  Leader commit_index: {leader_commit}"
 
     # Check state machine
-    set sm to map_get_val(r1 and "state_machine")
+    set sm to map_get_val(leader_node and "state_machine")
     if sm != 0:
         set sm_size to map_size(sm)
         display f"  Leader state machine entries: {sm_size}"

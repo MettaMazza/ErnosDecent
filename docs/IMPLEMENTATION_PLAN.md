@@ -64,6 +64,10 @@ threads, and the IMA-ADPCM table's freed global backing list. The media suite pa
 7 and the stress suite passed 5 of 5 under AddressSanitizer and UndefinedBehaviorSanitizer;
 the ordinary optimized Linux media build also passed 7 of 7.
 
+Raft integration checks use staggered election timeouts and bounded condition polling. The
+load test waits for all three TCP listeners, requires exactly one elected leader, and sends
+its proposal burst to the observed leader rather than assuming node1 wins on a fixed timer.
+
 Bootstrap does not ship a literal external seed. It accepts an explicit operator seed or previously verified cached peers, rejects wildcard/non-dialable endpoints, requires a framed DHT `PONG`, and reports connection, send, receive, invalid-response, close, registration, and invalid-endpoint failures distinctly. Without a reachable candidate, the node is truthfully reported as a mesh root. A configured static host skips operated default aliases while retaining explicit and cached peer eligibility. `network.public_host` is now preserved across default generation, load/save, and dashboard editing. Adding an operated default remains gated on a stable DNS record and independent external DHT verification.
 
 Public bootstrap remains explicitly **pre-launch** as of 19 July 2026. External TCP

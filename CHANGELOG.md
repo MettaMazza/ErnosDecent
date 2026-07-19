@@ -30,6 +30,7 @@ All notable changes to ErnosDecent. Dates are absolute. The engine ships on
 - Repaired compiler-emitted main and spawned-thread GC stack boundaries using the real pthread stack range on macOS and Linux, and corrected the IMA-ADPCM table's global ownership. Linux AddressSanitizer reproduced the out-of-range conservative stack scans and freed-table read, then completed the media and stress suites cleanly after the fixes.
 - Pinned CI to a reproducible Ernos compiler source revision with its adjacent standard library, and declared libsrtp2 on both runners so real DTLS-SRTP tests exercise the required native dependency.
 - Made the Raft TCP failover test use staggered follower timeouts and bounded condition polling, removing a same-timeout split-vote race that appeared only under slower hosted-runner scheduling.
+- Made the Raft load test wait for all TCP listeners, use bounded election polling, require exactly one leader, and direct proposals to whichever node actually won instead of hard-coding node1 after a fixed sleep.
 - Made platform detection validate macOS, Linux, and Windows consistently and routed both CI jobs through the checked test wrapper; Linux is no longer incorrectly treated as a macOS detection warning/failure.
 
 ### Verified
