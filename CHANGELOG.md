@@ -29,6 +29,7 @@ All notable changes to ErnosDecent. Dates are absolute. The engine ships on
 - Made generated binary-safe network-send patching structural and idempotent across old and new Ernos compiler output, preventing duplicate runtime symbols when parameter names or compiler-provided helpers differ.
 - Repaired the compiler-emitted main-thread GC stack boundary using the real pthread stack range on macOS and Linux, and corrected the IMA-ADPCM table's global ownership. Linux AddressSanitizer reproduced both the out-of-range conservative stack scan and freed-table read, then completed the full media suite cleanly after the fixes.
 - Pinned CI to a reproducible Ernos compiler source revision with its adjacent standard library, and declared libsrtp2 on both runners so real DTLS-SRTP tests exercise the required native dependency.
+- Made the Raft TCP failover test use staggered follower timeouts and bounded condition polling, removing a same-timeout split-vote race that appeared only under slower hosted-runner scheduling.
 
 ### Verified
 

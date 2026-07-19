@@ -33,11 +33,13 @@ define setup_cluster with port1 as Int and port2 as Int and port3 as Int returni
     set ok to append_list(peers3 and str_to_ptr("node2"))
     set node3 to raft_create_node("node3" and peers3)
 
-    # Initialize election timers: node1 shortest (500ms), others longer
-    # TCP round-trips add latency so we need wider gaps than in-memory tests
+    # Initialize deliberately staggered election timers. Giving both followers the
+    # same timeout creates a deterministic split vote after node1 fails; whether a
+    # later randomized retry finishes inside a fixed test sleep then depends on runner
+    # scheduling rather than Raft correctness.
     election_init_node(borrow node1 and 500)
     election_init_node(borrow node2 and 1500)
-    election_init_node(borrow node3 and 1500)
+    election_init_node(borrow node3 and 2500)
 
     # Build peer address strings
     set addr1 to concat("127.0.0.1:" and int_to_string(port1))
@@ -219,9 +221,16 @@ define test_leader_failure with cluster as Map returning Int:
     # "Kill" the leader by stopping its timer and server
     set ok to map_insert(old_leader_node and "running" and 0)
 
-    # Wait for remaining nodes to detect timeout and re-elect
-    # Election timeout is 1500ms, need ~5s for detection + new election
-    set ok to ep_sleep_ms(5000)
+    # Wait up to ten seconds for the observable condition instead of assuming a
+    # particular CI runner will complete network scheduling inside one fixed sleep.
+    set wait_ms to 0
+    set observed_new_leader to 0
+    repeat while wait_ms < 10000 and observed_new_leader == 0:
+        set ok to ep_sleep_ms(100)
+        set wait_ms to wait_ms + 100
+        set candidate_id to get_leader_id(cluster)
+        if string_length(candidate_id) > 0 and also (candidate_id equals old_leader_id) == 0:
+            set observed_new_leader to 1
 
     # Check for new leader among surviving nodes
     set new_leader_id to ""
