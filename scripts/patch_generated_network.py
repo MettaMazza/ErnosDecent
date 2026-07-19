@@ -10,10 +10,10 @@ The compiler's bundled SHA-256/MD5 byte assembly also left-shifts promoted signe
 ints. Bytes with the high bit set trigger undefined behavior before assignment to
 the unsigned destination. Cast every byte before shifting.
 
-The compiler also records the address of init_ep_args()'s temporary argc parameter
-as the main thread's stack boundary. That frame is gone after initialization, so a
-later conservative minor-GC scan can cross outside the mapped stack and segfault.
-Resolve the real pthread stack boundary on each supported native platform.
+The compiler also records temporary/local addresses as thread stack boundaries: the
+expired init_ep_args() argc frame for the main thread and a spawn-wrapper stack_dummy
+for worker threads. Conservative minor-GC scans can cross a pthread stack boundary and
+segfault. Resolve the real pthread stack boundary on each supported native platform.
 
 Older compiler builds do not emit the native binary-safe ep_net_send_raw helper;
 newer builds do, but may use different parameter names. Detect definitions by C
@@ -92,6 +92,7 @@ UNSAFE_RESOLUTION = re.compile(
 )
 UNSAFE_MAIN_STACK_REGISTRATION = "    ep_gc_register_thread((void*)&argc);"
 SAFE_MAIN_STACK_REGISTRATION = "    ep_gc_register_thread(ep_gc_platform_stack_bottom());"
+UNSAFE_SPAWN_STACK_REGISTRATION = "    ep_gc_register_thread(&stack_dummy);"
 INIT_ARGS_DEFINITION = "void init_ep_args(int argc, char** argv) {"
 STACK_BOTTOM_IMPLEMENTATION = r'''/* ERNOSDECENT_PLATFORM_STACK_BOTTOM */
 #if defined(__linux__)
@@ -185,10 +186,10 @@ def main() -> int:
         return 1
 
     if STACK_BOTTOM_MARKER in patched:
-        if UNSAFE_MAIN_STACK_REGISTRATION in patched:
+        if UNSAFE_MAIN_STACK_REGISTRATION in patched or UNSAFE_SPAWN_STACK_REGISTRATION in patched:
             print("GC stack-boundary patch: mixed patched/unsafe state", file=sys.stderr)
             return 1
-        if patched.count(STACK_BOTTOM_MARKER) != 1 or patched.count(SAFE_MAIN_STACK_REGISTRATION) != 1:
+        if patched.count(STACK_BOTTOM_MARKER) != 1 or patched.count(SAFE_MAIN_STACK_REGISTRATION) < 1:
             print("GC stack-boundary patch: malformed existing repair", file=sys.stderr)
             return 1
         stack_replacements = 0
@@ -210,7 +211,12 @@ def main() -> int:
             UNSAFE_MAIN_STACK_REGISTRATION,
             SAFE_MAIN_STACK_REGISTRATION,
         )
-        stack_replacements = 1
+        spawn_stack_replacements = patched.count(UNSAFE_SPAWN_STACK_REGISTRATION)
+        patched = patched.replace(
+            UNSAFE_SPAWN_STACK_REGISTRATION,
+            SAFE_MAIN_STACK_REGISTRATION,
+        )
+        stack_replacements = 1 + spawn_stack_replacements
 
     if SHIFT_MARKER in patched:
         if UNSAFE_SHA256_WORD in patched or UNSAFE_MD5_WORD in patched:

@@ -58,10 +58,11 @@ rather than an inline `RESPONSE` payload. A freshly linked AddressSanitizer and
 UndefinedBehaviorSanitizer node also completed clean startup after the emitted-runtime
 unsigned-shift repair without a sanitizer finding.
 
-The Linux sanitizer reproduction also identified and verified repairs for two emitted/native
-memory faults: the compiler's temporary-frame GC stack boundary and the IMA-ADPCM table's
-freed global backing list. The media suite then passed 7 of 7 under AddressSanitizer and
-UndefinedBehaviorSanitizer and under the ordinary optimized Linux build.
+The Linux sanitizer reproduction also identified and verified repairs for emitted/native
+memory faults: compiler temporary/local GC stack boundaries for the main and spawned
+threads, and the IMA-ADPCM table's freed global backing list. The media suite passed 7 of
+7 and the stress suite passed 5 of 5 under AddressSanitizer and UndefinedBehaviorSanitizer;
+the ordinary optimized Linux media build also passed 7 of 7.
 
 Bootstrap does not ship a literal external seed. It accepts an explicit operator seed or previously verified cached peers, rejects wildcard/non-dialable endpoints, requires a framed DHT `PONG`, and reports connection, send, receive, invalid-response, close, registration, and invalid-endpoint failures distinctly. Without a reachable candidate, the node is truthfully reported as a mesh root. A configured static host skips operated default aliases while retaining explicit and cached peer eligibility. `network.public_host` is now preserved across default generation, load/save, and dashboard editing. Adding an operated default remains gated on a stable DNS record and independent external DHT verification.
 
