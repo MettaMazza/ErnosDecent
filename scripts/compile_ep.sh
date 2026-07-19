@@ -69,7 +69,7 @@ fi
 
 python3 scripts/patch_generated_network.py "$compiled_c"
 
-common_flags=(-O2 -lpthread -DEP_HAS_SQLITE -lsqlite3 -Wno-int-conversion -Wno-parentheses-equality)
+common_flags=(-O2 -lpthread -DEP_HAS_SQLITE -DERNOSDECENT_GENERATED_NET_SEND_RAW -lsqlite3 -Wno-int-conversion -Wno-parentheses-equality)
 case "$(uname -s)" in
     Darwin)
         if [ -d /opt/homebrew/lib ]; then

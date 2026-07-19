@@ -14,6 +14,7 @@
  * failure.  A blocked socket is given a bounded 30-second writable wait so a
  * failed peer cannot stall the process indefinitely.
  */
+#ifndef ERNOSDECENT_GENERATED_NET_SEND_RAW
 long long ep_net_send_raw(long long fd_value, long long buffer_value, long long count_value) {
     if (fd_value < 0 || buffer_value == 0 || count_value < 0) {
         return -EINVAL;
@@ -76,3 +77,4 @@ long long ep_net_send_raw(long long fd_value, long long buffer_value, long long 
 
     return (long long)sent;
 }
+#endif

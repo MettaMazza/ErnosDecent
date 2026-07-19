@@ -386,7 +386,9 @@ if [ "${1:-}" = "test" ] || [ "${1:-}" = "--test" ] || [ "${1:-}" = "--compile-a
     fi
     python3 scripts/patch_generated_network.py decent_agent/test_agent_compiled.c
 
-    # Step 1b: Patch conflicting mutex declarations and inject cast_borrow_to_map, cast_map_to_int and ep_net_send_raw
+    # Step 1b: Patch conflicting mutex declarations and session helpers. The shared
+    # generated-network patcher above owns ep_net_send_raw so compiler versions cannot
+    # cause this block to double-define it.
     python3 -c "
 with open('decent_agent/test_agent_compiled.c', 'r') as f:
     content = f.read()
@@ -395,18 +397,6 @@ content = content.replace('long long ep_mutex_unlock(long long);', '')
 # NOTE: cast_borrow_to_map/cast_map_to_int (and cancel/json/async) are injected by the
 # SHARED inject_additive_helpers() below, so they are NOT defined here (would double-define).
 inject = '''
-long long ep_net_send_raw(long long fd, long long buf, long long count) {
-    if (count <= 0 || buf == 0) return 0;
-    const char* p = (const char*)buf;
-    long long total = 0;
-    while (total < count) {
-        ssize_t n = send((int)fd, p + total, (size_t)(count - total), 0);
-        if (n <= 0) break;
-        total += n;
-    }
-    return total;
-}
-
 __thread char ep_active_session_id[256] = \"\";
 
 long long tools_set_active_session(long long sid_ptr) {
@@ -724,49 +714,9 @@ else:
     echo "[*] Crash log patch applied."
 fi
 
-# Step 2b: Inject ep_net_send_raw — binary-safe send (no strlen truncation)
-# WebSocket frame headers contain null bytes (e.g., extended length 0x00 0x8A).
-# ep_net_send uses strlen which stops at null bytes, truncating the frame.
-# This function sends exactly 'count' bytes regardless of content.
-# Note: there are TWO ep_net_send definitions (wasm stub + real).
-# We inject before the SECOND one (the real non-wasm version).
-if grep -q "long long ep_net_send_raw(long long fd, long long buf, long long count) {" node_compiled.c; then
-    echo "[*] ep_net_send_raw already present."
-else
-    python3 -c "
-import re
-with open('node_compiled.c', 'r') as f:
-    content = f.read()
-inject = '''
-// Binary-safe send: sends exactly 'count' bytes regardless of null bytes.
-// ep_net_send uses strlen which truncates at nulls - fatal for WS frames.
-long long ep_net_send_raw(long long fd, long long buf, long long count) {
-    if (count <= 0 || buf == 0) return 0;
-    const char* p = (const char*)buf;
-    long long total = 0;
-    while (total < count) {
-        ssize_t n = send((int)fd, p + total, (size_t)(count - total), 0);
-        if (n <= 0) break;
-        total += n;
-    }
-    return total;
-}
-
-'''
-# Find the second occurrence of ep_net_send (the real non-wasm one)
-pat = 'long long ep_net_send(long long fd, const char* data) {'
-first = content.find(pat)
-second = content.find(pat, first + 1)
-if second > 0:
-    content = content[:second] + inject + content[second:]
-    with open('node_compiled.c', 'w') as f:
-        f.write(content)
-    print('Injected ep_net_send_raw before non-wasm ep_net_send')
-else:
-    raise SystemExit('ERROR: could not find second ep_net_send')
-"
-    echo "[*] Injected ep_net_send_raw (binary-safe send)."
-fi
+# Step 2b: ep_net_send_raw is owned by patch_generated_network.py above. It
+# structurally detects the native definition emitted by newer compilers and injects
+# exactly one for older compilers, independent of parameter names.
 
 # Step 2c: Inject additive runtime helpers via the SHARED injector (single source of
 # truth, also used by the test build so they cannot drift). The inline block below is

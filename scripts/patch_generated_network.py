@@ -9,6 +9,11 @@ misaligned pointer read and an intermittent SIGSEGV in the stress suite.
 The compiler's bundled SHA-256/MD5 byte assembly also left-shifts promoted signed
 ints. Bytes with the high bit set trigger undefined behavior before assignment to
 the unsigned destination. Cast every byte before shifting.
+
+Older compiler builds do not emit the native binary-safe ep_net_send_raw helper;
+newer builds do, but may use different parameter names. Detect definitions by C
+shape and native-section position rather than spelling so the patch stays
+idempotent and never introduces a duplicate definition.
 """
 
 from pathlib import Path
@@ -18,6 +23,36 @@ import sys
 
 MARKER = "/* ERNOSDECENT_THREAD_SAFE_DNS */"
 SHIFT_MARKER = "/* ERNOSDECENT_UNSIGNED_BYTE_SHIFTS */"
+RAW_SEND_MARKER = "/* ERNOSDECENT_NATIVE_RAW_SEND */"
+FUNCTION_SEND = re.compile(
+    r"\blong\s+long\s+ep_net_send\s*\([^;{}]*\)\s*\{",
+    re.DOTALL,
+)
+FUNCTION_RAW_SEND = re.compile(
+    r"\blong\s+long\s+ep_net_send_raw\s*\([^;{}]*\)\s*\{",
+    re.DOTALL,
+)
+RAW_SEND_IMPLEMENTATION = """/* ERNOSDECENT_NATIVE_RAW_SEND */
+long long ep_net_send_raw(long long fd, long long data_ptr, long long count) {
+    if (data_ptr == 0 || count <= 0) return 0;
+    const char* data = (const char*)data_ptr;
+    long long off = 0;
+    while (off < count) {
+#ifdef _WIN32
+        int chunk = count - off > INT_MAX ? INT_MAX : (int)(count - off);
+        int n = send((int)fd, data + off, chunk, 0);
+        if (n < 0 && WSAGetLastError() == WSAEINTR) continue;
+#else
+        ssize_t n = send((int)fd, data + off, (size_t)(count - off), 0);
+        if (n < 0 && errno == EINTR) continue;
+#endif
+        if (n <= 0) break;
+        off += (long long)n;
+    }
+    return off;
+}
+
+"""
 UNSAFE_SHA256_WORD = (
     "        m[i] = (data[j] << 24) | (data[j + 1] << 16) | "
     "(data[j + 2] << 8) | (data[j + 3]);"
@@ -119,10 +154,59 @@ def main() -> int:
         patched = patched.replace(UNSAFE_MD5_WORD, SAFE_MD5_WORD)
         shift_replacements = 2
 
+    send_definitions = list(FUNCTION_SEND.finditer(patched))
+    if len(send_definitions) != 2:
+        print(
+            f"raw-send runtime patch: expected two ep_net_send definitions, found {len(send_definitions)}",
+            file=sys.stderr,
+        )
+        return 1
+    native_send_position = send_definitions[1].start()
+    raw_definitions = list(FUNCTION_RAW_SEND.finditer(patched))
+    native_raw_definitions = [
+        match for match in raw_definitions if match.start() > native_send_position
+    ]
+    marker_count = patched.count(RAW_SEND_MARKER)
+    if marker_count > 1:
+        print(
+            "raw-send runtime patch: duplicate injected-helper markers already present",
+            file=sys.stderr,
+        )
+        return 1
+    if marker_count == 1:
+        marker_position = patched.index(RAW_SEND_MARKER)
+        marked_raw_definitions = [
+            match for match in raw_definitions
+            if marker_position < match.start() < native_send_position
+        ]
+        if len(marked_raw_definitions) != 1:
+            print(
+                "raw-send runtime patch: injected marker does not identify exactly one helper",
+                file=sys.stderr,
+            )
+            return 1
+        raw_send_replacements = 0
+    elif len(native_raw_definitions) > 1:
+        print(
+            "raw-send runtime patch: duplicate native ep_net_send_raw definitions already present",
+            file=sys.stderr,
+        )
+        return 1
+    elif native_raw_definitions:
+        raw_send_replacements = 0
+    else:
+        patched = (
+            patched[:native_send_position]
+            + RAW_SEND_IMPLEMENTATION
+            + patched[native_send_position:]
+        )
+        raw_send_replacements = 1
+
     generated_path.write_text(patched)
     print(
         f"Patched {dns_replacements} DNS resolver site(s) and "
-        f"{shift_replacements} unsigned byte-shift site(s) in {generated_path}"
+        f"{shift_replacements} unsigned byte-shift site(s); injected "
+        f"{raw_send_replacements} native raw-send helper(s) in {generated_path}"
     )
     return 0
 
