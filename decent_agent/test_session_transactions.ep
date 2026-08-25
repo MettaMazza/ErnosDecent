@@ -1,0 +1,202 @@
+import "session"
+import "fs"
+import "os"
+import "string"
+
+define transaction_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("  PASS: " and label)
+        return 1
+    display concat("  FAIL: " and label)
+    return 0
+
+define transaction_directory_has with dir as Str and fragment as Str returning Int:
+    set files to list_directory(dir)
+    if files == 0:
+        return 0
+    set n to length_list(files)
+    set i to 0
+    repeat while i < n:
+        if string_contains(get_list(files and i) and fragment) == 1:
+            free_list(files)
+            return 1
+        set i to i + 1
+    free_list(files)
+    return 0
+
+define main returning Int:
+    display "Session transaction and recovery tests"
+    set passed to 0
+    set total to 0
+
+    set config_created to create_directory("config")
+    set target_created to create_directory("linked_target")
+    set cwd to get_cwd()
+    set target_path to path_join(cwd and "linked_target")
+    set registry_content to concat("proj|Project|" and concat(target_path and "\n"))
+    set registry_written to write_file("config/linked_projects.txt" and registry_content)
+    set total to total + 1
+    set passed to passed + transaction_expect(file_exists("config") == 1 and also file_exists("linked_target") == 1 and also registry_written == 1 and "isolated workspace registry is prepared")
+
+    # Regression for the transferred-list UAF in wl_new_registry. ASan catches
+    # the freed lists at these length_list calls if ownership is not transferred.
+    set registry to links_load()
+    set total to total + 1
+    set passed to passed + transaction_expect(registry != 0 and also map_get_val(registry and "valid") == 1 and also length_list(map_get_val(registry and "ids")) == 1 and also length_list(map_get_val(registry and "paths")) == 1 and "linked-project registry retains owned lists")
+
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_create("") == 0 and also session_id_safe("bad/path") == 0 and also session_id_safe("hidden_transcript_part") == 0 and "manager paths and reserved session ids fail closed")
+
+    set mgr to session_manager_create("sessions")
+    set total to total + 1
+    set passed to passed + transaction_expect(mgr != 0 and also session_manager_shape_valid(mgr) == 1 and "session manager is structurally valid")
+
+    set s1 to session_manager_new_session(mgr and "s1" and "Session One" and "model-a" and "system-a")
+    set sessions_map to map_get_val(mgr and "sessions")
+    set active_path to path_join("sessions" and "active_session.txt")
+    set total to total + 1
+    set passed to passed + transaction_expect(s1 != 0 and also file_exists("sessions/s1.json") == 1 and also string_equals(read_file(active_path) and "s1") == 1 and also string_equals(map_get_val(mgr and "active_session_id") and "s1") == 1 and "new session commits file, tracker, map, and active id")
+
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_set_guidance_for(mgr and "s1" and "") == 0 and also map_contains(s1 and "session_guidance") == 1 and also string_equals(map_get_val(s1 and "session_guidance") and "") == 1 and "empty guidance is a successful persisted map update")
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_set_guidance_for(mgr and "s1" and "durable guidance") == 0 and also string_equals(session_manager_get_guidance_for(mgr and "s1") and "durable guidance") == 1 and "non-empty guidance persists")
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_set_guidance_for(mgr and "s1" and "") == 0 and also map_contains(session_load("sessions/s1.json") and "session_guidance") == 1 and "guidance can be durably cleared to empty")
+
+    set total to total + 1
+    set passed to passed + transaction_expect(links_set_active("proj") == 1 and also string_equals(map_get_val(links_load() and "active") and "proj") == 1 and "linked project is active before rollback test")
+    set tracker_corrupted to session_atomic_write(active_path and "ghost")
+    set failed_new to session_manager_new_session(mgr and "must_not_exist" and "Blocked" and "" and "")
+    set total to total + 1
+    set passed to passed + transaction_expect(tracker_corrupted == 0 and also failed_new == 0 and also map_contains(sessions_map and "must_not_exist") == 0 and also file_exists("sessions/must_not_exist.json") == 0 and also string_equals(map_get_val(mgr and "active_session_id") and "s1") == 1 and also string_equals(read_file(active_path) and "ghost") == 1 and also string_equals(map_get_val(links_load() and "active") and "proj") == 1 and "new-session preflight failure preserves every prior state")
+    set tracker_restored to session_atomic_write(active_path and "s1")
+
+    set s2 to session_manager_new_session(mgr and "s2" and "Session Two" and "model-2" and "system-2")
+    set total to total + 1
+    set passed to passed + transaction_expect(tracker_restored == 0 and also s2 != 0 and also string_equals(read_file(active_path) and "s2") == 1 and also string_equals(map_get_val(mgr and "active_session_id") and "s2") == 1 and also string_length(map_get_val(links_load() and "active")) == 0 and "new-session commit clears linked-project context")
+
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_switch_to(mgr and "s1") == 1 and also string_equals(read_file(active_path) and "s1") == 1 and also string_equals(map_get_val(mgr and "active_session_id") and "s1") == 1 and "switch commits tracker and memory together")
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_switch_to(mgr and "s1") == 1 and also string_equals(read_file(active_path) and "s1") == 1 and "switch is durably idempotent")
+
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_rename(mgr and "s1" and "Renamed Session") == 1 and also string_equals(map_get_val(s1 and "title") and "Renamed Session") == 1 and also string_contains(read_file("sessions/s1.json") and "Renamed Session") == 1 and "rename updates memory and durable record")
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_set_model(mgr and "s1" and "") == 1 and also string_equals(map_get_val(s1 and "model") and "") == 1 and "model can be explicitly cleared without false failure")
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_set_model(mgr and "s1" and "model-b") == 1 and also string_equals(map_get_val(session_load("sessions/s1.json") and "model") and "model-b") == 1 and "model update is durable")
+
+    # Mirror the node's real turn path: request metadata changes in memory and the
+    # append transaction persists those changes with the new message.
+    set ok to map_insert(s1 and "mode" and "tutor")
+    set ok to map_insert(s1 and "system_prompt" and "system-updated")
+    set ok to map_insert(s1 and "model" and "turn-model")
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_append_message(mgr and "s1" and "user" and "durable turn") == 0 and also length_list(map_get_val(s1 and "messages")) == 1 and "message append atomically persists request metadata")
+    set persisted_s1 to session_load("sessions/s1.json")
+    set total to total + 1
+    set passed to passed + transaction_expect(string_equals(map_get_val(persisted_s1 and "mode") and "tutor") == 1 and also string_equals(map_get_val(persisted_s1 and "system_prompt") and "system-updated") == 1 and also string_equals(map_get_val(persisted_s1 and "model") and "turn-model") == 1 and "request metadata survives session reload")
+
+    set messages to map_get_val(s1 and "messages")
+    set first_message to get_list(messages and 0)
+    set ok to map_insert(first_message and "content" and "tampered memory")
+    set stale_append to session_manager_append_message(mgr and "s1" and "assistant" and "must not append")
+    set total to total + 1
+    set passed to passed + transaction_expect(stale_append != 0 and also length_list(messages) == 1 and also string_contains(read_file("sessions/s1.json") and "must not append") == 0 and "stale transcript cannot overwrite durable history")
+    set ok to map_insert(first_message and "content" and "durable turn")
+
+    set reload_mgr to session_manager_create("sessions")
+    set reload_rc to session_manager_load_all(reload_mgr)
+    set reloaded_s1 to map_get_val(map_get_val(reload_mgr and "sessions") and "s1")
+    set total to total + 1
+    set passed to passed + transaction_expect(reload_rc == 0 and also string_equals(map_get_val(reload_mgr and "active_session_id") and "s1") == 1 and also string_equals(map_get_val(reloaded_s1 and "mode") and "tutor") == 1 and also length_list(map_get_val(reloaded_s1 and "messages")) == 1 and "validated load restores the exact active session")
+
+    set bad_dir_created to create_directory("bad_load")
+    set wrong_session to session_create_new("real_id" and "Real" and "" and "")
+    set wrong_saved to session_serialize(wrong_session and "bad_load/wrong_name.json")
+    set bad_load_mgr to session_manager_create("bad_load")
+    set bad_load_original to map_get_val(bad_load_mgr and "sessions")
+    set bad_load_rc to session_manager_load_all(bad_load_mgr)
+    set total to total + 1
+    set passed to passed + transaction_expect(bad_dir_created == 1 and also wrong_saved == 0 and also bad_load_rc != 0 and also map_get_val(bad_load_mgr and "sessions") == bad_load_original and also map_size(bad_load_original) == 0 and "filename/id mismatch rejects the whole load without partial memory")
+
+    set unknown_dir_created to create_directory("unknown_active")
+    set known_session to session_create_new("known" and "Known" and "" and "")
+    set known_saved to session_serialize(known_session and "unknown_active/known.json")
+    set unknown_tracker to write_file("unknown_active/active_session.txt" and "missing")
+    set unknown_mgr to session_manager_create("unknown_active")
+    set unknown_original to map_get_val(unknown_mgr and "sessions")
+    set unknown_rc to session_manager_load_all(unknown_mgr)
+    set total to total + 1
+    set passed to passed + transaction_expect(unknown_dir_created == 1 and also known_saved == 0 and also unknown_tracker == 1 and also unknown_rc != 0 and also map_get_val(unknown_mgr and "sessions") == unknown_original and "unknown active tracker fails load transactionally")
+
+    set total to total + 1
+    set passed to passed + transaction_expect(links_set_active("proj") == 1 and also session_manager_delete(mgr and "s2") == 1 and also map_contains(sessions_map and "s2") == 0 and also file_exists("sessions/s2.json") == 0 and also string_equals(read_file(active_path) and "s1") == 1 and also string_equals(map_get_val(links_load() and "active") and "proj") == 1 and "non-active delete preserves active tracker and linked project")
+    set total to total + 1
+    set passed to passed + transaction_expect(session_manager_delete(mgr and "s1") == 1 and also map_contains(sessions_map and "s1") == 0 and also file_exists("sessions/s1.json") == 0 and also string_length(read_file(active_path)) == 0 and also string_length(map_get_val(links_load() and "active")) == 0 and also transaction_directory_has("sessions" and ".deleting.") == 0 and "active delete commits quarantine, tracker, link, and memory")
+
+    set recover_session to session_create_new("recover" and "Recovered" and "" and "")
+    set quarantine_saved to session_serialize(recover_session and "sessions/recover.json.deleting.crash")
+    set recovery_mgr to session_manager_create("sessions")
+    set recovery_rc to session_manager_load_all(recovery_mgr)
+    set recovery_map to map_get_val(recovery_mgr and "sessions")
+    set total to total + 1
+    set passed to passed + transaction_expect(quarantine_saved == 0 and also recovery_rc == 0 and also file_exists("sessions/recover.json.deleting.crash") == 0 and also file_exists("sessions/recover.json") == 1 and also map_contains(recovery_map and "recover") == 1 and "load recovers interrupted delete quarantine before exposure")
+
+    set recovered_file_removed to session_remove_if_exists("sessions/recover.json")
+    set failed_delete to session_manager_delete(recovery_mgr and "recover")
+    set total to total + 1
+    set passed to passed + transaction_expect(recovered_file_removed == 1 and also failed_delete == 0 and also map_contains(recovery_map and "recover") == 1 and "missing durable file cannot produce a false successful delete")
+    set recovered_session to map_get_val(recovery_map and "recover")
+    set recovered_restored to session_serialize(recovered_session and "sessions/recover.json")
+    set total to total + 1
+    set passed to passed + transaction_expect(recovered_restored == 0 and also session_manager_delete(recovery_mgr and "recover") == 1 and also map_contains(recovery_map and "recover") == 0 and "restored durable session can be deleted cleanly")
+
+    # The real factory mutation removes config/sessions before rebuilding live state.
+    # Exercise that exact missing-directory condition instead of relying on residue
+    # from an earlier test run.
+    if file_exists("factory_missing_sessions/default.json") == 1:
+        set removed to remove_file("factory_missing_sessions/default.json")
+    if file_exists("factory_missing_sessions/active_session.txt") == 1:
+        set removed to remove_file("factory_missing_sessions/active_session.txt")
+    if file_exists("factory_missing_sessions") == 1:
+        set removed to remove_directory("factory_missing_sessions")
+    set factory_mgr to session_manager_create("factory_missing_sessions")
+    set factory_old_map to map_get_val(factory_mgr and "sessions")
+    set legacy to session_create_new("legacy" and "Legacy" and "" and "")
+    set ok to map_insert(factory_old_map and "legacy" and legacy)
+    set factory_rc to session_manager_factory_reset(factory_mgr)
+    set factory_new_map to map_get_val(factory_mgr and "sessions")
+    set total to total + 1
+    set passed to passed + transaction_expect(factory_rc == 0 and also factory_new_map != factory_old_map and also map_contains(factory_new_map and "default") == 1 and also map_contains(factory_new_map and "legacy") == 0 and also file_exists("factory_missing_sessions/default.json") == 1 and also string_equals(read_file("factory_missing_sessions/active_session.txt") and "default") == 1 and "factory reset recreates a missing sessions directory and commits a fresh durable default session")
+
+    set blocked_mgr to session_manager_create("/dev/null/blocked")
+    set blocked_old_map to map_get_val(blocked_mgr and "sessions")
+    set blocked_legacy to session_create_new("legacy" and "Legacy" and "" and "")
+    set ok to map_insert(blocked_old_map and "legacy" and blocked_legacy)
+    set blocked_factory_rc to session_manager_factory_reset(blocked_mgr)
+    set total to total + 1
+    set passed to passed + transaction_expect(blocked_factory_rc != 0 and also map_get_val(blocked_mgr and "sessions") == blocked_old_map and also map_contains(blocked_old_map and "legacy") == 1 and "failed factory reset restores the original in-memory registry")
+
+    set default_session to map_get_val(factory_new_map and "default")
+    set second_factory_session to session_manager_new_session(factory_mgr and "second" and "Second" and "" and "")
+    set default_removed to session_remove_if_exists("factory_missing_sessions/default.json")
+    set switch_failed to session_manager_switch_to(factory_mgr and "default")
+    set total to total + 1
+    set passed to passed + transaction_expect(second_factory_session != 0 and also default_removed == 1 and also switch_failed == 0 and also string_equals(map_get_val(factory_mgr and "active_session_id") and "second") == 1 and also string_equals(read_file("factory_missing_sessions/active_session.txt") and "second") == 1 and "switch failure leaves tracker and memory on the prior session")
+    set default_restored to session_serialize(default_session and "factory_missing_sessions/default.json")
+    set old_default_title to map_get_val(default_session and "title")
+    set missing_again to session_remove_if_exists("factory_missing_sessions/default.json")
+    set rename_failed to session_manager_rename(factory_mgr and "default" and "Must Not Apply")
+    set total to total + 1
+    set passed to passed + transaction_expect(default_restored == 0 and also missing_again == 1 and also rename_failed == 0 and also string_equals(map_get_val(default_session and "title") and old_default_title) == 1 and "rename failure does not mutate the in-memory title")
+
+    set total to total + 1
+    set passed to passed + transaction_expect(session_deserialize_json("{\"id\":7}") == 0 and also session_deserialize_json("{\"id\":\"x\",\"title\":\"x\",\"model\":\"\",\"system_prompt\":\"\",\"messages\":[{\"role\":\"\",\"content\":\"x\"}],\"compressed_sessions\":[]}") == 0 and "malformed nested session JSON fails closed")
+
+    display f"Session transactions: {passed}/{total} passed"
+    if passed != total:
+        return 1
+    return 0

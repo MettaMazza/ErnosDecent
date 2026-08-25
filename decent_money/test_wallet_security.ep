@@ -1,0 +1,141 @@
+import "wallet"
+import "../decent_id/keys"
+import "string"
+
+set WALLET_TESTS to 0
+set WALLET_PASSES to 0
+
+define wallet_expect with label as Str and condition as Int returning Int:
+    set WALLET_TESTS to WALLET_TESTS + 1
+    if condition == 1:
+        set WALLET_PASSES to WALLET_PASSES + 1
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main returning Int:
+    if init_crypto() != 0:
+        display "FAIL: libsodium initialization"
+        return 1
+
+    set mnemonic to "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+    # Poison same-sized allocator bins before the vector checks. HMAC padding and
+    # reconstructed entropy must not depend on whatever bytes malloc returns.
+    set poison_hmac to alloc_bytes(128)
+    set poison_i to 0
+    repeat while poison_i < 128:
+        set ok to poke_byte(poison_hmac and poison_i and 165)
+        set poison_i to poison_i + 1
+    set ok to free_bytes(poison_hmac)
+    set poison_entropy to alloc_bytes(32)
+    set poison_i to 0
+    repeat while poison_i < 32:
+        set ok to poke_byte(poison_entropy and poison_i and 165)
+        set poison_i to poison_i + 1
+    set ok to free_bytes(poison_entropy)
+    set valid_rc to wallet_mnemonic_valid(mnemonic)
+    set ok to wallet_expect("BIP39 checksum accepts published 256-bit vector" and (valid_rc == WALLET_ERR_NONE))
+
+    set expected_seed to "bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd3097170af7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8"
+    set actual_seed to wallet_mnemonic_to_seed(mnemonic and "TREZOR")
+    set ok to wallet_expect("BIP39 PBKDF2 seed matches published vector" and (actual_seed equals expected_seed))
+
+    set bad_mnemonic to "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon"
+    set ok to wallet_expect("BIP39 invalid checksum rejected" and (wallet_mnemonic_valid(bad_mnemonic) == WALLET_ERR_MNEMONIC_INVALID))
+    set unicode_mnemonic to concat(mnemonic and "é")
+    set ok to wallet_expect("unsupported non-NFKD Unicode mnemonic rejected" and (wallet_mnemonic_valid(unicode_mnemonic) == WALLET_ERR_UNSUPPORTED_UNICODE))
+    set ok to wallet_expect("unsupported non-NFKD Unicode passphrase rejected" and (string_length(wallet_mnemonic_to_seed(mnemonic and "trézor")) == 0))
+
+    set malformed_hex to wallet_derive_keypair("000102030405060708090a0b0c0d0g" and "m/0'")
+    set ok to wallet_expect("malformed seed hex rejected" and (map_get_val(malformed_hex and "error") == WALLET_ERR_INVALID_INPUT))
+    set non_hardened to wallet_derive_keypair("000102030405060708090a0b0c0d0e0f" and "m/0")
+    set ok to wallet_expect("non-hardened Ed25519 child rejected" and (map_get_val(non_hardened and "error") == WALLET_ERR_INVALID_INPUT))
+    set leading_zero to wallet_derive_keypair("000102030405060708090a0b0c0d0e0f" and "m/01'")
+    set ok to wallet_expect("non-canonical path component rejected" and (map_get_val(leading_zero and "error") == WALLET_ERR_INVALID_INPUT))
+    set too_large to wallet_derive_keypair("000102030405060708090a0b0c0d0e0f" and "m/2147483648'")
+    set ok to wallet_expect("SLIP-0010 child index overflow rejected" and (map_get_val(too_large and "error") == WALLET_ERR_INVALID_INPUT))
+
+    set derived_a to wallet_derive_keypair("000102030405060708090a0b0c0d0e0f" and "m/0'/1'")
+    set derived_b to wallet_derive_keypair("000102030405060708090a0b0c0d0e0f" and "m/0'/1'")
+    set derivation_ok to 0
+    if map_get_val(derived_a and "error") == WALLET_ERR_NONE and also map_get_val(derived_b and "error") == WALLET_ERR_NONE:
+        if string_equals(map_get_val(derived_a and "public_key") and map_get_val(derived_b and "public_key")) == 1:
+            if wallet_keypair_valid(map_get_val(derived_a and "public_key") and map_get_val(derived_a and "secret_key")) == 1:
+                set derivation_ok to 1
+    if derivation_ok == 0:
+        display concat("  derived_a error=" and int_to_string(map_get_val(derived_a and "error")))
+        display concat("  derived_b error=" and int_to_string(map_get_val(derived_b and "error")))
+        if map_contains(derived_a and "public_key") == 1:
+            display concat("  public length=" and int_to_string(string_length(map_get_val(derived_a and "public_key"))))
+            display concat("  deterministic=" and int_to_string(string_equals(map_get_val(derived_a and "public_key") and map_get_val(derived_b and "public_key"))))
+            display concat("  keypair_valid=" and int_to_string(wallet_keypair_valid(map_get_val(derived_a and "public_key") and map_get_val(derived_a and "secret_key"))))
+    set ok to wallet_expect("hardened SLIP-0010 derivation is deterministic and self-consistent" and derivation_ok)
+
+    set keystore to wallet_encrypt_keystore(derived_a and "correct horse battery staple")
+    if string_length(keystore) == 0:
+        display "  keystore encryption returned empty"
+        set probe_kdf to keys_pbkdf2_hmac_sha256("correct horse battery staple" and "00000000000000000000000000000000" and WALLET_KEYSTORE_ITERATIONS)
+        display concat("  KDF length=" and int_to_string(string_length(probe_kdf)))
+        set probe_enc to encrypt_symmetric(map_get_val(derived_a and "secret_key") and probe_kdf)
+        display concat("  encrypt error=" and int_to_string(map_get_val(probe_enc and "error")))
+        if map_contains(probe_enc and "ciphertext") == 1:
+            display concat("  ciphertext length=" and int_to_string(string_length(map_get_val(probe_enc and "ciphertext"))))
+        display concat("  input key valid=" and int_to_string(wallet_keypair_valid(map_get_val(derived_a and "public_key") and map_get_val(derived_a and "secret_key"))))
+    set keystore_v2_ok to 0
+    if string_contains(keystore and WALLET_KEYSTORE_MAGIC_V2) == 1 and also string_contains(keystore and "\"kdf_iterations\": 600000") == 1:
+        set keystore_v2_ok to 1
+    set ok to wallet_expect("new keystore uses authenticated V2 600k format" and keystore_v2_ok)
+
+    set decrypted to wallet_decrypt_keystore(keystore and "correct horse battery staple")
+    set decrypt_ok to 0
+    if map_get_val(decrypted and "error") == WALLET_ERR_NONE and also map_get_val(decrypted and "migration_required") == 0:
+        if string_equals(map_get_val(decrypted and "public_key") and map_get_val(derived_a and "public_key")) == 1:
+            if string_equals(map_get_val(decrypted and "secret_key") and map_get_val(derived_a and "secret_key")) == 1:
+                set decrypt_ok to 1
+    if decrypt_ok == 0:
+        display concat("  decrypt error=" and int_to_string(map_get_val(decrypted and "error")))
+        display concat("  keystore fields=" and int_to_string(length_list(get_list(json_parse(keystore) and 1))))
+        display concat("  migration=" and int_to_string(map_get_val(decrypted and "migration_required")))
+        display concat("  public equal=" and int_to_string(string_equals(map_get_val(decrypted and "public_key") and map_get_val(derived_a and "public_key"))))
+        display concat("  secret equal=" and int_to_string(string_equals(map_get_val(decrypted and "secret_key") and map_get_val(derived_a and "secret_key"))))
+    set ok to wallet_expect("V2 keystore decrypts exact keypair" and decrypt_ok)
+
+    set wrong_pass to wallet_decrypt_keystore(keystore and "wrong")
+    set ok to wallet_expect("wrong passphrase fails closed" and (map_get_val(wrong_pass and "error") == WALLET_ERR_PASSPHRASE_WRONG))
+
+    set legacy_salt to "00112233445566778899aabbccddeeff"
+    set legacy_key to keys_pbkdf2_hmac_sha256("legacy-pass" and legacy_salt and 10000)
+    set legacy_enc to encrypt_symmetric(map_get_val(derived_a and "secret_key") and legacy_key)
+    set legacy_verify to ep_sha256(legacy_key)
+    set legacy_public to map_get_val(derived_a and "public_key")
+    set legacy_ciphertext to map_get_val(legacy_enc and "ciphertext")
+    set legacy_nonce to map_get_val(legacy_enc and "nonce")
+    set legacy_json to "{"
+    set legacy_json to concat(legacy_json and f"\"magic\":\"{WALLET_KEYSTORE_MAGIC_V1}\",")
+    set legacy_json to concat(legacy_json and f"\"salt\":\"{legacy_salt}\",")
+    set legacy_json to concat(legacy_json and f"\"passphrase_verify\":\"{legacy_verify}\",")
+    set legacy_json to concat(legacy_json and f"\"public_key\":\"{legacy_public}\",")
+    set legacy_json to concat(legacy_json and f"\"encrypted_sk\":\"{legacy_ciphertext}\",")
+    set legacy_json to concat(legacy_json and f"\"nonce\":\"{legacy_nonce}\"")
+    set legacy_json to concat(legacy_json and "}")
+    set legacy_result to wallet_decrypt_keystore(legacy_json and "legacy-pass")
+    set legacy_ok to 0
+    if map_get_val(legacy_result and "error") == WALLET_ERR_NONE and also map_get_val(legacy_result and "migration_required") == 1:
+        if string_equals(map_get_val(legacy_result and "secret_key") and map_get_val(derived_a and "secret_key")) == 1:
+            set legacy_ok to 1
+    set ok to wallet_expect("salted V1 keystore opens only as explicit migration input" and legacy_ok)
+
+    set missing_salt to string_replace(keystore and wallet_json_string_value(json_parse(keystore) and "salt") and "")
+    set missing_salt_res to wallet_decrypt_keystore(missing_salt and "correct horse battery staple")
+    set ok to wallet_expect("missing salt has no weak fallback" and (map_get_val(missing_salt_res and "error") == WALLET_ERR_KEYSTORE_CORRUPT))
+
+    set other_seed to wallet_derive_keypair("101112131415161718191a1b1c1d1e1f" and "m/0'/1'")
+    set tampered_public to string_replace(keystore and map_get_val(derived_a and "public_key") and map_get_val(other_seed and "public_key"))
+    set tampered_res to wallet_decrypt_keystore(tampered_public and "correct horse battery staple")
+    set ok to wallet_expect("public/secret key mismatch rejected after authenticated decrypt" and (map_get_val(tampered_res and "error") == WALLET_ERR_KEYSTORE_CORRUPT))
+
+    display concat("RESULT: " and concat(int_to_string(WALLET_PASSES) and concat("/" and concat(int_to_string(WALLET_TESTS) and " passed"))))
+    if WALLET_PASSES != WALLET_TESTS:
+        return 1
+    return 0

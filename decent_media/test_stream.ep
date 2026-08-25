@@ -1,0 +1,98 @@
+# Bounded byte chunking and LRU cache regression suite
+
+import "stream"
+import "string"
+
+set STREAM_TEST_TOTAL to 0
+set STREAM_TEST_PASSED to 0
+set STREAM_CONCURRENT_CACHE to create_map()
+
+define stream_test_expect with name as Str and condition as Int returning Int:
+    set STREAM_TEST_TOTAL to STREAM_TEST_TOTAL + 1
+    if condition == 1:
+        display concat("  PASS: " and name)
+        set STREAM_TEST_PASSED to STREAM_TEST_PASSED + 1
+        return 1
+    display concat("  FAIL: " and name)
+    return 0
+
+define stream_cache_worker with worker_index as Int and result_channel as Int returning Int:
+    set key to concat("worker-" and int_to_string(worker_index))
+    set result to stream_cache_put(STREAM_CONCURRENT_CACHE and key and "data")
+    send result to result_channel
+    return 0
+
+define main returning Int:
+    display "==================================================="
+    display "  Byte Chunking and LRU Cache Regression Suite"
+    display "==================================================="
+
+    set chunk_set to stream_chunk_bytes("abcdefghijkl" and 5 and "fixture")
+    stream_test_expect("valid chunk set succeeds" and map_get_val(chunk_set and "error") == STREAM_ERR_NONE)
+    stream_test_expect("12 bytes split into three chunks" and map_get_val(chunk_set and "chunk_count") == 3)
+    stream_test_expect("chunk metadata preserves total size" and map_get_val(chunk_set and "total_size") == 12)
+    set chunks to map_get_val(chunk_set and "chunks")
+    stream_test_expect("first chunk is exact bytes" and map_get_val(get_list(chunks and 0) and "data") equals "abcde")
+    stream_test_expect("last chunk is exact remainder" and map_get_val(get_list(chunks and 2) and "data") equals "kl")
+    stream_test_expect("chunk hashes address exact bytes" and map_get_val(get_list(chunks and 1) and "hash") equals ep_sha256("fghij"))
+
+    set empty_result to stream_chunk_bytes("" and 5 and "invalid")
+    stream_test_expect("empty input is rejected" and map_get_val(empty_result and "error") == STREAM_ERR_INVALID)
+    set zero_result to stream_chunk_bytes("abc" and 0 and "invalid")
+    stream_test_expect("zero chunk size is rejected" and map_get_val(zero_result and "error") == STREAM_ERR_INVALID)
+    set huge_result to stream_chunk_bytes("abc" and STREAM_MAX_CHUNK_BYTES + 1 and "invalid")
+    stream_test_expect("oversized chunk size is rejected" and map_get_val(huge_result and "error") == STREAM_ERR_CAPACITY)
+
+    set cache to stream_create_lru_cache(15)
+    stream_test_expect("bounded cache is created" and stream_cache_valid(cache) == 1)
+    stream_test_expect("first put commits" and stream_cache_put(cache and "c0" and "12345") == STREAM_ERR_NONE)
+    stream_test_expect("second put commits" and stream_cache_put(cache and "c1" and "ABCDE") == STREAM_ERR_NONE)
+    stream_test_expect("third put commits" and stream_cache_put(cache and "c2" and "XYZ") == STREAM_ERR_NONE)
+    set hit to stream_cache_get(cache and "c0")
+    stream_test_expect("cache hit is explicit" and map_get_val(hit and "error") == STREAM_ERR_NONE and also map_get_val(hit and "value") equals "12345")
+    stream_test_expect("evicting put commits" and stream_cache_put(cache and "c3" and "99999") == STREAM_ERR_NONE)
+    stream_test_expect("recently read key survives" and stream_cache_has(cache and "c0") == 1)
+    stream_test_expect("least-recent key is evicted" and stream_cache_has(cache and "c1") == 0)
+    stream_test_expect("other retained key survives" and stream_cache_has(cache and "c2") == 1)
+    stream_test_expect("new key is present" and stream_cache_has(cache and "c3") == 1)
+    set size_before_reject to map_get_val(cache and "current_size")
+    stream_test_expect("value larger than cache is rejected" and stream_cache_put(cache and "huge" and repeat_string("x" and 16)) == STREAM_ERR_CAPACITY)
+    stream_test_expect("rejected value cannot mutate size" and map_get_val(cache and "current_size") == size_before_reject)
+    stream_test_expect("rejected value is absent" and stream_cache_has(cache and "huge") == 0)
+    set miss to stream_cache_get(cache and "missing")
+    stream_test_expect("cache miss carries an error" and map_get_val(miss and "error") != STREAM_ERR_NONE)
+    stream_test_expect("empty values are rejected" and stream_cache_put(cache and "empty" and "") == STREAM_ERR_INVALID)
+
+    set replace_cache to stream_create_lru_cache(10)
+    stream_test_expect("replacement fixture first value commits" and stream_cache_put(replace_cache and "a" and "12345") == STREAM_ERR_NONE)
+    stream_test_expect("replacement fixture second value commits" and stream_cache_put(replace_cache and "b" and "abcde") == STREAM_ERR_NONE)
+    stream_test_expect("replacement plus eviction commits atomically" and stream_cache_put(replace_cache and "a" and "0123456789") == STREAM_ERR_NONE)
+    set replacement_hit to stream_cache_get(replace_cache and "a")
+    stream_test_expect("replacement exposes the exact new value" and map_get_val(replacement_hit and "error") == STREAM_ERR_NONE and also map_get_val(replacement_hit and "value") equals "0123456789")
+    stream_test_expect("replacement evicts the older peer without stale size entries" and stream_cache_has(replace_cache and "b") == 0 and also map_get_val(replace_cache and "current_size") == 10 and also stream_cache_valid(replace_cache) == 1)
+    set replacement_size_before_reject to map_get_val(replace_cache and "current_size")
+    stream_test_expect("oversized replacement fails before mutation" and stream_cache_put(replace_cache and "a" and "01234567890") == STREAM_ERR_CAPACITY)
+    set replacement_after_reject to stream_cache_get(replace_cache and "a")
+    stream_test_expect("failed replacement preserves prior generation exactly" and map_get_val(replace_cache and "current_size") == replacement_size_before_reject and also map_get_val(replacement_after_reject and "value") equals "0123456789" and also stream_cache_valid(replace_cache) == 1)
+
+    set STREAM_CONCURRENT_CACHE to stream_create_lru_cache(64)
+    set result_channel to create_channel()
+    set worker_index to 0
+    repeat while worker_index < 64:
+        spawn stream_cache_worker(worker_index and result_channel)
+        set worker_index to worker_index + 1
+    set worker_successes to 0
+    set worker_index to 0
+    repeat while worker_index < 64:
+        set worker_result to receive from result_channel
+        if worker_result == STREAM_ERR_NONE:
+            set worker_successes to worker_successes + 1
+        set worker_index to worker_index + 1
+    set concurrent_entries to map_size(map_get_val(STREAM_CONCURRENT_CACHE and "cache_map"))
+    stream_test_expect("concurrent cache writers all complete without a lost transaction" and worker_successes == 64)
+    stream_test_expect("concurrent writes preserve exact capacity and cache invariants" and concurrent_entries == 16 and also map_get_val(STREAM_CONCURRENT_CACHE and "current_size") == 64 and also stream_cache_valid(STREAM_CONCURRENT_CACHE) == 1)
+
+    display concat("RESULT: " and concat(int_to_string(STREAM_TEST_PASSED) and concat("/" and concat(int_to_string(STREAM_TEST_TOTAL) and " passed"))))
+    if STREAM_TEST_PASSED != STREAM_TEST_TOTAL:
+        return 1
+    return 0

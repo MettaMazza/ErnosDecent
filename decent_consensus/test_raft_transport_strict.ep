@@ -1,0 +1,252 @@
+import "raft_transport"
+import "raft"
+import "state"
+import "collections"
+import "string"
+import "net"
+import "../decent_net/transport"
+
+set RAFT_STRICT_FIXTURE_ERROR to 0
+set RAFT_STRICT_COMMIT_ERROR to 0
+set RAFT_STRICT_DRIVEN_NODE to 0
+set RAFT_STRICT_ROLE_CHANGE_ERROR to 0
+set RAFT_STRICT_ROLE_CHANGE_NODE to 0
+
+define raft_strict_driven_node_map returning Map:
+    return RAFT_STRICT_DRIVEN_NODE
+
+define raft_strict_role_change_node_map returning Map:
+    return RAFT_STRICT_ROLE_CHANGE_NODE
+
+define raft_strict_record with label as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("  [PASS] " and label)
+        return 1
+    display concat("  [FAIL] " and label)
+    return 0
+
+define raft_strict_parse_rejected with payload as Str returning Int:
+    set parsed to raft_deserialize_message(payload)
+    if parsed == 0:
+        return 1
+    set rejected to map_get_val(parsed and "error") != 0
+    free_map(parsed)
+    return rejected
+
+define raft_strict_open_listener with first_port as Int returning Map:
+    set result to create_map()
+    set port to first_port
+    repeat while port <= 65000:
+        set fd to ep_net_listen(port)
+        if fd >= 0:
+            if raft_map_put_int_checked(result and "fd" and fd) == 0 or else raft_map_put_int_checked(result and "port" and port) == 0 or else raft_map_put_int_checked(result and "error" and 0) == 0:
+                set close_status to ep_net_close(fd)
+                if close_status != 0:
+                    free_map(result)
+                    return raft_error_result(RAFT_TRANSPORT_ERR_CLOSE)
+                return raft_result_with_error(result and RAFT_TRANSPORT_ERR_MUTATION)
+            return result
+        set port to port + 1
+    return raft_result_with_error(result and RAFT_TRANSPORT_ERR_CONNECT)
+
+define raft_strict_rpc_fixture with listener_fd as Int and envelope as Str and payload as Str returning Int:
+    set client_fd to ep_net_accept(listener_fd)
+    if client_fd < 0:
+        set RAFT_STRICT_FIXTURE_ERROR to 1
+        set listener_close to ep_net_close(listener_fd)
+        if listener_close != 0:
+            set RAFT_STRICT_FIXTURE_ERROR to 6
+        return 1
+    set conn to create_map()
+    if conn == 0 or else raft_map_put_int_checked(conn and "fd" and client_fd) == 0 or else raft_map_put_int_checked(conn and "connected" and 1) == 0:
+        set RAFT_STRICT_FIXTURE_ERROR to 2
+        set client_close to ep_net_close(client_fd)
+        set listener_close to ep_net_close(listener_fd)
+        if conn != 0:
+            free_map(conn)
+        if client_close != 0 or else listener_close != 0:
+            set RAFT_STRICT_FIXTURE_ERROR to 6
+        return 2
+    set request to transport_recv(conn)
+    if request == 0 or else map_get_val(request and "error") != TRANSPORT_ERR_NONE or else (ptr_to_str(map_get_val(request and "msg_type")) equals MSG_TYPE_CONSENSUS) == 0:
+        set RAFT_STRICT_FIXTURE_ERROR to 3
+    if request != 0:
+        free_map(request)
+    if RAFT_STRICT_FIXTURE_ERROR == 0:
+        set send_status to transport_send(conn and envelope and payload)
+        if send_status != TRANSPORT_ERR_NONE:
+            set RAFT_STRICT_FIXTURE_ERROR to 4
+    set close_status to transport_close(conn)
+    if close_status != TRANSPORT_ERR_NONE:
+        set RAFT_STRICT_FIXTURE_ERROR to 5
+    free_map(conn)
+    set listener_close to ep_net_close(listener_fd)
+    if listener_close != 0:
+        set RAFT_STRICT_FIXTURE_ERROR to 6
+    return RAFT_STRICT_FIXTURE_ERROR
+
+define raft_strict_run_rpc_fixture with first_port as Int and envelope as Str and payload as Str returning Map:
+    set listener to raft_strict_open_listener(first_port)
+    if map_get_val(listener and "error") != 0:
+        free_map(listener)
+        return raft_error_result(RAFT_TRANSPORT_ERR_CONNECT)
+    set listener_fd to map_get_val(listener and "fd")
+    set port to map_get_val(listener and "port")
+    free_map(listener)
+    set RAFT_STRICT_FIXTURE_ERROR to 0
+    spawn raft_strict_rpc_fixture(listener_fd and envelope and payload)
+    set sleep_status to ep_sleep_ms(20)
+    if sleep_status != 0:
+        return raft_error_result(RAFT_TRANSPORT_ERR_CONNECT)
+    set response to raft_send_rpc("127.0.0.1" and port and "CP|SET fixture=1")
+    set sleep_status to ep_sleep_ms(20)
+    if sleep_status != 0:
+        if response != 0:
+            free_map(response)
+        return raft_error_result(RAFT_TRANSPORT_ERR_CONNECT)
+    return response
+
+define raft_strict_commit_after_append returning Int:
+    set node to raft_strict_driven_node_map()
+    set waited to 0
+    repeat while length_list(map_get_val(node and "log")) == 0 and also waited < 500:
+        set sleep_status to ep_sleep_ms(5)
+        if sleep_status != 0:
+            set RAFT_STRICT_COMMIT_ERROR to 1
+            return 1
+        set waited to waited + 5
+    if length_list(map_get_val(node and "log")) != 1:
+        set RAFT_STRICT_COMMIT_ERROR to 2
+        return 2
+    if raft_map_put_int_checked(node and "commit_index" and 1) == 0:
+        set RAFT_STRICT_COMMIT_ERROR to 3
+        return 3
+    set apply_status to raft_apply_committed(node)
+    if apply_status != RAFT_TRANSPORT_ERR_NONE:
+        set RAFT_STRICT_COMMIT_ERROR to 4
+        return 4
+    return 0
+
+define raft_strict_step_down_after_append returning Int:
+    set node to raft_strict_role_change_node_map()
+    set waited to 0
+    repeat while length_list(map_get_val(node and "log")) == 0 and also waited < 500:
+        set sleep_status to ep_sleep_ms(5)
+        if sleep_status != 0:
+            set RAFT_STRICT_ROLE_CHANGE_ERROR to 1
+            return 1
+        set waited to waited + 5
+    if length_list(map_get_val(node and "log")) != 1:
+        set RAFT_STRICT_ROLE_CHANGE_ERROR to 2
+        return 2
+    if raft_map_put_str_checked(node and "role" and RAFT_ROLE_FOLLOWER) == 0:
+        set RAFT_STRICT_ROLE_CHANGE_ERROR to 3
+        return 3
+    return 0
+
+define main returning Int:
+    display "Raft strict transport and commit tests"
+    set passed to 0
+    set total to 0
+
+    set total to total + 1
+    set passed to passed + raft_strict_record("unknown RPC type rejected" and raft_strict_parse_rejected("WHAT|1") == 1)
+    set total to total + 1
+    set passed to passed + raft_strict_record("RequestVote wrong arity rejected" and raft_strict_parse_rejected("RV|1|candidate|0|0|extra") == 1)
+    set total to total + 1
+    set passed to passed + raft_strict_record("non-numeric term rejected" and raft_strict_parse_rejected("RVR|not-a-number|1|peer") == 1)
+    set total to total + 1
+    set passed to passed + raft_strict_record("non-boolean vote rejected" and raft_strict_parse_rejected("RVR|1|2|peer") == 1)
+    set total to total + 1
+    set passed to passed + raft_strict_record("negative index rejected" and raft_strict_parse_rejected("AER|1|1|-1|peer") == 1)
+    set total to total + 1
+    set passed to passed + raft_strict_record("non-canonical numeric field rejected" and raft_strict_parse_rejected("RV|01|candidate|0|0") == 1)
+    set total to total + 1
+    set passed to passed + raft_strict_record("malformed log entry rejected" and raft_strict_parse_rejected("AE|2|leader|0|0|0|1,1") == 1)
+    set total to total + 1
+    set passed to passed + raft_strict_record("non-contiguous log index rejected" and raft_strict_parse_rejected("AE|2|leader|0|0|0|1,2,SET x=1") == 1)
+    set total to total + 1
+    set passed to passed + raft_strict_record("empty log segment rejected" and raft_strict_parse_rejected("AE|2|leader|0|0|0|1,1,SET x=1;") == 1)
+    set total to total + 1
+    set passed to passed + raft_strict_record("unapplicable log command rejected" and raft_strict_parse_rejected("AE|2|leader|0|0|0|1,1,NOT A STATE COMMAND") == 1)
+
+    set cpr_ok to raft_deserialize_message("CPR|1|leader-a")
+    set total to total + 1
+    set passed to passed + raft_strict_record("CPR success parsed explicitly" and map_get_val(cpr_ok and "error") == 0 and also map_get_val(cpr_ok and "success") == 1 and also (ptr_to_str(map_get_val(cpr_ok and "leader_id")) equals "leader-a"))
+    free_map(cpr_ok)
+    set cpr_fail to raft_deserialize_message("CPR|0|")
+    set total to total + 1
+    set passed to passed + raft_strict_record("CPR rejection parsed explicitly" and map_get_val(cpr_fail and "error") == 0 and also map_get_val(cpr_fail and "success") == 0)
+    free_map(cpr_fail)
+    set total to total + 1
+    set passed to passed + raft_strict_record("malformed CPR boolean rejected" and raft_strict_parse_rejected("CPR|2|leader-a") == 1)
+
+    set bad_envelope to raft_strict_run_rpc_fixture(53000 and "WRONG" and "CPR|1|leader-a")
+    set total to total + 1
+    set passed to passed + raft_strict_record("raft_send_rpc rejects wrong envelope" and map_get_val(bad_envelope and "error") == RAFT_TRANSPORT_ERR_BAD_ENVELOPE and also RAFT_STRICT_FIXTURE_ERROR == 0)
+    free_map(bad_envelope)
+    set bad_payload to raft_strict_run_rpc_fixture(53100 and MSG_TYPE_CONSENSUS and "WHAT|1")
+    set total to total + 1
+    set passed to passed + raft_strict_record("raft_send_rpc propagates parse failure" and map_get_val(bad_payload and "error") == RAFT_TRANSPORT_ERR_PARSE and also RAFT_STRICT_FIXTURE_ERROR == 0)
+    free_map(bad_payload)
+    set good_payload to raft_strict_run_rpc_fixture(53200 and MSG_TYPE_CONSENSUS and "CPR|1|leader-a")
+    set total to total + 1
+    set passed to passed + raft_strict_record("raft_send_rpc accepts correlated CPR" and map_get_val(good_payload and "error") == 0 and also map_get_val(good_payload and "success") == 1 and also RAFT_STRICT_FIXTURE_ERROR == 0)
+    free_map(good_payload)
+
+    set solo_peers to create_list()
+    set solo to raft_create_node("solo" and solo_peers)
+    set setup_ok to raft_map_put_str_checked(solo and "role" and RAFT_ROLE_LEADER)
+    set setup_ok to setup_ok * raft_map_put_int_checked(solo and "current_term" and 1)
+    set solo_invalid to raft_propose_on_leader(solo and "NOT A STATE COMMAND")
+    set total to total + 1
+    set passed to passed + raft_strict_record("invalid state command is rejected before log append" and map_get_val(solo_invalid and "success") == 0 and also map_get_val(solo_invalid and "error") == RAFT_TRANSPORT_ERR_PARSE and also length_list(map_get_val(solo and "log")) == 0 and also map_get_val(solo and "commit_index") == 0)
+    free_map(solo_invalid)
+    set solo_result to raft_propose_on_leader(solo and "SET solo=ok")
+    set solo_state to map_get_val(solo and "state_machine")
+    set total to total + 1
+    set passed to passed + raft_strict_record("single-node proposal commits and applies before ACK" and setup_ok == 1 and also map_get_val(solo_result and "success") == 1 and also map_get_val(solo and "commit_index") == 1 and also map_get_val(solo and "last_applied") == 1 and also (ptr_to_str(map_get_val(solo_state and "solo")) equals "ok"))
+    free_map(solo_result)
+
+    set peer_list to create_list()
+    set ignored to append_list(peer_list and str_to_ptr("peer-b"))
+    set isolated to raft_create_node("leader-isolated" and peer_list)
+    set setup_ok to raft_map_put_str_checked(isolated and "role" and RAFT_ROLE_LEADER)
+    set setup_ok to setup_ok * raft_map_put_int_checked(isolated and "current_term" and 2)
+    set isolated_result to raft_propose_on_leader(isolated and "SET early=no")
+    set total to total + 1
+    set passed to passed + raft_strict_record("majority includes self and one peer in a two-node cluster" and raft_cluster_majority(isolated) == 2)
+    set total to total + 1
+    set passed to passed + raft_strict_record("multi-node leader never ACKs before quorum commit" and setup_ok == 1 and also map_get_val(isolated_result and "success") == 0 and also map_get_val(isolated_result and "error") == RAFT_TRANSPORT_ERR_COMMIT_TIMEOUT and also map_get_val(isolated and "commit_index") == 0 and also map_get_val(isolated and "last_applied") == 0)
+    free_map(isolated_result)
+
+    set changed_peers to create_list()
+    set changed_append to append_list(changed_peers and str_to_ptr("peer-b"))
+    set changed to raft_create_node("leader-changing" and changed_peers)
+    set setup_ok to raft_map_put_str_checked(changed and "role" and RAFT_ROLE_LEADER)
+    set setup_ok to setup_ok * raft_map_put_int_checked(changed and "current_term" and 3)
+    set RAFT_STRICT_ROLE_CHANGE_ERROR to 0
+    set RAFT_STRICT_ROLE_CHANGE_NODE to changed
+    spawn raft_strict_step_down_after_append()
+    set changed_result to raft_propose_on_leader(raft_strict_role_change_node_map() and "SET changed=no")
+    set total to total + 1
+    set passed to passed + raft_strict_record("leadership change rejects an uncommitted proposal" and changed_append != 0 and also setup_ok == 1 and also RAFT_STRICT_ROLE_CHANGE_ERROR == 0 and also map_get_val(changed_result and "success") == 0 and also map_get_val(changed_result and "error") == RAFT_TRANSPORT_ERR_NOT_LEADER and also map_get_val(raft_strict_role_change_node_map() and "commit_index") == 0)
+    free_map(changed_result)
+
+    set driven_peers to create_list()
+    set driven_append to append_list(driven_peers and str_to_ptr("peer-b"))
+    set driven to raft_create_node("leader-driven" and driven_peers)
+    set setup_ok to raft_map_put_str_checked(driven and "role" and RAFT_ROLE_LEADER)
+    set setup_ok to setup_ok * raft_map_put_int_checked(driven and "current_term" and 3)
+    set RAFT_STRICT_COMMIT_ERROR to 0
+    set RAFT_STRICT_DRIVEN_NODE to driven
+    spawn raft_strict_commit_after_append()
+    set driven_result to raft_propose_on_leader(raft_strict_driven_node_map() and "SET driven=yes")
+    set total to total + 1
+    set passed to passed + raft_strict_record("bounded wait observes independently driven exact commit" and driven_append != 0 and also setup_ok == 1 and also RAFT_STRICT_COMMIT_ERROR == 0 and also map_get_val(driven_result and "success") == 1 and also map_get_val(raft_strict_driven_node_map() and "commit_index") == 1 and also map_get_val(raft_strict_driven_node_map() and "last_applied") == 1)
+    free_map(driven_result)
+
+    display f"Raft strict transport: {passed}/{total} passed"
+    if passed != total:
+        return 1
+    return 0

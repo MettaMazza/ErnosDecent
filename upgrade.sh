@@ -7,6 +7,16 @@ echo "[UPGRADE] Starting upgrade sequence..."
 cp ./node ./node_rollback
 cp ./node_next ./node
 
+ipc_cmd() {
+    local port="$1"
+    local timeout_seconds="$2"
+    local cmd="$3"
+    local token
+    token=$(tr -d '\r\n ' < "$HOME/.ernosdecent/ipc-token" 2>/dev/null) || return 1
+    [ -n "$token" ] || return 1
+    printf 'AUTH %s %s\n' "$token" "$cmd" | nc -w "$timeout_seconds" 127.0.0.1 "$port" 2>/dev/null
+}
+
 # Kill the old node daemon (running on port 5000)
 OLD_PID=$(lsof -ti :5000 2>/dev/null)
 if [ -n "$OLD_PID" ]; then
@@ -27,7 +37,7 @@ HEALTHY=false
 for i in $(seq 1 15); do
     sleep 1
     # Try sending STATUS command via netcat to port 5000
-    res=$(echo "STATUS" | nc -w 1 127.0.0.1 5000 2>/dev/null)
+    res=$(ipc_cmd 5000 1 "STATUS")
     if echo "$res" | grep -q "status:active"; then
         HEALTHY=true
         echo "[UPGRADE] ✅ New daemon is active and healthy!"

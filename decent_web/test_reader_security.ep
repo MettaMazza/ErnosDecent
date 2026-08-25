@@ -1,0 +1,55 @@
+import "web_server"
+import "string"
+
+set reader_passed to 0
+set reader_failed to 0
+
+define reader_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("  PASS: " and label)
+        set reader_passed to reader_passed + 1
+        return 1
+    display concat("  FAIL: " and label)
+    set reader_failed to reader_failed + 1
+    return 0
+
+define main returning Int:
+    display "External reader security tests"
+
+    set ok to reader_expect(url_is_safe_external("https://example.com/path?q=1") == 1 and "default-port HTTPS hostname is accepted for DNS validation")
+    set ok to reader_expect(url_is_safe_external("http://example.com/") == 1 and "default-port HTTP hostname is accepted for DNS validation")
+    set ok to reader_expect(url_is_safe_external("ftp://example.com/file") == 0 and "non-HTTP scheme is rejected")
+    set ok to reader_expect(url_is_safe_external("http://user@example.com/") == 0 and "userinfo is rejected")
+    set ok to reader_expect(url_is_safe_external("http://example.com:8080/") == 0 and "explicit port is rejected")
+    set ok to reader_expect(url_is_safe_external("http://[::1]/") == 0 and "IPv6 literal is rejected by the IPv4-pinned reader")
+    set ok to reader_expect(url_is_safe_external("https://example.com' --data @.env/") == 0 and "shell metacharacters cannot enter the authority")
+    set oversized_host to concat("https://" and concat(repeat_string("a" and 254) and "/"))
+    set ok to reader_expect(url_is_safe_external(oversized_host) == 0 and "oversized DNS authorities are rejected before resolution")
+
+    set exact_headers to "GET / HTTP/1.1\r\nX-Decoy: X-Session-Token: forged\r\nX-Session-Token: real\r\n\r\nX-Session-Token: body"
+    set ok to reader_expect(extract_header_value(exact_headers and "X-Session-Token") equals "real" and "header extraction matches only an exact header line before the body")
+    set duplicate_headers to "GET / HTTP/1.1\r\nX-Session-Token: one\r\nX-Session-Token: two\r\n\r\n"
+    set ok to reader_expect(string_length(extract_header_value(duplicate_headers and "X-Session-Token")) == 0 and "ambiguous duplicate security headers are rejected")
+
+    set safe_upload_name to web_safe_basename("../../-bad name.txt")
+    set ok to reader_expect(string_contains(safe_upload_name and "..") == 0 and also string_contains(safe_upload_name and "/") == 0 and also string_contains(safe_upload_name and " ") == 0 and also get_character(safe_upload_name and 0) != 45 and also get_character(safe_upload_name and 0) != 46 and also string_length(safe_upload_name) <= 255 and "upload basename sanitization is bounded and traversal-free")
+
+    set public_ip to ep_net_resolve_public_ipv4("8.8.8.8")
+    set ok to reader_expect(public_ip equals "8.8.8.8" and "public numeric IPv4 is canonicalized")
+    set private_ip to ep_net_resolve_public_ipv4("127.0.0.1")
+    set ok to reader_expect(string_index_of(private_ip and "Error: DNS ") == 0 and "loopback resolution is rejected")
+    set private_reader to curl_get("http://localhost/" and "")
+    set ok to reader_expect(string_index_of(private_reader and "Error: HTTP blocked") == 0 and "reader fails closed before connecting to localhost")
+
+    set hostile to "<img src='https://tracker.invalid/pixel' onerror='steal()'><p>Hello & welcome</p><script>steal()</script><iframe src='https://tracker.invalid'></iframe>"
+    set inert to sanitize_reader_html(hostile)
+    set ok to reader_expect(string_index_of(inert and "<pre class='reader-inert-text'") == 0 and "reader output has one controlled wrapper")
+    set ok to reader_expect(string_contains(inert and "<img") == 0 and "remote image markup is removed")
+    set ok to reader_expect(string_contains(inert and "onerror") == 0 and "remote event attributes are removed")
+    set ok to reader_expect(string_contains(inert and "steal()") == 0 and "script content is removed")
+    set ok to reader_expect(string_contains(inert and "Hello &amp; welcome") == 1 and "remaining text is HTML escaped")
+
+    display f"Reader security: {reader_passed} passed, {reader_failed} failed"
+    if reader_failed > 0:
+        return 1
+    return 0

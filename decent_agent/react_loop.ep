@@ -12,6 +12,7 @@ import "./access"
 import "./orchestrator"
 import "memory"
 import "observer"
+import "reply_format"
 import "session"
 import "sync"
 import "trace"
@@ -109,9 +110,9 @@ define react_check_cancel with session_id as Str and run_epoch as Int returning 
                 return 1
     return 0
 
-# Drain all pending whispers for a session (called before each LLM call).
-# Returns concatenated whisper text or empty string. Consumes all whispers.
-define react_drain_whispers with session_id as Str returning Str:
+# Drain guidance addressed to this exact active turn. Empty target ids remain valid for
+# sub-agent steering, whose task id already uniquely identifies its running turn.
+define react_drain_whispers with session_id as Str and turn_id as Str returning Str:
     set db to storage_get_db()
     if db == 0:
         return ""
@@ -119,7 +120,8 @@ define react_drain_whispers with session_id as Str returning Str:
     if string_length(key) == 0:
         set key to "default"
     set es to string_replace(key and "'" and "''")
-    set rows to sql_query(db and f"SELECT id, content FROM trace_whispers WHERE session_id='{es}' ORDER BY id;")
+    set et to string_replace(turn_id and "'" and "''")
+    set rows to sql_query(db and f"SELECT id, content FROM trace_whispers WHERE session_id='{es}' AND (target_turn_id='' OR target_turn_id='{et}') ORDER BY id;")
     set count to length_list(rows)
     if count == 0:
         return ""
@@ -133,6 +135,20 @@ define react_drain_whispers with session_id as Str returning Str:
         set ok to sql_execute(db and f"DELETE FROM trace_whispers WHERE id={w_id};")
         set idx to idx + 1
     return out
+
+# Remove only guidance explicitly bound to a different, already-ended turn. This
+# prevents bleed-through without discarding guidance that arrived in the accept/start
+# race for the current turn.
+define react_discard_stale_whispers with session_id as Str and turn_id as Str returning Int:
+    set db to storage_get_db()
+    if db == 0:
+        return 1
+    set key to session_id
+    if string_length(key) == 0:
+        set key to "default"
+    set es to string_replace(key and "'" and "''")
+    set et to string_replace(turn_id and "'" and "''")
+    return sql_execute(db and f"DELETE FROM trace_whispers WHERE session_id='{es}' AND target_turn_id != '' AND target_turn_id != '{et}';")
 
 # Write a mid-turn message from the agent to the user via trace_events.
 # The Discord bridge picks up events with type 'mid_message' and posts them
@@ -276,52 +292,229 @@ define react_extract_raw_arg with args_str as Str returning Str:
         return args_str
     return substring(args_str and content_start and content_len)
 
+# Find a protocol marker only when it begins a real line (allowing indentation) and is
+# outside a fenced code/example block. Inline/backticked/quoted examples cannot execute.
+define react_find_line_marker_from with raw as Str and marker as Str and from_pos as Int returning Int:
+    set raw_len to string_length(raw)
+    set marker_len to string_length(marker)
+    set raw_lower to string_lower(raw)
+    set marker_lower to string_lower(marker)
+    set minimum_pos to from_pos
+    if minimum_pos < 0:
+        set minimum_pos to 0
+    # Always scan from the beginning so fenced-block state is correct even when a
+    # batched-action search begins in the middle of the response.
+    set line_start to 0
+    set in_fence to 0
+
+    repeat while line_start < raw_len:
+        set candidate to line_start
+        set skipping_indent to 1
+        repeat while candidate < raw_len and skipping_indent == 1:
+            set indent_ch to get_character(raw and candidate)
+            if indent_ch == 32 or else indent_ch == 9:
+                set candidate to candidate + 1
+            else:
+                set skipping_indent to 0
+        set fence_line to 0
+        if candidate + 3 <= raw_len:
+            if substring(raw and candidate and 3) equals "```":
+                set fence_line to 1
+                if in_fence == 0:
+                    set in_fence to 1
+                else:
+                    set in_fence to 0
+        if fence_line == 0 and also in_fence == 0 and also candidate >= minimum_pos:
+            if candidate + marker_len <= raw_len:
+                set marker_candidate to substring(raw_lower and candidate and marker_len)
+                if marker_candidate equals marker_lower:
+                    return candidate
+
+        set finding_end to 1
+        repeat while line_start < raw_len and finding_end == 1:
+            set line_ch to get_character(raw and line_start)
+            set line_start to line_start + 1
+            if line_ch == 10 or else line_ch == 13:
+                set finding_end to 0
+    return -1
+
+define react_find_protocol_marker_from with raw as Str and from_pos as Int returning Int:
+    set action_pos to react_find_line_marker_from(raw and "action:" and from_pos)
+    set call_pos to react_find_line_marker_from(raw and "call:" and from_pos)
+    if action_pos < 0:
+        return call_pos
+    if call_pos >= 0 and also call_pos < action_pos:
+        return call_pos
+    return action_pos
+
+# Plain final prose is already a valid user response even when a model omits the ReAct
+# wrapper. Recover it deterministically instead of paying for another inference and
+# feeding a format error back into the conversation. Thought/Observation continuations
+# and attempted action lines still go through the explicit correction path.
+define react_is_implicit_reply with raw as Str returning Int:
+    set clean to string_trim(raw)
+    if string_length(clean) == 0:
+        return 0
+    set clean_lower to string_lower(clean)
+    if string_index_of(clean_lower and "thought:") == 0:
+        return 0
+    if string_index_of(clean_lower and "observation:") == 0:
+        return 0
+    if react_find_line_marker_from(clean and "action:" and 0) >= 0:
+        return 0
+    if react_find_line_marker_from(clean and "call:" and 0) >= 0:
+        return 0
+    return 1
+
+# A model response is one protocol variant, never a mixture. Tool turns may have a
+# single explicit Thought prefix followed by Action lines; final prose has no Action
+# marker and is handled by react_is_implicit_reply. Any other prose before an action
+# is an invalid mixed response and must be regenerated, not silently discarded.
+define react_action_prefix_is_valid with raw as Str and action_start as Int returning Int:
+    if action_start <= 0:
+        return 1
+    set prefix to string_trim(substring(raw and 0 and action_start))
+    if string_length(prefix) == 0:
+        return 1
+    set lower to string_lower(prefix)
+    if string_index_of(lower and "thought:") != 0:
+        return 0
+    # A tool turn permits exactly one Thought line before the first Action. This
+    # prevents "Thought: ...\n<final prose>\nAction: ..." from executing the tool
+    # while silently discarding the prose.
+    set first_nl to string_index_of(prefix and "\n")
+    if first_nl >= 0:
+        set after_thought to string_trim(substring(prefix and first_nl + 1 and string_length(prefix) - first_nl - 1))
+        if string_length(after_thought) > 0:
+            return 0
+    return 1
+
+# Validate the WHOLE tool response before executing its first Action. The previous
+# guard checked only the prefix, so user-facing prose after the final Action was
+# discarded by the batch slicer. For asynchronous/non-idempotent tools that turned a
+# single request into repeated real dispatches. Only whitespace may occur between or
+# after Action calls.
+define react_action_turn_is_valid with raw as Str and first_start as Int and first_end as Int returning Int:
+    if react_action_prefix_is_valid(raw and first_start) == 0:
+        return 0
+    set raw_len to string_length(raw)
+    set current_end to first_end
+    repeat while current_end < raw_len:
+        set next_pos to react_find_protocol_marker_from(raw and current_end)
+        if next_pos < 0:
+            set tail to string_trim(substring(raw and current_end and raw_len - current_end))
+            if string_length(tail) > 0:
+                return 0
+            return 1
+        set gap to string_trim(substring(raw and current_end and next_pos - current_end))
+        if string_length(gap) > 0:
+            return 0
+        set remainder to substring(raw and next_pos and raw_len - next_pos)
+        set next_action to react_parse_action(remainder)
+        if map_get_val(next_action and "found") == 0:
+            free_map(next_action)
+            return 0
+        if map_get_val(next_action and "start_pos") != 0:
+            free_map(next_action)
+            return 0
+        set current_end to next_pos + map_get_val(next_action and "end_pos")
+        free_map(next_action)
+    return 1
+
+# Typed controller policy for tools whose successful execution IS the completion of
+# the foreground request. Kept as a pure helper so terminal lifecycle and asynchronous
+# dispatch invariants are regression-testable without invoking either real tool.
+define react_tool_result_finishes_turn with tool_name as Str and action_allowed as Int and tool_result as Str returning Int:
+    if action_allowed == 0:
+        return 0
+    if tool_name equals "generate_image":
+        if string_index_of(tool_result and "ERROR:") != 0:
+            return 1
+    if tool_name equals "session_terminate":
+        if string_index_of(tool_result and "Session closed by Echo.") == 0:
+            return 1
+    return 0
+
 define react_parse_action with raw as Str returning Map:
     set result to create_map()
     set ok to map_insert(result and "found" and 0)
-    
-    set raw_lower to string_lower(raw)
-    set pos to string_index_of(raw_lower and "action:")
-    set marker_len to 7
-    if pos < 0:
-        # gemma4 (and other models) sometimes emit Ollama's native tool syntax
-        # `call:tool([...])` instead of the ReAct `Action: tool([...])`. Accept it as an
-        # alias so the turn doesn't waste a round-trip on a format-violation retry. Only
-        # used when no `Action:` is present; a valid `(...)` is still required below, so a
-        # bare "call:" in prose is not mis-parsed.
-        set pos to string_index_of(raw_lower and "call:")
-        set marker_len to 5
-    if pos < 0:
-        return result
 
     set raw_len to string_length(raw)
-    set tool_name_start to pos + marker_len
-    set skip_done to 0
-    repeat while tool_name_start < raw_len and skip_done == 0:
-        set ch to get_character(raw and tool_name_start)
-        if ch == 32 or else ch == 9:
-            set tool_name_start to tool_name_start + 1
-        else:
-            set skip_done to 1
-            
-    if tool_name_start >= raw_len:
-        return result
-        
+    set raw_lower to string_lower(raw)
+    set search_from to 0
+    set pos to react_find_protocol_marker_from(raw and search_from)
+    set marker_len to 0
+    set tool_name_start to 0
+    set tool_name_end to 0
     set start_args to -1
-    set search_idx to tool_name_start
-    set args_found to 0
-    repeat while search_idx < raw_len and args_found == 0:
-        set ch to get_character(raw and search_idx)
-        if ch == 40: # '('
-            set start_args to search_idx
-            set args_found to 1
-        else:
-            set search_idx to search_idx + 1
-            
-    if start_args < 0:
+    set valid_header to 0
+
+    # Skip malformed or illustrative marker lines and keep looking for the first
+    # syntactically valid protocol action. This handles a quoted/example `Action:` line
+    # before the real action without executing prose or discarding the valid call.
+    repeat while pos >= 0 and valid_header == 0:
+        set marker_len to 7
+        if pos + 5 <= raw_len:
+            if substring(raw_lower and pos and 5) equals "call:":
+                set marker_len to 5
+        set tool_name_start to pos + marker_len
+        set skip_done to 0
+        repeat while tool_name_start < raw_len and skip_done == 0:
+            set ch to get_character(raw and tool_name_start)
+            if ch == 32 or else ch == 9:
+                set tool_name_start to tool_name_start + 1
+            else:
+                set skip_done to 1
+
+        set first_name_ok to 0
+        if tool_name_start < raw_len:
+            set first_name_ch to get_character(raw and tool_name_start)
+            if first_name_ch >= 65 and also first_name_ch <= 90:
+                set first_name_ok to 1
+            if first_name_ch >= 97 and also first_name_ch <= 122:
+                set first_name_ok to 1
+            if first_name_ch == 95:
+                set first_name_ok to 1
+
+        if first_name_ok == 1:
+            set tool_name_end to tool_name_start
+            set reading_name to 1
+            repeat while tool_name_end < raw_len and reading_name == 1:
+                set name_ch to get_character(raw and tool_name_end)
+                set valid_name_ch to 0
+                if name_ch >= 65 and also name_ch <= 90:
+                    set valid_name_ch to 1
+                if name_ch >= 97 and also name_ch <= 122:
+                    set valid_name_ch to 1
+                if name_ch >= 48 and also name_ch <= 57:
+                    set valid_name_ch to 1
+                if name_ch == 95:
+                    set valid_name_ch to 1
+                if valid_name_ch == 1:
+                    set tool_name_end to tool_name_end + 1
+                else:
+                    set reading_name to 0
+
+            set start_args to tool_name_end
+            set skipping_gap to 1
+            repeat while start_args < raw_len and skipping_gap == 1:
+                set gap_ch to get_character(raw and start_args)
+                if gap_ch == 32 or else gap_ch == 9:
+                    set start_args to start_args + 1
+                else:
+                    set skipping_gap to 0
+            if start_args < raw_len:
+                if get_character(raw and start_args) == 40:
+                    set valid_header to 1
+
+        if valid_header == 0:
+            set search_from to pos + marker_len
+            set pos to react_find_protocol_marker_from(raw and search_from)
+
+    if valid_header == 0:
         return result
-        
-    set tool_name to substring(raw and tool_name_start and start_args - tool_name_start)
+
+    set tool_name to substring(raw and tool_name_start and tool_name_end - tool_name_start)
     set tool_name_trimmed to string_trim(tool_name)
     
     set end_args to -1
@@ -372,7 +565,7 @@ define react_parse_action with raw as Str returning Map:
     return result
 
 
-# Return the substring of `raw` starting at the NEXT "Action:" (or "call:") marker at or
+# Return the substring of `raw` starting at the NEXT line-anchored "Action:" (or "call:") marker at or
 # after `from_pos`, or "" if there is none. `from_pos` is the position just past the FIRST
 # action's closing paren, so a spurious "action:" inside the first action's arguments is
 # never matched. This is what lets the model batch many tools into ONE response: the loop
@@ -382,14 +575,10 @@ define react_slice_from_next_action with raw as Str and from_pos as Int returnin
     set raw_len to string_length(raw)
     if from_pos < 0 or else from_pos >= raw_len:
         return ""
-    set tail to substring(raw and from_pos and raw_len - from_pos)
-    set tail_lower to string_lower(tail)
-    set off to string_index_of(tail_lower and "action:")
-    if off < 0:
-        set off to string_index_of(tail_lower and "call:")
-    if off < 0:
+    set next_pos to react_find_protocol_marker_from(raw and from_pos)
+    if next_pos < 0:
         return ""
-    return substring(tail and off and string_length(tail) - off)
+    return substring(raw and next_pos and raw_len - next_pos)
 
 
 # Scan a DROPPED text segment for orphaned tool calls — `name([...])` continuations the
@@ -572,7 +761,10 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         
         set query_prompt to current_prompt
         # Whisper checkpoint — drain any mid-turn user guidance before the LLM call.
-        set whispers to react_drain_whispers(trace_sid)
+        set trace_turn_id to ""
+        if map_contains(ctx and "turn_id") == 1:
+            set trace_turn_id to map_get_val(ctx and "turn_id")
+        set whispers to react_drain_whispers(trace_sid and trace_turn_id)
         if string_length(whispers) > 0:
             display f"[ReAct] Received mid-turn whisper(s) from user."
             set ok to trace_emit(trace_db and trace_sid and "whisper_received" and whispers)
@@ -608,7 +800,14 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 if map_contains(ctx and "selected_model") == 1:
                     set selected_model to map_get_val(ctx and "selected_model")
                 set ok to trace_emit(trace_db and trace_sid and "thinking" and f"Querying {selected_model}...")
-                set raw_output to query_local_llm(query_prompt and selected_model)
+                set turn_image_path to ""
+                if map_contains(ctx and "image_path") == 1:
+                    set turn_image_path to map_get_val(ctx and "image_path")
+                if string_length(turn_image_path) > 0:
+                    display f"[ReAct] Native vision input: {turn_image_path}"
+                    set raw_output to query_local_llm_image(query_prompt and turn_image_path and selected_model)
+                else:
+                    set raw_output to query_local_llm(query_prompt and selected_model)
                 
             if string_length(raw_output) == 0:
                 if is_test == 1:
@@ -674,8 +873,33 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
 
         set action_map to react_parse_action(raw_output)
         set found_action to map_get_val(action_map and "found")
+        set implicit_reply to 0
+        if found_action == 0 and also react_is_implicit_reply(raw_output) == 1:
+            # The model already wrote the answer; only its transport wrapper is missing.
+            # Route the text through the normal reply tool, formatter, Observer and
+            # continuity capture without another model call.
+            set implicit_reply to 1
+            set found_action to 1
+            set ok to map_insert(action_map and "found" and 1)
+            set ok to map_insert(action_map and "tool_name" and "reply_request")
+            set ok to map_insert(action_map and "args_str" and raw_output)
+            set ok to map_insert(action_map and "start_pos" and 0)
+            set ok to map_insert(action_map and "end_pos" and string_length(raw_output))
+            display "[ReAct] Recovered complete plain-text output as an implicit reply_request."
+            set ok to trace_emit(trace_db and trace_sid and "implicit_reply" and "Recovered plain-text final answer without an inference retry")
         
         if found_action == 1:
+            # Root terminal-contract invariant: never discard native final prose merely
+            # because a later Action marker exists. Mixed output is rejected before any
+            # tool executes; the model must choose a tool turn OR a final-prose turn.
+            if implicit_reply == 0 and also react_action_turn_is_valid(raw_output and map_get_val(action_map and "start_pos") and map_get_val(action_map and "end_pos")) == 0:
+                display "[ReAct] Mixed final prose and Action output rejected; no content or tool was executed."
+                set ok to trace_emit(trace_db and trace_sid and "no_action" and "Mixed final prose and Action output rejected")
+                set current_prompt to concat(current_prompt and "\n[PROTOCOL CORRECTION — INVISIBLE TO USER]\nYour previous response mixed user-facing prose with an Action call. Nothing from it was delivered or executed. Choose exactly one response type: if the task is complete, output the complete answer again as plain final prose with no Thought, Action, JSON, or reply_request wrapper; if a tool is still needed, output only one short Thought line followed by Action lines.\n")
+                free_map(action_map)
+                if is_batched_turn == 0:
+                    set loop_idx to loop_idx + 1
+                continue
             set tool_name to map_get_val(action_map and "tool_name")
             set args_str to map_get_val(action_map and "args_str")
             # BATCHING: if the model emitted MORE than one Action: in this single response,
@@ -718,8 +942,12 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             
             # Parse arguments as JSON array or fallback to raw string
             set args_list to create_list()
-            set json_node to json_parse(args_str)
-            if json_node != 0:
+            set json_node to 0
+            if implicit_reply == 1:
+                set ok to append_list(args_list and raw_output)
+            else:
+                set json_node to json_parse(args_str)
+            if implicit_reply == 0 and also json_node != 0:
                 set j_type to get_json_type(json_node)
                 if j_type == 3: # List
                     set parsed_items to get_json_value(json_node)
@@ -752,8 +980,14 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         set ok to append_list(args_list and int_to_string(get_json_value(json_node)))
                     else:
                         set ok to append_list(args_list and get_json_value(json_node))
-            else:
+            else if implicit_reply == 0:
                 set ok to append_list(args_list and args_str)
+
+            # Do this after JSON decoding (where the corruption is introduced) and
+            # before observer, memory, tool execution, persistence or platform delivery.
+            if tool_name equals "reply_request" and also length_list(args_list) > 0:
+                set reply_arg to get_list(args_list and 0)
+                set ok to set_list(args_list and 0 and reply_format_normalize(reply_arg))
                 
             set action_allowed to 1
             set action_reason to ""
@@ -1033,6 +1267,9 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 if string_length(audit_payload) > 0:
                     set audit_map to observer_audit(ctx and current_prompt and audit_payload)
                     set verdict to map_get_val(audit_map and "verdict")
+                    set audit_record_reason to map_get_val(audit_map and "reason")
+                    set ok to map_insert(ctx and "last_observer_verdict" and verdict)
+                    set ok to map_insert(ctx and "last_observer_reason" and audit_record_reason)
                     if verdict equals "BLOCKED":
                         # If the human already approved this action (via the approval gate
                         # or auto_approve), the observer's BLOCKED verdict is advisory only.
@@ -1062,6 +1299,9 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 # the next main call re-prefills the whole prompt from zero (~turn-1 TTFT).
                 # With the real prompt as system context the audit shares the prefix.
                 set ok to map_insert(ctx and "current_prompt" and current_prompt)
+                # Artifact provenance records the actual tool that created/shared the
+                # bytes. This is per-turn context, so concurrent sessions cannot race.
+                set ok to map_insert(ctx and "current_action_name" and tool_name)
                 set tool_result to tools_execute(tools_mgr and ctx and tool_name and args_list)
                 display f"Tool result: {tool_result}"
                 set ok to trace_emit(trace_db and trace_sid and "tool_result" and tool_result)
@@ -1071,35 +1311,57 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             # Store event in Tier 3 Timeline
             set ok to memory_store(memory_mgr and 3 and f"Action: {tool_name}" and f"Result: {tool_result}")
             
-            if tool_name equals "reply_request":
+            # Some successful tools are terminal by contract. Image generation already
+            # schedules attachment delivery; session termination has closed the current
+            # lifecycle. Neither may be fed back as an Observation or followed by another
+            # inference, audit, action, or reply from the terminated foreground turn.
+            if react_tool_result_finishes_turn(tool_name and action_allowed and tool_result) == 1:
+                display f"[ReAct] Terminal tool '{tool_name}' completed; ending request without another inference."
+                set ok to trace_emit(trace_db and trace_sid and "done" and concat("Terminal tool completed: " and tool_name))
+                set final_answer to tool_result
+                set finished to 1
+                set override_output to ""
+            else if tool_name equals "reply_request":
                 # Single inference-only audit — all LLM, no hardcoded checks
+                set ok to map_insert(ctx and "observer_capture_continuity" and 1)
                 set audit_map to observer_audit(ctx and current_prompt and tool_result)
+                set ok to map_delete(ctx and "observer_capture_continuity")
                 set verdict to map_get_val(audit_map and "verdict")
                 set audit_reason to map_get_val(audit_map and "reason")
+                set audit_parsed to map_get_val(audit_map and "parsed")
+                set audit_continuity to map_get_val(audit_map and "continuity_json")
                 free_map(audit_map)
                 
-                # Fail-open for reply_request when the observer had a parse failure.
-                # reply_request is user-visible text, not a dangerous system action.
-                # A parse failure should surface the response rather than silently
-                # discard it and re-prompt. Dangerous tools retain fail-closed.
-                set is_parse_fail to 0
-                if string_contains(audit_reason and "Audit unavailable") == 1:
-                    set is_parse_fail to 1
-                if verdict equals "ALLOWED" or else is_parse_fail == 1:
+                # Reply audits fail closed too. Invalid/empty observer output is useful
+                # corrective feedback, not permission to publish an unaudited response.
+                # This also prevents the exact bug where reasoning prose containing the
+                # word ALLOWED was mistaken for a valid audit verdict.
+                if audit_parsed == 0:
+                    # Regenerating Echo's candidate cannot repair an unavailable or
+                    # malformed Observer. The old loop regenerated three candidates
+                    # and retried two endpoints for each, turning one failed audit into
+                    # an apparent hang before publishing unaudited text.
+                    display "Observer reply audit unavailable. Withholding unaudited reply without regenerating it."
+                    set ok to trace_emit(trace_db and trace_sid and "reply_audit" and "Reply audit unavailable; reply withheld without regeneration")
+                    set final_answer to "Observer audit failed, so Echo's reply was withheld rather than published unaudited. Please retry this message; the failure has been logged."
+                    set finished to 1
+                else if verdict equals "ALLOWED":
+                    if string_length(audit_continuity) > 0:
+                        set ok to map_insert(ctx and "continuity_json" and audit_continuity)
                     display "Observer reply audit: ALLOWED. Final response ready."
                     set ok to trace_emit(trace_db and trace_sid and "reply_audit" and "Reply audit: ALLOWED")
+                    set reply_blocks to 0
                     set final_answer to tool_result
                     set finished to 1
-                    set reply_blocks to 0
                 else:
                     set reply_blocks to reply_blocks + 1
+                    set ok to trace_emit(trace_db and trace_sid and "reply_audit" and f"Reply audit: BLOCKED — {audit_reason} ({reply_blocks}/3)")
                     if reply_blocks >= 3:
-                        display f"Observer reply audit: BLOCKED {reply_blocks} consecutive times. Delivering last reply to avoid unbounded prompt inflation."
-                        set final_answer to tool_result
+                        display f"Observer reply audit: BLOCKED {reply_blocks} consecutive times. Withholding the rejected draft."
+                        set final_answer to "Echo's reply was withheld after three Observer rejections. The reasons were logged; please restate or narrow the request."
                         set finished to 1
                     else:
                         display f"Observer reply audit: BLOCKED. Reason: {audit_reason}. Re-prompting ({reply_blocks}/3)..."
-                        set ok to trace_emit(trace_db and trace_sid and "reply_audit" and f"Reply audit: BLOCKED — {audit_reason} ({reply_blocks}/3)")
                         # Concise correction — do NOT append the full raw_output (which
                         # added ~700+ chars per blocked turn, inflating the prompt from
                         # 16KB to 43KB over 28 turns and causing the SIGSEGV).
@@ -1118,7 +1380,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 # default (8192) and clamp tool output to 2048 chars, truncating file
                 # reads even though the real model window is large.
                 if string_length(obs_model) == 0:
-                    set obs_model to "gemma-4-31b"
+                    set obs_model to "gemma4:26b"
                 set obs_budget to react_observation_budget(obs_model and string_length(current_prompt))
                 set current_prompt to concat(current_prompt and "\n")
                 set current_prompt to concat(current_prompt and assistant_text)
@@ -1149,8 +1411,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             # and what it must do. Common cause: the LLM continuation-completed an empty
             # Observation instead of starting a new Thought/Action block.
             set current_prompt to concat(current_prompt and "\n")
-            set current_prompt to concat(current_prompt and raw_output)
-            set current_prompt to concat(current_prompt and "\n[FORMAT VIOLATION — YOUR OUTPUT ABOVE WAS INVALID]\nYour last output did NOT contain a valid Action call. What went wrong:\n1. You may have output raw data or continued from a previous Observation — stop. The Observation is COMPLETE. Move on.\n2. You may have written prose without calling any tool.\n\nYou MUST now output EXACTLY this format:\nThought: <your reasoning about what to do next>\nAction: <tool_name>([\"<arg1>\"])\n\nTo reply to the user: Action: reply_request([\"your response\"])\nTo call a tool: Action: <tool_name>([\"arg\"])\n\nDo NOT continue or amend the previous Observation. It is finished. Output your next Thought and Action now.\n")
+            set current_prompt to concat(current_prompt and "[FORMAT CORRECTION — INVISIBLE TO USER]\nYour output attempted protocol scaffolding but contained no syntactically valid line-anchored Action call. Do not revisit, quote, summarize or analyze the rejected output. The current task remains the exact User Request above. Output one short Thought and then a valid line beginning `Action:`. To answer directly use: Action: reply_request([\"your response\"])\n")
 
         # Batched actions (queued from a single response) do NOT count against the LLM-turn cap;
         # only a turn that made a fresh inference call advances loop_idx.
@@ -1166,7 +1427,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         set final_answer to "I could not complete this request within the allowed number of steps."
     free_list(values_list)
     set ok to tools_set_active_session("")
-    return final_answer
+    return reply_format_normalize(final_answer)
 
 
 define react_resume_approved with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and approved as Int and auto_approve_flag as Int returning Str:
@@ -1234,6 +1495,9 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
             if string_length(audit_payload) > 0:
                 set audit_map to observer_audit(ctx and current_prompt and audit_payload)
                 set verdict to map_get_val(audit_map and "verdict")
+                set audit_record_reason to map_get_val(audit_map and "reason")
+                set ok to map_insert(ctx and "last_observer_verdict" and verdict)
+                set ok to map_insert(ctx and "last_observer_reason" and audit_record_reason)
                 if verdict equals "BLOCKED":
                     # Since this is react_resume_approved, the action has been explicitly
                     # approved by the human user. The observer's BLOCKED verdict is advisory
@@ -1259,12 +1523,21 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
     
     if tool_name equals "reply_request" and approved == 1:
         # reply_request was approved — run observer audit on the reply content
+        set ok to map_insert(ctx and "observer_capture_continuity" and 1)
         set audit_map to observer_audit(ctx and current_prompt and tool_result)
+        set ok to map_delete(ctx and "observer_capture_continuity")
         set verdict to map_get_val(audit_map and "verdict")
         set audit_reason to map_get_val(audit_map and "reason")
+        set audit_parsed to map_get_val(audit_map and "parsed")
+        set audit_continuity to map_get_val(audit_map and "continuity_json")
         free_map(audit_map)
+        if audit_parsed == 0:
+            set ok to trace_emit(trace_db and trace_sid and "reply_audit" and "Approved reply audit unavailable; reply withheld without regeneration")
+            return "Observer audit failed, so Echo's reply was withheld rather than published unaudited. Please retry this message; the failure has been logged."
         if verdict equals "ALLOWED":
-            return tool_result
+            if string_length(audit_continuity) > 0:
+                set ok to map_insert(ctx and "continuity_json" and audit_continuity)
+            return reply_format_normalize(tool_result)
     
     # Inject the result as an Observation and re-enter the main loop — fit it to
     # the model's remaining context window (derived, never a fixed cap).
@@ -1360,15 +1633,20 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set ok to map_insert(ctx and "active_runs" and active_runs + 1)
 
     set ok to map_insert(ctx and "auto_approve" and 0)
-    # Drain any stale whispers left over from a previous query. Without this,
-    # whispers written during query A but not consumed before it finished would
-    # bleed into query B's first LLM call.
+    # Discard whispers targeted to older turns while retaining any guidance that
+    # arrived for THIS turn in the narrow accept/start race.
     set stale_sid to ""
     if map_contains(ctx and "session_id") == 1:
         set stale_sid to map_get_val(ctx and "session_id")
-    set stale_whispers to react_drain_whispers(stale_sid)
-    if string_length(stale_whispers) > 0:
-        display f"[ReAct] Discarded {string_length(stale_whispers)} chars of stale whispers from previous query."
+    set current_turn_id to ""
+    if map_contains(ctx and "turn_id") == 1:
+        set current_turn_id to map_get_val(ctx and "turn_id")
+    set stale_rc to react_discard_stale_whispers(stale_sid and current_turn_id)
+    if map_contains(ctx and "parent_session_id") == 0:
+        set stale_db to storage_get_db()
+        if stale_db != 0:
+            set stale_main_es to string_replace(react_cancel_key(stale_sid) and "'" and "''")
+            set ok to sql_execute(stale_db and f"DELETE FROM trace_whispers WHERE session_id='{stale_main_es}' AND target_turn_id='';")
     # Clear any stale global cancel sentinel left by a PREVIOUS run. /api/cancel writes a
     # '__CANCEL_ALL__' row; if a prior run exited (e.g. via a reply_request) without
     # crossing a turn boundary to consume it, that row would otherwise halt THIS fresh run
@@ -1390,24 +1668,20 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     # Trigger Hebbian learning on prompt concepts
     set ok to react_hebbian_trigger(memory_mgr and sanitized_user_prompt)
     
-    # Context window compression check — compress THIS turn's session (resolved from
-    # ctx session_id), never "the active one": with parallel per-session turns (Phase
-    # A2) another session's dispatch may have moved the global active pointer.
+    # Resolve THIS turn's session (never merely "the active one"): with parallel
+    # per-session turns another dispatch may have moved the global active pointer.
     set sessions_mgr to map_get_val(ctx and "sessions")
+    set sess to 0
     if sessions_mgr != 0:
         set comp_sid to ""
         if map_contains(ctx and "session_id") == 1:
             set comp_sid to map_get_val(ctx and "session_id")
-        set sess to 0
         if string_length(comp_sid) > 0:
             set comp_map to map_get_val(sessions_mgr and "sessions")
             if map_contains(comp_map and comp_sid) == 1:
                 set sess to map_get_val(comp_map and comp_sid)
         if sess == 0:
             set sess to session_manager_get_active(sessions_mgr)
-        if sess != 0:
-            set selected_model to map_get_val(ctx and "selected_model")
-            set ok to session_compress_active(sessions_mgr and sess and selected_model)
 
     set history to create_list()
     set values_list to create_list()
@@ -1421,6 +1695,60 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     set tools_schema to map_get_val(local_tools_mgr and "schemas")
     set ok to map_insert(ctx and "tools_schema" and tools_schema)
     set assembled_prompt to prompt_assemble(memory_mgr and ctx and sanitized_user_prompt and tools_schema)
+
+    # Provider-authoritative context accounting. Measure the fully assembled prompt,
+    # expose capacity to Echo, warn the user once near the boundary, and compact only
+    # at exactly 85% of the live provider's stated token window.
+    set selected_model to ""
+    if map_contains(ctx and "selected_model") == 1:
+        set selected_model to map_get_val(ctx and "selected_model")
+    set context_snapshot to llm_context_snapshot(selected_model and assembled_prompt)
+    if map_get_val(context_snapshot and "ok") == 1:
+        set context_provider to map_get_val(context_snapshot and "provider")
+        set context_model to map_get_val(context_snapshot and "model")
+        set context_limit to map_get_val(context_snapshot and "context_limit_tokens")
+        set context_used to map_get_val(context_snapshot and "used_tokens")
+        set capacity_text to session_context_capacity_text(context_provider and context_model and context_used and context_limit)
+        set ok to map_insert(ctx and "context_capacity" and capacity_text)
+        set assembled_prompt to prompt_assemble(memory_mgr and ctx and sanitized_user_prompt and tools_schema)
+        # Count again with the capacity record included so the 85% comparison applies
+        # to the actual prompt Echo receives, not a smaller preliminary prompt.
+        set final_snapshot to llm_context_snapshot(selected_model and assembled_prompt)
+        if map_get_val(final_snapshot and "ok") == 1:
+            set context_used to map_get_val(final_snapshot and "used_tokens")
+            set context_limit to map_get_val(final_snapshot and "context_limit_tokens")
+            set context_provider to map_get_val(final_snapshot and "provider")
+            set context_model to map_get_val(final_snapshot and "model")
+            set capacity_text to session_context_capacity_text(context_provider and context_model and context_used and context_limit)
+            set ok to map_insert(ctx and "context_capacity" and capacity_text)
+            set assembled_prompt to prompt_assemble(memory_mgr and ctx and sanitized_user_prompt and tools_schema)
+            if sess != 0:
+                if session_context_approaching_compaction(context_used and context_limit) == 1:
+                    set warning_sent to 0
+                    if map_contains(sess and "compression_warning_emitted") == 1:
+                        set warning_sent to map_get_val(sess and "compression_warning_emitted")
+                    if warning_sent == 0:
+                        set compaction_at to session_compaction_threshold(context_limit)
+                        set remaining_tokens to compaction_at - context_used
+                        set warning_message to f"⚠️ Context is approaching compaction: {context_used} of {context_limit} provider tokens are in use. Automatic compaction begins at {compaction_at} tokens (85%); {remaining_tokens} tokens remain before that point."
+                        set ok to react_write_mid_message(comp_sid and warning_message)
+                        set ok to map_insert(sess and "compression_warning_emitted" and 1)
+                if session_should_compress(context_used and context_limit) == 1:
+                    set compaction_at to session_compaction_threshold(context_limit)
+                    set compaction_message to f"⚠️ Context reached the {compaction_at}-token compaction point (85% of the provider's {context_limit}-token window). Earlier turns are being archived and the active context compacted now."
+                    set ok to react_write_mid_message(comp_sid and compaction_message)
+                    set compressed to session_compress_active(sessions_mgr and sess and context_used and context_limit)
+                    if compressed == 1:
+                        set ok to map_insert(sess and "compression_warning_emitted" and 0)
+                        set assembled_prompt to prompt_assemble(memory_mgr and ctx and sanitized_user_prompt and tools_schema)
+                        set compacted_snapshot to llm_context_snapshot(selected_model and assembled_prompt)
+                        if map_get_val(compacted_snapshot and "ok") == 1:
+                            set capacity_text to session_context_capacity_text(map_get_val(compacted_snapshot and "provider") and map_get_val(compacted_snapshot and "model") and map_get_val(compacted_snapshot and "used_tokens") and map_get_val(compacted_snapshot and "context_limit_tokens"))
+                            set ok to map_insert(ctx and "context_capacity" and capacity_text)
+                            set assembled_prompt to prompt_assemble(memory_mgr and ctx and sanitized_user_prompt and tools_schema)
+    else:
+        set context_error to map_get_val(context_snapshot and "error")
+        display concat("[CONTEXT CAPACITY] Measurement unavailable; compaction not performed without provider token evidence: " and context_error)
     set ok to append_list(values_list and assembled_prompt)
     
     set res to react_run_loop(model and memory_mgr and local_tools_mgr and ctx and assembled_prompt and 0 and values_list and 0)

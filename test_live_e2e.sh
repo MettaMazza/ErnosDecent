@@ -17,15 +17,10 @@ nc() {
     if [[ "$input" == "AUTH "* ]] || [[ "$input" == "GET "* ]] || [[ "$input" == "POST "* ]] || [[ "$input" == *"\r\n\r\n"* ]]; then
         printf '%s' "$input" | command nc "$@"
     else
-        local token=""
-        if [ -f "$HOME/.ernosdecent/ipc-token" ]; then
-            token=$(cat "$HOME/.ernosdecent/ipc-token" | tr -d '\r\n ')
-        fi
-        if [ -n "$token" ]; then
-            echo "AUTH $token $input" | command nc "$@"
-        else
-            echo "$input" | command nc "$@"
-        fi
+        local token
+        token=$(tr -d '\r\n ' < "$HOME/.ernosdecent/ipc-token" 2>/dev/null) || return 1
+        [ -n "$token" ] || return 1
+        printf 'AUTH %s %s\n' "$token" "$input" | command nc "$@"
     fi
 }
 

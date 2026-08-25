@@ -27,6 +27,12 @@ import os
 cfile = os.environ['CFILE']
 with open(cfile, 'r') as f:
     content = f.read()
+with open('decent_agent/run_command_runtime.c.inc', 'r') as f:
+    run_command_runtime = f.read()
+with open('decent_agent/rights_hash_runtime.c.inc', 'r') as f:
+    rights_hash_runtime = f.read()
+with open('decent_agent/stream_runtime.c.inc', 'r') as f:
+    stream_runtime = f.read()
 inject = '''
 long long cast_borrow_to_map(long long b) {
     return b;
@@ -34,6 +40,20 @@ long long cast_borrow_to_map(long long b) {
 
 long long cast_map_to_int(long long m) {
     return m;
+}
+
+/* Per-thread LLM cache-affinity identity. The generated session setter copies the
+   active agent session here; generic/test callers correctly remain unpinned. */
+__thread char ep_llm_session_id[256] = \"\";
+long long ep_llm_slot_index(long long slot_count) {
+    if (slot_count <= 0 || ep_llm_session_id[0] == 0) return -1;
+    const unsigned char* p = (const unsigned char*)ep_llm_session_id;
+    unsigned long long hash = 1469598103934665603ULL;
+    while (*p) {
+        hash ^= (unsigned long long)*p++;
+        hash *= 1099511628211ULL;
+    }
+    return (long long)(hash % (unsigned long long)slot_count);
 }
 
 /* Global cancel-all flag (see node build notes). */
@@ -90,6 +110,34 @@ long long ep_json_escape(long long s_ptr) {
     return r;
 }
 
+/* THREAD OWNERSHIP OF THE ASYNC LOOP (root fix for the sub-agent hangs).
+   The event loop (run queue + kqueue + timers) is single-threaded state with NO locks.
+   Sub-agent WORKER THREADS used to create read/timer tasks on the shared kqueue and
+   pump the loop concurrently from ep_await_future. kqueue hands each event to WHICHEVER
+   thread is parked in kevent(), so worker A's readiness event could be consumed by
+   another thread: A's future got completed, but A stayed parked in kevent() with no
+   event of its own, holding a fully-buffered LLM response until ANY new process I/O
+   (e.g. the operator's next command — the cancel) woke it. That is the observed
+   sub-agents-hang-then-complete-instantly-on-the-next-message bug, and the
+   unsynchronized run-queue linked list was a latent corruption risk on top.
+   Invariant restored: ONLY the loop-owner thread (main — captured by the constructor,
+   which runs on the main thread at load) may create loop tasks or pump the loop.
+   Non-owner threads wait with plain poll()/nanosleep (correct in a dedicated OS thread)
+   and get a PRE-COMPLETED future, which ep_await_future returns from immediately
+   without ever touching the loop. */
+#include <poll.h>
+#include <pthread.h>
+static pthread_t ep_loop_owner_thread;
+__attribute__((constructor)) static void ep_capture_loop_owner(void) {
+    ep_loop_owner_thread = pthread_self();
+}
+static EpFuture* ep_make_completed_future(long long value) {
+    EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
+    fut->completed = 1; fut->value = value; fut->waiting_task = NULL; fut->chan = 0;
+    { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
+    return fut;
+}
+
 /* Awaitable readable-OR-timeout future. */
 static long long ep_readto_read_step(void* r) {
     EpReadReadyArgs* a = (EpReadReadyArgs*)r;
@@ -108,6 +156,12 @@ static long long ep_readto_timer_step(void* r) {
     return 0;
 }
 long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
+    if (!pthread_equal(pthread_self(), ep_loop_owner_thread)) {
+        /* Worker thread: NEVER touch the shared loop — plain poll, pre-completed future. */
+        struct pollfd p; p.fd = (int)fd; p.events = POLLIN; p.revents = 0;
+        int r = poll(&p, 1, (int)timeout_ms);
+        return (long long)ep_make_completed_future(r > 0 ? 1 : 0);
+    }
     EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
     fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;
     { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
@@ -132,7 +186,9 @@ long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
    without blocking the single-threaded async loop — ep_sleep_ms stalls EVERY task for
    the duration; awaiting this yields, so sibling agent tasks (and their LLM reads)
    keep running. Reuses the readable-timeout plumbing's timer half. Used by
-   bridge_wait_result so a Discord RPC wait cannot freeze the node. */
+   bridge_wait_result so a Discord RPC wait cannot freeze the node.
+   THREAD-AWARE like async_wait_readable_timeout: a worker thread nanosleeps and gets a
+   pre-completed future instead of registering a timer on the loop it must not touch. */
 /* Phase A: set a socket non-blocking (the IPC LISTEN socket, so the accept task can
    wait via the event loop) and force one BLOCKING (each ACCEPTED client socket —
    Darwin inherits O_NONBLOCK on accept, which made every per-connection command read
@@ -151,6 +207,12 @@ long long ep_net_set_blocking(long long fd) {
 }
 
 long long ep_async_sleep_ms(long long ms) {
+    if (!pthread_equal(pthread_self(), ep_loop_owner_thread)) {
+        /* Worker thread: NEVER touch the shared loop — plain sleep, pre-completed future. */
+        struct timespec ts; ts.tv_sec = ms / 1000; ts.tv_nsec = (ms % 1000) * 1000000L;
+        nanosleep(&ts, NULL);
+        return (long long)ep_make_completed_future(0);
+    }
     EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
     fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;
     { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
@@ -201,16 +263,73 @@ long long ep_file_to_base64(long long path_ptr) {
 }
 
 '''
+inject = inject + '\n' + run_command_runtime + '\n' + rights_hash_runtime + '\n' + stream_runtime + '\n'
 pat = 'long long ep_net_send(long long fd, const char* data) {'
 first = content.find(pat)
 second = content.find(pat, first + 1)
 if second > 0:
     content = content[:second] + inject + content[second:]
-    with open(cfile, 'w') as f:
-        f.write(content)
-    print('Injected additive runtime helpers (cast/cancel/json/async) into ' + cfile)
 else:
     print('WARNING: could not find second ep_net_send in ' + cfile + ' — additive helpers NOT injected')
+
+# THREAD-SAFE RUN QUEUE: the compiler emits an unlocked linked-list run queue, which
+# worker threads can still touch via un-awaited async dispatch (e.g. a sub-agent tool
+# calling generate_image enqueues the poll chain from its worker thread while the main
+# thread pumps). Same root hazard family as the stolen-kevent-wakeup bug — an
+# unsynchronized cross-thread mutation of loop state. Guard both queue ops with a mutex
+# (pthread.h is included well before these functions in the emitted C).
+old_q = '''static void ep_task_enqueue(EpTask* task) {
+    if (!task) return;
+    task->next = NULL;
+    if (ep_run_queue_tail) {
+        ep_run_queue_tail->next = task;
+        ep_run_queue_tail = task;
+    } else {
+        ep_run_queue_head = ep_run_queue_tail = task;
+    }
+}
+
+static EpTask* ep_task_dequeue(void) {
+    if (!ep_run_queue_head) return NULL;
+    EpTask* task = ep_run_queue_head;
+    ep_run_queue_head = ep_run_queue_head->next;
+    if (!ep_run_queue_head) ep_run_queue_tail = NULL;
+    return task;
+}'''
+new_q = '''static pthread_mutex_t ep_run_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static void ep_task_enqueue(EpTask* task) {
+    if (!task) return;
+    pthread_mutex_lock(&ep_run_queue_lock);
+    task->next = NULL;
+    if (ep_run_queue_tail) {
+        ep_run_queue_tail->next = task;
+        ep_run_queue_tail = task;
+    } else {
+        ep_run_queue_head = ep_run_queue_tail = task;
+    }
+    pthread_mutex_unlock(&ep_run_queue_lock);
+}
+
+static EpTask* ep_task_dequeue(void) {
+    pthread_mutex_lock(&ep_run_queue_lock);
+    EpTask* task = ep_run_queue_head;
+    if (task) {
+        ep_run_queue_head = task->next;
+        if (!ep_run_queue_head) ep_run_queue_tail = NULL;
+    }
+    pthread_mutex_unlock(&ep_run_queue_lock);
+    return task;
+}'''
+if old_q in content:
+    content = content.replace(old_q, new_q, 1)
+    print('Injected additive runtime helpers + THREAD-SAFE run queue into ' + cfile)
+elif new_q in content:
+    print('Injected additive runtime helpers into ' + cfile + ' (run queue already thread-safe)')
+else:
+    print('WARNING: run-queue pattern not found in ' + cfile + ' — queue left UNLOCKED (compiler output changed?)')
+
+with open(cfile, 'w') as f:
+    f.write(content)
 "
 }
 
@@ -270,16 +389,19 @@ long long ep_net_send_raw(long long fd, long long buf, long long count) {
     return total;
 }
 
+extern __thread char ep_llm_session_id[256];
 __thread char ep_active_session_id[256] = \"\";
 
 long long tools_set_active_session(long long sid_ptr) {
     const char* sid = (const char*)sid_ptr;
     if (sid) {
         strncpy(ep_active_session_id, sid, sizeof(ep_active_session_id) - 1);
-        ep_active_session_id[sizeof(ep_active_session_id) - 1] = '\\0';
+        ep_active_session_id[sizeof(ep_active_session_id) - 1] = '\\\\0';
     } else {
-        ep_active_session_id[0] = '\\0';
+        ep_active_session_id[0] = '\\\\0';
     }
+    strncpy(ep_llm_session_id, ep_active_session_id, sizeof(ep_llm_session_id) - 1);
+    ep_llm_session_id[sizeof(ep_llm_session_id) - 1] = 0;
     return 0;
 }
 '''
@@ -372,9 +494,9 @@ print('Patched conflicting mutex declarations, test blocking barriers, and SQLit
     case "$OS" in
         Darwin)
             if [ -d "/opt/homebrew/lib" ]; then
-                CFLAGS="$CFLAGS -L/opt/homebrew/lib -lsodium -L/opt/homebrew/opt/openssl/lib -lcrypto"
+                CFLAGS="$CFLAGS -I/opt/homebrew/opt/openssl/include -L/opt/homebrew/lib -lsodium -L/opt/homebrew/opt/openssl/lib -lcrypto"
             elif [ -d "/usr/local/lib" ]; then
-                CFLAGS="$CFLAGS -L/usr/local/lib -lsodium -L/usr/local/opt/openssl/lib -lcrypto"
+                CFLAGS="$CFLAGS -I/usr/local/opt/openssl/include -L/usr/local/lib -lsodium -L/usr/local/opt/openssl/lib -lcrypto"
             else
                 CFLAGS="$CFLAGS -lsodium -lcrypto"
             fi
@@ -384,7 +506,7 @@ print('Patched conflicting mutex declarations, test blocking barriers, and SQLit
             ;;
     esac
     
-    clang decent_agent/test_agent_compiled.c $SD_SHIM_SRC -o ./decent_agent/test_agent $CFLAGS $SD_CFLAGS 2>&1
+    clang decent_agent/test_agent_compiled.c decent_net/network_runtime.c $SD_SHIM_SRC -o ./decent_agent/test_agent $CFLAGS $SD_CFLAGS 2>&1
     if [ "$OS" = "Darwin" ]; then
         codesign --force -s - ./decent_agent/test_agent 2>/dev/null || true
     fi
@@ -394,7 +516,17 @@ print('Patched conflicting mutex declarations, test blocking barriers, and SQLit
     
     echo ""
     echo "[*] Building GitDec Host Election Test Suite..."
+    set +e
     $ERNOS decent_net/test_host_election.ep 2>&1
+    set -e
+    if [ ! -f decent_net/test_host_election_compiled.c ]; then
+        echo "[-] Host-election compiler did not emit C; refusing a stale test binary."
+        exit 1
+    fi
+    clang decent_net/test_host_election_compiled.c decent_net/network_runtime.c -o ./decent_net/test_host_election $CFLAGS 2>&1
+    if [ "$OS" = "Darwin" ]; then
+        codesign --force -s - ./decent_net/test_host_election 2>/dev/null || true
+    fi
     echo "[*] Running GitDec Host Election tests..."
     ./decent_net/test_host_election
     
@@ -692,6 +824,18 @@ long long ep_json_escape(long long s_ptr) {
    accepts the connection then never responds, freezing the single-threaded daemon. The
    loser step is a no-op (guards on !completed) so there is no value clobber or double
    enqueue; each task self-frees when it eventually fires. */
+#include <poll.h>
+#include <pthread.h>
+static pthread_t ep_loop_owner_thread;
+__attribute__((constructor)) static void ep_capture_loop_owner(void) {
+    ep_loop_owner_thread = pthread_self();
+}
+static EpFuture* ep_make_completed_future(long long value) {
+    EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
+    fut->completed = 1; fut->value = value; fut->waiting_task = NULL; fut->chan = 0;
+    { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
+    return fut;
+}
 static long long ep_readto_read_step(void* r) {
     EpReadReadyArgs* a = (EpReadReadyArgs*)r;
     if (a && a->fut && !a->fut->completed) {
@@ -709,6 +853,12 @@ static long long ep_readto_timer_step(void* r) {
     return 0;
 }
 long long async_wait_readable_timeout(long long fd, long long timeout_ms) {
+    if (!pthread_equal(pthread_self(), ep_loop_owner_thread)) {
+        /* Worker thread: NEVER touch the shared loop — plain poll, pre-completed future. */
+        struct pollfd p; p.fd = (int)fd; p.events = POLLIN; p.revents = 0;
+        int r = poll(&p, 1, (int)timeout_ms);
+        return (long long)ep_make_completed_future(r > 0 ? 1 : 0);
+    }
     EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
     fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;
     { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
@@ -751,6 +901,12 @@ with open('node_compiled.c', 'r') as f:
 content = content.replace('long long ep_mutex_lock(long long);', '')
 content = content.replace('long long ep_mutex_unlock(long long);', '')
 content = content.replace('int main(int argc, char** argv) {', 'int main(int argc, char** argv) {\\n    setvbuf(stdout, NULL, _IONBF, 0);\\n    setvbuf(stderr, NULL, _IONBF, 0);')
+
+# A controlled RESTART is process replacement after its response, logs, reset
+# transaction, and recovery bundle have been flushed. stable-diffusion's Metal
+# globals abort in their C++ destructor during normal exit after prewarm, preventing
+# code 75 from reaching run_node.sh. Bypass only those process-global destructors.
+content = content.replace('ep_exit(75);', 'fflush(NULL);\\n    _exit(75);')
 
 content = content.replace(
     '#define EP_GC_UPDATE_TOP() { volatile int _dummy; ep_thread_local_top = (void*)&_dummy; }',
@@ -890,7 +1046,7 @@ import sys
 with open('node_compiled.c', 'r') as f:
     content = f.read()
 
-if 'ep_net_listen_loopback' in content:
+if 'long long ep_net_listen_loopback(long long port) {' in content:
     print('[*] ep_net_listen_loopback already present.')
 else:
     pat = 'long long ep_net_listen(long long port) {'
@@ -964,6 +1120,141 @@ long long ep_net_listen_loopback(long long port) {
         print('[*] Bound IPC + Web UI to loopback (127.0.0.1); P2P/DHT/relay remain public.')
 "
 
+# Newer compiler output can emit the public-DNS wrapper declaration without its
+# native body. Inject the same fail-closed IPv4 resolver used by the runtime so
+# reader/search URL checks cannot link against a missing external symbol.
+python3 <<'PY'
+import sys
+with open('node_compiled.c', 'r') as f:
+    content = f.read()
+
+if ('long long ep_net_resolve_public_ipv4(long long host_ptr) {' in content or
+        'long long ep_net_resolve_public_ipv4(const char* host) {' in content):
+    print('[*] ep_net_resolve_public_ipv4 already present.')
+else:
+    pat = 'long long ep_net_listen(long long port) {'
+    first = content.find(pat)
+    second = content.find(pat, first + 1)
+    target = second if second > 0 else first
+    if target < 0:
+        sys.exit('RUNTIME PATCH FAILED: ep_net_listen definition not found for DNS helper injection.')
+    inject = r'''
+static long long ep_public_dns_error(const char* detail) {
+    const char* safe_detail = detail ? detail : "unknown resolution failure";
+    const char* prefix = "Error: DNS ";
+    size_t prefix_length = strlen(prefix);
+    size_t detail_length = strlen(safe_detail);
+    if (detail_length > SIZE_MAX - prefix_length - 1) {
+        return (long long)strdup("Error: DNS error message is too large");
+    }
+    char* message = (char*)malloc(prefix_length + detail_length + 1);
+    if (!message) return (long long)strdup("Error: DNS memory allocation failed");
+    memcpy(message, prefix, prefix_length);
+    memcpy(message + prefix_length, safe_detail, detail_length + 1);
+    return (long long)message;
+}
+
+static int ep_public_dns_valid_hostname(const char* host) {
+    if (!host) return 0;
+    size_t length = strlen(host);
+    if (length == 0 || length > 253) return 0;
+    size_t label_length = 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)host[i];
+        if (c == '.') {
+            if (label_length == 0 || host[i - 1] == '-' ||
+                (i + 1 < length && host[i + 1] == '.')) return 0;
+            label_length = 0;
+            continue;
+        }
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '-')) return 0;
+        if (label_length == 0 && c == '-') return 0;
+        label_length++;
+        if (label_length > 63) return 0;
+    }
+    if (host[length - 1] != '.' &&
+        (label_length == 0 || host[length - 1] == '-')) return 0;
+    return 1;
+}
+
+static int ep_public_dns_ipv4_is_public(uint32_t address_network_order) {
+    uint32_t address = ntohl(address_network_order);
+    unsigned int first = (address >> 24) & 0xffU;
+    unsigned int second = (address >> 16) & 0xffU;
+    unsigned int third = (address >> 8) & 0xffU;
+    unsigned int fourth = address & 0xffU;
+    if (first == 0U || first == 10U || first == 127U) return 0;
+    if (first == 100U && second >= 64U && second <= 127U) return 0;
+    if (first == 169U && second == 254U) return 0;
+    if (first == 172U && second >= 16U && second <= 31U) return 0;
+    if (first == 192U && second == 0U && third == 0U && fourth != 9U && fourth != 10U) return 0;
+    if (first == 192U && second == 0U && third == 2U) return 0;
+    if (first == 192U && second == 88U && third == 99U) return 0;
+    if (first == 192U && second == 168U) return 0;
+    if (first == 198U && (second == 18U || second == 19U)) return 0;
+    if (first == 198U && second == 51U && third == 100U) return 0;
+    if (first == 203U && second == 0U && third == 113U) return 0;
+    if (first >= 224U) return 0;
+    return 1;
+}
+
+long long ep_net_resolve_public_ipv4(long long host_ptr) {
+    const char* host = (const char*)host_ptr;
+    if (!ep_public_dns_valid_hostname(host)) {
+        return ep_public_dns_error("hostname must be a valid ASCII DNS name or IPv4 literal");
+    }
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* results = NULL;
+    int resolution = getaddrinfo(host, NULL, &hints, &results);
+    if (resolution != 0) {
+        char detail[384];
+        const char* resolution_error = gai_strerror(resolution);
+        if (!resolution_error) resolution_error = "unknown resolver error";
+        int written = snprintf(detail, sizeof(detail), "resolution failed for %s: %s", host,
+                               resolution_error);
+        if (written < 0) return ep_public_dns_error("resolution failure could not be formatted");
+        return ep_public_dns_error(detail);
+    }
+    if (!results) return ep_public_dns_error("resolver returned no result list");
+
+    char selected[INET_ADDRSTRLEN] = {0};
+    int answer_count = 0;
+    int rejected = 0;
+    for (struct addrinfo* current = results; current != NULL; current = current->ai_next) {
+        if (!current->ai_addr || current->ai_family != AF_INET ||
+            (size_t)current->ai_addrlen < sizeof(struct sockaddr_in)) continue;
+        struct sockaddr_in ipv4;
+        memcpy(&ipv4, current->ai_addr, sizeof(ipv4));
+        answer_count++;
+        if (!ep_public_dns_ipv4_is_public(ipv4.sin_addr.s_addr)) {
+            rejected = 1;
+            break;
+        }
+        if (selected[0] == '\0' &&
+            !inet_ntop(AF_INET, &ipv4.sin_addr, selected, sizeof(selected))) {
+            rejected = 1;
+            break;
+        }
+    }
+    freeaddrinfo(results);
+    if (rejected) return ep_public_dns_error("hostname has a non-public or unrepresentable IPv4 answer");
+    if (answer_count == 0 || selected[0] == '\0') return ep_public_dns_error("hostname has no IPv4 answer");
+    char* result = strdup(selected);
+    if (!result) return ep_public_dns_error("memory allocation failed for resolved address");
+    return (long long)result;
+}
+
+'''
+    content = content[:target] + inject + content[target:]
+    with open('node_compiled.c', 'w') as f:
+        f.write(content)
+    print('[*] Injected ep_net_resolve_public_ipv4.')
+PY
+
 # Step 2h: Inject tools_set_active_session and refactor ep_http_request in node_compiled.c
 python3 -c "
 with open('node_compiled.c', 'r') as f:
@@ -982,6 +1273,7 @@ long long ep_cancel_epoch_get(long long);
 long long react_request_cancel(long long);
 long long ptr_to_str(long long);
 
+extern __thread char ep_llm_session_id[256];
 __thread char ep_active_session_id[256] = \"\";
 
 long long tools_set_active_session(long long sid_ptr) {
@@ -992,6 +1284,8 @@ long long tools_set_active_session(long long sid_ptr) {
     } else {
         ep_active_session_id[0] = '\\\\0';
     }
+    strncpy(ep_llm_session_id, ep_active_session_id, sizeof(ep_llm_session_id) - 1);
+    ep_llm_session_id[sizeof(ep_llm_session_id) - 1] = 0;
     return 0;
 }
 
@@ -1150,11 +1444,11 @@ case "$OS" in
         # macOS: detect Homebrew prefix (ARM64 vs Intel)
         if [ -d "/opt/homebrew/lib" ]; then
             # Apple Silicon (ARM64)
-            CFLAGS="$CFLAGS -L/opt/homebrew/lib -lsodium"
+            CFLAGS="$CFLAGS -I/opt/homebrew/opt/openssl/include -L/opt/homebrew/lib -lsodium"
             CFLAGS="$CFLAGS -L/opt/homebrew/opt/openssl/lib -lcrypto"
         elif [ -d "/usr/local/lib" ]; then
             # Intel Mac (x86_64 Homebrew)
-            CFLAGS="$CFLAGS -L/usr/local/lib -lsodium"
+            CFLAGS="$CFLAGS -I/usr/local/opt/openssl/include -L/usr/local/lib -lsodium"
             CFLAGS="$CFLAGS -L/usr/local/opt/openssl/lib -lcrypto"
         else
             CFLAGS="$CFLAGS -lsodium -lcrypto"

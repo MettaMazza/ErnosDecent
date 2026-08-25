@@ -22,6 +22,16 @@ fail() {
     echo "  [FAIL] $1"
 }
 
+ipc_cmd() {
+    local port="$1"
+    local timeout_seconds="$2"
+    local cmd="$3"
+    local token
+    token=$(tr -d '\r\n ' < "$HOME/.ernosdecent/ipc-token" 2>/dev/null) || return 1
+    [ -n "$token" ] || return 1
+    printf 'AUTH %s %s\n' "$token" "$cmd" | nc -w "$timeout_seconds" 127.0.0.1 "$port" 2>/dev/null
+}
+
 cleanup() {
     echo "[*] Cleaning up..."
     lsof -ti:5000,8080,9100,9101,9102 2>/dev/null | xargs kill -9 2>/dev/null
@@ -43,7 +53,7 @@ DAEMON_PID=$!
 sleep 3
 
 # Verify daemon alive
-check=$(echo "STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
+check=$(ipc_cmd 5000 2 "STATUS")
 if ! echo "$check" | grep -q "status:active"; then
     echo "[-] FATAL: Daemon failed to start"
     exit 1
@@ -58,7 +68,7 @@ echo "=== TEST 1: IPC Flood (100 rapid STATUS) ==="
 ipc_ok=0
 ipc_fail=0
 for i in $(seq 1 100); do
-    r=$(echo "STATUS" | nc -w 1 127.0.0.1 5000 2>/dev/null)
+    r=$(ipc_cmd 5000 1 "STATUS")
     if echo "$r" | grep -q "status:active"; then
         ipc_ok=$((ipc_ok + 1))
     else
@@ -73,7 +83,7 @@ else
 fi
 
 # Verify daemon survived
-post_ipc=$(echo "STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
+post_ipc=$(ipc_cmd 5000 2 "STATUS")
 if echo "$post_ipc" | grep -q "status:active"; then
     pass "Daemon alive after IPC flood"
 else
@@ -101,7 +111,7 @@ else
 fi
 
 # Verify daemon survived
-post_http=$(echo "STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
+post_http=$(ipc_cmd 5000 2 "STATUS")
 if echo "$post_http" | grep -q "status:active"; then
     pass "Daemon alive after HTTP flood"
 else
@@ -130,7 +140,7 @@ else
 fi
 
 # Verify daemon survived (this was the original crash trigger)
-post_ws=$(echo "STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
+post_ws=$(ipc_cmd 5000 2 "STATUS")
 if echo "$post_ws" | grep -q "status:active"; then
     pass "Daemon alive after WS reconnect storm"
 else
@@ -145,7 +155,7 @@ echo ""
 echo "=== TEST 4: Message Storm (50 rapid MSG SEND) ==="
 msg_ok=0
 for i in $(seq 1 50); do
-    r=$(echo "MSG SEND Stress message number $i" | nc -w 1 127.0.0.1 5000 2>/dev/null)
+    r=$(ipc_cmd 5000 1 "MSG SEND Stress message number $i")
     if echo "$r" | grep -q "msg:sent"; then
         msg_ok=$((msg_ok + 1))
     fi
@@ -157,7 +167,7 @@ else
     fail "Message storm: only $msg_ok/50 messages sent"
 fi
 
-post_msg=$(echo "STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
+post_msg=$(ipc_cmd 5000 2 "STATUS")
 if echo "$post_msg" | grep -q "status:active"; then
     pass "Daemon alive after message storm"
 else
@@ -172,10 +182,10 @@ echo ""
 echo "=== TEST 5: Transfer Storm (50 rapid MONEY TRANSFER) ==="
 
 # Get initial balance
-bal_before=$(echo "WALLET BALANCE" | nc -w 2 127.0.0.1 5000 2>/dev/null | sed 's/wallet_balance://')
+bal_before=$(ipc_cmd 5000 2 "WALLET BALANCE" | sed 's/wallet_balance://')
 xfer_ok=0
 for i in $(seq 1 50); do
-    r=$(echo "MONEY TRANSFER 1 did:key:zStressRecipient$i" | nc -w 1 127.0.0.1 5000 2>/dev/null)
+    r=$(ipc_cmd 5000 1 "MONEY TRANSFER 1 did:key:zStressRecipient$i")
     if echo "$r" | grep -q "transfer:ok"; then
         xfer_ok=$((xfer_ok + 1))
     fi
@@ -188,7 +198,7 @@ else
 fi
 
 # Verify balance changed correctly
-bal_after=$(echo "WALLET BALANCE" | nc -w 2 127.0.0.1 5000 2>/dev/null | sed 's/wallet_balance://')
+bal_after=$(ipc_cmd 5000 2 "WALLET BALANCE" | sed 's/wallet_balance://')
 expected_decrease=$xfer_ok
 actual_decrease=$((bal_before - bal_after))
 if [ "$actual_decrease" -eq "$expected_decrease" ] 2>/dev/null; then
@@ -197,7 +207,7 @@ else
     fail "Balance accounting wrong ($bal_before -> $bal_after, expected -$expected_decrease, got -$actual_decrease)"
 fi
 
-post_xfer=$(echo "STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
+post_xfer=$(ipc_cmd 5000 2 "STATUS")
 if echo "$post_xfer" | grep -q "status:active"; then
     pass "Daemon alive after transfer storm"
 else
@@ -212,7 +222,7 @@ echo ""
 echo "=== TEST 6: DHT Rapid Write/Read (100 KV pairs) ==="
 dht_write_ok=0
 for i in $(seq 1 100); do
-    r=$(echo "DHT STORE stress_key_$i stress_val_$i" | nc -w 1 127.0.0.1 5000 2>/dev/null)
+    r=$(ipc_cmd 5000 1 "DHT STORE stress_key_$i stress_val_$i")
     if echo "$r" | grep -q "dht:stored"; then
         dht_write_ok=$((dht_write_ok + 1))
     fi
@@ -227,7 +237,7 @@ fi
 # Read back a random sample
 dht_read_ok=0
 for i in 10 25 50 75 99; do
-    r=$(echo "DHT GET stress_key_$i" | nc -w 1 127.0.0.1 5000 2>/dev/null)
+    r=$(ipc_cmd 5000 1 "DHT GET stress_key_$i")
     if echo "$r" | grep -q "value:stress_val_$i"; then
         dht_read_ok=$((dht_read_ok + 1))
     fi
@@ -247,9 +257,9 @@ echo ""
 echo "=== TEST 7: Mixed Workload (interleaved ops) ==="
 mixed_ok=0
 for i in $(seq 1 20); do
-    r1=$(echo "STATUS" | nc -w 1 127.0.0.1 5000 2>/dev/null)
-    r2=$(echo "MSG SEND Mixed test $i" | nc -w 1 127.0.0.1 5000 2>/dev/null)
-    r3=$(echo "DHT STORE mix_$i mixv_$i" | nc -w 1 127.0.0.1 5000 2>/dev/null)
+    r1=$(ipc_cmd 5000 1 "STATUS")
+    r2=$(ipc_cmd 5000 1 "MSG SEND Mixed test $i")
+    r3=$(ipc_cmd 5000 1 "DHT STORE mix_$i mixv_$i")
     r4=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/status 2>/dev/null)
     if echo "$r1" | grep -q "status:active" && echo "$r2" | grep -q "msg:sent" && echo "$r3" | grep -q "dht:stored" && [ "$r4" = "200" ]; then
         mixed_ok=$((mixed_ok + 1))
@@ -268,14 +278,14 @@ echo ""
 # TEST 8: Final Health Check
 # ================================================================
 echo "=== TEST 8: Final Health Check ==="
-final_status=$(echo "STATUS" | nc -w 2 127.0.0.1 5000 2>/dev/null)
+final_status=$(ipc_cmd 5000 2 "STATUS")
 if echo "$final_status" | grep -q "status:active"; then
     pass "Daemon alive after all stress tests"
 else
     fail "Daemon died during stress tests"
 fi
 
-final_health=$(echo "HEALTH" | nc -w 2 127.0.0.1 5000 2>/dev/null)
+final_health=$(ipc_cmd 5000 2 "HEALTH")
 if echo "$final_health" | grep -q "health:"; then
     pass "Health check: responsive after all stress ($(echo "$final_health" | grep -o 'health:[a-z]*'))"
 else

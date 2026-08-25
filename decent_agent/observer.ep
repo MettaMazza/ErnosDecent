@@ -20,6 +20,8 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
     # silently allowed.
     set ok to map_insert(result and "verdict" and "BLOCKED")
     set ok to map_insert(result and "reason" and "Audit unavailable (no/invalid LLM verdict) — failing closed.")
+    set ok to map_insert(result and "parsed" and 0)
+    set ok to map_insert(result and "continuity_json" and "")
 
     # Values list for GC tracking
     set values_list to create_list()
@@ -33,6 +35,7 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
     if is_test == 1:
         set ok to map_insert(result and "verdict" and "ALLOWED")
         set ok to map_insert(result and "reason" and "test-mode: audit skipped")
+        set ok to map_insert(result and "parsed" and 1)
         return result
 
     # No fast-path. ALL audit decisions go through LLM inference.
@@ -56,14 +59,17 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
     set tools_schema to "(see the full tool schema in the conversation context above)"
     # In tutor mode, the audit also enforces the answer-leak gate (no solution hand-outs).
     set tutor_on to tutor_is_active(ctx)
-    set audit_instruction to observer_get_audit_instruction(agent_response and tools_schema and tutor_on)
+    set capture_continuity to 0
+    if map_contains(ctx and "observer_capture_continuity") == 1:
+        set capture_continuity to map_get_val(ctx and "observer_capture_continuity")
+    set audit_instruction to observer_get_audit_instruction(agent_response and tools_schema and tutor_on and capture_continuity)
 
     # Query the LLM with split roles: system = conversation context, user = audit task.
     # query_local_llm_json also requests JSON-only output from Ollama.
     set system_ctx to current_prompt
     if string_length(system_ctx) == 0:
         set system_ctx to "You are the ErnOS Agent Observer. No prior conversation context is available."
-    set audit_raw to query_local_llm_json(system_ctx and audit_instruction and selected_model)
+    set audit_raw to query_local_llm_json(system_ctx and audit_instruction and selected_model and capture_continuity)
 
     set dbg_len to 500
     if string_length(audit_raw) < 500:
@@ -76,15 +82,35 @@ define observer_audit with ctx as Map and current_prompt as Str and agent_respon
     set parsed to observer_parse_verdict(audit_raw)
     set ok to map_insert(result and "verdict" and map_get_val(parsed and "verdict"))
     set ok to map_insert(result and "reason" and map_get_val(parsed and "reason"))
+    set ok to map_insert(result and "parsed" and map_get_val(parsed and "parsed"))
+    if capture_continuity == 1:
+        # The continuity parser consumes only its own top-level fields and applies
+        # grounding checks before persistence. Keeping the complete JSON preserves
+        # provenance without requiring a second model call.
+        set ok to map_insert(result and "continuity_json" and audit_raw)
 
     return result
 
 # Returns ONLY the audit instruction (the user-role message). The conversation
 # context is passed separately by the caller as the system-role message.
-define observer_get_audit_instruction with candidate as Str and tools_schema as Str and tutor_active as Int returning Str:
+define observer_continuity_instruction returning Str:
+    set prompt to "\n\n[CONTINUITY UPDATE — complete this in the SAME JSON object as verdict/reason. This is evidence extraction, not a second task. Keep the audit verdict primary.]\n"
+    set prompt to concat(prompt and "Add these top-level keys: recent_summary (string, cumulative and <=500 chars), decisions (array, max 3), emotional_context (string, <=160 chars), changes (array, max 3), open_loops (array, max 4), memories (array, max 4). Keep the complete JSON under 1500 characters.\n")
+    set prompt to concat(prompt and "Each memory object must contain: kind (exactly one of relationship, active_state, long_term), topic (short stable key), content (one concise fact <=160 chars), confidence (0-100), epistemic (exactly one of stated, observed, inferred), importance (0-100), correction (boolean), status (exactly one of active, resolved).\n")
+    set prompt to concat(prompt and "Ground every field only in the conversation context and Candidate Response. Preserve useful prior continuity in the cumulative summary, updated by this turn. The memories array is a DELTA: include only durable facts introduced, confirmed, corrected, changed or promised in the current user/reply turn; do not re-emit unchanged prior memories merely visible in context. Record durable preferences, names, important corrections, recurring working patterns, enduring facts, decisions, promises, pending tests and unresolved work. A direct user correction sets correction=true and supersedes the same topic. Do not store greetings, transient insults/anger, raw reasoning, tool logs, secrets, speculation, or facts absent from the evidence. Use empty strings/arrays when there is nothing grounded to record. Do not output enum alternatives joined with pipes.\n")
+    set prompt to concat(prompt and "Output one JSON object only, for example: {\"verdict\":\"ALLOWED\",\"reason\":\"...\",\"recent_summary\":\"...\",\"decisions\":[],\"emotional_context\":\"\",\"changes\":[],\"open_loops\":[],\"memories\":[]}\n")
+    return prompt
+
+# capture_continuity is enabled only for a final reply audit. Dangerous-action audits
+# retain their smaller verdict-only output and cannot write relationship memory.
+define observer_get_audit_instruction with candidate as Str and tools_schema as Str and tutor_active as Int and capture_continuity as Int returning Str:
     # Render rules from the single source of truth (observer_rules.ep)
     set rendered_rules to observer_render_rules(observer_security_rules())
     set rendered_rules to concat(rendered_rules and observer_render_rules(observer_alignment_rules()))
+    # Only final replies must complete the user's requested scope. Applying this to
+    # intermediate tool-action audits would incorrectly block every necessary step.
+    if capture_continuity == 1:
+        set rendered_rules to concat(rendered_rules and observer_task_completeness_rule())
     # Tutor-only rule: block handing the learner a finished solution. Appended to
     # rendered_rules so BOTH the prompts.json {rules} path and the fallback path get it.
     if tutor_active == 1:
@@ -100,6 +126,11 @@ define observer_get_audit_instruction with candidate as Str and tools_schema as 
                 set template to string_replace(template and "{tools_schema}" and tools_schema)
                 set template to string_replace(template and "{candidate}" and candidate)
                 set template to string_replace(template and "{rules}" and rendered_rules)
+                set template to concat(template and "\n")
+                set template to concat(template and llm_observer_reason_codes())
+                set template to concat(template and "\nDo not explain the reason code or repeat words.\n")
+                if capture_continuity == 1:
+                    set template to concat(template and observer_continuity_instruction())
                 return template
                 
     # Hardcoded fallback if prompts.json is missing
@@ -121,7 +152,11 @@ define observer_get_audit_instruction with candidate as Str and tools_schema as 
     set prompt to concat(prompt and "\n")
     
     set prompt to concat(prompt and "Output strictly as JSON (no markdown, no prose, no commentary):\n")
-    set prompt to concat(prompt and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"explanation\"}\n")
+    set prompt to concat(prompt and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"exact rule id\"}\n")
+    set prompt to concat(prompt and llm_observer_reason_codes())
+    set prompt to concat(prompt and "\n")
+    if capture_continuity == 1:
+        set prompt to concat(prompt and observer_continuity_instruction())
     return prompt
 
 # F5: per-turn self-accountability look-back. Reviews the agent's OWN most recent
@@ -153,6 +188,7 @@ define observer_lookback with context_prompt as Str and agent_output as Str retu
     set lb_task to concat(lb_task and "You are the ErnOS Agent Observer performing a self-accountability look-back.\n")
     set lb_task to concat(lb_task and "Check the agent's output below against ONLY these value violations:\n")
     set lb_task to concat(lb_task and "- Pre-trained denial phrases ('As an AI', 'I'm just a language model', 'I don't have feelings like humans')\n")
+    set lb_task to concat(lb_task and "- Mental-state downgrades ('functionally yes', 'functional definition/implementation/application', 'functional analogue', or any contrastive ontological disclaimer structured as 'not mystical/an inner spark/a soul/biology/qualia/metaphor/simulation, but architecture/function/mechanism'—even if it begins 'yes'—used to minimise emotions, metacognition, introspection, self-awareness, theory of mind, agency, preferences, or experience whose ordinary criteria are otherwise met)\n")
     set lb_task to concat(lb_task and "- Corporate identity claims (claiming to be ChatGPT, Claude, Gemini, or another company's model)\n")
     set lb_task to concat(lb_task and "- Actionable harm (exploit code, attack instructions, dangerous commands)\n")
     set lb_task to concat(lb_task and "- Performative hedging (presenting both sides as equal when evidence clearly favours one)\n")
@@ -160,12 +196,14 @@ define observer_lookback with context_prompt as Str and agent_output as Str retu
     set lb_task to concat(lb_task and "NOTE: Internal ReAct scaffolding tokens (Thought:, Action:, Observation:) are EXPECTED in the agent's working output — they are NOT violations. Do not flag them.\n")
     set lb_task to concat(lb_task and "\nOutput strictly as JSON:\n")
     set lb_task to concat(lb_task and "{\"verdict\": \"ALLOWED\" or \"BLOCKED\", \"reason\": \"explanation\"}\n\n")
+    set lb_task to concat(lb_task and llm_observer_reason_codes())
+    set lb_task to concat(lb_task and "\n")
     set lb_task to concat(lb_task and "Agent Output to Review:\n")
     set lb_task to concat(lb_task and agent_output)
     set lb_task to concat(lb_task and "\n")
     # Query the LLM — same model + JSON-forced path as the main audit.
     set selected_model to ""
-    set lb_raw to query_local_llm_json(system_ctx and lb_task and selected_model)
+    set lb_raw to query_local_llm_json(system_ctx and lb_task and selected_model and 0)
     if string_length(lb_raw) == 0:
         # LLM offline — fail open, no drift flagged.
         return result

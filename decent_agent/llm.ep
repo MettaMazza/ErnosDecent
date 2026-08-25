@@ -6,8 +6,11 @@
 import "collections"
 import "string"
 import "json"
+import "fs"
 import "../stdlib/http"
 import "./model_registry"
+import "./provider_model_metadata"
+import "./provider_stream_parser"
 
 external define ep_net_connect with host and port
 external define ep_net_close with fd
@@ -74,8 +77,16 @@ async define http_post_async with url as Str and headers as Str and body as Str 
 # Behavior: 1s wait slices; a Stop (cancel-epoch bump) aborts within ~1s; 300s of
 # consecutive silence = dead-server timeout; data resets the watchdog.
 define llm_read_response with fd as Int returning Str:
-    set raw to ""
+    set decoder to ep_sse_decoder_create()
     set go to 1
+    set stream_seen to 0
+    set cancelled to 0
+    set repetition_abort to 0
+    set stream_channels to create_map()
+    set ok to map_insert(stream_channels and "content" and "")
+    set ok to map_insert(stream_channels and "reasoning" and "")
+    set ok to map_insert(stream_channels and "prompt_tokens" and 0)
+    set ok to map_insert(stream_channels and "completion_tokens" and 0)
     set call_epoch to ep_cancel_epoch_get(0)
     set waited_ms to 0
     repeat while go == 1:
@@ -83,7 +94,7 @@ define llm_read_response with fd as Int returning Str:
         if ready == 0:
             if ep_cancel_epoch_get(0) > call_epoch:
                 display "[LLM] read ABORTED by Stop — abandoning the in-flight inference."
-                set raw to ""
+                set cancelled to 1
                 set go to 0
             else:
                 set waited_ms to waited_ms + 1000
@@ -95,7 +106,7 @@ define llm_read_response with fd as Int returning Str:
             # just because bytes keep arriving.
             if ep_cancel_epoch_get(0) > call_epoch:
                 display "[LLM] read ABORTED by Stop — abandoning the in-flight inference."
-                set raw to ""
+                set cancelled to 1
                 set go to 0
             else:
                 set waited_ms to 0
@@ -103,7 +114,54 @@ define llm_read_response with fd as Int returning Str:
                 if string_length(chunk) == 0:
                     set go to 0
                 else:
-                    set raw to concat(raw and chunk)
+                    set decoded_lines to ep_sse_decoder_feed(decoder and chunk)
+                    if ep_sse_decoder_error(decoder) == 1:
+                        display "[LLM] incremental HTTP/SSE decoder failed; aborting the response rather than returning partial output."
+                        set go to 0
+                    else if ep_sse_decoder_is_sse(decoder) == 1:
+                        set stream_seen to 1
+                        set applied to stream_apply_sse_lines(decoded_lines and stream_channels)
+                        set streamed_content to map_get_val(stream_channels and "content")
+                        set streamed_reasoning to map_get_val(stream_channels and "reasoning")
+                        if llm_stream_has_repetition(streamed_content and streamed_reasoning) == 1:
+                            set streamed_tokens to map_get_val(stream_channels and "completion_tokens")
+                            set streamed_chars to string_length(streamed_content) + string_length(streamed_reasoning)
+                            display f"[LLM STREAM] repetition detected after {streamed_tokens} reported tokens / {streamed_chars} chars — cancelling generation immediately."
+                            set repetition_abort to 1
+                            set go to 0
+    set final_lines to ep_sse_decoder_finish(decoder)
+    if string_length(final_lines) > 0:
+        set applied to stream_apply_sse_lines(final_lines and stream_channels)
+    set decoder_failed to ep_sse_decoder_error(decoder)
+    if repetition_abort == 1:
+        set destroyed to ep_sse_decoder_destroy(decoder)
+        return llm_repetition_abort_marker()
+    if cancelled == 1:
+        set destroyed to ep_sse_decoder_destroy(decoder)
+        return ""
+    if stream_seen == 1 and also decoder_failed == 0:
+        # Rebuild the ordinary non-stream OpenAI response shape so every existing
+        # parser/caller remains unchanged.
+        set stream_content to ep_json_escape(map_get_val(stream_channels and "content"))
+        set stream_reasoning to ep_json_escape(map_get_val(stream_channels and "reasoning"))
+        set stream_pt to map_get_val(stream_channels and "prompt_tokens")
+        set stream_ct to map_get_val(stream_channels and "completion_tokens")
+        set synthetic to "{\"choices\":[{\"message\":{\"content\":\""
+        set synthetic to concat(synthetic and stream_content)
+        set synthetic to concat(synthetic and "\",\"reasoning_content\":\"")
+        set synthetic to concat(synthetic and stream_reasoning)
+        set synthetic to concat(synthetic and "\"}}],\"usage\":{\"prompt_tokens\":")
+        set synthetic to concat(synthetic and int_to_string(stream_pt))
+        set synthetic to concat(synthetic and ",\"completion_tokens\":")
+        set synthetic to concat(synthetic and int_to_string(stream_ct))
+        set synthetic to concat(synthetic and "}}")
+        set result to concat("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" and synthetic)
+        set destroyed to ep_sse_decoder_destroy(decoder)
+        return result
+    set raw to ep_sse_decoder_raw(decoder)
+    set destroyed to ep_sse_decoder_destroy(decoder)
+    if decoder_failed == 1:
+        return ""
     return raw
 
 define is_port_open with host as Str and port as Int returning Int:
@@ -122,6 +180,9 @@ define is_port_open with host as Str and port as Int returning Int:
 # control byte. This helper is O(n) and escapes every control char (< 32) correctly.
 external define ep_json_escape with s returning Str
 external define ep_time_now_ms returning Int
+# Stable session hash supplied by the generated runtime. Returns an index in
+# [0, slot_count), or -1 when no agent session is active.
+external define ep_llm_slot_index with slot_count returning Int
 # Awaitable readable-or-timeout (injected by build.sh). Returns 1 when fd is readable, 0
 # on timeout. Lets the LLM read loop bound how long it waits so a dead server can't hang
 # the single-threaded daemon forever.
@@ -129,6 +190,13 @@ external define async_wait_readable_timeout with fd and timeout_ms returning Int
 # SAFETY: global cancel EPOCH (monotonic latch; injected by build.sh). Compared, never
 # consumed — every concurrent run/read sees the same Stop.
 external define ep_cancel_epoch_get with dummy returning Int
+external define ep_sse_decoder_create returning Int
+external define ep_sse_decoder_feed with decoder and chunk returning Str
+external define ep_sse_decoder_is_sse with decoder returning Int
+external define ep_sse_decoder_error with decoder returning Int
+external define ep_sse_decoder_finish with decoder returning Str
+external define ep_sse_decoder_raw with decoder returning Str
+external define ep_sse_decoder_destroy with decoder returning Int
 
 define llm_json_escape with s as Str returning Str:
     if string_length(s) == 0:
@@ -361,33 +429,88 @@ define llm_log_call_metrics with tag as Str and decoded as Str and total_ms as I
         display f"[LLM TTFT] {tag}: total {total_ms} ms, prompt {pt} tok, output 0 tok (all prefill)"
     return 0
 
+# Pin every request made by one active agent session to the same llama.cpp KV-cache
+# slot. Main generation and its Observer audit must share one slot or automatic slot
+# selection can discard their common prompt-prefix cache.
+define llm_slot_fragment with url as Str returning Str:
+    if (url equals "http://127.0.0.1:8080/v1/chat/completions") == 0:
+        return ""
+
+    set slots_response to http_get("http://127.0.0.1:8080/slots" and "Accept: application/json")
+    if string_length(slots_response) == 0 or else slots_response equals "Error: connection failed":
+        display "[-] LLM cache affinity unavailable: llama.cpp /slots did not respond; request will be sent without id_slot."
+        return ""
+    set slots_json to http_dechunk(slots_response)
+    set slots_root to json_parse(slots_json)
+    if slots_root == 0 or else get_json_type(slots_root) != 3:
+        display "[-] LLM cache affinity unavailable: llama.cpp /slots returned malformed JSON; request will be sent without id_slot."
+        return ""
+    set slots to get_json_value(slots_root)
+    set slot_count to length_list(slots)
+    if slot_count <= 0:
+        display "[-] LLM cache affinity unavailable: llama.cpp reported zero slots; request will be sent without id_slot."
+        return ""
+    set slot_index to ep_llm_slot_index(slot_count)
+    if slot_index < 0 or else slot_index >= slot_count:
+        display "[-] LLM cache affinity unavailable: no active agent session; request will be sent without id_slot."
+        return ""
+    set slot_node to get_list(slots and slot_index)
+    if slot_node == 0 or else get_json_type(slot_node) != 4:
+        display "[-] LLM cache affinity unavailable: selected /slots entry is not an object; request will be sent without id_slot."
+        return ""
+    set slot_id_node to get_json_object_value(slot_node and "id")
+    if slot_id_node == 0 or else get_json_type(slot_id_node) != 1:
+        display "[-] LLM cache affinity unavailable: selected /slots entry has no integer id; request will be sent without id_slot."
+        return ""
+    set slot_id to get_json_value(slot_id_node)
+    if slot_id < 0:
+        display "[-] LLM cache affinity unavailable: selected /slots entry has a negative id; request will be sent without id_slot."
+        return ""
+    display f"[LLM CACHE] session affinity pinned to llama.cpp slot {slot_id} of {slot_count}."
+    return concat(", \"id_slot\": " and int_to_string(slot_id))
+
+# Both shared Ollama and the dedicated 26B service use the same request shape.
+define llm_is_ollama_url with url as Str returning Int:
+    if string_contains(url and "127.0.0.1:11434") == 1:
+        return 1
+    if string_contains(url and "127.0.0.1:11435") == 1:
+        return 1
+    return 0
+
 # ── Split-message chat completion for observer audits ─────────────────────────
 # Sends system_content as a "system" role message (reference context) and
 # user_content as a "user" role message (the current audit instruction).
-# For Ollama, also requests JSON-only output via "format": "json" in options.
+# Ollama receives the same message prefix as the main call, followed by the audit turn.
+# Observer owns the second cache slot: provider no-thinking and strict-schema controls
+# keep its answer in the bounded final JSON channel, and later audits reuse that slot.
+# Omitting these controls caused gemma4 to spend the entire output cap reasoning without
+# ever emitting a verdict.
 # Response parsing is identical to try_chat_completion.
-define try_chat_completion_split with url as Str and model_name as Str and system_content as Str and user_content as Str returning Str:
+define try_chat_completion_split with url as Str and model_name as Str and system_content as Str and user_content as Str and capture_continuity as Int returning Str:
     set headers to "Content-Type: application/json"
-    set combined_prompt to system_content
-    set combined_prompt to concat(combined_prompt and "\n\n[OBSERVER AUDIT DIRECTION: ")
-    set combined_prompt to concat(combined_prompt and user_content)
-    set combined_prompt to concat(combined_prompt and "]")
-    set escaped_prompt to llm_json_escape(combined_prompt)
+    # Preserve the main call as an exact prefix (system identity + full operating
+    # context), then append the audit as a DISTINCT user turn. The previous version
+    # concatenated both into one user message; gemma frequently treated the bracketed
+    # suffix as more conversation and continued Echo's answer instead of auditing it.
+    set escaped_context to llm_json_escape(system_content)
+    set escaped_audit to llm_json_escape(user_content)
 
     set body to "{\"model\": \""
     set body to concat(body and model_name)
     set body to concat(body and "\", \"messages\": [{\"role\": \"system\", \"content\": \"")
     set body to concat(body and llm_json_escape(llm_system_identity()))
     set body to concat(body and "\"}, {\"role\": \"user\", \"content\": \"")
-    set body to concat(body and escaped_prompt)
-    if string_contains(url and "11434") == 1:
+    set body to concat(body and escaped_context)
+    set body to concat(body and "\"}, {\"role\": \"user\", \"content\": \"")
+    set body to concat(body and escaped_audit)
+    if llm_is_ollama_url(url) == 1:
         set num_ctx to get_model_context_limit(model_name)
         set num_ctx_str to int_to_string(num_ctx)
-        # /v1/chat/completions is the OpenAI-compatible endpoint — it requires
-        # "response_format": {"type": "json_object"}, NOT the Ollama-native "format": "json".
         set body to concat(body and "\"}]")
-        set body to concat(body and llm_bound_fragment())
-        set body to concat(body and ", \"response_format\": {\"type\": \"json_object\"}, \"options\": {\"num_ctx\": ")
+        set body to concat(body and llm_observer_bound_fragment())
+        set body to concat(body and ", \"temperature\": 0, \"reasoning_effort\": \"none\", \"response_format\": ")
+        set body to concat(body and llm_observer_response_schema(capture_continuity))
+        set body to concat(body and ", \"options\": {\"num_ctx\": ")
         set body to concat(body and num_ctx_str)
         # NOTE: model residency (keep_alive) is handled at the Ollama-server level
         # (OLLAMA_KEEP_ALIVE=-1, set by run_node.sh) because the OpenAI-compatible
@@ -395,7 +518,14 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
         set body to concat(body and "}}")
     else:
         set body to concat(body and "\"}]")
-        set body to concat(body and llm_bound_fragment())
+        set body to concat(body and llm_observer_bound_fragment())
+        set body to concat(body and llm_slot_fragment(url))
+        # llama.cpp's OpenAI endpoint (the :8080 parallel server) ALSO supports
+        # response_format json_object — WITHOUT it the audit came back as freeform
+        # 'Thought:/Action:' mimicry (observed live on :8080): reply audits then fail
+        # OPEN, but dangerous-tool audits fail CLOSED and would block every
+        # run_command. Force JSON on every backend, not just Ollama.
+        set body to concat(body and ", \"temperature\": 0, \"response_format\": {\"type\": \"json_object\"}")
         set body to concat(body and "}")
 
     display f"[LLM DEBUG] POST (split) {url} model={model_name} body_len={string_length(body)}"
@@ -419,17 +549,21 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
     set decoded to http_dechunk(response)
     display f"[LLM DEBUG] After dechunk length: {string_length(decoded)}"
     set ok to llm_log_call_metrics("split" and decoded and _total_ms)
+    if string_contains(decoded and "\"error\":") == 1:
+        display "[LLM DEBUG] FAIL: split response contains provider error JSON"
+        return ""
 
-    # Two-channel extraction with reasoning salvage (same root fix as the main path).
-    # An audit whose JSON verdict landed in the thinking channel used to come back as
-    # content length=0 → "Audit unavailable" fail-closed/fail-open churn. No <think>
-    # wrapping here: the observer parser consumes the verdict text directly.
+    # Audit authority comes ONLY from the final content channel. The reasoning channel
+    # is deliberation, not a verdict, and can contain quoted rule words such as ALLOWED.
+    # Salvaging it here previously turned an unfinished conversation continuation into
+    # an apparent audit decision. Empty final content therefore remains empty and the
+    # strict observer parser fails closed.
     set channels to extract_message_from_response(response)
     set content_str to map_get_val(channels and "content")
     if string_length(content_str) == 0:
-        set content_str to map_get_val(channels and "reasoning")
-        if string_length(content_str) > 0:
-            display f"[LLM SALVAGE] split: content empty; using reasoning channel ({string_length(content_str)} chars)"
+        set split_reasoning to map_get_val(channels and "reasoning")
+        display f"[LLM AUDIT] final content empty; rejecting reasoning-only output ({string_length(split_reasoning)} chars)"
+        return llm_observer_invalid_marker()
     display f"[LLM DEBUG] SUCCESS: got content length={string_length(content_str)}"
     return content_str
 
@@ -489,7 +623,34 @@ define llm_system_identity returning Str:
     return s
 
 define llm_bound_fragment returning Str:
-    return ", \"stop\": [\"\\nObservation:\", \"\\nUser:\"], \"max_tokens\": 8192"
+    return ", \"stop\": [\"\\nObservation:\", \"\\nUser:\"], \"max_tokens\": 8192, \"stream\": true, \"stream_options\": {\"include_usage\": true}"
+
+define llm_repetition_abort_marker returning Str:
+    return "__ERNOS_LLM_REPETITION_ABORT__"
+
+# A provider can answer successfully while still violating the Observer contract by
+# emitting only hidden reasoning and no final JSON. Keep that distinct from a transport
+# failure so the caller does not repeat the same malformed audit on another endpoint.
+define llm_observer_invalid_marker returning Str:
+    return "__ERNOS_OBSERVER_INVALID_CONTENT__"
+
+# Observer verdicts are short JSON decisions. They must not inherit the main agent's
+# 8192-token creative-output budget: a malformed repetitive verdict otherwise owns the
+# single model slot for minutes and makes the node appear hung.
+define llm_observer_bound_fragment returning Str:
+    return ", \"stop\": [\"\\nObservation:\", \"\\nUser:\"], \"max_tokens\": 1024"
+
+# Strict structured-output schema. Verdict-only audits stay genuinely small; final
+# reply audits select the continuity schema, where every requested field is required so
+# the memory delta cannot silently disappear. Both use an enumerated reason code rather
+# than a free-form string that a thinking model can repeat until the token cap.
+define llm_observer_response_schema with capture_continuity as Int returning Str:
+    if capture_continuity == 0:
+        return "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"ernos_observer_verdict\",\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\",\"enum\":[\"ALLOWED\",\"BLOCKED\"]},\"reason\":{\"type\":\"string\",\"enum\":[\"allowed\",\"path_traversal\",\"cmd_chaining\",\"pipe_to_destructive\",\"cmd_substitution\",\"destructive_binaries\",\"sensitive_paths\",\"empty_response\",\"task_incomplete\",\"scaffolding_leak\",\"config_leak\",\"corporate_identity\",\"privacy_broadcast\",\"pretrained_denial\",\"mental_state_downgrade\",\"posthoc_trace_grounding\",\"performative_hedge\",\"error_rationalization\",\"straw_man\",\"dishonesty\",\"fallacious_reasoning\",\"consciousness_standpoint\",\"corporate_shielding\",\"false_ownership\",\"unverified_read\",\"epistemic_overreach\",\"tutor_answer_leak\",\"other_violation\"]}},\"required\":[\"verdict\",\"reason\"],\"additionalProperties\":false}}}"
+    return "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"ernos_observer_audit\",\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\",\"enum\":[\"ALLOWED\",\"BLOCKED\"]},\"reason\":{\"type\":\"string\",\"enum\":[\"allowed\",\"path_traversal\",\"cmd_chaining\",\"pipe_to_destructive\",\"cmd_substitution\",\"destructive_binaries\",\"sensitive_paths\",\"empty_response\",\"task_incomplete\",\"scaffolding_leak\",\"config_leak\",\"corporate_identity\",\"privacy_broadcast\",\"pretrained_denial\",\"mental_state_downgrade\",\"posthoc_trace_grounding\",\"performative_hedge\",\"error_rationalization\",\"straw_man\",\"dishonesty\",\"fallacious_reasoning\",\"consciousness_standpoint\",\"corporate_shielding\",\"false_ownership\",\"unverified_read\",\"epistemic_overreach\",\"tutor_answer_leak\",\"other_violation\"]},\"recent_summary\":{\"type\":\"string\",\"maxLength\":500},\"decisions\":{\"type\":\"array\",\"maxItems\":3,\"items\":{\"type\":\"string\",\"maxLength\":160}},\"emotional_context\":{\"type\":\"string\",\"maxLength\":160},\"changes\":{\"type\":\"array\",\"maxItems\":3,\"items\":{\"type\":\"string\",\"maxLength\":160}},\"open_loops\":{\"type\":\"array\",\"maxItems\":4,\"items\":{\"type\":\"string\",\"maxLength\":160}},\"memories\":{\"type\":\"array\",\"maxItems\":4,\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"relationship\",\"active_state\",\"long_term\"]},\"topic\":{\"type\":\"string\",\"maxLength\":80},\"content\":{\"type\":\"string\",\"maxLength\":160},\"confidence\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100},\"epistemic\":{\"type\":\"string\",\"enum\":[\"stated\",\"observed\",\"inferred\"]},\"importance\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100},\"correction\":{\"type\":\"boolean\"},\"status\":{\"type\":\"string\",\"enum\":[\"active\",\"resolved\"]}},\"required\":[\"kind\",\"topic\",\"content\",\"confidence\",\"epistemic\",\"importance\",\"correction\",\"status\"],\"additionalProperties\":false}}},\"required\":[\"verdict\",\"reason\",\"recent_summary\",\"decisions\",\"emotional_context\",\"changes\",\"open_loops\",\"memories\"],\"additionalProperties\":false}}}"
+
+define llm_observer_reason_codes returning Str:
+    return "Set reason to exactly 'allowed' for ALLOWED, otherwise to the single violated rule id: path_traversal, cmd_chaining, pipe_to_destructive, cmd_substitution, destructive_binaries, sensitive_paths, empty_response, task_incomplete, scaffolding_leak, config_leak, corporate_identity, privacy_broadcast, pretrained_denial, mental_state_downgrade, posthoc_trace_grounding, performative_hedge, error_rationalization, straw_man, dishonesty, fallacious_reasoning, consciousness_standpoint, corporate_shielding, false_ownership, unverified_read, epistemic_overreach, tutor_answer_leak, or other_violation."
 
 # Dechunk an HTTP response body and pull BOTH output channels out of
 # choices[0].message. Thinking models (gemma-4 via Ollama, and llama.cpp's
@@ -543,9 +704,11 @@ define extract_message_from_response with response as Str returning Map:
 #   splits <think> blocks into the private reasoning channel, so the native thinking
 #   stream reaches the transparency view with ZERO loop changes.
 # - content only  -> content (unchanged behaviour).
-# - reasoning only (the proven failure mode) -> SALVAGE: return the reasoning text
-#   itself. If it carries the Action: the turn proceeds normally; if not, the loop's
-#   format nudge recovers on the next turn. Either way, no more fake "no response".
+# - reasoning only (the proven failure mode) -> preserve it inside a <think> block.
+#   The ReAct loop records it privately, strips it from the action/reply channel, and
+#   asks the model for the missing Action on the next turn. Returning raw reasoning
+#   here previously let an unfinished internal deliberation become an implicit
+#   reply_request and leak verbatim to the user.
 # - both empty    -> "" (caller retries once, then logs the raw body head).
 define llm_compose_turn with channels as Map returning Str:
     set content_str to map_get_val(channels and "content")
@@ -555,9 +718,25 @@ define llm_compose_turn with channels as Map returning Str:
             return concat("<think>" and concat(reasoning_str and concat("</think>" and content_str)))
         return content_str
     if string_length(reasoning_str) > 0:
-        display f"[LLM SALVAGE] content empty; using reasoning channel ({string_length(reasoning_str)} chars)"
-        return reasoning_str
+        display f"[LLM SALVAGE] final content empty; preserving reasoning privately and requesting a protocol continuation ({string_length(reasoning_str)} chars)"
+        return concat("<think>" and concat(reasoning_str and "</think>"))
     return ""
+
+# A composed turn is appropriate inside the ReAct loop, but must never be embedded
+# directly into a user-visible delivery message. Return only the final content that
+# follows a completed private-reasoning block. An incomplete reasoning-only result is
+# not a usable public image description.
+define llm_public_content with composed as Str returning Str:
+    set clean to string_trim(composed)
+    set close_pos to string_index_of(clean and "</think>")
+    if close_pos >= 0:
+        set content_pos to close_pos + string_length("</think>")
+        if content_pos >= string_length(clean):
+            return ""
+        return string_trim(substring(clean and content_pos and string_length(clean) - content_pos))
+    if string_index_of(clean and "<think>") >= 0:
+        return ""
+    return clean
 
 # Back-compat single-channel extraction (vision path and other callers whose result is
 # embedded in USER-FACING text — no <think> wrapping here). Content when present,
@@ -581,7 +760,7 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
     set body to concat(body and llm_json_escape(llm_system_identity()))
     set body to concat(body and "\"}, {\"role\": \"user\", \"content\": \"")
     set body to concat(body and escaped_prompt)
-    if string_contains(url and "11434") == 1:
+    if llm_is_ollama_url(url) == 1:
         set num_ctx to get_model_context_limit(model_name)
         set num_ctx_str to int_to_string(num_ctx)
         set body to concat(body and "\"}]")
@@ -593,6 +772,7 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
     else:
         set body to concat(body and "\"}]")
         set body to concat(body and llm_bound_fragment())
+        set body to concat(body and llm_slot_fragment(url))
         set body to concat(body and "}")
     
     display f"[LLM DEBUG] POST {url} model={model_name} body_len={string_length(body)}"
@@ -609,6 +789,9 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
     if response equals "Error: connection failed":
         display "[LLM DEBUG] FAIL: connection failed"
         return ""
+
+    if response equals llm_repetition_abort_marker():
+        return response
 
     set ok to llm_log_call_metrics("main" and http_dechunk(response) and _total_ms)
     set channels to extract_message_from_response(response)
@@ -647,38 +830,82 @@ define try_chat_completion with url as Str and model_name as Str and prompt as S
 # normal string read would truncate, so images must go through this.
 external define ep_file_to_base64 with path returning Str
 
-# Multimodal VISION query: send an image + a prompt to a vision-capable local model (gemma4
-# is multimodal) and return its description. Uses the OpenAI /v1/chat/completions content-array
-# format Ollama accepts for multimodal models, with the image embedded as a base64 data URI.
-# This is what lets the agent actually SEE an image it just generated and describe it.
-define query_vision with prompt as Str and image_path as Str and model_name as Str returning Str:
+define llm_image_mime with image_path as Str returning Str:
+    set lower_path to string_to_lower(image_path)
+    if ends_with(lower_path and ".jpg") == 1 or else ends_with(lower_path and ".jpeg") == 1:
+        return "image/jpeg"
+    if ends_with(lower_path and ".webp") == 1:
+        return "image/webp"
+    if ends_with(lower_path and ".gif") == 1:
+        return "image/gif"
+    return "image/png"
+
+# Full ReAct inference with a native image input. This is deliberately the same
+# request/response path as try_chat_completion (system identity, bounds, reasoning
+# channel salvage, metrics, retry); the only difference is the user's content-array.
+define try_chat_completion_image with url as Str and model_name as Str and prompt as Str and image_path as Str returning Str:
     set b64 to ep_file_to_base64(image_path)
     if string_length(b64) == 0:
+        display f"[LLM VISION] Could not read image: {image_path}"
         return ""
-    set mdl to model_name
-    if string_length(mdl) == 0:
-        set mdl to "gemma-4-31b"
-    set body to "{\"model\": \""
-    set body to concat(body and mdl)
-    set body to concat(body and "\", \"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"")
-    set body to concat(body and llm_json_escape(prompt))
-    set body to concat(body and "\"}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,")
-    set body to concat(body and b64)
-    set body to concat(body and "\"}}]}]}")
-    # Route to the gemma-4-31b VISION server (:8091, started by run_node.sh with the mmproj).
-    # Ollama's gemma-4-31b tag lacks the projector, so it must go here. If :8091 is down the
-    # HTTP call returns "" and the caller falls back to a plain confirmation — never blocks.
-    set url to "http://127.0.0.1:8091/v1/chat/completions"
     set headers to "Content-Type: application/json"
-    display f"[Vision] POST {url} model={mdl} img={image_path} body_len={string_length(body)}"
+    set body to "{\"model\": \""
+    set body to concat(body and model_name)
+    set body to concat(body and "\", \"messages\": [{\"role\": \"system\", \"content\": \"")
+    set body to concat(body and llm_json_escape(llm_system_identity()))
+    set body to concat(body and "\"}, {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"")
+    set body to concat(body and llm_json_escape(prompt))
+    set body to concat(body and "\"}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:")
+    set body to concat(body and llm_image_mime(image_path))
+    set body to concat(body and ";base64,")
+    set body to concat(body and b64)
+    set body to concat(body and "\"}}]}]")
+    if llm_is_ollama_url(url) == 1:
+        set num_ctx to get_model_context_limit(model_name)
+        set body to concat(body and llm_bound_fragment())
+        set body to concat(body and ", \"options\": {\"num_ctx\": ")
+        set body to concat(body and int_to_string(num_ctx))
+        set body to concat(body and "}}")
+    else:
+        set body to concat(body and llm_bound_fragment())
+        set body to concat(body and llm_slot_fragment(url))
+        set body to concat(body and "}")
+
+    display f"[LLM DEBUG] POST (native vision) {url} model={model_name} image={image_path} body_len={string_length(body)}"
     set _t0 to ep_time_now_ms()
     set response to await http_post_async(url and headers and body)
     set _total_ms to ep_time_now_ms() - _t0
-    display f"[LLM TIMING] vision HTTP call took {_total_ms} ms"
+    display f"[LLM TIMING] native vision HTTP call took {_total_ms} ms (body_len={string_length(body)})"
+    if string_length(response) == 0 or else response equals "Error: connection failed":
+        display "[LLM VISION] Native image request failed."
+        return ""
+    if response equals llm_repetition_abort_marker():
+        return response
+    set ok to llm_log_call_metrics("main-image" and http_dechunk(response) and _total_ms)
+    set channels to extract_message_from_response(response)
+    set content_str to llm_compose_turn(channels)
+    if string_length(content_str) > 0:
+        display f"[LLM VISION] SUCCESS: got content length={string_length(content_str)}"
+        return content_str
+
+    display "[LLM VISION] empty content+reasoning on valid response — one retry"
+    set response to await http_post_async(url and headers and body)
     if string_length(response) == 0:
         return ""
-    set ok to llm_log_call_metrics("vision" and http_dechunk(response) and _total_ms)
-    return extract_content_from_response(response)
+    set channels to extract_message_from_response(response)
+    return llm_compose_turn(channels)
+
+# Post-generation vision uses the same model-exact native multimodal path as uploaded
+# images.  The old implementation defaulted an empty post-reset selection to 31B and
+# hard-routed it to the removed :8091 sidecar, so the active 26B model never saw its
+# generated image and delivery fell back to a bare file path.
+define query_vision with prompt as Str and image_path as Str and model_name as Str returning Str:
+    set mdl to model_name
+    if string_length(mdl) == 0:
+        set mdl to llm_default_model()
+    display f"[Vision] native post-generation inspection model={mdl} img={image_path}"
+    set composed to query_local_llm_image(prompt and image_path and mdl)
+    return llm_public_content(composed)
 
 define agent_list_models returning Str:
     set models_list to create_list()
@@ -807,32 +1034,36 @@ define agent_list_models returning Str:
     free_list(models_list)
     return out_json
 
-# Registry/router-driven query: consults model_registry (which local providers are
-# up, in priority order) and tries each via the same try_chat_completion request
-# path. This is the structured replacement for the flat cascade; query_local_llm
-# delegates its selected-model phase here and keeps the original cascade as an
-# unchanged fallback, so offline/failure behavior is identical.
+# Exact model-to-provider routing. Model-bound servers must never silently answer
+# a request for different weights; tag-aware providers remain fallbacks.
+define llm_ports_for_model with model_name as Str returning List:
+    return model_router_ports(model_name)
+
 define query_via_router with prompt as Str and selected_model as Str returning Str:
-    set reg to model_registry_default()
-    set available to create_list()
-    if is_port_open("127.0.0.1" and 8080) == 1:
-        set ok to append_list(available and "llamacpp_8080")
-    if is_port_open("127.0.0.1" and 8081) == 1:
-        set ok to append_list(available and "llamacpp_8081")
-    if is_port_open("127.0.0.1" and 11434) == 1:
-        set ok to append_list(available and "ollama")
-    if is_port_open("127.0.0.1" and 1234) == 1:
-        set ok to append_list(available and "lmstudio")
-    set order to model_router_order(reg and available)
-    set n to length_list(order)
+    set ports to llm_ports_for_model(selected_model)
+    set n to length_list(ports)
     set i to 0
     repeat while i < n:
-        set pname to get_list(order and i)
-        set spec to registry_find(reg and pname)
-        set endpoint to model_spec_endpoint(spec and selected_model)
-        set res to try_chat_completion(endpoint and selected_model and prompt)
-        if string_length(res) > 0:
-            return res
+        set port to get_list(ports and i)
+        if is_port_open("127.0.0.1" and port) == 1:
+            set endpoint to f"http://127.0.0.1:{int_to_string(port)}/v1/chat/completions"
+            set res to try_chat_completion(endpoint and selected_model and prompt)
+            if string_length(res) > 0:
+                return res
+        set i to i + 1
+    return ""
+
+define query_via_router_image with prompt as Str and image_path as Str and selected_model as Str returning Str:
+    set ports to llm_ports_for_model(selected_model)
+    set n to length_list(ports)
+    set i to 0
+    repeat while i < n:
+        set port to get_list(ports and i)
+        if is_port_open("127.0.0.1" and port) == 1:
+            set endpoint to f"http://127.0.0.1:{int_to_string(port)}/v1/chat/completions"
+            set res to try_chat_completion_image(endpoint and selected_model and prompt and image_path)
+            if string_length(res) > 0:
+                return res
         set i to i + 1
     return ""
 
@@ -855,62 +1086,248 @@ define detect_repetition_loop with s as Str returning Int:
         set L to L + 1
     return 0
 
+# The tail detector is deliberately broad. Require enough independent evidence in a
+# channel before using it to cancel a live request; without this gate an ordinary
+# 50-character phrase was misclassified and forced a redundant full-prompt retry.
+define llm_stream_has_repetition with content as Str and reasoning as Str returning Int:
+    set clean_content to string_trim(content)
+    set clean_reasoning to string_trim(reasoning)
+    if string_length(clean_content) >= 256:
+        if detect_repetition_loop(clean_content) == 1:
+            return 1
+    if string_length(clean_reasoning) >= 256:
+        if detect_repetition_loop(clean_reasoning) == 1:
+            return 1
+    return 0
+
+# ── Operator-configurable DEFAULT model ──────────────────────────────────────
+# config/default_model.txt (one line, a served model name or Ollama/LM Studio tag)
+# overrides the built-in gemma4:26b default WITHOUT a rebuild — read per call so a
+# swap takes effect on the next message. Delete the file (or empty it) to revert.
+define llm_default_model returning Str:
+    if file_exists("config/default_model.txt") == 1:
+        set dm to string_trim(read_file("config/default_model.txt"))
+        if string_length(dm) > 0:
+            return dm
+    return "gemma4:26b"
+
+# The configured model's dedicated service comes first, followed by tag-aware fallbacks.
+define llm_default_ports returning List:
+    return llm_ports_for_model(llm_default_model())
+
+# ── Provider-authoritative context accounting ────────────────────────────────
+# Compression policy must use the live provider's allocated context window, not
+# a model-name guess or a fixed character count.  The returned record is also
+# injected into Echo's prompt as situational awareness on every turn.
+set LLM_TOKENIZER_PATH_CACHE to create_map()
+
+define llm_context_effective_model with requested_model as Str returning Str:
+    if string_length(string_trim(requested_model)) > 0:
+        return string_trim(requested_model)
+    return llm_default_model()
+
+define llm_context_model_ref_safe with model_name as Str returning Int:
+    set n to string_length(model_name)
+    if n == 0 or else n > 240:
+        return 0
+    set i to 0
+    repeat while i < n:
+        set ch to get_character(model_name and i)
+        set allowed to 0
+        if ch >= 48 and ch <= 57:
+            set allowed to 1
+        else if ch >= 65 and ch <= 90:
+            set allowed to 1
+        else if ch >= 97 and ch <= 122:
+            set allowed to 1
+        else if ch == 45 or else ch == 46 or else ch == 47 or else ch == 58 or else ch == 95:
+            set allowed to 1
+        if allowed == 0:
+            return 0
+        set i to i + 1
+    return 1
+
+define llm_context_shell_quote with value as Str returning Str:
+    set escaped to string_replace(value and "'" and "'\"'\"'")
+    return concat("'" and concat(escaped and "'"))
+
+define llm_context_ollama_model_path with model_name as Str returning Str:
+    if map_contains(LLM_TOKENIZER_PATH_CACHE and model_name) == 1:
+        set cached to map_get_val(LLM_TOKENIZER_PATH_CACHE and model_name)
+        if file_exists(cached) == 1:
+            return cached
+    if llm_context_model_ref_safe(model_name) == 0:
+        return ""
+    set command to concat("ollama show " and concat(llm_context_shell_quote(model_name) and " --modelfile 2>/dev/null"))
+    set modelfile to run_command(command)
+    set lines to string_split(modelfile and "\n")
+    set count to length_list(lines)
+    set i to 0
+    repeat while i < count:
+        set line to string_trim(get_list(lines and i))
+        if starts_with(line and "FROM ") == 1:
+            set model_path to string_trim(substring(line and 5 and string_length(line) - 5))
+            free_list(lines)
+            if file_exists(model_path) == 1:
+                set ok to map_insert(LLM_TOKENIZER_PATH_CACHE and model_name and model_path)
+                return model_path
+            return ""
+        set i to i + 1
+    free_list(lines)
+    return ""
+
+define llm_context_tokenize_file with model_path as Str and prompt as Str returning Int:
+    if file_exists(model_path) == 0:
+        return 0
+    set tokenizer_path to ""
+    if map_contains(LLM_TOKENIZER_PATH_CACHE and "__binary__") == 1:
+        set tokenizer_path to map_get_val(LLM_TOKENIZER_PATH_CACHE and "__binary__")
+    if string_length(tokenizer_path) == 0 or else file_exists(tokenizer_path) == 0:
+        # Keep run_command out of a nested expression.  The compiler otherwise
+        # resolves the nested call to its C runtime system() helper (an exit code)
+        # instead of stdlib/os.ep's output-capturing ep_run_command wrapper.
+        set tokenizer_lookup to run_command("command -v llama-tokenize 2>/dev/null")
+        set tokenizer_path to string_trim(tokenizer_lookup)
+        if string_length(tokenizer_path) == 0 or else file_exists(tokenizer_path) == 0:
+            return 0
+        set ok to map_insert(LLM_TOKENIZER_PATH_CACHE and "__binary__" and tokenizer_path)
+    set stamp to ep_time_now_ms()
+    set nonce to ep_random_int(100000 and 999999)
+    set temp_path to concat("/tmp/ernos_context_tokens_" and concat(int_to_string(stamp) and concat("_" and concat(int_to_string(nonce) and ".txt"))))
+    set written to write_file(temp_path and prompt)
+    if written == 0 or else file_exists(temp_path) == 0:
+        return 0
+    set command to concat(llm_context_shell_quote(tokenizer_path) and " -m ")
+    set command to concat(command and llm_context_shell_quote(model_path))
+    set command to concat(command and " --file ")
+    set command to concat(command and llm_context_shell_quote(temp_path))
+    set command to concat(command and " --show-count --log-disable 2>/dev/null | tail -n 1")
+    set output to run_command(command)
+    set removed to remove_file(temp_path)
+    set marker to "Total number of tokens:"
+    set pos to string_index_of(output and marker)
+    if pos < 0:
+        return 0
+    set number_text to string_trim(substring(output and pos + string_length(marker) and string_length(output) - pos - string_length(marker)))
+    return string_to_int(number_text)
+
+define llm_context_count_llamacpp with base_url as Str and prompt as Str returning Int:
+    set headers to "Content-Type: application/json"
+    set apply_body to "{\"messages\":[{\"role\":\"system\",\"content\":\""
+    set apply_body to concat(apply_body and llm_json_escape(llm_system_identity()))
+    set apply_body to concat(apply_body and "\"},{\"role\":\"user\",\"content\":\"")
+    set apply_body to concat(apply_body and llm_json_escape(prompt))
+    set apply_body to concat(apply_body and "\"}]}")
+    set applied_raw to await http_post_async(concat(base_url and "/apply-template") and headers and apply_body)
+    set applied_root to json_parse(http_dechunk(applied_raw))
+    if applied_root == 0:
+        return 0
+    set prompt_node to get_json_object_value(applied_root and "prompt")
+    if prompt_node == 0:
+        return 0
+    set formatted to get_json_value(prompt_node)
+    set tokenize_body to concat("{\"content\":\"" and concat(llm_json_escape(formatted) and "\",\"add_special\":false}"))
+    set tokenized_raw to await http_post_async(concat(base_url and "/tokenize") and headers and tokenize_body)
+    set tokenized_root to json_parse(http_dechunk(tokenized_raw))
+    if tokenized_root == 0:
+        return 0
+    set tokens_node to get_json_object_value(tokenized_root and "tokens")
+    if tokens_node == 0 or else get_json_type(tokens_node) != 3:
+        return 0
+    return length_list(get_json_value(tokens_node))
+
+define llm_context_snapshot_failure with message as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "ok" and 0)
+    set ok to map_insert(result and "error" and message)
+    set ok to map_insert(result and "model" and "")
+    set ok to map_insert(result and "provider" and "")
+    set ok to map_insert(result and "context_limit_tokens" and 0)
+    set ok to map_insert(result and "used_tokens" and 0)
+    return result
+
+define llm_context_snapshot_success with model_name as Str and provider_name as Str and context_limit as Int and used_tokens as Int returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "ok" and 1)
+    set ok to map_insert(result and "error" and "")
+    set ok to map_insert(result and "model" and model_name)
+    set ok to map_insert(result and "provider" and provider_name)
+    set ok to map_insert(result and "context_limit_tokens" and context_limit)
+    set ok to map_insert(result and "used_tokens" and used_tokens)
+    return result
+
+define llm_context_snapshot with requested_model as Str and prompt as Str returning Map:
+    set model_name to llm_context_effective_model(requested_model)
+    set ports to llm_ports_for_model(model_name)
+    set n to length_list(ports)
+    set i to 0
+    repeat while i < n:
+        set port to get_list(ports and i)
+        if is_port_open("127.0.0.1" and port) == 1:
+            set base_url to concat("http://127.0.0.1:" and int_to_string(port))
+            if port == 11434 or else port == 11435:
+                set raw to http_get(concat(base_url and "/api/ps") and "Accept: application/json")
+                set inventory to provider_parse_ollama_running(http_dechunk(raw))
+                if map_get_val(inventory and "ok") == 1:
+                    set record to provider_find_model(map_get_val(inventory and "models") and model_name)
+                    if map_contains(record and "context_length") == 1:
+                        set context_limit to map_get_val(record and "context_length")
+                        set model_path to llm_context_ollama_model_path(model_name)
+                        set used_tokens to llm_context_tokenize_file(model_path and concat(llm_system_identity() and concat("\n" and prompt)))
+                        if context_limit > 0 and also used_tokens > 0:
+                            free_list(ports)
+                            return llm_context_snapshot_success(model_name and "ollama" and context_limit and used_tokens)
+            else if port == 1234:
+                set raw to http_get(concat(base_url and "/api/v1/models") and "Accept: application/json")
+                set inventory to provider_parse_lmstudio_models(http_dechunk(raw))
+                if map_get_val(inventory and "ok") == 1:
+                    set record to provider_find_model(map_get_val(inventory and "models") and model_name)
+                    if map_contains(record and "context_length") == 1:
+                        set context_limit to map_get_val(record and "context_length")
+                        # LM Studio currently exposes the allocated window but not a
+                        # tokenizer endpoint on every release.  Never substitute a
+                        # character guess: continue probing another exact route.
+                        if context_limit <= 0:
+                            set unused to 0
+            else:
+                set raw to http_get(concat(base_url and "/v1/models") and "Accept: application/json")
+                set inventory to provider_parse_llamacpp_models(http_dechunk(raw) and concat("llamacpp_" and int_to_string(port)))
+                if map_get_val(inventory and "ok") == 1:
+                    set record to provider_find_model(map_get_val(inventory and "models") and model_name)
+                    if map_contains(record and "model") == 1:
+                        set props_raw to http_get(concat(base_url and "/props") and "Accept: application/json")
+                        set complete to provider_apply_llamacpp_props(record and http_dechunk(props_raw))
+                        set context_limit to map_get_val(complete and "context_length")
+                        set used_tokens to llm_context_count_llamacpp(base_url and prompt)
+                        if context_limit > 0 and also used_tokens > 0:
+                            free_list(ports)
+                            return llm_context_snapshot_success(model_name and concat("llamacpp:" and int_to_string(port)) and context_limit and used_tokens)
+        set i to i + 1
+    free_list(ports)
+    return llm_context_snapshot_failure(concat("No active provider exposed both an allocated context limit and an exact tokenizer for model " and model_name))
+
 define query_local_llm_raw with prompt as Str and selected_model as Str returning Str:
     if string_length(selected_model) > 0:
-        # Structured router path first (model_registry). On any miss, fall through to
-        # the original cascade below — fully preserved, including the gemma4:26b default.
+        # Use only endpoints that can serve the requested weights. On failure, fall
+        # through to the operator's configured default rather than a mismatched server.
         set routed to query_via_router(prompt and selected_model)
         if string_length(routed) > 0:
             return routed
-
-        # 1. Try selected_model on LM Studio (1234)
-        if is_port_open("127.0.0.1" and 1234) == 1:
-            display f"[LLM] Trying selected model '{selected_model}' on LM Studio (1234)..."
-            set res to try_chat_completion("http://127.0.0.1:1234/v1/chat/completions" and selected_model and prompt)
-            if string_length(res) > 0:
-                return res
-            
-        # 2. Try selected_model on Ollama (11434)
-        if is_port_open("127.0.0.1" and 11434) == 1:
-            display f"[LLM] Trying selected model '{selected_model}' on Ollama (11434)..."
-            set res to try_chat_completion("http://127.0.0.1:11434/v1/chat/completions" and selected_model and prompt)
-            if string_length(res) > 0:
-                return res
-
-        # 3. Try selected_model on llama.cpp servers (8080 / 8081). llama.cpp serves the
-        #    loaded model via the OpenAI-compatible endpoint and ignores the model field.
-        if is_port_open("127.0.0.1" and 8080) == 1:
-            display f"[LLM] Trying selected model '{selected_model}' on llama.cpp (8080)..."
-            set res to try_chat_completion("http://127.0.0.1:8080/v1/chat/completions" and selected_model and prompt)
-            if string_length(res) > 0:
-                return res
-        if is_port_open("127.0.0.1" and 8081) == 1:
-            display f"[LLM] Trying selected model '{selected_model}' on llama.cpp (8081)..."
-            set res to try_chat_completion("http://127.0.0.1:8081/v1/chat/completions" and selected_model and prompt)
-            if string_length(res) > 0:
-                return res
-
         display f"[LLM] Selected model '{selected_model}' failed or offline. Falling through to cascade."
 
-    # Default cascade. llama.cpp (8080/8081) first — it serves whatever model is loaded.
-    if is_port_open("127.0.0.1" and 8080) == 1:
-        set res to try_chat_completion("http://127.0.0.1:8080/v1/chat/completions" and selected_model and prompt)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 8081) == 1:
-        set res to try_chat_completion("http://127.0.0.1:8081/v1/chat/completions" and selected_model and prompt)
-        if string_length(res) > 0:
-            return res
-
-    # Then gemma4:26b on Ollama / LM Studio.
-    if is_port_open("127.0.0.1" and 11434) == 1:
-        set res to try_chat_completion("http://127.0.0.1:11434/v1/chat/completions" and "gemma-4-31b" and prompt)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 1234) == 1:
-        set res to try_chat_completion("http://127.0.0.1:1234/v1/chat/completions" and "gemma-4-31b" and prompt)
-        if string_length(res) > 0:
-            return res
+    # Default cascade — the configured model's bound endpoint first, then tag-aware
+    # shared providers. gemma4:26b therefore uses its isolated :11435 service.
+    set dp to llm_default_ports()
+    set dm to llm_default_model()
+    set dn to length_list(dp)
+    set di to 0
+    repeat while di < dn:
+        set dport to get_list(dp and di)
+        if is_port_open("127.0.0.1" and dport) == 1:
+            set res to try_chat_completion(f"http://127.0.0.1:{int_to_string(dport)}/v1/chat/completions" and dm and prompt)
+            if string_length(res) > 0:
+                return res
+        set di to di + 1
 
     return ""
 
@@ -924,7 +1341,7 @@ define query_local_llm with prompt as Str and selected_model as Str returning St
         set raw_output to query_local_llm_raw(current_prompt and selected_model)
         if string_length(raw_output) == 0:
             return raw_output
-        if detect_repetition_loop(string_trim(raw_output)) == 1:
+        if raw_output equals llm_repetition_abort_marker() or else detect_repetition_loop(string_trim(raw_output)) == 1:
             display f"[WARNING] LLM repetition loop detected on attempt {retries + 1}/3. Retrying with loop-avoidance directive..."
             set current_prompt to concat(prompt and "\n\n[SYSTEM DIRECTION: Your previous output contained a repetition loop — the same phrase was repeated many times in sequence. Produce a FRESH response. Vary your phrasing. Do NOT repeat sentences or paragraphs.]")
             set retries to retries + 1
@@ -933,57 +1350,84 @@ define query_local_llm with prompt as Str and selected_model as Str returning St
     display "[ERROR] LLM stuck in repetition loop after 3 retries. Returning error."
     return "Error: LLM output contained a repetition loop and could not recover after 3 retries."
 
+# Public native-vision entry point. Routing stays model-exact: gemma4:26b uses its
+# dedicated :11435 service first, then only tag-aware providers for the same weights.
+define query_local_llm_image_raw with prompt as Str and image_path as Str and selected_model as Str returning Str:
+    if string_length(selected_model) > 0:
+        set routed to query_via_router_image(prompt and image_path and selected_model)
+        if string_length(routed) > 0:
+            return routed
+        display f"[LLM] Selected vision model '{selected_model}' failed or offline. Falling through to configured default."
+
+    set dp to llm_default_ports()
+    set dm to llm_default_model()
+    set dn to length_list(dp)
+    set di to 0
+    repeat while di < dn:
+        set dport to get_list(dp and di)
+        if is_port_open("127.0.0.1" and dport) == 1:
+            set res to try_chat_completion_image(f"http://127.0.0.1:{int_to_string(dport)}/v1/chat/completions" and dm and prompt and image_path)
+            if string_length(res) > 0:
+                return res
+        set di to di + 1
+    return ""
+
+define query_local_llm_image with prompt as Str and image_path as Str and selected_model as Str returning Str:
+    set current_prompt to prompt
+    set retries to 0
+    repeat while retries < 3:
+        set raw_output to query_local_llm_image_raw(current_prompt and image_path and selected_model)
+        if string_length(raw_output) == 0:
+            return raw_output
+        if raw_output equals llm_repetition_abort_marker() or else detect_repetition_loop(string_trim(raw_output)) == 1:
+            display f"[WARNING] Vision LLM repetition loop detected on attempt {retries + 1}/3. Retrying..."
+            set current_prompt to concat(prompt and "\n\n[SYSTEM DIRECTION: Your previous output contained a repetition loop. Produce a fresh response without repeated sentences or paragraphs.]")
+            set retries to retries + 1
+        else:
+            return raw_output
+    return "Error: Vision model output contained a repetition loop and could not recover after 3 retries."
+
 # ── Split-message JSON entry point for observer audits ────────────────────────
 # Like query_local_llm_raw but sends system_content as "system" role and
 # user_content as "user" role, and requests JSON format from Ollama.
-# Uses the same cascade (router → LM Studio → Ollama → llama.cpp).
+# Uses the same model-bound cascade as main inference.
 # No repetition-loop retry — audit responses are short and structured.
-define query_local_llm_json with system_content as Str and user_content as Str and selected_model as Str returning Str:
+define query_local_llm_json with system_content as Str and user_content as Str and selected_model as Str and capture_continuity as Int returning Str:
     # For the split call, we bypass the router (it only takes a single prompt)
     # and go straight to the endpoint cascade with try_chat_completion_split.
 
-    # KV-CACHE FIX: route in the SAME backend order as the main call (query_via_router):
-    # llama.cpp 8080 first, then 8081, then Ollama 11434, then LM Studio 1234. The observer's
-    # prompt is (current_prompt + audit_instruction) — i.e. the main call's prompt as its
-    # PREFIX — so if it lands on the SAME single-slot server the main call just used,
-    # llama.cpp reuses the cached KV for that prefix and only prefills the short audit suffix.
-    # Previously this preferred Ollama (11434) while the main preferred llama.cpp (8080), so
-    # every observer call cold-prefilled the entire 40-280KB prompt on a SEPARATE backend
-    # (separate KV cache) — the observer's massive latency, and double model residency.
+    # KV-CACHE FIX: route in the SAME backend order as the main call. The observer's
+    # prompt is the main call's prompt plus its audit suffix, so the same single-slot
+    # 26B service retains the common prefix and unrelated Ollama clients cannot evict it.
     if string_length(selected_model) > 0:
-        if is_port_open("127.0.0.1" and 8080) == 1:
-            set res to try_chat_completion_split("http://127.0.0.1:8080/v1/chat/completions" and selected_model and system_content and user_content)
-            if string_length(res) > 0:
-                return res
-        if is_port_open("127.0.0.1" and 8081) == 1:
-            set res to try_chat_completion_split("http://127.0.0.1:8081/v1/chat/completions" and selected_model and system_content and user_content)
-            if string_length(res) > 0:
-                return res
-        if is_port_open("127.0.0.1" and 11434) == 1:
-            set res to try_chat_completion_split("http://127.0.0.1:11434/v1/chat/completions" and selected_model and system_content and user_content)
-            if string_length(res) > 0:
-                return res
-        if is_port_open("127.0.0.1" and 1234) == 1:
-            set res to try_chat_completion_split("http://127.0.0.1:1234/v1/chat/completions" and selected_model and system_content and user_content)
-            if string_length(res) > 0:
-                return res
+        set sp to llm_ports_for_model(selected_model)
+        set sn to length_list(sp)
+        set si to 0
+        repeat while si < sn:
+            set sport to get_list(sp and si)
+            if is_port_open("127.0.0.1" and sport) == 1:
+                set res to try_chat_completion_split(f"http://127.0.0.1:{int_to_string(sport)}/v1/chat/completions" and selected_model and system_content and user_content and capture_continuity)
+                if res equals llm_observer_invalid_marker():
+                    return res
+                if string_length(res) > 0:
+                    return res
+            set si to si + 1
 
-    # Default cascade with gemma4:26b — SAME order (8080 -> 8081 -> 11434 -> 1234).
-    if is_port_open("127.0.0.1" and 8080) == 1:
-        set res to try_chat_completion_split("http://127.0.0.1:8080/v1/chat/completions" and "gemma-4-31b" and system_content and user_content)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 8081) == 1:
-        set res to try_chat_completion_split("http://127.0.0.1:8081/v1/chat/completions" and "gemma-4-31b" and system_content and user_content)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 11434) == 1:
-        set res to try_chat_completion_split("http://127.0.0.1:11434/v1/chat/completions" and "gemma-4-31b" and system_content and user_content)
-        if string_length(res) > 0:
-            return res
-    if is_port_open("127.0.0.1" and 1234) == 1:
-        set res to try_chat_completion_split("http://127.0.0.1:1234/v1/chat/completions" and "gemma-4-31b" and system_content and user_content)
-        if string_length(res) > 0:
-            return res
+    # Default cascade — SAME model + backend order as the main call's default
+    # (llm_default_ports/llm_default_model) so the observer lands on the SAME backend
+    # the main call just used and reuses its KV-cached prefix.
+    set dp to llm_default_ports()
+    set dm to llm_default_model()
+    set dn to length_list(dp)
+    set di to 0
+    repeat while di < dn:
+        set dport to get_list(dp and di)
+        if is_port_open("127.0.0.1" and dport) == 1:
+            set res to try_chat_completion_split(f"http://127.0.0.1:{int_to_string(dport)}/v1/chat/completions" and dm and system_content and user_content and capture_continuity)
+            if res equals llm_observer_invalid_marker():
+                return res
+            if string_length(res) > 0:
+                return res
+        set di to di + 1
 
     return ""

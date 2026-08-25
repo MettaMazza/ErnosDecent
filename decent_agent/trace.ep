@@ -9,6 +9,7 @@ import "string"
 import "collections"
 import "sql"
 import "datetime"
+import "os"
 
 define trace_sql_escape with s as Str returning Str:
     return string_replace(s and "'" and "''")
@@ -57,7 +58,33 @@ define trace_init with db as Int returning Int:
     if ok != 0:
         return 1
     # Whisper mid-turn user guidance — bridge INSERTs, react loop SELECTs + DELETEs
-    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS trace_whispers (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0);")
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS trace_whispers (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, target_turn_id TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0);")
+    if ok != 0:
+        return 1
+    # Migration for databases created before whispers were bound to a concrete turn.
+    set turn_col_rows to sql_query(db and "SELECT COUNT(*) FROM pragma_table_info('trace_whispers') WHERE name='target_turn_id';")
+    if length_list(turn_col_rows) == 0:
+        return 1
+    set turn_col_row to get_list(turn_col_rows and 0)
+    if string_to_int(get_list(turn_col_row and 0)) == 0:
+        set ok to sql_execute(db and "ALTER TABLE trace_whispers ADD COLUMN target_turn_id TEXT NOT NULL DEFAULT '';")
+        if ok != 0:
+            return 1
+    set ok to sql_execute(db and "CREATE INDEX IF NOT EXISTS idx_trace_whispers_target ON trace_whispers(session_id, target_turn_id, id);")
+    if ok != 0:
+        return 1
+    # Sub-agent approval forwarding — sub-agent INSERTs pending, polls for decision;
+    # IPC AI APPROVE handler UPDATEs the decision column. Session_id is the sub-agent's
+    # task_id (e.g. "agent_1"). Cleaned up after the sub-agent resumes.
+    # MIGRATION: an EARLIER version created this table with only (session_id, decision,
+    # created_at). CREATE TABLE IF NOT EXISTS cannot add the tool_name/args_str/summary
+    # columns to that stale table, so on those DBs every sub-agent approval INSERT failed
+    # SILENTLY (sql_execute swallows the error) — the sub-agent then polled a row that
+    # never existed and HUNG for an hour while the operator's approve click updated 0
+    # rows (Maria's agent_7 workspace_link hang). This table holds only in-flight
+    # requests (none survive a restart), so DROP + recreate at boot is a safe migration.
+    set ok to sql_execute(db and "DROP TABLE IF EXISTS trace_approvals;")
+    set ok to sql_execute(db and "CREATE TABLE trace_approvals (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, tool_name TEXT NOT NULL, args_str TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', decision TEXT DEFAULT NULL, created_at INTEGER NOT NULL DEFAULT 0);")
     return 0
 
 # ================================================================
@@ -79,7 +106,37 @@ define trace_emit with db as Int and session_id as Str and event_type as Str and
     set q to concat("INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('" and es)
     set q to concat(q and concat("', '" and concat(et and concat("', '" and concat(ec and concat("', " and concat(int_to_string(now) and ", 0);")))))))
     set ok to sql_execute(db and q)
-    return 0
+    # Never report success when SQLite rejected the row. final_reply is a delivery
+    # boundary, not best-effort telemetry; callers must be able to retry/fail closed.
+    return ok
+
+# Terminal replies receive stronger semantics than ordinary transparency events:
+# wait/retry transient contention and verify that the exact row exists before the
+# agent turn is released. The storage connection's busy_timeout supplies the bounded
+# lock wait for each attempt.
+define trace_emit_terminal with db as Int and session_id as Str and content as Str returning Int:
+    if db == 0:
+        return 1
+    set es to trace_sql_escape(session_id)
+    set ec to trace_sql_escape(content)
+    set verify_q to concat("SELECT id FROM trace_events WHERE session_id='" and es)
+    set verify_q to concat(verify_q and concat("' AND event_type='final_reply' AND content='" and concat(ec and "' ORDER BY id DESC LIMIT 1;")))
+    set attempt to 0
+    repeat while attempt < 4:
+        # Idempotence: a prior attempt may have committed even if its result could not
+        # be observed. Never append a duplicate terminal event on retry.
+        set existing to sql_query(db and verify_q)
+        if length_list(existing) > 0:
+            return 0
+        set rc to trace_emit(db and session_id and "final_reply" and content)
+        if rc == 0:
+            set committed to sql_query(db and verify_q)
+            if length_list(committed) > 0:
+                return 0
+        set attempt to attempt + 1
+        if attempt < 4:
+            set waited to ep_sleep_ms(50)
+    return 1
 
 # ================================================================
 # Poll — called by bridge via TRACE POLL IPC verb

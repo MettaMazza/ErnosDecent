@@ -18,6 +18,7 @@ import "../storage"
 # Two modes: single-file (model_path set; SD1.5/SDXL — CLIP+VAE built in) OR Flux
 # (diffusion_model + clip_l + t5xxl + vae set; model_path ""). Empty "" means unused.
 external define sd_ep_generate with model_path and diffusion_model and clip_l and t5xxl and vae and prompt and negative and width and height and steps and cfg and seed and out_png_path returning Int
+external define sd_ep_preload with model_path and diffusion_model and clip_l and t5xxl and vae returning Int
 
 # Read a string field from config/image.json (empty if absent).
 define image_gen_config_str with key as Str returning Str:
@@ -57,21 +58,60 @@ external define ep_time_now_ms returning Int
 # cross the thread boundary). The agent-side tool polls the row with an async-yielding
 # sleep, so the event loop keeps serving everything while the GPU works.
 
+set IMAGE_GEN_JOBS_RECOVERED to create_map()
+
+# Factory reset invalidates the process-local recovery sentinel together with the
+# durable image_jobs table. The next job therefore performs normal recovery setup
+# against the fresh table and receives the reset AUTOINCREMENT sequence.
+define image_gen_factory_reset returning Int:
+    set IMAGE_GEN_JOBS_RECOVERED to create_map()
+    return 0
+
 define image_gen_jobs_ensure with db as Int returning Int:
     if db == 0:
         return 1
-    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS image_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL DEFAULT 'running', result TEXT NOT NULL DEFAULT '');")
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS image_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL DEFAULT 'running', result TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '');")
+    # Migrate nodes whose table predates session-scoped single-flight protection.
+    set columns to sql_query(db and "PRAGMA table_info(image_jobs);")
+    set has_session to 0
+    set ci to 0
+    repeat while ci < length_list(columns):
+        set column to get_list(columns and ci)
+        if length_list(column) > 1:
+            if get_list(column and 1) equals "session_id":
+                set has_session to 1
+        set ci to ci + 1
+    if has_session == 0:
+        set ok to sql_execute(db and "ALTER TABLE image_jobs ADD COLUMN session_id TEXT NOT NULL DEFAULT '';")
+    # A process restart kills every render worker. Recover stale rows once before
+    # enforcing the unique running-job constraint.
+    if map_contains(IMAGE_GEN_JOBS_RECOVERED and "done") == 0:
+        set ok to sql_execute(db and "UPDATE image_jobs SET status='done', result='ERROR: image render interrupted by node restart' WHERE status='running';")
+        set ok to map_insert(IMAGE_GEN_JOBS_RECOVERED and "done" and 1)
+    set ok to sql_execute(db and "CREATE UNIQUE INDEX IF NOT EXISTS image_jobs_one_running_per_session ON image_jobs(session_id) WHERE status='running';")
     return 0
 
-# Create a job row; returns its id (0 when no DB — caller falls back to synchronous).
-define image_gen_job_create with db as Int returning Int:
+# Positive = a newly claimed job; negative = the session's existing active job;
+# zero = no DB (caller uses the synchronous fallback). INSERT OR IGNORE plus the
+# partial unique index makes the claim atomic across concurrent turns.
+define image_gen_job_create with db as Int and session_id as Str returning Int:
     if db == 0:
         return 0
     set ok to image_gen_jobs_ensure(db)
-    set ok to sql_execute(db and "INSERT INTO image_jobs (status, result) VALUES ('running', '');")
-    set rows to sql_query(db and "SELECT id FROM image_jobs ORDER BY id DESC LIMIT 1;")
+    set sid to session_id
+    if string_length(sid) == 0:
+        set sid to "__local__"
+    set esid to string_replace(sid and "'" and "''")
+    # RETURNING makes ownership detection one SQLite operation. A separate
+    # INSERT/SELECT changes() pair is unsafe on the shared connection because another
+    # thread could update the connection's changes counter between those calls.
+    set inserted_rows to sql_query(db and f"INSERT OR IGNORE INTO image_jobs (status, result, session_id) VALUES ('running', '', '{esid}') RETURNING id;")
+    if length_list(inserted_rows) > 0:
+        return string_to_int(get_list(get_list(inserted_rows and 0) and 0))
+    set rows to sql_query(db and f"SELECT id FROM image_jobs WHERE session_id='{esid}' AND status='running' ORDER BY id DESC LIMIT 1;")
     if length_list(rows) > 0:
-        return string_to_int(get_list(get_list(rows and 0) and 0))
+        set job_id to string_to_int(get_list(get_list(rows and 0) and 0))
+        return 0 - job_id
     return 0
 
 # The job's result when done ("<png path>" or "ERROR: ..."), else "pending:running".
@@ -104,6 +144,42 @@ define image_gen_preflight with label as Str and path as Str returning Str:
     if file_exists(path) == 1:
         return ""
     return concat("ERROR: " and concat(label and concat(" file not found: " and concat(path and " — is the external drive mounted?"))))
+
+# Preload the configured image pipeline into this node's linked Metal runtime. This
+# performs no diffusion and creates no file; it only fills the same process-local ctx
+# cache image_gen_run uses. Called on a background OS thread during node startup.
+define image_gen_preload returning Int:
+    set diffusion to image_gen_config_str("diffusion_model")
+    if string_length(diffusion) > 0:
+        set clip_l to image_gen_config_str("clip_l")
+        set t5xxl to image_gen_config_str("t5xxl")
+        set vae to image_gen_config_str("vae")
+        if string_length(image_gen_preflight("flux diffusion model" and diffusion)) > 0:
+            return 3
+        if string_length(image_gen_preflight("flux clip_l" and clip_l)) > 0:
+            return 3
+        if string_length(image_gen_preflight("flux t5xxl" and t5xxl)) > 0:
+            return 3
+        if string_length(image_gen_preflight("flux vae" and vae)) > 0:
+            return 3
+        display "[ImageGen] startup prewarm loading Flux context in background."
+        set _t0 to ep_time_now_ms()
+        set rc to sd_ep_preload("" and diffusion and clip_l and t5xxl and vae)
+        set _ms to ep_time_now_ms() - _t0
+        display f"[ImageGen] startup prewarm rc={rc} in {_ms} ms."
+        return rc
+    set model to image_gen_default_model()
+    if string_length(image_gen_preflight("image model" and model)) > 0:
+        return 3
+    display "[ImageGen] startup prewarm loading single-file context in background."
+    set _t0 to ep_time_now_ms()
+    set rc to sd_ep_preload(model and "" and "" and "" and "")
+    set _ms to ep_time_now_ms() - _t0
+    display f"[ImageGen] startup prewarm rc={rc} in {_ms} ms."
+    return rc
+
+define image_gen_preload_worker returning Int:
+    return image_gen_preload()
 
 # Map a shim return code to its meaning (codes defined in vendor/sd/sd_ep_shim.cpp).
 define image_gen_rc_reason with rc as Int returning Str:

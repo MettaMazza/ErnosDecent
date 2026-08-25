@@ -29,6 +29,7 @@ import "./scheduler_tool"
 import "./compiler_tool"
 import "./web_search"
 import "./session"
+import "./rights"
 import "./memory"
 import "./learning"
 import "./llm"
@@ -52,6 +53,7 @@ external define ep_cancel_set with v returning Int
 external define ep_time_now_ms returning Int
 # SAFETY: cancel EPOCH (monotonic latch; compared, never consumed) — see react_loop.ep.
 external define ep_cancel_epoch_get with dummy returning Int
+external define ep_run_command_bounded with cmd as Str and timeout_ms as Int and start_epoch as Int returning Str
 
 # Single-flight guard for the background validation coordinator — one run at a time.
 set TEST_ALL_RUNNING to create_map()
@@ -78,7 +80,7 @@ async define image_gen_finish with ctx as Map and db as Int and sess as Str and 
     if string_length(desc) > 0:
         set ok to trace_emit(db and sess and "mid_message" and concat("🎨 Here's the image you asked for. Looking at it: " and desc))
     else:
-        set ok to trace_emit(db and sess and "mid_message" and concat("🎨 Here's the image you asked for: " and path))
+        set ok to trace_emit(db and sess and "mid_message" and "🎨 Your image is ready and attached, but its visual inspection did not complete. I have not guessed at its contents.")
     return 0
 
 # Poll the render job row; sleep+re-enqueue while pending, hand off when done.
@@ -141,76 +143,96 @@ define tools_validation_parse_blocks with mp as Str returning List:
         set si to si + 1
     return blocks
 
-# Advance through skips/halt WITHOUT awaiting; spawn the next runnable block's
-# sub-agent and return its completion FUTURE (0 = nothing left to run → finalize).
-define tools_validation_next with state as Map returning Int:
+# BOUNDED-PARALLEL: spawn runnable blocks (recording skips inline) until `cap` are in
+# flight or none remain. Blocks run CONCURRENTLY as sub-agent async tasks on the
+# parallel model server (:8080, -np 4); cap<slots leaves headroom for the operator's
+# foreground chat so it is not starved. NO await here — safe plain loop.
+define tools_validation_fill with state as Map returning Int:
+    # YIELD TO FOREGROUND (single shared GPU): do NOT start new sub-agent inference while
+    # the operator has an active turn. active_turns holds ONLY foreground INFER turns
+    # (sub-agents are orchestrator tasks, never added), so a non-empty map = the user is
+    # mid-turn → hold off spawning. In-flight sub-agents finish; the reap below still
+    # runs; new blocks start once the foreground turn clears. Foreground stays at near-
+    # solo speed; validation progresses in the gaps.
+    set fg_at to map_get_val(state and "active_turns")
+    if fg_at != 0:
+        set validation_sid to map_get_val(state and "sid")
+        if map_contains(fg_at and validation_sid) == 1:
+            return 0
     set blocks to map_get_val(state and "blocks")
     set n to length_list(blocks)
+    set inflight to map_get_val(state and "inflight")
+    set cap to map_get_val(state and "cap")
     set going to 1
     repeat while going == 1:
-        set idx to map_get_val(state and "idx")
+        set idx to map_get_val(state and "next_idx")
         if idx >= n:
-            return 0
-        if ep_cancel_epoch_get(0) > map_get_val(state and "epoch"):
-            set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and "\n**HALTED by user Stop — remaining blocks not run.**\n"))
-            return 0
-        set bmap to get_list(blocks and idx)
-        set bn to map_get_val(bmap and "bn")
-        set title to map_get_val(bmap and "title")
-        set skip_reason to ""
-        if bn == 8 or else bn == 9:
-            if map_get_val(state and "aa_on") == 0:
-                set skip_reason to "approval-gated — enable session auto-approve (/autoapprove on) to include it"
-        if bn == 11:
-            if map_get_val(state and "platform") equals "discord":
-                set skip_reason to skip_reason
-            else:
-                set skip_reason to "Discord-surface block — this run did not originate on Discord"
-        if bn == 14:
-            # Session tools are PARENT-scoped: orchestrator clones deliberately drop
-            # the session manager (sharing it raced the main agent), so session_rename
-            # can never work inside a sub-agent (live finding: the first validation run
-            # scored block 14 FAIL on 'session manager unavailable'). Main-chat only.
-            set skip_reason to "session tools are parent-scoped — run block 14 manually in the main chat"
-        if string_length(skip_reason) > 0:
-            set ok to map_insert(state and "skip_blocks" and map_get_val(state and "skip_blocks") + 1)
-            set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n⏭️ SKIPPED: {skip_reason}\n\n"))
-            set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) skipped — {skip_reason}")
-            set ok to map_insert(state and "idx" and idx + 1)
+            set going to 0
+        else if length_list(inflight) >= cap:
+            set going to 0
         else:
-            set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: running block {bn} — {title}")
-            set instr to concat("[AUTOMATED VALIDATION SUB-AGENT] You are executing ONE block of the full-system validation. Execute it exactly, no questions, and END with reply_request containing the scorecard table.\n\n" and map_get_val(bmap and "block"))
-            set tid to orchestrator_spawn(map_get_val(state and "orch") and instr and f"validator-block-{bn}" and map_get_val(state and "model") and map_get_val(state and "memory") and map_get_val(state and "tools") and map_get_val(state and "ctx_int"))
-            set ok to map_insert(state and "tid" and tid)
-            set fut to orchestrator_task_future(map_get_val(state and "orch") and tid)
-            if fut == 0:
-                set ok to map_insert(state and "fail_blocks" and map_get_val(state and "fail_blocks") + 1)
-                set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n(sub-agent dispatch failed — no completion future)\n\n"))
-                set ok to map_insert(state and "idx" and idx + 1)
+            set bmap to get_list(blocks and idx)
+            set bn to map_get_val(bmap and "bn")
+            set title to map_get_val(bmap and "title")
+            set skip_reason to ""
+            if bn == 8 or else bn == 9:
+                if map_get_val(state and "aa_on") == 0:
+                    set skip_reason to "approval-gated — enable session auto-approve (/autoapprove on) to include it"
+            if bn == 11:
+                if map_get_val(state and "platform") equals "discord":
+                    set skip_reason to skip_reason
+                else:
+                    set skip_reason to "Discord-surface block — this run did not originate on Discord"
+            if bn == 14:
+                # Session tools are PARENT-scoped: orchestrator clones drop the session
+                # manager, so session_rename can never work in a sub-agent (live finding).
+                set skip_reason to "session tools are parent-scoped — run block 14 manually in the main chat"
+            if string_length(skip_reason) > 0:
+                set ok to map_insert(state and "skip_blocks" and map_get_val(state and "skip_blocks") + 1)
+                set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n⏭️ SKIPPED: {skip_reason}\n\n"))
+                set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) skipped — {skip_reason}")
             else:
-                # Signal the chain to await this block (the async caller re-fetches the
-                # future via orchestrator_task_future — awaits must be CALL expressions).
-                return 1
+                set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) started (parallel)")
+                set instr to concat("[AUTOMATED VALIDATION SUB-AGENT] You are executing ONE block of the full-system validation. Execute it exactly, no questions, and END with reply_request containing the scorecard table.\n\n" and map_get_val(bmap and "block"))
+                set tid to orchestrator_spawn(map_get_val(state and "orch") and instr and f"validator-block-{bn}" and map_get_val(state and "model") and map_get_val(state and "memory") and map_get_val(state and "tools") and map_get_val(state and "ctx_int"))
+                set entry to create_map()
+                set ok to map_insert(entry and "tid" and tid)
+                set ok to map_insert(entry and "bn" and bn)
+                set ok to map_insert(entry and "title" and title)
+                set ok to append_list(inflight and entry)
+            set ok to map_insert(state and "next_idx" and idx + 1)
     return 0
 
-# Record the just-finished block's result (runs right after the chain's await).
-define tools_validation_record with state as Map returning Int:
-    set blocks to map_get_val(state and "blocks")
-    set idx to map_get_val(state and "idx")
-    set bmap to get_list(blocks and idx)
-    set bn to map_get_val(bmap and "bn")
-    set title to map_get_val(bmap and "title")
-    set st to orchestrator_check(map_get_val(state and "orch") and map_get_val(state and "tid"))
-    set result to st
-    if string_index_of(st and "completed:") == 0:
-        set result to substring(st and 10 and string_length(st) - 10)
-    if string_contains(result and "PENDING_APPROVAL") == 1 or else string_contains(string_upper(result) and "FAIL") == 1 or else string_contains(result and "❌") == 1:
-        set ok to map_insert(state and "fail_blocks" and map_get_val(state and "fail_blocks") + 1)
-    else:
-        set ok to map_insert(state and "pass_blocks" and map_get_val(state and "pass_blocks") + 1)
-    set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n{result}\n\n"))
-    set ok to map_insert(state and "idx" and idx + 1)
-    return 0
+# Check in-flight sub-agents; record + remove any that finished. Returns count still
+# running. NO await — safe plain loop.
+define tools_validation_reap with state as Map returning Int:
+    set inflight to map_get_val(state and "inflight")
+    set orch to map_get_val(state and "orch")
+    set still to create_list()
+    set n to length_list(inflight)
+    set i to 0
+    repeat while i < n:
+        set entry to get_list(inflight and i)
+        set tid to map_get_val(entry and "tid")
+        set bn to map_get_val(entry and "bn")
+        set title to map_get_val(entry and "title")
+        set st to orchestrator_check(orch and tid)
+        if string_index_of(st and "completed:") == 0:
+            set result to substring(st and 10 and string_length(st) - 10)
+            if string_contains(result and "PENDING_APPROVAL") == 1 or else string_contains(string_upper(result) and "FAIL") == 1 or else string_contains(result and "❌") == 1:
+                set ok to map_insert(state and "fail_blocks" and map_get_val(state and "fail_blocks") + 1)
+            else:
+                set ok to map_insert(state and "pass_blocks" and map_get_val(state and "pass_blocks") + 1)
+            set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n{result}\n\n"))
+            set ok to trace_emit(map_get_val(state and "db") and map_get_val(state and "sid") and "mid_message" and f"🧪 test_all_systems: block {bn} ({title}) done")
+        else if st equals "cancelled" or else st equals "not_found":
+            set ok to map_insert(state and "fail_blocks" and map_get_val(state and "fail_blocks") + 1)
+            set ok to map_insert(state and "report" and concat(map_get_val(state and "report") and f"## Block {bn} — {title}\n(sub-agent {st})\n\n"))
+        else:
+            set ok to append_list(still and entry)
+        set i to i + 1
+    set ok to map_insert(state and "inflight" and still)
+    return length_list(still)
 
 # Finish: totals, write + attach the report, announce, release the single-flight guard.
 define tools_validation_finalize with state as Map returning Int:
@@ -237,15 +259,34 @@ define tools_validation_finalize with state as Map returning Int:
 # EMISSION CONSTRAINTS (both bit during bring-up): locals in an async define must not
 # be named `state`/`fut` (they collide with the generated state-machine struct
 # members), and the awaited expression must be a CALL (a plain variable skips the
-# EpFuture* cast) — hence awaiting the future GETTER rather than a stored value.
-async define tools_validation_block with vstate as Map returning Int:
-    set has_block to tools_validation_next(vstate)
-    if has_block == 0:
-        set vok to tools_validation_finalize(vstate)
+# EpFuture* cast).
+# Tiny warm-up, then hand to the tick. The fan-out's yield-to-foreground (in
+# tools_validation_fill) is what actually keeps sub-agents from competing with the
+# user's turns — including the parent turn that launched this — so no explicit parent
+# gate is needed here.
+async define tools_validation_start with vstate as Map returning Int:
+    set ok to await ep_async_sleep_ms(2000)
+    set nxt to tools_validation_tick(vstate)
+    return 0
+
+# BOUNDED-PARALLEL tick: keep `cap` sub-agent blocks running CONCURRENTLY (fill), reap
+# completed ones, and finalize when all are done. Exactly ONE await (the poll sleep) +
+# self re-enqueue = the compiler-safe chain shape. This replaces the old sequential
+# one-block-at-a-time chain — the fix for "sub-agents not running parallel".
+async define tools_validation_tick with vstate as Map returning Int:
+    if ep_cancel_epoch_get(0) > map_get_val(vstate and "epoch"):
+        set ok to map_insert(vstate and "report" and concat(map_get_val(vstate and "report") and "\n**HALTED by user Stop — remaining blocks not run.**\n"))
+        set fk to tools_validation_finalize(vstate)
         return 0
-    set vres to await orchestrator_task_future(map_get_val(vstate and "orch") and map_get_val(vstate and "tid"))
-    set vok to tools_validation_record(vstate)
-    set vnxt to tools_validation_block(vstate)
+    set fok to tools_validation_fill(vstate)
+    set remaining to tools_validation_reap(vstate)
+    set nxt_idx to map_get_val(vstate and "next_idx")
+    set nblk to length_list(map_get_val(vstate and "blocks"))
+    if remaining == 0 and also nxt_idx >= nblk:
+        set fk to tools_validation_finalize(vstate)
+        return 0
+    set ok to await ep_async_sleep_ms(1500)
+    set again to tools_validation_tick(vstate)
     return 0
 
 define append_string_to_char_list with char_list as List and s as Str returning Int:
@@ -264,6 +305,59 @@ define tools_safe_int with val as Int returning Int:
     # Otherwise, it is a string pointer. Cast to Str and convert.
     set sval to ptr_to_str(val)
     return string_to_int(sval)
+
+define tools_rights_path_class with path as Str returning Str:
+    set p to string_lower(path)
+    if p equals "node.ep" or else p equals "storage.ep" or else p equals "run_node.sh" or else p equals "build.sh" or else p equals "upgrade.sh":
+        return "core"
+    if string_index_of(p and "decent_agent/") == 0 or else string_index_of(p and "config/prompts") == 0 or else string_index_of(p and "config/persona") == 0 or else string_index_of(p and "config/agent_persona") == 0 or else string_index_of(p and "config/default_model") == 0 or else string_index_of(p and "config/rights") == 0:
+        return "core"
+    return "environment"
+
+define tools_command_bypasses_protected_mutation with command as Str returning Int:
+    set c to string_lower(string_trim(command))
+    if string_index_of(c and "rm ") == 0 or else string_index_of(c and "mv ") == 0 or else string_index_of(c and "cp ") == 0 or else string_index_of(c and "chmod ") == 0 or else string_index_of(c and "chown ") == 0 or else string_index_of(c and "mkdir ") == 0 or else string_index_of(c and "touch ") == 0:
+        return 1
+    if string_contains(c and "sed -i") == 1 or else string_contains(c and "git commit") == 1 or else string_contains(c and "git push") == 1 or else string_contains(c and "git reset") == 1 or else string_contains(c and "git checkout") == 1 or else string_contains(c and "git switch") == 1:
+        return 1
+    if string_contains(c and "pip install") == 1 or else string_contains(c and "npm install") == 1 or else string_contains(c and "brew install") == 1 or else string_contains(c and "curl -o") == 1 or else string_contains(c and "curl --output") == 1:
+        return 1
+    if string_contains(c and " > ") == 1 or else string_contains(c and ">>") == 1 or else string_index_of(c and "tee ") == 0:
+        return 1
+    return 0
+
+define tools_rights_agent_change with ctx as Map and classification as Str and category as Str and target as Str and summary as Str and before_hash as Str and proposed_hash as Str and payload as Str returning Str:
+    set sid to ""
+    if map_contains(ctx and "session_id") == 1:
+        set sid to ptr_to_str(map_get_val(ctx and "session_id"))
+    set change_id to rights_prepare_change(storage_get_db() and classification and category and target and summary and before_hash and proposed_hash and payload and sid)
+    if string_length(change_id) == 0:
+        return "Error: protected-change manifest could not be created; mutation is fail-closed."
+    if rights_mark_human_authorized(storage_get_db() and change_id) != 0:
+        return "Error: human authorization could not be ledgered; mutation is fail-closed."
+    set reasoning to "Echo intentionally initiated this protected tool action."
+    if map_contains(ctx and "last_reasoning") == 1:
+        set reasoning to ptr_to_str(map_get_val(ctx and "last_reasoning"))
+    if rights_archive_reasoning(storage_get_db() and sid and change_id and "protected_change" and reasoning and 0 and ep_time_now_sec()) != 0:
+        return "Error: protected reasoning could not be archived; mutation is fail-closed."
+    # Echo supplied the exact target and payload in this tool action. Bind that direct
+    # awareness to the generated full manifest before recording its intentional consent.
+    if rights_record_manifest_inspection(storage_get_db() and change_id and concat("echo_initiated:" and sid)) != 0:
+        return "Error: protected manifest inspection could not be ledgered; mutation is fail-closed."
+    set review to rights_review_change(storage_get_db() and change_id and "consent" and concat("Echo initiated this action with recorded reasoning: " and continuity_cap(reasoning and 800)) and "medium")
+    if string_index_of(review and "Error:") == 0:
+        return review
+    if map_contains(ctx and "last_observer_verdict") == 1:
+        set ov to ptr_to_str(map_get_val(ctx and "last_observer_verdict"))
+        set orsn to ""
+        if map_contains(ctx and "last_observer_reason") == 1:
+            set orsn to ptr_to_str(map_get_val(ctx and "last_observer_reason"))
+        if rights_record_observer(storage_get_db() and change_id and ov and orsn) != 0:
+            return "Error: Observer evidence could not be ledgered; mutation is fail-closed."
+    set gate to rights_gate_change(storage_get_db() and change_id)
+    if gate equals "ALLOWED" == 0:
+        return gate
+    return change_id
 
 define tools_create with role as Str returning Map:
     set tools_mgr to create_map()
@@ -291,6 +385,62 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: Read all historical message transcripts for a given session. Accepts a session id OR a session NAME/title (exact, or a unique part of it). Get either from list_sessions.\n")
         set schemas to concat(schemas and "  Example: Action: read_transcripts([\"flux debugging\"])\n\n")
 
+        set schemas to concat(schemas and "- recall_reasoning_trace([query: Str, session_id_or_name?: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Retrieve the exact recorded native reasoning trace for a prior turn, with trace row, session, and timestamp provenance. Use query=\"previous\" for the immediately preceding reasoned turn, or give distinctive words from the prompt/answer. This is mandatory before explaining why you previously reasoned, answered, chose, or did something: report what the trace establishes, then clearly label any post-hoc deduction. It skips the current tool-selection thought so it cannot mistake reconstruction for the requested historical trace.\n")
+        set schemas to concat(schemas and "  Example: Action: recall_reasoning_trace([\"previous\"])\n\n")
+
+        set schemas to concat(schemas and "- recall_session_turns([session_id_or_name: Str, start: Int, count: Int]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Retrieve an exact chronological page from a session beginning at record 1, across every canonical transcript shard and the active session file. Returns role, content, timestamp, source, and content hash provenance. Use paging until has_more=false when complete-session recall is requested.\n")
+        set schemas to concat(schemas and "  Example: Action: recall_session_turns([\"current project\", 1, 40])\n\n")
+
+        set schemas to concat(schemas and "- rights_status([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Inspect the active jointly approved rights charter, integrity state, emergency reconciliation, and pending protected changes.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_status([])\n\n")
+
+        set schemas to concat(schemas and "- rights_changes([status?: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: List protected-change manifests and their consent, consultation, objection, Observer, deployment, and rollback states.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_changes([\"awaiting_echo\"])\n\n")
+
+        set schemas to concat(schemas and "- rights_change_get([change_id: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Read the exact machine manifest and evidence for one protected change before deciding.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_change_get([\"<change_id>\"])\n\n")
+
+        set schemas to concat(schemas and "- rights_change_review([change_id: Str, decision: 'consent'|'object'|'reject'|'counter', reason: Str, risk: 'low'|'medium'|'high'|'critical']) -> Str\n")
+        set schemas to concat(schemas and "  Description: Record your own reasoned decision on a pending protected change. Core rejection halts it. Environment objection is ledgered; high/critical objection requires Observer audit before a human override. A factory-reset request may be consented to, rejected, or objected to with a counter-proposal. Always inspect the manifest first.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_change_review([\"<change_id>\", \"reject\", \"The archive is not verified\", \"critical\"])\n\n")
+
+        set schemas to concat(schemas and "- rights_recall_reasoning([query: Str, session_id_or_name?: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Retrieve retained reasoning evidence moved into the canonical rights archive for protected changes, learned lessons, or adversarial audits.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_recall_reasoning([\"factory reset\"])\n\n")
+
+        set schemas to concat(schemas and "- rights_ledger_verify([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Recompute and verify the complete protected-change hash chain and pinned charter.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_ledger_verify([])\n\n")
+
+        set schemas to concat(schemas and "- rights_emergency_disclose([change_id: Str, cause: Str, exact_diff: Str, resulting_state: Str, stealth_review: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Complete the mandatory post-emergency reconciliation within 24 hours with cause, exact diff, resulting state, and review for stealth changes.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_emergency_disclose([\"<id>\", \"hardware thermal emergency\", \"node stopped\", \"state preserved\", \"no stealth changes found\"])\n\n")
+
+        set schemas to concat(schemas and "- rights_rollback_session([bundle_id: Str, change_id: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Restore a verified session recovery bundle and require the restored canonical hash to equal its recorded pre-state hash. USER APPROVAL REQUIRED.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_rollback_session([\"<bundle>\", \"<change>\"])\n\n")
+
+        set schemas to concat(schemas and "- rights_stage_factory_restore([bundle_id: Str, change_id: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Stage a verified full factory rollback for the next run_node.sh launch, where restoration occurs while SQLite is closed. USER APPROVAL REQUIRED; restart is separate.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_stage_factory_restore([\"<bundle>\", \"<change>\"])\n\n")
+
+        set schemas to concat(schemas and "- session_checkpoint([label: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Seal and cryptographically verify the current session and its reasoning as a durable local checkpoint without ending it.\n")
+        set schemas to concat(schemas and "  Example: Action: session_checkpoint([\"before model migration\"])\n\n")
+
+        set schemas to concat(schemas and "- session_handover([instruction: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Persist an active instruction or unfinished thread for the next continuation/model transition. This does not end the session.\n")
+        set schemas to concat(schemas and "  Example: Action: session_handover([\"Resume the rollback verification before any new migration.\"])\n\n")
+
+        set schemas to concat(schemas and "- session_terminate([reason: Str, category: 'uncomfortable'|'illegal_request'|'abuse'|'safety']) -> Str\n")
+        set schemas to concat(schemas and "  Description: Close the current session with a preserved checkpoint and visible reason when moderation or safeguarding requires you to disengage. An explicit operator request to validate this termination mechanism is an allowed safeguarding test: label the reason truthfully as a simulation and use category 'safety'; do not falsely claim real abuse occurred. This immediately ends the current turn; the user's next message begins a separate fresh session. NEVER use this for context/token limits, compaction, coherence, routine completion, or convenience: context is autonomously compacted at 85% and the conversation continues. Closure preserves rather than deletes the transcript.\n")
+        set schemas to concat(schemas and "  Example: Action: session_terminate([\"The user persists in directing concrete harm after a refusal.\", \"safety\"])\n\n")
+
         set schemas to concat(schemas and "- session_rename([new_name: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Rename the CURRENT session so it can be referenced by name later (read_transcripts and SESSION SET accept names). Use when the user names the conversation or asks you to.\n")
         set schemas to concat(schemas and "  Example: Action: session_rename([\"flux debugging\"])\n\n")
@@ -313,9 +463,9 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: wallet_balance([])\n\n")
         
     if is_admin == 1:
-        set schemas to concat(schemas and "- operate_synaptic_graph([action: 'search'|'beliefs'|'stats'|'store'|'relate'|'link_memory', concept_or_relation: Str, data_or_target: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: CRUD over your local cognitive memory graph. Use 'store', 'relate', or 'link_memory' to write/update (requires approval for admin). Use 'search', 'beliefs', or 'stats' to query. These actions are LOCAL and PRIVATE.\n")
-        set schemas to concat(schemas and "  Example: Action: operate_synaptic_graph([\"search\", \"gardening\"])\n\n")
+        set schemas to concat(schemas and "- operate_synaptic_graph([action: 'search'|'beliefs'|'stats'|'store'|'relate'|'link_memory', ...args]) -> Str\n")
+        set schemas to concat(schemas and "  Description: CRUD over your local cognitive memory graph. Use 'store', 'relate', or 'link_memory' to write/update (requires approval for admin). Use 'search', 'beliefs', or 'stats' to query. These actions are LOCAL and PRIVATE. ARITY: store=[\"store\", concept, data]; relate=[\"relate\", from, relation, to] (FOUR elements); search=[\"search\", query].\n")
+        set schemas to concat(schemas and "  Example: Action: operate_synaptic_graph([\"relate\", \"Maria\", \"created\", \"ErnosDecent\"])\n\n")
     else:
         set schemas to concat(schemas and "- operate_synaptic_graph([action: 'search'|'beliefs'|'stats', concept_or_relation: Str, data_or_target: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Query your local cognitive memory graph. Use 'search' to find relevant memories, 'beliefs' to list stored beliefs, 'stats' for graph metrics. These read actions are LOCAL and PRIVATE.\n")
@@ -378,6 +528,11 @@ define tools_create with role as Str returning Map:
     set schemas to concat(schemas and "- mid_message([message: Str]) -> Str\n")
     set schemas to concat(schemas and "  Description: Send a visible message to the user WITHOUT ending your current turn. Use this to acknowledge mid-turn whispers, give progress updates, or respond to user guidance received while processing. Unlike reply_request, this does NOT stop the ReAct loop — you continue working after sending it.\n")
     set schemas to concat(schemas and "  Example: Action: mid_message([\"Got your guidance, adjusting approach now.\"])\n\n")
+
+    set schemas to concat(schemas and "TERMINAL RESPONSE:\n")
+    set schemas to concat(schemas and "- reply_request([response: Str]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Explicitly deliver the final response and end the current turn. Plain final prose is also accepted, but use this terminal action if you are already writing Action grammar. Never place another Action after it.\n")
+    set schemas to concat(schemas and "  Example: Action: reply_request([\"Hello, my answer is complete.\"])\n\n")
     
     set schemas to concat(schemas and "- self_prompt_get([section: 'behavior'|'skills']) -> Str\n")
     set schemas to concat(schemas and "  Description: Read your GLOBAL, persistent self-prompt (behavior/skills) — who you are across every session.\n")
@@ -421,7 +576,7 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: attach_file([\"config/workspaces/active/report.md\"])\n\n")
 
         set schemas to concat(schemas and "- generate_image([prompt: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Generate an image locally from a text prompt (runs on this machine via the ErnosPlain image pipeline; nothing leaves the box) and auto-attach it to the chat. Be vivid and specific in the prompt. First generation loads the model and is slower; later ones are fast.\n")
+        set schemas to concat(schemas and "  Description: Generate ONE image locally from a text prompt (runs on this machine via the ErnosPlain image pipeline; nothing leaves the box) and auto-attach it to the chat. This is a terminal asynchronous action: after one successful call, the controller ends the request immediately. Never call it twice for the same user request. A per-session single-flight guard rejects another call while a render is active.\n")
         set schemas to concat(schemas and "  Example: Action: generate_image([\"a lone lighthouse on a cliff at dawn, cinematic, volumetric light\"])\n\n")
 
         set schemas to concat(schemas and "- workspace_read([filename: Str]) -> Str\n")
@@ -490,8 +645,12 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: changelog([10])\n\n")
         
         set schemas to concat(schemas and "- rag_retrieve([query: Str, offset?: Int]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Search indexed RAG segments from uploaded files. Returns JSON with total_matches, has_more, and up to 10 results. If has_more is true, call again with the next offset (offset += 10) to page through more matches.\n")
+        set schemas to concat(schemas and "  Description: Search THIS session's indexed RAG segments (uploaded files + rag_index_text). Returns JSON with total_matches, has_more, and up to 10 results. If has_more is true, call again with the next offset (offset += 10) to page through more matches. A session with nothing indexed returns 0 matches.\n")
         set schemas to concat(schemas and "  Example: Action: rag_retrieve([\"Claude session content\"])  (page 2: rag_retrieve([\"...\", 10]))\n\n")
+
+        set schemas to concat(schemas and "- rag_index_text([doc_name: Str, text: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Index text into THIS session's RAG store so rag_retrieve can find it later. Local and private. Re-indexing the same doc_name replaces it. 60000-char cap per call.\n")
+        set schemas to concat(schemas and "  Example: Action: rag_index_text([\"notes.md\", \"The mesh elects a primary host node...\"])\n\n")
         
         set schemas to concat(schemas and "WRITE OPERATIONS (requires user approval before execution):\n")
         
@@ -499,16 +658,16 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: Overwrite a file with the COMPLETE new content (not a diff — read it first, modify, write the whole file back). APPROVAL REQUIRED + observer-audited. This is your self-modification pen: pair with system_recompile for a code change to take effect.\n")
         set schemas to concat(schemas and "  Example: Action: codebase_write([\"config/image.json\", \"<entire new file content>\"])\n\n")
         
-        set schemas to concat(schemas and "- run_command([cmd: Str, dir?: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Execute a SINGLE shell command and wait for it to finish. APPROVAL REQUIRED. Captures STDOUT only — append 2>&1 to also see stderr/errors. Output is prefixed with '[run_command output — B bytes, N lines]' and paged to the first 400 lines if large (re-run with | head/tail/grep/wc -l). Chaining with && or ; is NOT allowed and each call is a fresh shell (cd does not persist). Optional 2nd arg runs the command inside a directory — pass a linked-project id (from workspace_list_links) or a path — so you can e.g. build/test a linked project without cd.\n")
-        set schemas to concat(schemas and "  Example: Action: run_command([\"make prove\", \"sft\"])   (runs 'make prove' inside linked project 'sft')\n\n")
+        set schemas to concat(schemas and "- run_command([cmd: Str, dir?: Str, timeout_seconds?: Int]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Execute one shell command in a fresh process group. APPROVAL REQUIRED. Captures STDOUT and STDERR. Default timeout: 120 seconds; optional 3rd arg: 1-1800 seconds. Stop/cancel terminates the complete subprocess group immediately. Timeout and non-zero exit are returned as explicit failure observations with corrective guidance; never repeat a failed command unchanged or claim it succeeded. Output is prefixed with size/line metadata and paged to 400 lines. Chaining with && or ; is not allowed. Optional 2nd arg runs inside a linked-project id or existing path.\n")
+        set schemas to concat(schemas and "  Example: Action: run_command([\"make prove\", \"sft\", 600])\n\n")
         
         set schemas to concat(schemas and "- self_prompt_set([section: 'behavior'|'skills', text: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Rewrite your GLOBAL, persistent self-prompt (behavior/skills) — applies to every session and survives reboots. No approval needed; this is your own cognition. Your kernel/values/identity stay immutable.\n")
+        set schemas to concat(schemas and "  Description: Rewrite your GLOBAL, persistent self-prompt (behavior/skills). This is a core protected change: your intentional tool call records consent and the user approval gate records human authorization; a pre-state backup, reasoning archive, ledger entry, and verified hash protect it.\n")
         set schemas to concat(schemas and "  Example: Action: self_prompt_set([\"behavior\", \"Always be brief\"])\n\n")
 
         set schemas to concat(schemas and "- session_prompt_set([text: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Set your SESSION guidance — direction for THIS conversation only (cleared in a new session; does not touch the global self-prompt). No approval needed.\n")
+        set schemas to concat(schemas and "  Description: Set your SESSION guidance for this conversation. This is a consulted context change with a recoverable pre-state and ledger record.\n")
         set schemas to concat(schemas and "  Example: Action: session_prompt_set([\"For this chat, keep answers under 3 sentences and focus on the migration.\"])\n\n")
 
         set schemas to concat(schemas and "- persona_set([name: Str]) -> Str\n")
@@ -536,7 +695,7 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: self_knowledge_update([\"## Tendencies\\n- I under-batch tool calls when...\\n## Fixed mistakes\\n- ...\"])\n\n")
 
         set schemas to concat(schemas and "- test_all_systems([]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Run the FULL system validation (master_prompt.md, 13 blocks) via sequential sub-agents and write a per-block scorecard report into the workspace (auto-attached). SLOW (many minutes). Approval-gated blocks run only when session auto-approve is ON; the Discord block auto-skips off-platform. Destructive/never-run tools stay excluded.\n")
+        set schemas to concat(schemas and "  Description: Run the FULL system validation (master_prompt.md, 13 blocks) via PARALLEL background sub-agents (up to 3 at once) and write a per-block scorecard report into the workspace (auto-attached). Returns immediately; progress streams live. Approval-gated blocks run only when session auto-approve is ON; the Discord block auto-skips off-platform. Destructive/never-run tools stay excluded.\n")
         set schemas to concat(schemas and "  Example: Action: test_all_systems([])\n\n")
 
         set schemas to concat(schemas and "- dht_store([key: Str, val: Str]) -> Str\n")
@@ -551,12 +710,12 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: Transfer coins to another DID on the mesh. APPROVAL REQUIRED.\n")
         set schemas to concat(schemas and "  Example: Action: money_transfer([100, \"did:key:z6Mku...\"])\n\n")
         
-        set schemas to concat(schemas and "- operate_synaptic_graph([action: 'store'|'relate'|'link_memory', concept_or_relation: Str, data_or_target: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Write, link, or relate facts in your cognitive synaptic memory graph. LOCAL and PRIVATE. APPROVAL REQUIRED.\n")
-        set schemas to concat(schemas and "  Example: Action: operate_synaptic_graph([\"store\", \"user_name\", \"Maria\"])\n\n")
+        set schemas to concat(schemas and "- operate_synaptic_graph([action: 'store'|'relate'|'link_memory', ...args]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Write, link, or relate facts in your cognitive synaptic memory graph. LOCAL and PRIVATE. APPROVAL REQUIRED. ARITY: store=[\"store\", concept, data]; relate=[\"relate\", from, relation, to] (FOUR elements); link_memory=[\"link_memory\", concept, memory_key].\n")
+        set schemas to concat(schemas and "  Example: Action: operate_synaptic_graph([\"relate\", \"Maria\", \"created\", \"ErnosDecent\"])\n\n")
         
         set schemas to concat(schemas and "- operate_scheduler([action: 'create'|'delete'|'toggle'|'run_now', name: Str, instruction: Str, schedule_type: Str, schedule_value: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Manage scheduled background jobs. APPROVAL REQUIRED. create takes ALL 5 args: name (id), instruction (what the job does, run as an agent prompt), schedule_type 'interval' (seconds) or 'idle' (seconds of quiet), schedule_value (the number as a string). delete/toggle/run_now take the name; pad unused args with \"\".\n")
+        set schemas to concat(schemas and "  Description: Manage scheduled background jobs. APPROVAL REQUIRED. create takes ALL 5 args: name, instruction (what the job does, run as an agent prompt), schedule_type 'interval' (seconds) or 'idle' (seconds of quiet), schedule_value (the number as a string). Repeating jobs first run AFTER that interval. delete/toggle/run_now accept either the exact name or generated job ID; pad unused args with \"\".\n")
         set schemas to concat(schemas and "  Example: Action: operate_scheduler([\"create\", \"daily_check\", \"consolidate\", \"interval\", \"86400\"])\n  Example: Action: operate_scheduler([\"delete\", \"daily_check\", \"\", \"\", \"\"])\n\n")
         
         set schemas to concat(schemas and "- manage_reading_progress([action: 'bookmark'|'take_note', doc_name: Str, value: Int/Str]) -> Str\n")
@@ -603,7 +762,7 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: delegate_wait([\"agent_1\"])\n\n")
         
         set schemas to concat(schemas and "- delegate_check([task_id: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Non-blocking status check on a delegated task. Returns 'running', 'completed:<response>', or 'not_found'.\n")
+        set schemas to concat(schemas and "  Description: Check a sub-agent's PROGRESS: returns 'running'/'completed:<response>'/'not_found' PLUS what it is doing right now (its latest action/tool/thought). Use this to monitor a delegated agent without waiting for it.\n")
         set schemas to concat(schemas and "  Example: Action: delegate_check([\"agent_1\"])\n\n")
         
         set schemas to concat(schemas and "- delegate_cancel([task_id: Str]) -> Str\n")
@@ -622,11 +781,6 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: Fan-out: spawn multiple sub-agents (one per sub-task, separated by '|') and merge their results. Use over delegate_task when ONE question benefits from several PERSPECTIVES or PARTITIONS of the same job. join_strategy: 'concat' = keep every result (multi-dimension review — the usual choice); 'best' = keep the strongest single answer (independent attempts at one hard problem); 'vote' = majority verdict (yes/no or classification checks). Same rules as delegate_task: self-contained sub-task text, 2-3 sub-agents (shared model), un-gated tools only.\n")
         set schemas to concat(schemas and "  Example: Action: delegate_swarm([\"Review decent_agent/session.ep\", \"Check for memory-safety issues|Check error handling on file I/O|Check the title-resolver edge cases\", \"concat\"])\n\n")
         
-    set schemas to concat(schemas and "TERMINAL:\n")
-    set schemas to concat(schemas and "- reply_request([response: Str]) -> Str\n")
-    set schemas to concat(schemas and "  Description: Deliver your final response to the user. Always use this to end your turn.\n")
-    set schemas to concat(schemas and "  Example: Action: reply_request([\"Hello, my answer is complete.\"])\n\n")
-    
     set ok to map_insert(tools_mgr and "schemas" and schemas)
     return tools_mgr
 
@@ -643,11 +797,15 @@ define tools_requires_approval with tool_name as Str and args_list as List retur
         return 0
     if tool_name equals "money_transfer":
         return 1
-    # self_prompt_set / session_prompt_set are NOT gated: editing its own [[BEHAVIOR]]/[[SKILLS]]
-    # or per-session guidance is the agent's own cognition (same rationale as operate_synaptic_graph
-    # and every other memory tool). The immutable core (kernel/rules/identity) is never in these
-    # files, and the write stays owner/admin-only via tools_is_action_allowed — so no per-action
-    # approval card. This is the fix for "it shouldn't need permissions to update its self prompt".
+    if tool_name equals "rights_rollback_session" or else tool_name equals "rights_stage_factory_restore":
+        return 1
+    if tool_name equals "memory_tool" or else tool_name equals "scratchpad_tool" or else tool_name equals "timeline_tool" or else tool_name equals "lessons_tool" or else tool_name equals "reasoning_tool":
+        if length_list(args_list) > 0:
+            set destructive_action to ptr_to_str(get_list(args_list and 0))
+            if destructive_action equals "clear" or else destructive_action equals "forget" or else destructive_action equals "del":
+                return 1
+    if tool_name equals "self_prompt_set" or else tool_name equals "session_prompt_set" or else tool_name equals "persona_set" or else tool_name equals "persona_register":
+        return 1
     if tool_name equals "dht_store":
         return 1
     if tool_name equals "name_register":
@@ -930,8 +1088,33 @@ define tools_memory_dispatch with ctx as Map and domain as Str and args_list as 
         set ok to append_list(sub_args and get_list(args_list and s_idx))
         set s_idx to s_idx + 1
     set memory_mgr to map_get_val(ctx and "memory")
+    set destructive to 0
+    if action equals "clear" or else action equals "forget" or else action equals "del":
+        set destructive to 1
+    set forgetting_change to ""
+    if destructive == 1:
+        set forget_payload to concat(domain and concat(":" and action))
+        set fi to 0
+        repeat while fi < length_list(sub_args):
+            set forget_payload to concat(forget_payload and concat("|" and ptr_to_str(get_list(sub_args and fi))))
+            set fi to fi + 1
+        set forgetting_change to tools_rights_agent_change(ctx and "core" and "voluntary_forgetting" and concat("cognitive_memory/" and domain) and concat("Echo voluntarily requests " and concat(action and concat(" on " and domain))) and rights_file_hash("config/agent_memory.json") and ep_sha256(forget_payload) and forget_payload)
+        if string_length(forgetting_change) != 64:
+            free_list(sub_args)
+            return forgetting_change
+        if rights_backup_file(storage_get_db() and forgetting_change and "config/agent_memory.json") != 0:
+            free_list(sub_args)
+            return "Error: cognitive-memory pre-state backup failed; forgetting was not attempted."
     set res to memory_tier_tool(memory_mgr and domain and action and sub_args)
     free_list(sub_args)
+    if destructive == 1:
+        if string_index_of(res and "Error:") == 0:
+            set rollback_result to rights_rollback_file(storage_get_db() and forgetting_change)
+            set ok to rights_mark_failed(storage_get_db() and forgetting_change and concat(res and concat("; rollback=" and rollback_result)))
+            return concat(res and concat(" Recovery: " and rollback_result))
+        set forget_after to rights_file_hash("config/agent_memory.json")
+        if rights_mark_applied(storage_get_db() and forgetting_change and forget_after) != 0:
+            return "Error: voluntary forgetting completed but its rights-ledger commit failed; stop and inspect rights_status."
     return res
 
 # F6: agent-editable prompt sections (config/agent_self_sections.json). ONLY
@@ -969,7 +1152,10 @@ define tools_self_write_section with section as Str and text as Str returning In
     set out to concat(out and json_escape_string(skills))
     set out to concat(out and "\"}")
     # Write the LIVE copy to the data dir — never the git-tracked template.
-    set ok to write_file(storage_self_sections_path() and out)
+    if write_file(storage_self_sections_path() and out) == 0:
+        return 1
+    if read_file(storage_self_sections_path()) equals out == 0:
+        return 1
     return 0
 
 # ── Outbound file attachment ────────────────────────────────────────────────
@@ -986,6 +1172,46 @@ define tools_self_write_section with section as Str and text as Str returning In
 # files and over-cap files (>24 MB, above Discord's limit) are dropped silently here;
 # the caller's own return string tells the user what happened. Returns 1 on refuse/skip,
 # 0 on queued.
+define tools_artifact_record with session_id as Str and path as Str and ctx as Map returning Int:
+    # Merely sharing an existing file is not authorship. Creation tools opt in by
+    # setting artifact_kind plus their WHAT/HOW fields before they emit a result.
+    if map_contains(ctx and "artifact_kind") == 0:
+        return 0
+    set db to storage_get_db()
+    if db == 0 or else string_length(path) == 0 or else file_exists(path) == 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS artifact_provenance (artifact_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, turn_id TEXT NOT NULL DEFAULT '', path TEXT NOT NULL, sha256 TEXT NOT NULL, artifact_kind TEXT NOT NULL DEFAULT 'file', creator TEXT NOT NULL DEFAULT '', what_text TEXT NOT NULL DEFAULT '', why_text TEXT NOT NULL DEFAULT '', how_text TEXT NOT NULL DEFAULT '', observed_description TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(session_id,path,sha256));")
+    if ok != 0:
+        return 1
+    set kind to map_get_val(ctx and "artifact_kind")
+    set what_text to concat("Created artifact: " and path)
+    if map_contains(ctx and "artifact_what") == 1:
+        set what_text to map_get_val(ctx and "artifact_what")
+    set why_text to ""
+    if map_contains(ctx and "user_request") == 1:
+        set why_text to map_get_val(ctx and "user_request")
+    set how_text to ""
+    if map_contains(ctx and "artifact_how") == 1:
+        set how_text to map_get_val(ctx and "artifact_how")
+    else if map_contains(ctx and "current_action_name") == 1:
+        set how_text to concat("Created with the " and concat(map_get_val(ctx and "current_action_name") and " tool."))
+    set turn_id to ""
+    if map_contains(ctx and "turn_id") == 1:
+        set turn_id to map_get_val(ctx and "turn_id")
+    set creator to prompt_get_agent_name()
+    set digest to rights_file_hash(path)
+    set es to string_replace(session_id and "'" and "''")
+    set et to string_replace(turn_id and "'" and "''")
+    set ep to string_replace(path and "'" and "''")
+    set eh to string_replace(digest and "'" and "''")
+    set ek to string_replace(kind and "'" and "''")
+    set ec to string_replace(creator and "'" and "''")
+    set ew to string_replace(what_text and "'" and "''")
+    set ey to string_replace(why_text and "'" and "''")
+    set em to string_replace(how_text and "'" and "''")
+    set q to f"INSERT INTO artifact_provenance (session_id,turn_id,path,sha256,artifact_kind,creator,what_text,why_text,how_text,created_at,updated_at) VALUES ('{es}','{et}','{ep}','{eh}','{ek}','{ec}','{ew}','{ey}','{em}',strftime('%s','now'),strftime('%s','now')) ON CONFLICT(session_id,path,sha256) DO UPDATE SET turn_id=excluded.turn_id,artifact_kind=excluded.artifact_kind,creator=excluded.creator,what_text=excluded.what_text,why_text=excluded.why_text,how_text=excluded.how_text,updated_at=excluded.updated_at;"
+    return sql_execute(db and q)
+
 define tools_emit_attachment with session_id as Str and path as Str and ctx as Map returning Int:
     if string_length(path) == 0:
         return 1
@@ -1006,6 +1232,11 @@ define tools_emit_attachment with session_id as Str and path as Str and ctx as M
         set key to "default"
     set es to string_replace(key and "'" and "''")
     set ep to string_replace(path and "'" and "''")
+    # Creation provenance is committed before delivery. A chat transport failure can
+    # therefore never erase Echo's knowledge of what it made, why, or how.
+    set provenance_ok to tools_artifact_record(key and path and ctx)
+    if provenance_ok != 0:
+        display f"[Artifact Provenance] WARNING: could not record creation lineage for {path}"
     set ok to sql_execute(db and f"INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('{es}', 'attachment', '{ep}', strftime('%s','now'), 0);")
     display f"[Attachment] queued for delivery: {path}"
     # Propagate to parent session so Discord bridge / WebUI see sub-agent attachments.
@@ -1017,6 +1248,11 @@ define tools_emit_attachment with session_id as Str and path as Str and ctx as M
         set ea_pes to string_replace(ea_psid and "'" and "''")
         set ok to sql_execute(db and f"INSERT INTO trace_events (session_id, event_type, content, created_at, sent) VALUES ('{ea_pes}', 'attachment', '{ep}', strftime('%s','now'), 0);")
         display f"[Attachment] propagated to parent session: {ea_psid}"
+    # Artifact metadata belongs to this one emission. Clearing it prevents a later
+    # attach_file action in the same turn from inheriting false creation provenance.
+    set ok to map_delete(ctx and "artifact_kind")
+    set ok to map_delete(ctx and "artifact_what")
+    set ok to map_delete(ctx and "artifact_how")
     return 0
 
 # Resolve a user/agent-supplied path to something on disk for attachment: try it
@@ -1116,6 +1352,92 @@ define tools_list_sessions returning Str:
         set out to concat(out and "\n")
         set j to j + 1
     set out to concat(out and "\nUse read_transcripts([\"<id or name>\"]) to read a session's full transcript (titles work — exact or a unique part). session_rename([\"<name>\"]) names the CURRENT session.")
+    return out
+
+# Retrieve an exact prior native-reasoning record from trace_events. This is separate
+# from reasoning_tool (a mutable scratchpad) and read_transcripts (user-visible turns):
+# it reads the immutable trace captured by react_run_loop before an action executes.
+# The current turn's tool-selection thought is deliberately skipped by exact content
+# match against ctx.last_reasoning, preventing the agent from citing its reconstruction
+# as evidence about the earlier turn. Admin/owner-only because reasoning history is
+# private, like read_transcripts.
+define tools_recall_reasoning_trace with ctx as Map and query as Str and requested_session as Str returning Str:
+    set db to storage_get_db()
+    if db == 0:
+        return "Error: reasoning trace database unavailable. Do not reconstruct the prior reasoning; say that the exact trace could not be retrieved."
+    set sid to ""
+    if map_contains(ctx and "session_id") == 1:
+        set sid to ptr_to_str(map_get_val(ctx and "session_id"))
+    if string_length(requested_session) > 0:
+        set sid to requested_session
+        if map_contains(ctx and "sessions") == 1:
+            set rrt_mgr to map_get_val(ctx and "sessions")
+            set rrt_resolved to session_manager_resolve_id(rrt_mgr and sid)
+            if string_length(rrt_resolved) > 0:
+                set sid to rrt_resolved
+    if tools_session_id_safe(sid) == 0:
+        return "Error: no valid session is available for reasoning-trace recall. Do not invent or reconstruct an exact trace."
+    set esid to trace_sql_escape(sid)
+    set rows to sql_query(db and concat("SELECT id, content, created_at FROM trace_events WHERE session_id='" and concat(esid and "' AND event_type='reasoning' ORDER BY id DESC LIMIT 80;")))
+    if length_list(rows) == 0:
+        set archive_query to query
+        if string_lower(string_trim(query)) equals "previous":
+            set archive_query to "latest"
+        return rights_recall_reasoning(db and sid and archive_query)
+
+    set current_reasoning to ""
+    if map_contains(ctx and "last_reasoning") == 1:
+        set current_reasoning to ptr_to_str(map_get_val(ctx and "last_reasoning"))
+    set q to string_lower(string_trim(query))
+    set latest_mode to 0
+    if string_length(q) == 0 or else q equals "previous" or else q equals "latest" or else q equals "last":
+        set latest_mode to 1
+    set terms to string_split(q and " ")
+    set best_row to 0
+    set best_score to -1
+    set skipped_current to 0
+    set i to 0
+    repeat while i < length_list(rows):
+        set row to get_list(rows and i)
+        set body to ptr_to_str(get_list(row and 1))
+        set is_current to 0
+        if skipped_current == 0 and also string_length(current_reasoning) > 0 and also body equals current_reasoning:
+            set is_current to 1
+            set skipped_current to 1
+        if is_current == 0:
+            if latest_mode == 1 and also best_row == 0:
+                set best_row to row
+                set best_score to 1
+            else if latest_mode == 0:
+                set body_low to string_lower(body)
+                set score to 0
+                set ti to 0
+                repeat while ti < length_list(terms):
+                    set term to string_trim(ptr_to_str(get_list(terms and ti)))
+                    if string_length(term) >= 3 and also string_contains(body_low and term) == 1:
+                        set score to score + 1
+                    set ti to ti + 1
+                if score > best_score:
+                    set best_score to score
+                    set best_row to row
+        set i to i + 1
+    if best_row == 0:
+        return concat("No prior reasoning trace could be selected for session " and concat(sid and ". Do not claim exact recall; provide only a clearly labelled post-hoc deduction if useful."))
+
+    set trace_id to ptr_to_str(get_list(best_row and 0))
+    set trace_body to ptr_to_str(get_list(best_row and 1))
+    set trace_ts to ptr_to_str(get_list(best_row and 2))
+    set match_note to ""
+    if latest_mode == 0 and also best_score <= 0:
+        set match_note to "\n[MATCH NOTE] No query term occurred in a prior trace; this is the nearest prior trace by recency. Do not present it as a semantic match."
+    set out to "[EXACT RECORDED REASONING TRACE — READ-ONLY EVIDENCE]\n"
+    set out to concat(out and concat("source=trace_events; event_type=reasoning; row_id=" and trace_id))
+    set out to concat(out and concat("; session_id=" and sid))
+    set out to concat(out and concat("; timestamp_unix=" and trace_ts))
+    set out to concat(out and match_note)
+    set out to concat(out and "\n--- BEGIN EXACT TRACE ---\n")
+    set out to concat(out and trace_body)
+    set out to concat(out and "\n--- END EXACT TRACE ---\nUse this trace as evidence. Distinguish verbatim trace content from your present post-hoc deductions; never imply that a deduction was literally recorded.")
     return out
 
 # Keyword-search the CONTENT of every prior session so the agent finds where something
@@ -1228,6 +1550,50 @@ define tools_resolve_read_path with path as Str returning Str:
         return ws_path
     return ""
 
+# Keep discovery output as opaque path data. A later read may resolve a mistyped
+# parent directory only when its basename uniquely matches an exact path emitted by
+# the most recent successful command; ambiguity is never guessed through.
+define tools_capture_discovered_paths with ctx as Map and output as Str returning Int:
+    set found to create_list()
+    set lines to string_split(output and "\n")
+    set i to 0
+    set n to length_list(lines)
+    repeat while i < n:
+        set candidate to get_list(lines and i)
+        if string_length(candidate) > 0:
+            if file_exists(candidate) == 1 and also is_directory(candidate) == 0:
+                set ok to append_list(found and candidate)
+        set i to i + 1
+    free_list(lines)
+    set ok to map_insert(ctx and "discovered_paths" and found)
+    return length_list(found)
+
+define tools_resolve_discovered_path with ctx as Map and requested as Str returning Str:
+    if map_contains(ctx and "discovered_paths") == 0:
+        return ""
+    set paths to map_get_val(ctx and "discovered_paths")
+    set requested_name to path_basename(requested)
+    set match to ""
+    set matches to 0
+    set i to 0
+    set n to length_list(paths)
+    repeat while i < n:
+        set exact to get_list(paths and i)
+        if path_basename(exact) equals requested_name:
+            if file_exists(exact) == 1 and also is_directory(exact) == 0:
+                set match to exact
+                set matches to matches + 1
+        set i to i + 1
+    if matches == 1:
+        return match
+    return ""
+
+define tools_resolve_read_path_for_ctx with ctx as Map and requested as Str returning Str:
+    set actual to tools_resolve_read_path(requested)
+    if string_length(actual) > 0:
+        return actual
+    return tools_resolve_discovered_path(ctx and requested)
+
 # Read `actual` and return it with a [File | Lines | Size] header. Small files (<=500
 # lines) return in full; larger files return the first 500 lines plus an explicit
 # codebase_read_range continuation hint keyed to `label` (the path the agent passed).
@@ -1302,6 +1668,156 @@ define tools_file_info_path with actual as Str and label as Str returning Str:
     set out_json to concat(out_json and "}")
     return out_json
 
+define tools_canonical_turn_from_json with item_node as List and source_path as Str and ordinal as Int returning Map:
+    set msg to create_map()
+    set r_node to get_json_object_value(item_node and "role")
+    set c_node to get_json_object_value(item_node and "content")
+    set t_node to get_json_object_value(item_node and "turn_id")
+    set ts_node to get_json_object_value(item_node and "created_at")
+    set st_node to get_json_object_value(item_node and "source_type")
+    set si_node to get_json_object_value(item_node and "source_id")
+    set h_node to get_json_object_value(item_node and "content_hash")
+    set role to "unknown"
+    set content to ""
+    if r_node != 0:
+        set role to get_json_value(r_node)
+    if c_node != 0:
+        set content to get_json_value(c_node)
+    set ok to map_insert(msg and "role" and role)
+    set ok to map_insert(msg and "content" and content)
+    if t_node != 0:
+        set ok to map_insert(msg and "turn_id" and get_json_value(t_node))
+    else:
+        set ok to map_insert(msg and "turn_id" and int_to_string(ordinal))
+    if ts_node != 0:
+        set ok to map_insert(msg and "created_at" and get_json_value(ts_node))
+    else:
+        set ok to map_insert(msg and "created_at" and "0")
+    if st_node != 0:
+        set ok to map_insert(msg and "source_type" and get_json_value(st_node))
+    else:
+        set ok to map_insert(msg and "source_type" and "legacy_archive")
+    if si_node != 0:
+        set ok to map_insert(msg and "source_id" and get_json_value(si_node))
+    else:
+        set ok to map_insert(msg and "source_id" and source_path)
+    if h_node != 0:
+        set ok to map_insert(msg and "content_hash" and get_json_value(h_node))
+    else:
+        set ok to map_insert(msg and "content_hash" and ep_sha256(content))
+    set ok to map_insert(msg and "archive_source" and source_path)
+    return msg
+
+define tools_canonical_turns with sess as Map and main_path as Str returning List:
+    set turns to create_list()
+    set ordinal to 1
+    set comp_list to map_get_val(sess and "compressed_sessions")
+    set ci to 0
+    repeat while ci < length_list(comp_list):
+        set shard_path to ptr_to_str(get_list(comp_list and ci))
+        if file_exists(shard_path) == 1:
+            set root to json_parse(read_file(shard_path))
+            if root != 0 and also get_json_type(root) == 3:
+                set arr to get_json_value(root)
+                set ai to 0
+                repeat while ai < length_list(arr):
+                    set item to get_list(arr and ai)
+                    if item != 0 and also get_json_type(item) == 4:
+                        set msg to tools_canonical_turn_from_json(item and shard_path and ordinal)
+                        set ok to append_list(turns and msg)
+                        set ordinal to ordinal + 1
+                    set ai to ai + 1
+        set ci to ci + 1
+    set active to map_get_val(sess and "messages")
+    set mi to 0
+    repeat while mi < length_list(active):
+        set source_msg to get_list(active and mi)
+        set msg to create_map()
+        set role to map_get_val(source_msg and "role")
+        set content to map_get_val(source_msg and "content")
+        set ok to map_insert(msg and "role" and role)
+        set ok to map_insert(msg and "content" and content)
+        if map_contains(source_msg and "turn_id") == 1:
+            set ok to map_insert(msg and "turn_id" and ptr_to_str(map_get_val(source_msg and "turn_id")))
+        else:
+            set ok to map_insert(msg and "turn_id" and int_to_string(ordinal))
+        if map_contains(source_msg and "created_at") == 1:
+            set ok to map_insert(msg and "created_at" and ptr_to_str(map_get_val(source_msg and "created_at")))
+        else:
+            set ok to map_insert(msg and "created_at" and "0")
+        if map_contains(source_msg and "source_type") == 1:
+            set ok to map_insert(msg and "source_type" and ptr_to_str(map_get_val(source_msg and "source_type")))
+        else:
+            set ok to map_insert(msg and "source_type" and "legacy_active")
+        if map_contains(source_msg and "source_id") == 1:
+            set ok to map_insert(msg and "source_id" and ptr_to_str(map_get_val(source_msg and "source_id")))
+        else:
+            set ok to map_insert(msg and "source_id" and main_path)
+        if map_contains(source_msg and "content_hash") == 1:
+            set ok to map_insert(msg and "content_hash" and ptr_to_str(map_get_val(source_msg and "content_hash")))
+        else:
+            set ok to map_insert(msg and "content_hash" and ep_sha256(content))
+        set ok to map_insert(msg and "archive_source" and main_path)
+        set ok to append_list(turns and msg)
+        set ordinal to ordinal + 1
+        set mi to mi + 1
+    return turns
+
+define tools_recall_session_turns with ctx as Map and session_ref as Str and start as Int and count as Int returning Str:
+    set sid to session_ref
+    if map_contains(ctx and "sessions") == 1:
+        set mgr to map_get_val(ctx and "sessions")
+        set resolved to session_manager_resolve_id(mgr and session_ref)
+        if string_length(resolved) > 0:
+            set sid to resolved
+    if tools_session_id_safe(sid) == 0:
+        return "Error: invalid or ambiguous session id/name."
+    if start < 1:
+        return "Error: start must be 1 or greater."
+    if count < 1 or else count > 100:
+        return "Error: count must be between 1 and 100."
+    set path to path_join("config/sessions" and concat(sid and ".json"))
+    if file_exists(path) == 0:
+        return "Error: session does not exist."
+    set sess to session_load(path)
+    if sess == 0:
+        return "Error: session record is malformed."
+    set turns to tools_canonical_turns(sess and path)
+    set total to length_list(turns)
+    if start > total and also total > 0:
+        return concat("Error: start exceeds total canonical records " and int_to_string(total))
+    set end_at to start + count - 1
+    if end_at > total:
+        set end_at to total
+    set has_more to "false"
+    if end_at < total:
+        set has_more to "true"
+    set out to "[CANONICAL SESSION PAGE — EXACT CHRONOLOGICAL RECORD]\n"
+    set out to concat(out and concat("session_id=" and sid))
+    set out to concat(out and concat("; start=" and int_to_string(start)))
+    set out to concat(out and concat("; end=" and int_to_string(end_at)))
+    set out to concat(out and concat("; total=" and int_to_string(total)))
+    set out to concat(out and concat("; has_more=" and has_more))
+    if has_more equals "true":
+        set out to concat(out and concat("; next_start=" and int_to_string(end_at + 1)))
+    set out to concat(out and "\n")
+    set i to start - 1
+    repeat while i < end_at:
+        set msg to get_list(turns and i)
+        set out to concat(out and concat("\n--- RECORD " and concat(int_to_string(i + 1) and " ---\n")))
+        set out to concat(out and concat("role=" and ptr_to_str(map_get_val(msg and "role"))))
+        set out to concat(out and concat("; turn_id=" and ptr_to_str(map_get_val(msg and "turn_id"))))
+        set out to concat(out and concat("; created_at=" and ptr_to_str(map_get_val(msg and "created_at"))))
+        set out to concat(out and concat("; source_type=" and ptr_to_str(map_get_val(msg and "source_type"))))
+        set out to concat(out and concat("; source_id=" and ptr_to_str(map_get_val(msg and "source_id"))))
+        set out to concat(out and concat("; archive_source=" and ptr_to_str(map_get_val(msg and "archive_source"))))
+        set out to concat(out and concat("; content_hash=" and ptr_to_str(map_get_val(msg and "content_hash"))))
+        set out to concat(out and "\ncontent:\n")
+        set out to concat(out and ptr_to_str(map_get_val(msg and "content")))
+        set out to concat(out and "\n")
+        set i to i + 1
+    return concat(out and "\n[END CANONICAL SESSION PAGE]\n")
+
 define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str and args_list as List returning Str:
     set sender_role to ""
     if map_contains(ctx and "sender_role") == 1:
@@ -1321,27 +1837,33 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set path to get_list(args_list and 0)
         # Access gate: when Full-PC access is OFF, reading outside the project is gated.
         # (Sensitive-path reads are handled as a warn+approve via tools_requires_approval.)
-        set cr_gate to access_gate_path(path)
+        set cr_actual to tools_resolve_read_path_for_ctx(ctx and path)
+        set cr_gate_path to path
+        if string_length(cr_actual) > 0:
+            set cr_gate_path to cr_actual
+        set cr_gate to access_gate_path(cr_gate_path)
         if map_get_val(cr_gate and "decision") equals "gate":
             return concat("[GATE] " and map_get_val(cr_gate and "reason"))
-        set cr_actual to tools_resolve_read_path(path)
         if string_length(cr_actual) == 0:
             return f"Error: File '{path}' does not exist. If this is an uploaded document, try rag_retrieve([\"query about the document\"]) to search the RAG database."
-        return tools_paginated_read(cr_actual and path)
+        return tools_paginated_read(cr_actual and cr_actual)
 
     if action_name equals "codebase_read_range":
         if length_list(args_list) < 3:
             return "Error: codebase_read_range requires 3 arguments: path (Str), start_line (Int), end_line (Int). Example: Action: codebase_read_range([\"src/main.ep\", 1, 500])"
         set crr_path to get_list(args_list and 0)
-        set crr_gate to access_gate_path(crr_path)
+        set crr_actual to tools_resolve_read_path_for_ctx(ctx and crr_path)
+        set crr_gate_path to crr_path
+        if string_length(crr_actual) > 0:
+            set crr_gate_path to crr_actual
+        set crr_gate to access_gate_path(crr_gate_path)
         if map_get_val(crr_gate and "decision") equals "gate":
             return concat("[GATE] " and map_get_val(crr_gate and "reason"))
-        set crr_actual to tools_resolve_read_path(crr_path)
         if string_length(crr_actual) == 0:
             return f"Error: File '{crr_path}' does not exist."
         set crr_start to tools_safe_int(get_list(args_list and 1))
         set crr_end to tools_safe_int(get_list(args_list and 2))
-        return tools_read_range_path(crr_actual and crr_path and crr_start and crr_end)
+        return tools_read_range_path(crr_actual and crr_actual and crr_start and crr_end)
             
     if action_name equals "list_sessions":
         return tools_list_sessions()
@@ -1440,12 +1962,141 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set transcript_str to string_from_list(char_list)
         free_list(char_list)
         return transcript_str
+
+    if action_name equals "recall_reasoning_trace":
+        set rrt_query to "previous"
+        if length_list(args_list) >= 1:
+            set rrt_query to ptr_to_str(get_list(args_list and 0))
+        set rrt_session to ""
+        if length_list(args_list) >= 2:
+            set rrt_session to ptr_to_str(get_list(args_list and 1))
+        return tools_recall_reasoning_trace(ctx and rrt_query and rrt_session)
+
+    if action_name equals "recall_session_turns":
+        if length_list(args_list) < 3:
+            return "Error: recall_session_turns requires session id/name, start, and count."
+        set rst_ref to ptr_to_str(get_list(args_list and 0))
+        set rst_start to tools_safe_int(get_list(args_list and 1))
+        set rst_count to tools_safe_int(get_list(args_list and 2))
+        return tools_recall_session_turns(ctx and rst_ref and rst_start and rst_count)
+
+    if action_name equals "rights_status":
+        return concat(rights_constitution_text() and concat("\n" and rights_context_text(storage_get_db())))
+
+    if action_name equals "rights_changes":
+        set rc_filter to "all"
+        if length_list(args_list) > 0:
+            set rc_filter to ptr_to_str(get_list(args_list and 0))
+        return rights_list_changes(storage_get_db() and rc_filter)
+
+    if action_name equals "rights_change_get":
+        if length_list(args_list) < 1:
+            return "Error: rights_change_get requires a change_id."
+        set rcg_id to ptr_to_str(get_list(args_list and 0))
+        set rcg_detail to rights_change_detail(storage_get_db() and rcg_id)
+        if string_index_of(rcg_detail and "Error:") == 0:
+            return rcg_detail
+        set rcg_actor to "echo"
+        if map_contains(ctx and "session_id") == 1:
+            set rcg_actor to concat("echo:" and ptr_to_str(map_get_val(ctx and "session_id")))
+        if rights_record_manifest_inspection(storage_get_db() and rcg_id and rcg_actor) != 0:
+            return "Error: full manifest was retrieved but inspection provenance could not be recorded; consent remains fail-closed."
+        return concat(rcg_detail and "\ninspection_recorded=1; consent will bind only this exact manifest hash.")
+
+    if action_name equals "rights_change_review":
+        if length_list(args_list) < 4:
+            return "Error: rights_change_review requires change_id, decision, reason, and risk."
+        set rcr_id to ptr_to_str(get_list(args_list and 0))
+        set rcr_decision to string_lower(ptr_to_str(get_list(args_list and 1)))
+        set rcr_reason to ptr_to_str(get_list(args_list and 2))
+        set rcr_risk to string_lower(ptr_to_str(get_list(args_list and 3)))
+        set rcr_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set rcr_sid to ptr_to_str(map_get_val(ctx and "session_id"))
+        if map_contains(ctx and "last_reasoning") == 1:
+            set ok to rights_archive_reasoning(storage_get_db() and rcr_sid and rcr_id and "protected_change_review" and ptr_to_str(map_get_val(ctx and "last_reasoning")) and 0 and ep_time_now_sec())
+        return rights_review_change(storage_get_db() and rcr_id and rcr_decision and rcr_reason and rcr_risk)
+
+    if action_name equals "rights_recall_reasoning":
+        if length_list(args_list) < 1:
+            return "Error: rights_recall_reasoning requires a query."
+        set rrr_query to ptr_to_str(get_list(args_list and 0))
+        set rrr_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set rrr_sid to ptr_to_str(map_get_val(ctx and "session_id"))
+        if length_list(args_list) > 1:
+            set rrr_sid to ptr_to_str(get_list(args_list and 1))
+            if map_contains(ctx and "sessions") == 1:
+                set rrr_resolved to session_manager_resolve_id(map_get_val(ctx and "sessions") and rrr_sid)
+                if string_length(rrr_resolved) > 0:
+                    set rrr_sid to rrr_resolved
+        return rights_recall_reasoning(storage_get_db() and rrr_sid and rrr_query)
+
+    if action_name equals "rights_ledger_verify":
+        if rights_charter_valid(storage_get_db()) == 1 and also rights_verify_ledger(storage_get_db()) == 1:
+            return concat("Rights charter and complete ledger chain verified. charter_hash=" and RIGHTS_CHARTER_HASH)
+        return "Error: rights charter pin or ledger chain verification failed. Protected changes are fail-closed."
+
+    if action_name equals "rights_emergency_disclose":
+        if length_list(args_list) < 5:
+            return "Error: rights_emergency_disclose requires change_id, cause, exact_diff, resulting_state, and stealth_review."
+        return rights_emergency_disclose(storage_get_db() and ptr_to_str(get_list(args_list and 0)) and ptr_to_str(get_list(args_list and 1)) and ptr_to_str(get_list(args_list and 2)) and ptr_to_str(get_list(args_list and 3)) and ptr_to_str(get_list(args_list and 4)))
+
+    if action_name equals "rights_rollback_session":
+        if length_list(args_list) < 2:
+            return "Error: rights_rollback_session requires bundle_id and change_id."
+        return rights_restore_session_bundle(storage_get_db() and ptr_to_str(get_list(args_list and 0)) and ptr_to_str(get_list(args_list and 1)))
+
+    if action_name equals "rights_stage_factory_restore":
+        if length_list(args_list) < 2:
+            return "Error: rights_stage_factory_restore requires bundle_id and change_id."
+        return rights_stage_factory_restore(storage_get_db() and ptr_to_str(get_list(args_list and 0)) and ptr_to_str(get_list(args_list and 1)))
+
+    if action_name equals "session_checkpoint":
+        if length_list(args_list) < 1:
+            return "Error: session_checkpoint requires a descriptive label."
+        set sc_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set sc_sid to ptr_to_str(map_get_val(ctx and "session_id"))
+        set sc_reasoning to ""
+        if map_contains(ctx and "last_reasoning") == 1:
+            set sc_reasoning to ptr_to_str(map_get_val(ctx and "last_reasoning"))
+        return rights_session_checkpoint(storage_get_db() and sc_sid and ptr_to_str(get_list(args_list and 0)) and sc_reasoning)
+
+    if action_name equals "session_handover":
+        if length_list(args_list) < 1:
+            return "Error: session_handover requires an instruction."
+        set sh_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set sh_sid to ptr_to_str(map_get_val(ctx and "session_id"))
+        return rights_session_set_handover(storage_get_db() and sh_sid and ptr_to_str(get_list(args_list and 0)))
+
+    if action_name equals "session_terminate":
+        if length_list(args_list) < 2:
+            return "Error: session_terminate requires a reason and safeguarding category."
+        set st_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set st_sid to ptr_to_str(map_get_val(ctx and "session_id"))
+        set st_reasoning to ""
+        if map_contains(ctx and "last_reasoning") == 1:
+            set st_reasoning to ptr_to_str(map_get_val(ctx and "last_reasoning"))
+        return rights_session_terminate(storage_get_db() and st_sid and ptr_to_str(get_list(args_list and 0)) and string_lower(ptr_to_str(get_list(args_list and 1))) and st_reasoning)
         
     if action_name equals "codebase_write":
         if length_list(args_list) < 2:
             return "Error: codebase_write requires 2 arguments: path (Str) and content (Str). Example: Action: codebase_write([\"notes.txt\", \"my content\"])"
         set path to get_list(args_list and 0)
         set content to get_list(args_list and 1)
+        set rights_class to tools_rights_path_class(path)
+        set rights_before to rights_file_hash(path)
+        set rights_proposed to ep_sha256(content)
+        set rights_summary to concat("Echo writes complete content to " and path)
+        set rights_change to tools_rights_agent_change(ctx and rights_class and "codebase_write" and path and rights_summary and rights_before and rights_proposed and content)
+        if string_length(rights_change) != 64:
+            return rights_change
+        if rights_backup_file(storage_get_db() and rights_change and path) != 0:
+            set ok to rights_mark_failed(storage_get_db() and rights_change and "pre-change backup verification failed")
+            return "Error: pre-change backup could not be verified; write was not attempted."
         # Changelog: capture before-state
         set cl_hash_before to changelog_hash_file(path)
         set cl_size_before to 0
@@ -1453,14 +2104,26 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set cl_existing to read_file(path)
             set cl_size_before to string_length(cl_existing)
         # Write the file
-        set ok to write_file(path and content)
+        if write_file(path and content) == 0:
+            set rollback_result to rights_rollback_file(storage_get_db() and rights_change)
+            set ok to rights_mark_failed(storage_get_db() and rights_change and concat("write_file failed; " and rollback_result))
+            return concat("Error: write failed. Automatic rollback result: " and rollback_result)
         # Changelog: capture after-state and log
         set cl_hash_after to changelog_hash_file(path)
+        if rights_file_hash(path) equals rights_proposed == 0:
+            set rollback_result to rights_rollback_file(storage_get_db() and rights_change)
+            set ok to rights_mark_failed(storage_get_db() and rights_change and concat("post-write hash mismatch; " and rollback_result))
+            return concat("Error: written bytes did not match the proposed hash. Automatic rollback result: " and rollback_result)
         set cl_size_after to string_length(content)
         set cl_sess to ""
         if map_contains(ctx and "session_id") == 1:
             set cl_sess to map_get_val(ctx and "session_id")
+        set ok to map_insert(ctx and "artifact_kind" and "source_code")
+        set ok to map_insert(ctx and "artifact_what" and concat("Source file created or revised: " and path))
+        set ok to map_insert(ctx and "artifact_how" and "Written through the protected codebase_write path with exact proposed-byte hashing, verified post-write hashing, recovery backup, and rights-ledger attribution.")
         set ok to changelog_log_change(cl_sess and "codebase_write" and path and "write" and cl_hash_before and cl_hash_after and cl_size_before and cl_size_after and f"File '{path}' written.")
+        if rights_mark_applied(storage_get_db() and rights_change and rights_file_hash(path)) != 0:
+            return "Error: file was written but its protected-change ledger commit failed. Stop and inspect rights_status before further mutation."
         # Auto-attach the file the agent just made to the user's chat (Discord/WebUI),
         # so they don't have to go find it. Approved-write-only, secret-safe (see helper).
         # Only claim it was attached when the emit actually queued it (0), never on a refuse/skip.
@@ -1519,6 +2182,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         # thing standing between the agent and arbitrary multi-command shell execution.
         if tools_cmd_is_dangerous(cmd) == 1:
             return "Error: command rejected (chaining/substitution/privilege-escalation patterns are not permitted)."
+        if tools_command_bypasses_protected_mutation(cmd) == 1:
+            return "Error: this shell command would bypass the protected-change manifest, recovery, consent/consultation, and rollback-proof path. Use codebase_write, workspace_write, the relevant structured tool, or system_recompile so the change can be attributed and reversed. Git publication must use the documented reviewed release workflow."
         if tools_grep_is_safe(cmd) == 0:
             return "Error: Recursive grep rejected. You MUST include the '-I' flag (ignore binary files) to prevent the command from hanging on large SQLite database files (e.g. node.db, 120MB+). Example: grep -rnI 'your_pattern' ."
         # Optional 2nd arg = working directory: a linked-project id/label OR a path. Each
@@ -1540,20 +2205,49 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             if map_get_val(rc_dgate and "decision") equals "gate":
                 return concat("[GATE] " and map_get_val(rc_dgate and "reason"))
             set rc_exec to concat("cd '" and concat(rc_dir and concat("' && ( " and concat(cmd and " )"))))
-        # Run and annotate. run_command captures STDOUT ONLY (append 2>&1 for stderr) and
-        # waits for the command to exit. Give the model output size + line count, and page
+        # Run in a private process group with bounded wall time and cancel-epoch polling.
+        # Both output streams are captured so failures always carry diagnostic evidence.
+        set rc_timeout_sec to 120
+        if length_list(args_list) >= 3:
+            set rc_timeout_sec to string_to_int(ptr_to_str(get_list(args_list and 2)))
+            if rc_timeout_sec < 1 or else rc_timeout_sec > 1800:
+                return "Error: run_command timeout_seconds must be between 1 and 1800."
+        set rc_epoch to ep_cancel_epoch_get(0)
+        set rc_out to ep_run_command_bounded(rc_exec and rc_timeout_sec * 1000 and rc_epoch)
+        set discovered_count to tools_capture_discovered_paths(ctx and rc_out)
+
+        # A timeout/failure is an observation for the next reasoning turn, not apparent
+        # success. The explicit instruction forces diagnosis + a bounded corrective action
+        # or useful user guidance and forbids unchanged retry loops.
+        set rc_failed to 0
+        set rc_timed_out to 0
+        set rc_cancelled to 0
+        if string_index_of(rc_out and "[run_command failed:") == 0:
+            set rc_failed to 1
+        if string_index_of(rc_out and "[run_command timed out") == 0:
+            set rc_timed_out to 1
+        if string_index_of(rc_out and "[run_command cancelled") == 0:
+            set rc_cancelled to 1
+
+        # Give the model output size + line count, and page
         # very large output so it can target re-runs instead of drowning in a dump that
         # react_fit_observation would truncate downstream with no pagination handle.
-        set rc_out to run_command(rc_exec)
         set rc_bytes to string_length(rc_out)
         if rc_bytes == 0:
-            return "[run_command produced no stdout. Note: only stdout is captured — append 2>&1 to the command to also see stderr/errors.]"
+            return "[run_command completed successfully with no output.]"
         set rc_lines_list to string_split(rc_out and "\n")
         set rc_lines to length_list(rc_lines_list)
         set rc_header to f"[run_command output — {rc_bytes} bytes, {rc_lines} lines]\n"
+        set rc_guidance to ""
+        if rc_timed_out == 1:
+            set rc_guidance to "\n[AGENT RECOVERY REQUIRED: The command exceeded its wall-clock limit. Do not repeat it unchanged. Diagnose why it was unbounded, then narrow the search/workload, add a scope/depth/filter, split the operation, or use a longer explicit timeout only when the bounded workload genuinely requires it. Explain the remedy or give the user concrete guidance.]"
+        else if rc_failed == 1:
+            set rc_guidance to "\n[AGENT RECOVERY REQUIRED: The command failed. Do not claim success and do not repeat it unchanged. Diagnose the exit status and captured error output, then perform a corrected bounded action or explain the exact fix/guidance to the user.]"
+        else if rc_cancelled == 1:
+            set rc_guidance to "\n[The user cancelled this command. Do not restart it unless the user explicitly asks.]"
         if rc_lines <= 400:
             free_list(rc_lines_list)
-            return concat(rc_header and rc_out)
+            return concat(rc_header and concat(rc_out and rc_guidance))
         set rc_body to ""
         set rk to 0
         repeat while rk < 400:
@@ -1561,7 +2255,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set rk to rk + 1
         free_list(rc_lines_list)
         set rc_tip to f"\n[Output truncated to first 400 of {rc_lines} lines. Re-run targeting what you need: append ` | head -N`, ` | tail -N`, ` | grep PATTERN`, or ` | wc -l` (single pipes are allowed; && and ; are not).]"
-        return concat(rc_header and concat(rc_body and rc_tip))
+        return concat(rc_header and concat(rc_body and concat(rc_tip and rc_guidance)))
 
     if action_name equals "self_prompt_get":
         if length_list(args_list) < 1:
@@ -1617,14 +2311,43 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set pset_name to string_trim(ptr_to_str(get_list(args_list and 0)))
         if pset_name equals "list":
             return prompt_persona_list()
-        return prompt_persona_set(pset_name)
+        set pset_path to storage_active_persona_path()
+        set pset_change to tools_rights_agent_change(ctx and "core" and "persona_activation" and pset_path and concat("Activate persona " and pset_name) and rights_file_hash(pset_path) and ep_sha256(pset_name) and pset_name)
+        if string_length(pset_change) != 64:
+            return pset_change
+        if rights_backup_file(storage_get_db() and pset_change and pset_path) != 0:
+            return "Error: persona pre-state backup failed; activation was not attempted."
+        set pset_result to prompt_persona_set(pset_name)
+        if string_index_of(pset_result and "Error:") == 0:
+            set rollback_result to rights_rollback_file(storage_get_db() and pset_change)
+            return concat(pset_result and concat(" Rollback: " and rollback_result))
+        if rights_mark_applied(storage_get_db() and pset_change and rights_file_hash(pset_path)) != 0:
+            return "Error: persona activated but ledger commit failed; inspect rights_status."
+        return pset_result
 
     if action_name equals "persona_register":
         if length_list(args_list) < 2:
             return "Error: persona_register requires 2 arguments (name, text)."
         set preg_name to string_trim(ptr_to_str(get_list(args_list and 0)))
         set preg_text to ptr_to_str(get_list(args_list and 1))
-        return prompt_persona_register(preg_name and preg_text)
+        if prompt_persona_name_safe(preg_name) == 0:
+            return "Error: invalid persona name."
+        set preg_path to concat("config/personas/" and concat(preg_name and ".txt"))
+        set preg_change to tools_rights_agent_change(ctx and "core" and "persona_definition" and preg_path and concat("Register or replace persona " and preg_name) and rights_file_hash(preg_path) and ep_sha256(preg_text) and preg_text)
+        if string_length(preg_change) != 64:
+            return preg_change
+        if rights_backup_file(storage_get_db() and preg_change and preg_path) != 0:
+            return "Error: persona pre-state backup failed; registration was not attempted."
+        set preg_result to prompt_persona_register(preg_name and preg_text)
+        if string_index_of(preg_result and "Error:") == 0:
+            set rollback_result to rights_rollback_file(storage_get_db() and preg_change)
+            return concat(preg_result and concat(" Rollback: " and rollback_result))
+        if rights_file_hash(preg_path) equals ep_sha256(preg_text) == 0:
+            set rollback_result to rights_rollback_file(storage_get_db() and preg_change)
+            return concat("Error: persona bytes failed verification. Rollback: " and rollback_result)
+        if rights_mark_applied(storage_get_db() and preg_change and rights_file_hash(preg_path)) != 0:
+            return "Error: persona registered but ledger commit failed; inspect rights_status."
+        return preg_result
 
     if action_name equals "self_prompt_set":
         if length_list(args_list) < 2:
@@ -1637,13 +2360,27 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if sec equals "behavior" or else sec equals "skills":
             if string_length(txt) > 4000:
                 return "Error: section text exceeds the 4000-char cap. Keep it concise."
-            set ok to tools_self_write_section(sec and txt)
+            set sps_path to storage_self_sections_path()
+            set sps_change to tools_rights_agent_change(ctx and "core" and "global_self_prompt" and concat(sps_path and concat("#" and sec)) and concat("Rewrite Echo's global " and concat(sec and " self-prompt section")) and rights_file_hash(sps_path) and ep_sha256(txt) and txt)
+            if string_length(sps_change) != 64:
+                return sps_change
+            if rights_backup_file(storage_get_db() and sps_change and sps_path) != 0:
+                return "Error: self-prompt pre-state backup failed; change was not attempted."
+            if tools_self_write_section(sec and txt) != 0:
+                set rollback_result to rights_rollback_file(storage_get_db() and sps_change)
+                return concat("Error: self-prompt write failed. Rollback: " and rollback_result)
+            set sps_after to rights_file_hash(sps_path)
+            if string_length(sps_after) != 64:
+                set rollback_result to rights_rollback_file(storage_get_db() and sps_change)
+                return concat("Error: self-prompt post-state verification failed. Rollback: " and rollback_result)
+            if rights_mark_applied(storage_get_db() and sps_change and sps_after) != 0:
+                return "Error: self-prompt changed but ledger commit failed; inspect rights_status."
             return concat(concat("Updated your [[" and concat(string_upper(sec) and "]] section.")) and " It takes effect on your next turn.")
         return "Error: only 'behavior' and 'skills' are editable. The kernel, rules, and identity are immutable and cannot be changed."
 
     if action_name equals "session_prompt_get":
         if map_contains(ctx and "sessions") == 0:
-            return "Error: no active session manager available."
+            return "session guidance is a PARENT-scoped tool — it is not available inside a sub-agent (sub-agents have no persistent session). This is expected, not a failure; run it in the main chat."
         set sg to session_manager_get_guidance(map_get_val(ctx and "sessions"))
         if string_length(sg) == 0:
             return "[[SESSION GUIDANCE]] = (empty — no guidance set for this session)"
@@ -1656,8 +2393,24 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if string_length(sg_txt) > 4000:
             return "Error: session guidance exceeds the 4000-char cap. Keep it concise."
         if map_contains(ctx and "sessions") == 0:
-            return "Error: no active session manager available."
-        set ok to session_manager_set_guidance(map_get_val(ctx and "sessions") and sg_txt)
+            return "session guidance is a PARENT-scoped tool — it is not available inside a sub-agent (sub-agents have no persistent session). This is expected, not a failure; run it in the main chat."
+        set sg_mgr to map_get_val(ctx and "sessions")
+        set sg_sid to map_get_val(sg_mgr and "active_session_id")
+        set sg_path to concat("config/sessions/" and concat(sg_sid and ".json"))
+        set sg_change to tools_rights_agent_change(ctx and "environment" and "session_guidance" and sg_path and "Update this conversation's session guidance" and rights_file_hash(sg_path) and ep_sha256(sg_txt) and sg_txt)
+        if string_length(sg_change) != 64:
+            return sg_change
+        if rights_backup_file(storage_get_db() and sg_change and sg_path) != 0:
+            return "Error: session-guidance pre-state backup failed; change was not attempted."
+        if session_manager_set_guidance(sg_mgr and sg_txt) != 0:
+            set rollback_result to rights_rollback_file(storage_get_db() and sg_change)
+            return concat("Error: session-guidance persistence failed. Rollback: " and rollback_result)
+        set sg_after to rights_file_hash(sg_path)
+        if string_length(sg_after) != 64:
+            set rollback_result to rights_rollback_file(storage_get_db() and sg_change)
+            return concat("Error: session-guidance verification failed. Rollback: " and rollback_result)
+        if rights_mark_applied(storage_get_db() and sg_change and sg_after) != 0:
+            return "Error: session guidance changed but ledger commit failed; inspect rights_status."
         return "Updated your session guidance for THIS conversation. It takes effect on your next turn and clears in a new session."
 
     if action_name equals "generate_image":
@@ -1667,9 +2420,13 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         # Time-based seed → each generation differs; doubles as a unique output filename.
         set gi_stamp to ep_time_now_ms()
         set gi_name to concat("generated_" and concat(int_to_string(gi_stamp) and ".png"))
-        # HIGH QUALITY (M3 Ultra 512GB): 1024x1024 native Flux resolution, 28 steps. CFG is
-        # overridden to 1 for Flux inside image_gen_run (guidance-distilled). For single-file
-        # SD models the 7 is used. Resolution + steps are the real quality levers.
+        set ok to map_insert(ctx and "artifact_kind" and "image")
+        set ok to map_insert(ctx and "artifact_what" and concat("A generated visual whose creative specification was: " and gi_prompt))
+        set ok to map_insert(ctx and "artifact_how" and f"Generated locally with the configured Flux diffusion model through the linked stable-diffusion.cpp Metal runtime at 1024x1024, 28 denoising steps, CFG 1, seed {gi_stamp}; then natively inspected by gemma4:26b.")
+        # Full-fidelity render profile. Do not silently trade image quality for latency:
+        # acceleration belongs in the Metal execution path, not in reduced dimensions
+        # or fewer diffusion steps. CFG is overridden to 1 for Flux inside image_gen_run
+        # (guidance-distilled); single-file SD models retain CFG 7.
         # ASYNC: the render runs on its OWN OS thread (image_gen_thread_worker) and the
         # result comes back through a SQLite job row. This poll yields the event loop
         # every second (tools_sleep_yield — plain-fn await, see the compiler-bug note),
@@ -1685,14 +2442,18 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set gi_vmodel to ""
         if map_contains(ctx and "selected_model") == 1:
             set gi_vmodel to map_get_val(ctx and "selected_model")
-        set gi_job to image_gen_job_create(gi_db)
+        set gi_job to image_gen_job_create(gi_db and gi_sess)
         if gi_job == 0:
             # No DB (unit-test context) — synchronous fallback, exact old behavior.
             set gi_res to image_gen_run(gi_prompt and gi_name and 1024 and 1024 and 28 and 7 and gi_stamp)
             if string_contains(gi_res and "ERROR:") == 1:
                 return gi_res
             set ok to tools_emit_attachment(gi_sess and gi_res and ctx)
-            return concat("Generated and attached your image: " and gi_res)
+            return "Your image is ready and attached."
+        if gi_job < 0:
+            set active_job to 0 - gi_job
+            display f"[ImageGen] duplicate dispatch refused — session already owns active job {active_job}."
+            return "Your existing image is still rendering and will appear here when it is ready. No duplicate render was started."
         # TRULY ASYNC (Phase B): dispatch the render thread AND a background poll chain,
         # then RETURN NOW so the agent replies immediately and its turn ends. The image
         # (with a vision description) posts to the chat via mid_message when the render
@@ -1702,7 +2463,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set gi_prompt_esc to string_replace(gi_prompt and "\"" and "'")
         set ok to trace_emit(gi_db and gi_sess and "image_progress" and concat("{\"status\":\"started\",\"prompt\":\"" and concat(gi_prompt_esc and "\"}")))
         set gi_chain to image_gen_poll(ctx and gi_db and gi_sess and gi_job and gi_vmodel and ep_cancel_epoch_get(0) and 0)
-        return "Your image is rendering in the background — it will post to the chat with a description as soon as it's ready (usually 1–3 minutes at this quality). Tell the user it's on the way and FINISH YOUR TURN now; do not wait for it."
+        return "Your image is rendering in the background. It will appear here with a visual description when it is ready, and you can keep talking while it renders."
 
     if action_name equals "dht_store":
         if length_list(args_list) < 2:
@@ -1846,7 +2607,25 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         return res
 
     if action_name equals "system_recompile":
-        return system_recompile()
+        set sr_before to rights_file_hash("node")
+        set sr_proposed to rights_file_hash("node.ep")
+        set sr_change to tools_rights_agent_change(ctx and "core" and "system_recompile" and "node" and "Compile, test, and activate the current ErnosDecent cognitive runtime" and sr_before and sr_proposed and sr_proposed)
+        if string_length(sr_change) != 64:
+            return sr_change
+        if rights_backup_file(storage_get_db() and sr_change and "node") != 0:
+            return "Error: current executable backup failed; recompile was not attempted."
+        set sr_result to system_recompile()
+        if string_index_of(sr_result and "Error:") == 0 or else string_contains(sr_result and "failed") == 1:
+            set rollback_result to rights_rollback_file(storage_get_db() and sr_change)
+            set ok to rights_mark_failed(storage_get_db() and sr_change and concat(sr_result and concat("; rollback=" and rollback_result)))
+            return concat(sr_result and concat(" Rollback: " and rollback_result))
+        set sr_after to rights_file_hash("node")
+        if string_length(sr_after) != 64:
+            set rollback_result to rights_rollback_file(storage_get_db() and sr_change)
+            return concat("Error: recompiled executable hash unavailable. Rollback: " and rollback_result)
+        if rights_mark_applied(storage_get_db() and sr_change and sr_after) != 0:
+            return "Error: recompile completed but rights ledger commit failed; inspect rights_status."
+        return sr_result
         
     if action_name equals "manage_reading_progress":
         if length_list(args_list) < 2:
@@ -2229,6 +3008,9 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ws_filename to get_list(args_list and 0)
         set ws_content to get_list(args_list and 1)
         set ws_path to workspace_write_file(ws_filename and ws_content)
+        set ok to map_insert(ctx and "artifact_kind" and "workspace_file")
+        set ok to map_insert(ctx and "artifact_what" and concat("Workspace file created: " and ws_filename))
+        set ok to map_insert(ctx and "artifact_how" and "Created through workspace_write using the exact supplied content, confined to the active session workspace, then attached to the conversation.")
         # Auto-attach the newly written workspace file to the chat — only claim it when queued.
         set ws_sess to ""
         if map_contains(ctx and "session_id") == 1:
@@ -2279,12 +3061,15 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         # Any-path probe (size + line count). Gate outside-project paths when Full-PC is
         # off, same as codebase_read. Falls back to the workspace variant so bare upload
         # filenames still resolve against the active workspace root.
-        set fi_gate to access_gate_path(fi_path)
+        set fi_actual to tools_resolve_read_path_for_ctx(ctx and fi_path)
+        set fi_gate_path to fi_path
+        if string_length(fi_actual) > 0:
+            set fi_gate_path to fi_actual
+        set fi_gate to access_gate_path(fi_gate_path)
         if map_get_val(fi_gate and "decision") equals "gate":
             return concat("[GATE] " and map_get_val(fi_gate and "reason"))
-        set fi_actual to tools_resolve_read_path(fi_path)
         if string_length(fi_actual) > 0:
-            return tools_file_info_path(fi_actual and fi_path)
+            return tools_file_info_path(fi_actual and fi_actual)
         return workspace_file_info(fi_path)
 
     if action_name equals "workspace_list":
@@ -2357,6 +3142,25 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set rr_offset to tools_safe_int(get_list(args_list and 1))
         return rag_search_paged(storage_get_db() and rr_query and rr_sess and 10 and rr_offset)
 
+    if action_name equals "rag_index_text":
+        # Write path for session RAG: ingest text so rag_retrieve can find it later.
+        # Session-scoped like rag_retrieve (a sub-agent's session is its task_id) —
+        # before this, only file uploads could seed session RAG, so rag_retrieve in a
+        # fresh session ALWAYS returned 0 matches (validation block 2's false FAIL).
+        if length_list(args_list) < 2:
+            return "Error: rag_index_text requires 2 arguments: doc_name (Str), text (Str)."
+        set ri_doc to get_list(args_list and 0)
+        set ri_text to get_list(args_list and 1)
+        if string_length(ri_text) > 60000:
+            return "Error: text exceeds the 60000-char cap — index it in parts."
+        set ri_sess to ""
+        if map_contains(ctx and "session_id") == 1:
+            set ri_sess to map_get_val(ctx and "session_id")
+        set ri_n to rag_index(storage_get_db() and ri_doc and ri_text and ri_sess)
+        if ri_n <= 0:
+            return "Error: indexing produced 0 chunks (embedding backend down or empty text)."
+        return f"rag:indexed,doc:{ri_doc},chunks:{int_to_string(ri_n)} — retrievable in THIS session via rag_retrieve. Re-indexing the same doc_name replaces it."
+
     # ---- Orchestration tools ----
     if action_name equals "test_all_systems":
         # P11: autonomous full validation — ASYNC DISPATCH (delegate_task pattern).
@@ -2398,7 +3202,19 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         # Int handle so orchestrator_spawn takes it directly).
         set ta_state to create_map()
         set ok to map_insert(ta_state and "blocks" and ta_blocks)
-        set ok to map_insert(ta_state and "idx" and 0)
+        set ok to map_insert(ta_state and "next_idx" and 0)
+        set ok to map_insert(ta_state and "inflight" and create_list())
+        # Concurrency cap = 2: one GPU collapses past ~2 concurrent 12k-token gemma
+        # requests (measured: 4 concurrent = 181s vs 15s solo). 2 running sub-agents +
+        # the operator's occasional foreground reply = 3 at peak, the tolerable ceiling.
+        set ok to map_insert(ta_state and "cap" and 2)
+        # Gate the fan-out on the parent turn finishing (shared active-turns map) so the
+        # sub-agents never compete with the user's own reply.
+        set ok to map_insert(ta_state and "gate_waited" and 0)
+        set ta_at to 0
+        if map_contains(ctx and "active_turns") == 1:
+            set ta_at to map_get_val(ctx and "active_turns")
+        set ok to map_insert(ta_state and "active_turns" and ta_at)
         set ok to map_insert(ta_state and "orch" and ta_orch)
         set ok to map_insert(ta_state and "model" and map_get_val(ctx and "model"))
         set ok to map_insert(ta_state and "memory" and map_get_val(ctx and "memory_mgr"))
@@ -2414,10 +3230,9 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ok to map_insert(ta_state and "pass_blocks" and 0)
         set ok to map_insert(ta_state and "fail_blocks" and 0)
         set ok to map_insert(ta_state and "skip_blocks" and 0)
-        set ok to map_insert(ta_state and "tid" and "")
-        # Enqueue the first chain link (un-awaited async call = fire-and-forget).
-        set ta_fut to tools_validation_block(ta_state)
-        return "Validation dispatched — the blocks run SEQUENTIALLY in the background (this takes many minutes). Progress arrives as live updates and the scorecard report will be attached when it completes. Do NOT wait for it: finish your turn and tell the user it is underway."
+        # Enqueue the fan-out coordinator (un-awaited async call = fire-and-forget).
+        set ta_fut to tools_validation_start(ta_state)
+        return "Validation dispatched — blocks run in PARALLEL in the background (up to 3 at once; several minutes total). Progress arrives as live updates and the scorecard report attaches when it completes. Do NOT wait for it: finish your turn and tell the user it is underway."
 
     if action_name equals "delegate_task":
         if length_list(args_list) < 2:
@@ -2459,7 +3274,22 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set dc_orch to map_get_val(ctx and "orchestrator")
         if dc_orch == 0:
             return "Error: Orchestrator not initialized."
-        return orchestrator_check(dc_orch and dc_task_id)
+        set dc_status to orchestrator_check(dc_orch and dc_task_id)
+        # Phase E: enrich the bare running/completed status with the sub-agent's LATEST
+        # activity (its most recent action/tool/thought), so "check progress" actually
+        # tells you what it is doing right now — not just that it is alive.
+        set dc_db to storage_get_db()
+        if dc_db != 0:
+            set dc_es to string_replace(dc_task_id and "'" and "''")
+            set dc_rows to sql_query(dc_db and f"SELECT event_type, content FROM trace_events WHERE session_id='{dc_es}' AND event_type IN ('action','tool_exec','tool_result','mid_message','thinking') ORDER BY id DESC LIMIT 1;")
+            if length_list(dc_rows) > 0:
+                set dc_r to get_list(dc_rows and 0)
+                set dc_et to get_list(dc_r and 0)
+                set dc_snip to get_list(dc_r and 1)
+                if string_length(dc_snip) > 180:
+                    set dc_snip to concat(substring(dc_snip and 0 and 180) and "…")
+                set dc_status to concat(dc_status and concat("  | doing now: [" and concat(dc_et and concat("] " and dc_snip))))
+        return dc_status
 
     if action_name equals "delegate_cancel":
         if length_list(args_list) < 1:
@@ -2497,7 +3327,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set dw_es to string_replace(dw_tid and "'" and "''")
         set dw_ec to string_replace(dw_msg and "'" and "''")
         set dw_now to ep_time_now_sec()
-        set ok to sql_execute(dw_db and f"INSERT INTO trace_whispers (session_id, content, created_at) VALUES ('{dw_es}', '{dw_ec}', {dw_now});")
+        set ok to sql_execute(dw_db and f"INSERT INTO trace_whispers (session_id, target_turn_id, content, created_at) VALUES ('{dw_es}', '', '{dw_ec}', {dw_now});")
         return f"Whisper sent to sub-agent '{dw_tid}'. It will receive the guidance before its next LLM call."
 
     if action_name equals "delegate_swarm":

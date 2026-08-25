@@ -7,49 +7,85 @@ import "string"
 import "collections"
 import "json"
 
-# Extract the delta content from a single SSE line ("data: {json}"); "" otherwise.
-define stream_extract_delta with line as Str returning Str:
+# Apply one OpenAI-compatible SSE delta to an accumulated channel map.  Thinking
+# models may stream private reasoning separately from final content; preserve both.
+define stream_apply_delta with line as Str and state as Map returning Int:
     if string_length(line) < 6:
-        return ""
+        return 0
     set pfx to substring(line and 0 and 5)
     if pfx equals "data:" == 0:
-        return ""
+        return 0
     set payload to string_trim(substring(line and 5 and string_length(line) - 5))
     if payload equals "[DONE]":
-        return ""
+        return 0
     set node to json_parse(payload)
     if node == 0:
-        return ""
+        return 0
+
+    # With stream_options.include_usage, the final chunk carries usage and no choices.
+    set usage to get_json_object_value(node and "usage")
+    if usage != 0:
+        set prompt_tokens to get_json_object_value(usage and "prompt_tokens")
+        if prompt_tokens != 0:
+            set ok to map_insert(state and "prompt_tokens" and get_json_value(prompt_tokens))
+        set completion_tokens to get_json_object_value(usage and "completion_tokens")
+        if completion_tokens != 0:
+            set ok to map_insert(state and "completion_tokens" and get_json_value(completion_tokens))
+
     set choices to get_json_object_value(node and "choices")
     if choices == 0:
-        return ""
+        return 0
     set clist to get_json_value(choices)
     if length_list(clist) == 0:
-        return ""
+        return 0
     set c0 to get_list(clist and 0)
     if c0 == 0:
-        return ""
+        return 0
     set delta to get_json_object_value(c0 and "delta")
     if delta == 0:
-        return ""
+        return 0
     set content to get_json_object_value(delta and "content")
-    if content == 0:
-        return ""
-    return get_json_value(content)
+    if content != 0:
+        set old_content to map_get_val(state and "content")
+        set ok to map_insert(state and "content" and concat(old_content and get_json_value(content)))
+    set reasoning to get_json_object_value(delta and "reasoning")
+    if reasoning == 0:
+        set reasoning to get_json_object_value(delta and "reasoning_content")
+    if reasoning == 0:
+        set reasoning to get_json_object_value(delta and "thinking")
+    if reasoning != 0:
+        set old_reasoning to map_get_val(state and "reasoning")
+        set ok to map_insert(state and "reasoning" and concat(old_reasoning and get_json_value(reasoning)))
+    return 1
+
+# Apply a batch of complete SSE lines to an existing accumulator. The native wire
+# decoder retains partial lines, so no JSON delta is reconsidered on later reads.
+define stream_apply_sse_lines with complete_lines as Str and state as Map returning Int:
+    set lines to string_split(complete_lines and "\n")
+    set i to 0
+    set n to length_list(lines)
+    repeat while i < n:
+        set line to get_list(lines and i)
+        if string_length(line) > 0:
+            set applied to stream_apply_delta(line and state)
+        set i to i + 1
+    free_list(lines)
+    return 0
+
+define stream_parse_sse_channels with raw as Str returning Map:
+    set state to create_map()
+    set ok to map_insert(state and "content" and "")
+    set ok to map_insert(state and "reasoning" and "")
+    set ok to map_insert(state and "prompt_tokens" and 0)
+    set ok to map_insert(state and "completion_tokens" and 0)
+    set applied to stream_apply_sse_lines(raw and state)
+    return state
+
+# Extract the final-content delta from one line for backwards-compatible callers.
+define stream_extract_delta with line as Str returning Str:
+    set state to stream_parse_sse_channels(concat(line and "\n"))
+    return map_get_val(state and "content")
 
 define stream_parse_sse with raw as Str returning Str:
-    set out to ""
-    set line to ""
-    set n to string_length(raw)
-    set i to 0
-    repeat while i < n:
-        set c to get_character(raw and i)
-        if c == 10:
-            set out to concat(out and stream_extract_delta(line))
-            set line to ""
-        else:
-            set line to concat(line and substring(raw and i and 1))
-        set i to i + 1
-    # trailing line with no newline
-    set out to concat(out and stream_extract_delta(line))
-    return out
+    set state to stream_parse_sse_channels(raw)
+    return map_get_val(state and "content")

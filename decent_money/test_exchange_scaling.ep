@@ -1,0 +1,82 @@
+# Focused price-time priority and large-book complexity regression.
+
+import "collections"
+import "string"
+import "exchange"
+
+set EXCHANGE_SCALING_TOTAL to 0
+
+define exchange_scaling_expect with condition as Int and label as Str returning Int:
+    set EXCHANGE_SCALING_TOTAL to EXCHANGE_SCALING_TOTAL + 1
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define exchange_scaling_order with order_id as Str and price as Int and created_at as Int returning Map:
+    set order to create_map()
+    set ok to map_insert(order and "order_id" and order_id)
+    set ok to map_insert(order and "price" and price)
+    set ok to map_insert(order and "created_at" and created_at)
+    return order
+
+define main returning Int:
+    set passed to 0
+
+    # 32,768 ascending prices are the worst case for descending buy priority.
+    # Bubble sort performs about 1.07 billion comparisons here; merge sort performs
+    # fewer than 500,000 and completes inside this native regression's 15s bound.
+    set buy_count to 32768
+    set buys to create_list()
+    set i to 0
+    repeat while i < buy_count:
+        set order to exchange_scaling_order(concat("buy_" and int_to_string(i)) and i + 1 and i + 1)
+        set ok to append_list(buys and order)
+        set i to i + 1
+    set buy_started to ep_time_now_ms()
+    set buy_sort_rc to dex_sort_buys(buys)
+    set buy_elapsed to ep_time_now_ms() - buy_started
+    set passed to passed + exchange_scaling_expect(buy_sort_rc == DEX_ERR_NONE and also buy_elapsed < 15000 and "32K worst-order buy book sorts within the O(n log n) regression bound")
+    set passed to passed + exchange_scaling_expect(map_get_val(get_list(buys and 0) and "price") == buy_count and also map_get_val(get_list(buys and buy_count - 1) and "price") == 1 and "buy priority is highest price first")
+    set buy_ordered to 1
+    set i to 0
+    repeat while i < buy_count - 1:
+        if map_get_val(get_list(buys and i) and "price") <= map_get_val(get_list(buys and i + 1) and "price"):
+            set buy_ordered to 0
+        set i to i + 1
+    set passed to passed + exchange_scaling_expect(buy_ordered == 1 and "every large buy-book adjacency is ordered")
+
+    set tied to create_list()
+    set ok to append_list(tied and exchange_scaling_order("ord_c" and 10 and 7))
+    set ok to append_list(tied and exchange_scaling_order("ord_a" and 10 and 7))
+    set ok to append_list(tied and exchange_scaling_order("ord_b" and 10 and 7))
+    set tie_rc to dex_sort_buys(tied)
+    set passed to passed + exchange_scaling_expect(tie_rc == DEX_ERR_NONE and also (map_get_val(get_list(tied and 0) and "order_id") equals "ord_a") == 1 and also (map_get_val(get_list(tied and 1) and "order_id") equals "ord_b") == 1 and also (map_get_val(get_list(tied and 2) and "order_id") equals "ord_c") == 1 and "equal price-time orders use deterministic id priority")
+
+    set sells to create_list()
+    set sell_count to 8192
+    set i to 0
+    repeat while i < sell_count:
+        set order to exchange_scaling_order(concat("sell_" and int_to_string(i)) and sell_count - i and i + 1)
+        set ok to append_list(sells and order)
+        set i to i + 1
+    set sell_rc to dex_sort_sells(sells)
+    set passed to passed + exchange_scaling_expect(sell_rc == DEX_ERR_NONE and also map_get_val(get_list(sells and 0) and "price") == 1 and also map_get_val(get_list(sells and sell_count - 1) and "price") == sell_count and "sell priority is lowest price first")
+
+    # Matching consumes cursors and compacts once; it never repeatedly shifts index 0.
+    set compact to create_list()
+    set i to 1
+    repeat while i <= 6:
+        set ok to append_list(compact and i)
+        set i to i + 1
+    set compact_rc to dex_compact_consumed_prefix(compact and 4)
+    set passed to passed + exchange_scaling_expect(compact_rc == DEX_ERR_NONE and also length_list(compact) == 2 and also get_list(compact and 0) == 5 and also get_list(compact and 1) == 6 and "consumed match prefix compacts survivors in one linear pass")
+    set invalid_compact to dex_compact_consumed_prefix(compact and 3)
+    set passed to passed + exchange_scaling_expect(invalid_compact == DEX_ERR_INVALID_ORDER and also length_list(compact) == 2 and "invalid prefix count is rejected without mutation")
+
+    display f"BUY_SORT_MS: {buy_elapsed}"
+    display f"RESULT: {passed}/{EXCHANGE_SCALING_TOTAL} passed"
+    if passed != EXCHANGE_SCALING_TOTAL:
+        return 1
+    return 0

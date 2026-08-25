@@ -22,12 +22,45 @@ external define cast_borrow_to_map with b returning Map
 # shared agent maps — a latent heap-corruption crash. The IPC daemon is the single, serial
 # owner of react runs, so routing through it makes the scheduled turn run on the IPC thread,
 # serialized with user turns. This thread just blocks on the socket until the turn returns.
-define scheduler_submit_via_ipc with instruction as Str returning Str:
+define scheduler_ack_field with resp as Str and field as Str returning Str:
+    set marker to concat(field and ":")
+    set start to string_index_of(resp and marker)
+    if start < 0:
+        return ""
+    set rest to substring(resp and start + string_length(marker) and string_length(resp) - start - string_length(marker))
+    set comma to string_index_of(rest and ",")
+    if comma >= 0:
+        return substring(rest and 0 and comma)
+    return rest
+
+define scheduler_wait_final_reply with sid as Str and turn_id as Str returning Str:
+    set db to storage_get_db()
+    if db == 0:
+        return "error:db_unavailable"
+    set es to string_replace(sid and "'" and "''")
+    set prefix to concat("turn:" and concat(turn_id and ","))
+    set eprefix to string_replace(prefix and "'" and "''")
+    set waited to 0
+    repeat while waited < 1800000:
+        set rows to sql_query(db and f"SELECT id, content FROM trace_events WHERE session_id='{es}' AND event_type='final_reply' AND sent=0 AND content LIKE '{eprefix}%' ORDER BY id LIMIT 1;")
+        if length_list(rows) > 0:
+            set row to get_list(rows and 0)
+            set rid to get_list(row and 0)
+            set content to get_list(row and 1)
+            set ok to sql_execute(db and f"UPDATE trace_events SET sent=1 WHERE id={rid};")
+            return substring(content and string_length(prefix) and string_length(content) - string_length(prefix))
+        set ok to sleep_ms(250)
+        set waited to waited + 250
+    return "error:turn_timeout"
+
+define scheduler_submit_via_ipc with job_id as Str and instruction as Str returning Str:
     set fd to ep_net_connect("127.0.0.1" and 5000)
     if fd < 0:
         return "error:daemon_offline"
     set tok to ipc_read_token()
-    set ok to ep_net_send(fd and concat("AUTH " and concat(tok and concat(" AI INFER " and instruction))))
+    set scheduler_sid to concat("scheduler_" and job_id)
+    set tagged to concat("[SESSION:" and concat(scheduler_sid and concat("] [SENDER:scheduler] [ROLE:owner] [PLATFORM:scheduler] " and instruction)))
+    set ok to ep_net_send(fd and concat("AUTH " and concat(tok and concat(" AI INFER " and tagged))))
     set resp to ""
     set reading to 1
     repeat while reading == 1:
@@ -37,6 +70,11 @@ define scheduler_submit_via_ipc with instruction as Str returning Str:
         else:
             set resp to concat(resp and chunk)
     set ok to ep_net_close(fd)
+    if string_index_of(resp and "ai:accepted") == 0:
+        set accepted_sid to scheduler_ack_field(resp and "session")
+        set accepted_turn to scheduler_ack_field(resp and "turn")
+        if string_length(accepted_sid) > 0 and also string_length(accepted_turn) > 0:
+            return scheduler_wait_final_reply(accepted_sid and accepted_turn)
     return resp
 
 define cast_int_to_str with val as Int returning Str:
@@ -293,7 +331,7 @@ define scheduler_execute_job with job_id as Str and instruction as Str and model
             log_info("scheduler" and concat("Executing background scheduled job: " and instruction))
             # Route through the serial IPC daemon (NOT react_run on this thread — that races
             # the user turn over GC-managed maps and can corrupt the heap).
-            set agent_resp to scheduler_submit_via_ipc(instruction)
+            set agent_resp to scheduler_submit_via_ipc(job_id and instruction)
             log_info("scheduler" and concat("Job completed, response: " and agent_resp))
     
     # Reload jobs, record last_run, and save

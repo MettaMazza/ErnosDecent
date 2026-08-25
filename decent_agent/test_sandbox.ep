@@ -1,0 +1,66 @@
+import "fs"
+import "string"
+import "./sandbox_ep"
+
+define sandbox_test_pass with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main returning Int:
+    set passed to 0
+    set total to 7
+
+    set empty_result to run_ep_code("")
+    set passed to passed + sandbox_test_pass(string_index_of(empty_result and "Error:") == 0 and "empty source fails explicitly")
+
+    set valid_code to "define main returning Int:\n    display \"sandbox-ok\"\n    return 0\n"
+    set valid_result to run_ep_code(valid_code)
+    if string_contains(valid_result and "sandbox-ok") == 0 or else string_contains(valid_result and "Sandbox cleanup error") == 1:
+        display concat("Sandbox valid result:\n" and valid_result)
+    set passed to passed + sandbox_test_pass(string_contains(valid_result and "sandbox-ok") == 1 and also string_contains(valid_result and "Sandbox cleanup error") == 0 and "valid source compiles and runs in the OS sandbox")
+
+    set invalid_code to "define main returning Int:\n    this is not valid ErnosPlain\n"
+    set invalid_result to run_ep_code(invalid_code)
+    set passed to passed + sandbox_test_pass(string_index_of(invalid_result and "Your ErnosPlain code did not compile:") == 0 and also string_contains(invalid_result and "Sandbox cleanup error") == 0 and "invalid source returns real compiler failure")
+
+    set outside_path to concat("/tmp/ernos_sandbox_escape_probe_" and concat(int_to_string(get_pid()) and concat("_" and int_to_string(ep_time_now_ms()))))
+    if file_exists(outside_path) == 1:
+        display concat("FAIL: outside-write fixture already exists: " and outside_path)
+        return 1
+    set escape_code to concat("import \"fs\"\nimport \"string\"\ndefine main returning Int:\n    set wrote to write_file(\"" and concat(outside_path and "\" and \"forbidden\")\n    display int_to_string(wrote)\n    return 0\n"))
+    set escape_result to run_ep_code(escape_code)
+    set escaped to file_exists(outside_path)
+    if escaped == 1:
+        set removed_escape to remove_file(outside_path)
+        if removed_escape == 0:
+            display concat("FAIL: sandbox escape probe could not be removed: " and outside_path)
+    if escaped != 0 or else string_contains(escape_result and "Program output:") == 0 or else string_contains(escape_result and "0") == 0 or else string_contains(escape_result and "Sandbox cleanup error") == 1:
+        display concat("Sandbox escape result:\n" and escape_result)
+    set passed to passed + sandbox_test_pass(escaped == 0 and also string_contains(escape_result and "Program output:") == 1 and also string_contains(escape_result and "0") == 1 and also string_contains(escape_result and "Sandbox cleanup error") == 0 and "filesystem writes outside scratch are denied")
+
+    set secret_path to concat("/tmp/ernos_sandbox_read_probe_" and concat(int_to_string(get_pid()) and concat("_" and int_to_string(ep_time_now_ms()))))
+    set secret_value to "sandbox-secret-must-not-escape"
+    set secret_written to write_file(secret_path and secret_value)
+    if secret_written == 0 or else read_file(secret_path) != secret_value:
+        display "FAIL: could not create outside-read fixture"
+        return 1
+    set read_code to concat("import \"fs\"\ndefine main returning Int:\n    display read_file(\"" and concat(secret_path and "\")\n    return 0\n"))
+    set read_result to run_ep_code(read_code)
+    set secret_removed to remove_file(secret_path)
+    set passed to passed + sandbox_test_pass(string_contains(read_result and secret_value) == 0 and also string_contains(read_result and "Program output:") == 1 and also secret_removed != 0 and also file_exists(secret_path) == 0 and also string_contains(read_result and "Sandbox cleanup error") == 0 and "filesystem reads outside scratch are denied")
+
+    set network_code to "import \"net\"\nimport \"string\"\ndefine main returning Int:\n    set fd to ep_net_connect(\"127.0.0.1\" and 9)\n    display int_to_string(fd)\n    return 0\n"
+    set network_result to run_ep_code(network_code)
+    set passed to passed + sandbox_test_pass(string_contains(network_result and "\n-1\n") == 1 and also string_contains(network_result and "Sandbox cleanup error") == 0 and "network access is denied")
+
+    set timeout_code to "define main returning Int:\n    set counter to 0\n    repeat while 1 == 1:\n        set counter to counter + 1\n    return counter\n"
+    set timeout_result to run_ep_code(timeout_code)
+    set passed to passed + sandbox_test_pass(string_contains(timeout_result and "Stopped: hit the 5-second wall-clock limit") == 1 and also string_contains(timeout_result and "Sandbox cleanup error") == 0 and "infinite learner code is stopped by the wall-clock limit")
+
+    display concat(int_to_string(passed) and concat("/" and concat(int_to_string(total) and " sandbox tests passed")))
+    if passed != total:
+        return 1
+    return 0

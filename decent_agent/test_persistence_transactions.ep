@@ -1,0 +1,266 @@
+# Focused persistence transaction tests for cognitive memory, synaptic graph,
+# and scheduler mutations. All artifacts stay under scratch/ and are removed.
+
+import "fs"
+import "collections"
+import "string"
+import "os"
+import "./memory"
+import "./synaptic_tool"
+import "./scheduler_tool"
+
+define persistence_pass with label as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define persistence_is_error with result as Str returning Int:
+    return string_index_of(result and "Error:") == 0
+
+define scheduler_named_count with path as Str and wanted_name as Str returning Int:
+    set status to create_map()
+    set jobs to scheduler_load_from_path(path and status)
+    if map_get_val(status and "error") != 0:
+        free_list(jobs)
+        return 0 - 1
+    set count to 0
+    set i to 0
+    repeat while i < length_list(jobs):
+        set job to get_list(jobs and i)
+        set name to concat(map_get_val(job and "name") and "")
+        if name equals wanted_name:
+            set count to count + 1
+        set i to i + 1
+    free_list(jobs)
+    return count
+
+define scheduler_named_enabled with path as Str and wanted_name as Str returning Str:
+    set status to create_map()
+    set jobs to scheduler_load_from_path(path and status)
+    if map_get_val(status and "error") != 0:
+        free_list(jobs)
+        return "error"
+    set enabled to "missing"
+    set i to 0
+    repeat while i < length_list(jobs):
+        set job to get_list(jobs and i)
+        set name to concat(map_get_val(job and "name") and "")
+        if name equals wanted_name:
+            set enabled to concat(map_get_val(job and "enabled") and "")
+        set i to i + 1
+    free_list(jobs)
+    return enabled
+
+define main returning Int:
+    set passed to 0
+    set total to 0
+
+    set fixture_root to concat("/tmp/ernos_persistence_transactions_" and concat(int_to_string(ep_time_now_ms()) and concat("_" and int_to_string(ep_random_int(100000 and 999999)))))
+    set fixture_created to create_directory(fixture_root)
+    if fixture_created == 0 or else is_directory(fixture_root) == 0:
+        display "FAIL: isolated persistence fixture directory could not be created"
+        return 1
+    set memory_path to path_join(fixture_root and "memory.json")
+    set scheduler_path to path_join(fixture_root and "scheduler.json")
+    set malformed_path to path_join(fixture_root and "scheduler_malformed.json")
+    set blocker_path to path_join(fixture_root and "parent_blocker")
+    set blocker_written to write_file(blocker_path and "regular file blocks child paths")
+    set bad_memory_path to concat(blocker_path and "/memory.json")
+    set bad_scheduler_path to concat(blocker_path and "/scheduler.json")
+
+    set total to total + 1
+    set passed to passed + persistence_pass("fault-injection parent is a regular file" and blocker_written == 1)
+
+    # Primitive serialization contract.
+    set memory_mgr to memory_create()
+    set total to total + 1
+    set passed to passed + persistence_pass("memory serialize succeeds on writable path" and memory_serialize(memory_mgr and memory_path) == 0 and also file_exists(memory_path) == 1)
+    set total to total + 1
+    set passed to passed + persistence_pass("memory serialize propagates impossible-parent failure" and memory_serialize(memory_mgr and bad_memory_path) != 0)
+
+    # User-facing memory tool transactions.
+    set args to create_list()
+    set ok to append_list(args and "alpha")
+    set ok to append_list(args and "one")
+    set result to memory_tier_tool_with_path(memory_mgr and "scratchpad" and "write" and args and bad_memory_path)
+    set scratchpad to map_get_val(memory_mgr and "scratchpad")
+    set total to total + 1
+    set passed to passed + persistence_pass("scratchpad failed write returns Error" and persistence_is_error(result))
+    set total to total + 1
+    set passed to passed + persistence_pass("scratchpad failed write rolls back map mutation" and map_contains(scratchpad and "alpha") == 0)
+
+    set result to memory_tier_tool_with_path(memory_mgr and "scratchpad" and "write" and args and memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("scratchpad retry succeeds" and result equals "scratchpad:set,alpha" and also map_get_val(scratchpad and "alpha") equals "one")
+
+    set overwrite_args to create_list()
+    set ok to append_list(overwrite_args and "alpha")
+    set ok to append_list(overwrite_args and "two")
+    set result to memory_tier_tool_with_path(memory_mgr and "scratchpad" and "write" and overwrite_args and bad_memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("scratchpad failed overwrite restores prior value" and persistence_is_error(result) and also map_get_val(scratchpad and "alpha") equals "one")
+
+    set forget_args to create_list()
+    set ok to append_list(forget_args and "alpha")
+    set result to memory_tier_tool_with_path(memory_mgr and "scratchpad" and "forget" and forget_args and bad_memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("scratchpad failed delete restores entry" and persistence_is_error(result) and also map_get_val(scratchpad and "alpha") equals "one")
+
+    set lesson_args to create_list()
+    set ok to append_list(lesson_args and "lesson_a")
+    set ok to append_list(lesson_args and "verify persistence")
+    set result to memory_tier_tool_with_path(memory_mgr and "lessons" and "add" and lesson_args and bad_memory_path)
+    set lessons to map_get_val(memory_mgr and "lessons")
+    set total to total + 1
+    set passed to passed + persistence_pass("lesson failed write rolls back map and counter" and persistence_is_error(result) and also map_contains(lessons and "lesson_a") == 0 and also map_get_val(memory_mgr and "lessons_count") == 0)
+    set result to memory_tier_tool_with_path(memory_mgr and "lessons" and "add" and lesson_args and memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("lesson retry succeeds once" and result equals "lessons:added,lesson_a" and also map_get_val(memory_mgr and "lessons_count") == 1)
+
+    set timeline_args to create_list()
+    set ok to append_list(timeline_args and "transaction note")
+    set timeline to map_get_val(memory_mgr and "timeline")
+    set result to memory_tier_tool_with_path(memory_mgr and "timeline" and "add" and timeline_args and bad_memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("timeline failed write rolls back appended entry" and persistence_is_error(result) and also length_list(timeline) == 0)
+    set result to memory_tier_tool_with_path(memory_mgr and "timeline" and "add" and timeline_args and memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("timeline retry succeeds once" and result equals "timeline:added" and also length_list(timeline) == 1)
+
+    set reasoning_args to create_list()
+    set ok to append_list(reasoning_args and "reasoned transaction")
+    set result to memory_tier_tool_with_path(memory_mgr and "reasoning" and "note" and reasoning_args and memory_path)
+    set reasoning to map_get_val(memory_mgr and "reasoning")
+    set total to total + 1
+    set passed to passed + persistence_pass("reasoning note persists" and result equals "reasoning:noted" and also length_list(reasoning) == 1)
+    set no_args to create_list()
+    set result to memory_tier_tool_with_path(memory_mgr and "reasoning" and "clear" and no_args and bad_memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("reasoning failed clear restores entries" and persistence_is_error(result) and also length_list(reasoning) == 1)
+
+    # Synaptic graph transactions.
+    set store_args to create_list()
+    set ok to append_list(store_args and "Persist Concept")
+    set ok to append_list(store_args and "first datum")
+    set result to operate_synaptic_graph_with_path(memory_mgr and "store" and store_args and bad_memory_path)
+    set syn_nodes to map_get_val(memory_mgr and "synaptic_nodes")
+    set total to total + 1
+    set passed to passed + persistence_pass("synaptic new-node failure returns Error and rolls back node" and persistence_is_error(result) and also map_contains(syn_nodes and "persist concept") == 0)
+    set result to operate_synaptic_graph_with_path(memory_mgr and "store" and store_args and memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("synaptic new-node retry succeeds" and string_index_of(result and "Stored:") == 0 and also map_contains(syn_nodes and "persist concept") == 1)
+
+    set node_map to map_get_val(syn_nodes and "persist concept")
+    set node_data to map_get_val(node_map and "data")
+    set second_store_args to create_list()
+    set ok to append_list(second_store_args and "Persist Concept")
+    set ok to append_list(second_store_args and "second datum")
+    set result to operate_synaptic_graph_with_path(memory_mgr and "store" and second_store_args and bad_memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("synaptic existing-node failure restores data length" and persistence_is_error(result) and also length_list(node_data) == 1)
+    set result to operate_synaptic_graph_with_path(memory_mgr and "store" and second_store_args and memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("synaptic existing-node retry appends once" and string_index_of(result and "Stored:") == 0 and also length_list(node_data) == 2)
+
+    set relate_args to create_list()
+    set ok to append_list(relate_args and "Persist Concept")
+    set ok to append_list(relate_args and "supports")
+    set ok to append_list(relate_args and "Recovery")
+    set syn_edges to map_get_val(memory_mgr and "synaptic_edges")
+    set result to operate_synaptic_graph_with_path(memory_mgr and "relate" and relate_args and bad_memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("synaptic relate failure rolls back edge" and persistence_is_error(result) and also length_list(syn_edges) == 0)
+    set result to operate_synaptic_graph_with_path(memory_mgr and "relate" and relate_args and memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("synaptic relate retry appends once" and string_index_of(result and "Relationship stored:") == 0 and also length_list(syn_edges) == 1)
+
+    set link_args to create_list()
+    set ok to append_list(link_args and "Persist Concept")
+    set ok to append_list(link_args and "transaction note")
+    set ok to append_list(link_args and "timeline")
+    set result to operate_synaptic_graph_with_path(memory_mgr and "link_memory" and link_args and bad_memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("synaptic link failure rolls back edge" and persistence_is_error(result) and also length_list(syn_edges) == 1)
+    set result to operate_synaptic_graph_with_path(memory_mgr and "link_memory" and link_args and memory_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("synaptic link retry appends once" and string_index_of(result and "Linked concept") == 0 and also length_list(syn_edges) == 2)
+
+    set reloaded_memory to memory_deserialize(memory_path)
+    set reloaded_nodes to map_get_val(reloaded_memory and "synaptic_nodes")
+    set reloaded_node to map_get_val(reloaded_nodes and "persist concept")
+    set total to total + 1
+    set passed to passed + persistence_pass("recovery state reloads from durable memory" and reloaded_node != 0 and also length_list(map_get_val(reloaded_node and "data")) == 2)
+
+    # Scheduler load, mutation-failure, retry, and malformed-file recovery.
+    set malformed_written to write_file(malformed_path and "{")
+    set malformed_status to create_map()
+    set malformed_jobs to scheduler_load_from_path(malformed_path and malformed_status)
+    set total to total + 1
+    set passed to passed + persistence_pass("malformed scheduler file fails without overwrite" and malformed_written == 1 and also map_get_val(malformed_status and "error") != 0 and also read_file(malformed_path) equals "{")
+    free_list(malformed_jobs)
+    set ok to write_file(malformed_path and "[]")
+    set recovery_status to create_map()
+    set recovery_jobs to scheduler_load_from_path(malformed_path and recovery_status)
+    set total to total + 1
+    set passed to passed + persistence_pass("scheduler load recovers after valid rewrite" and map_get_val(recovery_status and "error") == 0 and also length_list(recovery_jobs) == 3)
+    free_list(recovery_jobs)
+
+    set create_args to create_list()
+    set ok to append_list(create_args and "persist_job")
+    set ok to append_list(create_args and "do durable work")
+    set ok to append_list(create_args and "interval")
+    set ok to append_list(create_args and "60")
+    set init_status to create_map()
+    set init_jobs to scheduler_load_from_path(scheduler_path and init_status)
+    free_list(init_jobs)
+    set result to operate_scheduler_with_paths("create" and create_args and scheduler_path and bad_scheduler_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("scheduler create failure returns Error and leaves persisted state unchanged" and persistence_is_error(result) and also scheduler_named_count(scheduler_path and "persist_job") == 0)
+    set result to operate_scheduler_with_path("create" and create_args and scheduler_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("scheduler create retry succeeds exactly once" and string_index_of(result and "Successfully created") == 0 and also scheduler_named_count(scheduler_path and "persist_job") == 1)
+
+    set target_args to create_list()
+    set ok to append_list(target_args and "persist_job")
+    set result to operate_scheduler_with_paths("toggle" and target_args and scheduler_path and bad_scheduler_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("scheduler toggle failure returns Error and preserves enabled state" and persistence_is_error(result) and also scheduler_named_enabled(scheduler_path and "persist_job") equals "1")
+    set result to operate_scheduler_with_path("toggle" and target_args and scheduler_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("scheduler toggle retry changes state once" and string_index_of(result and "Successfully toggled") == 0 and also scheduler_named_enabled(scheduler_path and "persist_job") equals "0")
+
+    set result to operate_scheduler_with_path("run_now" and target_args and scheduler_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("run_now reports that no job was triggered" and persistence_is_error(result) and also string_contains(result and "no job was triggered") == 1)
+
+    set result to operate_scheduler_with_paths("delete" and target_args and scheduler_path and bad_scheduler_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("scheduler delete failure returns Error and preserves job" and persistence_is_error(result) and also scheduler_named_count(scheduler_path and "persist_job") == 1)
+    set result to operate_scheduler_with_path("delete" and target_args and scheduler_path)
+    set total to total + 1
+    set passed to passed + persistence_pass("scheduler delete retry removes job once" and string_index_of(result and "Successfully deleted") == 0 and also scheduler_named_count(scheduler_path and "persist_job") == 0)
+
+    set memory_removed to 1
+    if file_exists(memory_path) == 1:
+        set memory_removed to remove_file(memory_path)
+    set scheduler_removed to 1
+    if file_exists(scheduler_path) == 1:
+        set scheduler_removed to remove_file(scheduler_path)
+    set malformed_removed to 1
+    if file_exists(malformed_path) == 1:
+        set malformed_removed to remove_file(malformed_path)
+    set blocker_removed to 1
+    if file_exists(blocker_path) == 1:
+        set blocker_removed to remove_file(blocker_path)
+    set fixture_removed to remove_directory(fixture_root)
+    set total to total + 1
+    set passed to passed + persistence_pass("isolated persistence fixtures are removed" and memory_removed != 0 and also scheduler_removed != 0 and also malformed_removed != 0 and also blocker_removed != 0 and also fixture_removed != 0 and also file_exists(fixture_root) == 0)
+
+    display f"=== {passed}/{total} persistence transaction checks passed ==="
+    if passed != total:
+        display "FAILURES PRESENT"
+        return 1
+    display "ALL PERSISTENCE TRANSACTION TESTS PASSED"
+    return 0

@@ -6,6 +6,15 @@ import "json"
 import "collections"
 import "string"
 import "./workspace_links"
+import "./rights"
+import "../storage"
+import "../decent_store/continuity"
+
+# Ownership bridge supplied by the generated runtime. A manager retains the created
+# session Map; lifecycle helpers carry only an integer handle/borrow so an IPC-local
+# owner cannot free the manager's live value on return.
+external define cast_map_to_int with m returning Int
+external define cast_borrow_to_map with b returning Map
 
 # ---- JSON escaping helper ----
 define session_json_escape with s as Str returning Str:
@@ -49,15 +58,27 @@ define session_create_new with id as Str and title as Str and model as Str and s
     set ok to map_insert(sess and "system_prompt" and system_prompt)
     set ok to map_insert(sess and "messages" and create_list())
     set ok to map_insert(sess and "compressed_sessions" and create_list())
+    set ok to map_insert(sess and "next_turn_id" and "1")
     return sess
 
 # ---- Add message helper ----
 define session_add_message with sess as Map and role as Str and content as Str returning Int:
     set messages_list to map_get_val(sess and "messages")
     set msg_map to create_map()
+    set turn_id to 1
+    if map_contains(sess and "next_turn_id") == 1:
+        set turn_id to string_to_int(ptr_to_str(map_get_val(sess and "next_turn_id")))
+    if turn_id <= 0:
+        set turn_id to length_list(messages_list) + 1
     set ok to map_insert(msg_map and "role" and role)
     set ok to map_insert(msg_map and "content" and content)
+    set ok to map_insert(msg_map and "turn_id" and int_to_string(turn_id))
+    set ok to map_insert(msg_map and "created_at" and int_to_string(ep_time_now_sec()))
+    set ok to map_insert(msg_map and "source_type" and "direct")
+    set ok to map_insert(msg_map and "source_id" and map_get_val(sess and "id"))
+    set ok to map_insert(msg_map and "content_hash" and ep_sha256(content))
     set ok to append_list(messages_list and msg_map)
+    set ok to map_insert(sess and "next_turn_id" and int_to_string(turn_id + 1))
     return 0
 
 # ---- Manual JSON Serializer ----
@@ -68,6 +89,9 @@ define session_serialize with sess as Map and path as Str returning Int:
     set system_val to map_get_val(sess and "system_prompt")
     set messages_list to map_get_val(sess and "messages")
     set comp_list to map_get_val(sess and "compressed_sessions")
+    set next_turn_val to "1"
+    if map_contains(sess and "next_turn_id") == 1:
+        set next_turn_val to ptr_to_str(map_get_val(sess and "next_turn_id"))
     
     set summary_val to ""
     if map_contains(sess and "compression_summary") == 1:
@@ -76,7 +100,6 @@ define session_serialize with sess as Map and path as Str returning Int:
     set guidance_val to ""
     if map_contains(sess and "session_guidance") == 1:
         set guidance_val to map_get_val(sess and "session_guidance")
-
     set json_str to "{\n"
     set json_str to concat(json_str and f"  \"id\": \"{session_json_escape(id_val)}\",\n")
     set json_str to concat(json_str and f"  \"title\": \"{session_json_escape(title_val)}\",\n")
@@ -84,6 +107,7 @@ define session_serialize with sess as Map and path as Str returning Int:
     set json_str to concat(json_str and f"  \"system_prompt\": \"{session_json_escape(system_val)}\",\n")
     set json_str to concat(json_str and f"  \"compression_summary\": \"{session_json_escape(summary_val)}\",\n")
     set json_str to concat(json_str and f"  \"session_guidance\": \"{session_json_escape(guidance_val)}\",\n")
+    set json_str to concat(json_str and f"  \"next_turn_id\": \"{session_json_escape(next_turn_val)}\",\n")
     
     # messages list
     set json_str to concat(json_str and "  \"messages\": [\n")
@@ -93,9 +117,29 @@ define session_serialize with sess as Map and path as Str returning Int:
         set msg_map to get_list(messages_list and idx)
         set r_val to map_get_val(msg_map and "role")
         set c_val to map_get_val(msg_map and "content")
+        set turn_val to int_to_string(idx + 1)
+        set created_val to "0"
+        set source_type_val to "legacy"
+        set source_id_val to id_val
+        set hash_val to ep_sha256(c_val)
+        if map_contains(msg_map and "turn_id") == 1:
+            set turn_val to ptr_to_str(map_get_val(msg_map and "turn_id"))
+        if map_contains(msg_map and "created_at") == 1:
+            set created_val to ptr_to_str(map_get_val(msg_map and "created_at"))
+        if map_contains(msg_map and "source_type") == 1:
+            set source_type_val to ptr_to_str(map_get_val(msg_map and "source_type"))
+        if map_contains(msg_map and "source_id") == 1:
+            set source_id_val to ptr_to_str(map_get_val(msg_map and "source_id"))
+        if map_contains(msg_map and "content_hash") == 1:
+            set hash_val to ptr_to_str(map_get_val(msg_map and "content_hash"))
         set json_str to concat(json_str and "    {\n")
         set json_str to concat(json_str and f"      \"role\": \"{session_json_escape(r_val)}\",\n")
-        set json_str to concat(json_str and f"      \"content\": \"{session_json_escape(c_val)}\"\n")
+        set json_str to concat(json_str and f"      \"content\": \"{session_json_escape(c_val)}\",\n")
+        set json_str to concat(json_str and f"      \"turn_id\": \"{session_json_escape(turn_val)}\",\n")
+        set json_str to concat(json_str and f"      \"created_at\": \"{session_json_escape(created_val)}\",\n")
+        set json_str to concat(json_str and f"      \"source_type\": \"{session_json_escape(source_type_val)}\",\n")
+        set json_str to concat(json_str and f"      \"source_id\": \"{session_json_escape(source_id_val)}\",\n")
+        set json_str to concat(json_str and f"      \"content_hash\": \"{session_json_escape(hash_val)}\"\n")
         if idx < m_len - 1:
             set json_str to concat(json_str and "    },\n")
         else:
@@ -117,7 +161,11 @@ define session_serialize with sess as Map and path as Str returning Int:
         set idx to idx + 1
     set json_str to concat(json_str and "  ]\n}")
     
-    set ok to write_file(path and json_str)
+    if write_file(path and json_str) == 0:
+        return 1
+    set verify to read_file(path)
+    if verify equals json_str == 0:
+        return 1
     return 0
 
 # ---- Deserialize JSON ----
@@ -134,6 +182,7 @@ define session_deserialize_json with content as Str returning Map:
     set comp_node to get_json_object_value(root and "compressed_sessions")
     set summary_node to get_json_object_value(root and "compression_summary")
     set guidance_node to get_json_object_value(root and "session_guidance")
+    set next_turn_node to get_json_object_value(root and "next_turn_id")
 
     set sess to create_map()
     if id_node != 0:
@@ -148,6 +197,8 @@ define session_deserialize_json with content as Str returning Map:
         set ok to map_insert(sess and "compression_summary" and get_json_value(summary_node))
     if guidance_node != 0:
         set ok to map_insert(sess and "session_guidance" and get_json_value(guidance_node))
+    if next_turn_node != 0:
+        set ok to map_insert(sess and "next_turn_id" and get_json_value(next_turn_node))
         
     set msg_list to create_list()
     if messages_node != 0:
@@ -158,15 +209,39 @@ define session_deserialize_json with content as Str returning Map:
             set item_node to get_list(raw_list and i)
             set r_node to get_json_object_value(item_node and "role")
             set c_node to get_json_object_value(item_node and "content")
+            set turn_node to get_json_object_value(item_node and "turn_id")
+            set created_node to get_json_object_value(item_node and "created_at")
+            set source_type_node to get_json_object_value(item_node and "source_type")
+            set source_id_node to get_json_object_value(item_node and "source_id")
+            set hash_node to get_json_object_value(item_node and "content_hash")
             set msg_map to create_map()
             if r_node != 0:
                 set ok to map_insert(msg_map and "role" and get_json_value(r_node))
             if c_node != 0:
                 set ok to map_insert(msg_map and "content" and get_json_value(c_node))
+            if turn_node != 0:
+                set ok to map_insert(msg_map and "turn_id" and get_json_value(turn_node))
+            else:
+                set ok to map_insert(msg_map and "turn_id" and int_to_string(i + 1))
+            if created_node != 0:
+                set ok to map_insert(msg_map and "created_at" and get_json_value(created_node))
+            else:
+                set ok to map_insert(msg_map and "created_at" and "0")
+            if source_type_node != 0:
+                set ok to map_insert(msg_map and "source_type" and get_json_value(source_type_node))
+            else:
+                set ok to map_insert(msg_map and "source_type" and "legacy")
+            if source_id_node != 0:
+                set ok to map_insert(msg_map and "source_id" and get_json_value(source_id_node))
+            else if id_node != 0:
+                set ok to map_insert(msg_map and "source_id" and get_json_value(id_node))
+            if hash_node != 0:
+                set ok to map_insert(msg_map and "content_hash" and get_json_value(hash_node))
+            else if c_node != 0:
+                set ok to map_insert(msg_map and "content_hash" and ep_sha256(get_json_value(c_node)))
             set ok to append_list(msg_list and msg_map)
             set i to i + 1
     set ok to map_insert(sess and "messages" and msg_list)
-    
     set comp_list to create_list()
     if comp_node != 0:
         set raw_list to get_json_value(comp_node)
@@ -177,6 +252,17 @@ define session_deserialize_json with content as Str returning Map:
             set ok to append_list(comp_list and get_json_value(item_node))
             set i to i + 1
     set ok to map_insert(sess and "compressed_sessions" and comp_list)
+    if next_turn_node == 0:
+        set prior_count to 0
+        set ci to 0
+        repeat while ci < length_list(comp_list):
+            set shard_path to ptr_to_str(get_list(comp_list and ci))
+            if file_exists(shard_path) == 1:
+                set shard_root to json_parse(read_file(shard_path))
+                if shard_root != 0 and also get_json_type(shard_root) == 3:
+                    set prior_count to prior_count + length_list(get_json_value(shard_root))
+            set ci to ci + 1
+        set ok to map_insert(sess and "next_turn_id" and int_to_string(prior_count + length_list(msg_list) + 1))
     
     return sess
 
@@ -264,12 +350,21 @@ define session_manager_set_guidance with mgr as Map and text as Str returning In
     set sess to session_manager_get_active(mgr)
     if sess == 0:
         return 1
+    set old_text to ""
+    set had_old to map_contains(sess and "session_guidance")
+    if had_old == 1:
+        set old_text to ptr_to_str(map_get_val(sess and "session_guidance"))
     set ok to map_insert(sess and "session_guidance" and text)
     # Persist immediately to the session's own JSON file so a reboot keeps it.
     set active_id to map_get_val(mgr and "active_session_id")
     set dir to map_get_val(mgr and "sessions_dir")
     set filepath to path_join(dir and concat(active_id and ".json"))
-    set ok to session_serialize(sess and filepath)
+    if session_serialize(sess and filepath) != 0:
+        if had_old == 1:
+            set ok to map_insert(sess and "session_guidance" and old_text)
+        else:
+            set ok to map_delete(sess and "session_guidance")
+        return 1
     return 0
 
 define session_manager_new_session with mgr as Map and id as Str and title as Str and model as Str and sys_prompt as Str returning Map:
@@ -292,6 +387,33 @@ define session_manager_new_session with mgr as Map and id as Str and title as St
     
     return sess
 
+# Start the first empty session after a prior session has been closed by Echo.  The
+# caller decides whether the prior session is closed; this helper owns collision-free
+# ID generation and uses the same durable session transaction as every manual /new.
+#
+# Return the ID, not the created Map. An owned Map returned into the long-lived IPC
+# handler becomes an owned local there; the compiler consequently frees it when that
+# one socket command ends even though the manager's sessions map still references it.
+# The next AI INFER then dereferences the freed session and crashes before ReAct starts.
+define session_manager_start_followup_session with mgr as Map returning Str:
+    set sessions_map to map_get_val(mgr and "sessions")
+    set base_id to concat("session_" and int_to_string(ep_time_now_ms()))
+    set new_id to base_id
+    set suffix to 1
+    repeat while map_contains(sessions_map and new_id) == 1:
+        set new_id to concat(base_id and concat("_" and int_to_string(suffix)))
+        set suffix to suffix + 1
+    set title to concat("Session " and new_id)
+    # Convert the returned owned Map directly to an integer handle. The manager is the
+    # durable owner; this helper only borrows it long enough to verify the committed ID.
+    set created_handle to cast_map_to_int(session_manager_new_session(mgr and new_id and title and "" and "You are a helpful assistant."))
+    if created_handle == 0:
+        return ""
+    set committed_id to ptr_to_str(map_get_val(cast_borrow_to_map(created_handle) and "id"))
+    if committed_id equals new_id == 0:
+        return ""
+    return committed_id
+
 define session_manager_switch_to with mgr as Map and id as Str returning Int:
     set sessions_map to map_get_val(mgr and "sessions")
     if map_contains(sessions_map and id) == 1:
@@ -311,8 +433,28 @@ define session_manager_delete with mgr as Map and id as Str returning Int:
         set dir to map_get_val(mgr and "sessions_dir")
         set filepath to path_join(dir and concat(id and ".json"))
         if file_exists(filepath) == 1:
-            set ok to remove_file(filepath)
+            if remove_file(filepath) == 0:
+                return 0
+        set files to list_directory(dir)
+        set prefix to concat(id and "_transcript_")
+        set i to 0
+        repeat while i < length_list(files):
+            set name to ptr_to_str(get_list(files and i))
+            if string_index_of(name and prefix) == 0 and also string_contains(name and ".json") == 1:
+                if remove_file(path_join(dir and name)) == 0:
+                    return 0
+            set i to i + 1
         set ok to map_delete(sessions_map and id)
+        set active_id to map_get_val(mgr and "active_session_id")
+        if active_id equals id:
+            if map_contains(sessions_map and "default") == 0:
+                set replacement to session_create_new("default" and "Default Session" and "" and "You are a helpful assistant.")
+                set ok to map_insert(sessions_map and "default" and replacement)
+                if session_serialize(replacement and path_join(dir and "default.json")) != 0:
+                    return 0
+            set ok to map_insert(mgr and "active_session_id" and "default")
+            if write_file(path_join(dir and "active_session.txt") and "default") == 0:
+                return 0
         return 1
     return 0
 
@@ -323,23 +465,47 @@ define session_manager_rename with mgr as Map and id as Str and new_title as Str
         set ok to map_insert(sess and "title" and new_title)
         set dir to map_get_val(mgr and "sessions_dir")
         set filepath to path_join(dir and concat(id and ".json"))
-        set ok to session_serialize(sess and filepath)
+        if session_serialize(sess and filepath) != 0:
+            return 0
         return 1
     return 0
 
-# FACTORY RESET: forget every session in the LIVE manager (the caller wipes the
-# on-disk config/sessions/ separately) and start over with a fresh "default" session,
-# exactly like first boot. session_manager_new_session also clears the active
-# workspace-link marker and persists the new active id.
+# FACTORY RESET: construct and durably verify the fresh registry before exposing it
+# to the live manager. The caller deliberately removes config/sessions/ first, so
+# this function owns recreating that directory. A persistence failure must leave the
+# prior in-memory registry and active id untouched for the recovery path.
 define session_manager_factory_reset with mgr as Map returning Int:
-    set sessions_map to map_get_val(mgr and "sessions")
-    set keys to map_keys(sessions_map)
-    set n to length_list(keys)
-    set i to 0
-    repeat while i < n:
-        set ok to map_delete(sessions_map and get_list(keys and i))
-        set i to i + 1
-    set sess to session_manager_new_session(mgr and "default" and "Default Session" and "" and "You are a helpful assistant.")
+    set dir to map_get_val(mgr and "sessions_dir")
+    if string_length(dir) == 0:
+        return 1
+    if file_exists(dir) == 0:
+        if create_directory(dir) == 0 or else file_exists(dir) == 0:
+            return 1
+
+    set fresh_sessions to create_map()
+    set fresh_session to session_create_new("default" and "Default Session" and "" and "You are a helpful assistant.")
+    set ok to map_insert(fresh_sessions and "default" and fresh_session)
+    set default_path to path_join(dir and "default.json")
+    set active_path to path_join(dir and "active_session.txt")
+    if session_serialize(fresh_session and default_path) != 0:
+        return 1
+    if write_file(active_path and "default") == 0:
+        return 1
+    if file_exists(default_path) == 0 or else file_exists(active_path) == 0:
+        return 1
+    if string_trim(read_file(active_path)) equals "default" == 0:
+        return 1
+    set persisted to session_load(default_path)
+    if persisted == 0 or else map_contains(persisted and "id") == 0:
+        return 1
+    if ptr_to_str(map_get_val(persisted and "id")) equals "default" == 0:
+        return 1
+    if links_clear_active() != 0:
+        return 1
+
+    # Commit the reconstructed state only after every durable postcondition passes.
+    set ok to map_insert(mgr and "sessions" and fresh_sessions)
+    set ok to map_insert(mgr and "active_session_id" and "default")
     return 0
 
 # Resolve a session reference to an id: exact id → exact title (case-insensitive) →
@@ -427,6 +593,9 @@ define session_serialize_json_string with sess as Map returning Str:
     set guidance_val to ""
     if map_contains(sess and "session_guidance") == 1:
         set guidance_val to map_get_val(sess and "session_guidance")
+    set next_turn_val to "1"
+    if map_contains(sess and "next_turn_id") == 1:
+        set next_turn_val to ptr_to_str(map_get_val(sess and "next_turn_id"))
 
     set json_str to "{\"id\":\""
     set json_str to concat(json_str and session_json_escape(id_val))
@@ -440,6 +609,8 @@ define session_serialize_json_string with sess as Map returning Str:
     set json_str to concat(json_str and session_json_escape(summary_val))
     set json_str to concat(json_str and "\",\"session_guidance\":\"")
     set json_str to concat(json_str and session_json_escape(guidance_val))
+    set json_str to concat(json_str and "\",\"next_turn_id\":\"")
+    set json_str to concat(json_str and session_json_escape(next_turn_val))
     set json_str to concat(json_str and "\",")
     
     # messages list
@@ -450,11 +621,36 @@ define session_serialize_json_string with sess as Map returning Str:
         set msg_map to get_list(messages_list and idx)
         set r_val to map_get_val(msg_map and "role")
         set c_val to map_get_val(msg_map and "content")
+        set turn_val to int_to_string(idx + 1)
+        set created_val to "0"
+        set source_type_val to "legacy"
+        set source_id_val to id_val
+        set hash_val to ep_sha256(c_val)
+        if map_contains(msg_map and "turn_id") == 1:
+            set turn_val to ptr_to_str(map_get_val(msg_map and "turn_id"))
+        if map_contains(msg_map and "created_at") == 1:
+            set created_val to ptr_to_str(map_get_val(msg_map and "created_at"))
+        if map_contains(msg_map and "source_type") == 1:
+            set source_type_val to ptr_to_str(map_get_val(msg_map and "source_type"))
+        if map_contains(msg_map and "source_id") == 1:
+            set source_id_val to ptr_to_str(map_get_val(msg_map and "source_id"))
+        if map_contains(msg_map and "content_hash") == 1:
+            set hash_val to ptr_to_str(map_get_val(msg_map and "content_hash"))
         
         set item_str to "{\"role\":\""
         set item_str to concat(item_str and session_json_escape(r_val))
         set item_str to concat(item_str and "\",\"content\":\"")
         set item_str to concat(item_str and session_json_escape(c_val))
+        set item_str to concat(item_str and "\",\"turn_id\":\"")
+        set item_str to concat(item_str and session_json_escape(turn_val))
+        set item_str to concat(item_str and "\",\"created_at\":\"")
+        set item_str to concat(item_str and session_json_escape(created_val))
+        set item_str to concat(item_str and "\",\"source_type\":\"")
+        set item_str to concat(item_str and session_json_escape(source_type_val))
+        set item_str to concat(item_str and "\",\"source_id\":\"")
+        set item_str to concat(item_str and session_json_escape(source_id_val))
+        set item_str to concat(item_str and "\",\"content_hash\":\"")
+        set item_str to concat(item_str and session_json_escape(hash_val))
         set item_str to concat(item_str and "\"}")
         
         set json_str to concat(json_str and item_str)
@@ -478,21 +674,40 @@ define session_serialize_json_string with sess as Map returning Str:
     set json_str to concat(json_str and "]}")
     return json_str
 
-define session_compress_active with mgr as Map and sess as Map and model_name as Str returning Int:
+define session_compaction_threshold with provider_context_tokens as Int returning Int:
+    if provider_context_tokens <= 0:
+        return 0
+    return (provider_context_tokens * 85) / 100
+
+define session_should_compress with used_tokens as Int and provider_context_tokens as Int returning Int:
+    set threshold to session_compaction_threshold(provider_context_tokens)
+    if threshold <= 0 or else used_tokens < threshold:
+        return 0
+    return 1
+
+define session_context_approaching_compaction with used_tokens as Int and provider_context_tokens as Int returning Int:
+    set threshold to session_compaction_threshold(provider_context_tokens)
+    if threshold <= 0 or else used_tokens >= threshold:
+        return 0
+    set warning_point to (threshold * 9) / 10
+    if used_tokens >= warning_point:
+        return 1
+    return 0
+
+define session_context_capacity_text with provider_name as Str and model_name as Str and used_tokens as Int and provider_context_tokens as Int returning Str:
+    set threshold to session_compaction_threshold(provider_context_tokens)
+    set remaining to threshold - used_tokens
+    if remaining < 0:
+        set remaining to 0
+    return f"[CONTEXT CAPACITY — runtime measurement]\nProvider: {provider_name}; model: {model_name}.\nCurrent assembled prompt: {used_tokens} tokens. Provider context window: {provider_context_tokens} tokens. Automatic compaction point: {threshold} tokens (85%). Tokens remaining before compaction: {remaining}.\nThis is situational awareness, not a request. Do not mention it in ordinary replies; the runtime separately warns the user when compaction is approaching.\n[/CONTEXT CAPACITY]\n"
+
+define session_compress_active with mgr as Map and sess as Map and used_tokens as Int and provider_context_tokens as Int returning Int:
     set messages_list to map_get_val(sess and "messages")
     set m_len to length_list(messages_list)
     if m_len < 4:
         return 0
-        
-    set total_chars to 0
-    set i to 0
-    repeat while i < m_len:
-        set msg_map to get_list(messages_list and i)
-        set content_val to map_get_val(msg_map and "content")
-        set total_chars to total_chars + string_length(content_val)
-        set i to i + 1
-        
-    if total_chars < 12000:
+
+    if session_should_compress(used_tokens and provider_context_tokens) == 0:
         return 0
         
     set last_msg to get_list(messages_list and m_len - 1)
@@ -517,34 +732,72 @@ define session_compress_active with mgr as Map and sess as Map and model_name as
         set msg_map to get_list(comp_msgs and idx)
         set r_val to map_get_val(msg_map and "role")
         set c_val to map_get_val(msg_map and "content")
+        set turn_val to int_to_string(idx + 1)
+        set created_val to "0"
+        set source_type_val to "legacy"
+        set source_id_val to sess_id
+        set hash_val to ep_sha256(c_val)
+        if map_contains(msg_map and "turn_id") == 1:
+            set turn_val to ptr_to_str(map_get_val(msg_map and "turn_id"))
+        if map_contains(msg_map and "created_at") == 1:
+            set created_val to ptr_to_str(map_get_val(msg_map and "created_at"))
+        if map_contains(msg_map and "source_type") == 1:
+            set source_type_val to ptr_to_str(map_get_val(msg_map and "source_type"))
+        if map_contains(msg_map and "source_id") == 1:
+            set source_id_val to ptr_to_str(map_get_val(msg_map and "source_id"))
+        if map_contains(msg_map and "content_hash") == 1:
+            set hash_val to ptr_to_str(map_get_val(msg_map and "content_hash"))
         set json_str to concat(json_str and "  {\n")
         set json_str to concat(json_str and f"    \"role\": \"{session_json_escape(r_val)}\",\n")
-        set json_str to concat(json_str and f"    \"content\": \"{session_json_escape(c_val)}\"\n")
+        set json_str to concat(json_str and f"    \"content\": \"{session_json_escape(c_val)}\",\n")
+        set json_str to concat(json_str and f"    \"turn_id\": \"{session_json_escape(turn_val)}\",\n")
+        set json_str to concat(json_str and f"    \"created_at\": \"{session_json_escape(created_val)}\",\n")
+        set json_str to concat(json_str and f"    \"source_type\": \"{session_json_escape(source_type_val)}\",\n")
+        set json_str to concat(json_str and f"    \"source_id\": \"{session_json_escape(source_id_val)}\",\n")
+        set json_str to concat(json_str and f"    \"content_hash\": \"{session_json_escape(hash_val)}\"\n")
         if idx < c_len - 1:
             set json_str to concat(json_str and "  },\n")
         else:
             set json_str to concat(json_str and "  }\n")
         set idx to idx + 1
     set json_str to concat(json_str and "]")
-    set ok to write_file(transcript_path and json_str)
+    if write_file(transcript_path and json_str) == 0:
+        return 0
+    if read_file(transcript_path) equals json_str == 0:
+        return 0
+    if rights_archive_session_traces(storage_get_db() and sess_id) != 0:
+        return 0
+    if rights_record_compaction(storage_get_db() and sess_id and transcript_path and used_tokens and provider_context_tokens) != 0:
+        return 0
     
     set ok to append_list(comp_list and transcript_path)
     
-    set summary_text to f"Conversation up to turn {m_len - 1} was compressed due to context limits. Topics discussed included: "
-    set topics to ""
-    set i to 0
-    repeat while i < c_len:
-        set msg_map to get_list(comp_msgs and i)
-        set role_val to map_get_val(msg_map and "role")
-        if role_val equals "user":
-            set content_val to map_get_val(msg_map and "content")
-            set short_prompt to substring(content_val and 0 and 40)
-            if string_length(topics) > 0:
-                set topics to concat(topics and f"; \"{short_prompt}...\"")
+    # Prefer the automatically maintained cumulative semantic state.  The previous
+    # compressor kept only the first 40 characters of each user message and replaced
+    # the prior summary on every compression, losing decisions and open loops.
+    set summary_text to continuity_previous_summary(storage_get_db() and sess_id)
+    if string_length(summary_text) == 0:
+        # Offline/fresh-install fallback: preserve a bounded, cumulative extractive
+        # record of both sides rather than a list of clipped user-message openings.
+        set summary_text to f"Conversation up to turn {m_len - 1}:\n"
+        if map_contains(sess and "compression_summary") == 1:
+            set prior_summary to map_get_val(sess and "compression_summary")
+            if string_length(prior_summary) > 0:
+                set summary_text to concat(summary_text and concat("Prior compressed context:\n" and concat(continuity_cap(prior_summary and 1600) and "\nNewer context:\n")))
+        set start_extract to c_len - 8
+        if start_extract < 0:
+            set start_extract to 0
+        set i to start_extract
+        repeat while i < c_len:
+            set msg_map to get_list(comp_msgs and i)
+            set role_val to map_get_val(msg_map and "role")
+            set content_val to continuity_cap(map_get_val(msg_map and "content") and 320)
+            if role_val equals "user":
+                set summary_text to concat(summary_text and concat("User: " and concat(content_val and "\n")))
             else:
-                set topics to f"\"{short_prompt}...\""
-        set i to i + 1
-    set summary_text to concat(summary_text and topics)
+                set summary_text to concat(summary_text and concat("Echo: " and concat(content_val and "\n")))
+            set i to i + 1
+        set summary_text to continuity_cap(summary_text and 5000)
     
     set ok to map_insert(sess and "compression_summary" and summary_text)
     
@@ -553,17 +806,26 @@ define session_compress_active with mgr as Map and sess as Map and model_name as
     set ok to map_insert(sess and "messages" and new_msgs)
     
     set sess_filepath to path_join(dir and concat(sess_id and ".json"))
-    set ok to session_serialize(sess and sess_filepath)
+    if session_serialize(sess and sess_filepath) != 0:
+        return 0
     return 1
 
 define session_manager_set_model with mgr as Map and id as Str and model as Str returning Int:
     set sessions_map to map_get_val(mgr and "sessions")
     if map_contains(sessions_map and id) == 1:
         set sess to map_get_val(sessions_map and id)
+        set old_model to ""
+        set had_old to map_contains(sess and "model")
+        if had_old == 1:
+            set old_model to ptr_to_str(map_get_val(sess and "model"))
         set ok to map_insert(sess and "model" and model)
         set dir to map_get_val(mgr and "sessions_dir")
         set filepath to path_join(dir and concat(id and ".json"))
-        set ok to session_serialize(sess and filepath)
+        if session_serialize(sess and filepath) != 0:
+            if had_old == 1:
+                set ok to map_insert(sess and "model" and old_model)
+            else:
+                set ok to map_delete(sess and "model")
+            return 0
         return 1
     return 0
-

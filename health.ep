@@ -1,6 +1,6 @@
 # ErnosDecent -- Health Check System
 # Component: health.ep
-# Provides self-diagnostic checks for all subsystems
+# Provides self-diagnostic checks for active runtime services
 # Returns structured health report
 # Status: Production
 
@@ -10,6 +10,7 @@ import "net"
 import "./decent_net/dht"
 import "./decent_consensus/raft"
 import "./decent_net/relay"
+import "./storage"
 
 # ================================================================
 # Constants
@@ -18,6 +19,7 @@ import "./decent_net/relay"
 set HEALTH_OK to "healthy"
 set HEALTH_DEGRADED to "degraded"
 set HEALTH_DOWN to "down"
+set HEALTH_DISABLED to "disabled"
 # A mesh root / first node legitimately has zero peers. That is a topology state,
 # not a fault, so it gets its own status that does NOT drag overall to "degraded".
 set HEALTH_STANDALONE to "standalone"
@@ -36,6 +38,99 @@ define check_crypto_health returning Map:
         set ok to map_insert(result and "status" and HEALTH_DOWN)
         set ok to map_insert(result and "error" and "crypto init failed")
     return result
+
+define check_component_health with subsystem as Str and ready as Int returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "subsystem" and subsystem)
+    if ready == 1:
+        set ok to map_insert(result and "status" and HEALTH_OK)
+    else if ready == 2:
+        set ok to map_insert(result and "status" and HEALTH_DISABLED)
+    else:
+        set ok to map_insert(result and "status" and HEALTH_DOWN)
+        set ok to map_insert(result and "error" and "runtime service unavailable")
+    return result
+
+define check_identity_health with borrow identity as Map returning Map:
+    set ready to 0
+    if identity != 0:
+        if map_contains(identity and "did") == 1:
+            set did_val to ptr_to_str(map_get_val(identity and "did"))
+            if string_length(did_val) > 0:
+                set ready to 1
+    return check_component_health("identity" and ready)
+
+define check_storage_health returning Map:
+    set ready to 0
+    if storage_get_db() != 0:
+        set ready to 1
+    return check_component_health("storage" and ready)
+
+define check_runtime_service_health with borrow agent_ctx as Map and subsystem as Str and service_key as Str returning Map:
+    set ready to 0
+    if agent_ctx != 0:
+        if map_contains(agent_ctx and "runtime_services") == 1:
+            set services to map_get_val(agent_ctx and "runtime_services")
+            if services != 0:
+                if map_contains(services and service_key) == 1:
+                    set ready to map_get_val(services and service_key)
+    return check_component_health(subsystem and ready)
+
+define check_agent_health with borrow agent_ctx as Map returning Map:
+    set ready to 1
+    if agent_ctx == 0:
+        set ready to 0
+    else:
+        if map_contains(agent_ctx and "memory") == 0:
+            set ready to 0
+        if map_contains(agent_ctx and "agent_tools") == 0:
+            set ready to 0
+        if map_contains(agent_ctx and "sessions") == 0:
+            set ready to 0
+        if map_contains(agent_ctx and "orchestrator") == 0:
+            set ready to 0
+    return check_component_health("agent" and ready)
+
+define check_protocol_state_health with borrow agent_ctx as Map returning Map:
+    set ready to 1
+    if agent_ctx == 0:
+        set ready to 0
+    else:
+        if map_contains(agent_ctx and "name_resolver") == 0:
+            set ready to 0
+        if map_contains(agent_ctx and "crdt_clock") == 0 or else map_contains(agent_ctx and "crdt_store") == 0:
+            set ready to 0
+        if map_contains(agent_ctx and "crdt_lock") == 0:
+            set ready to 0
+        if map_contains(agent_ctx and "social_feed") == 0 or else map_contains(agent_ctx and "activitypub_actor") == 0:
+            set ready to 0
+        if map_contains(agent_ctx and "social_publisher") == 0:
+            set ready to 0
+        if map_contains(agent_ctx and "stream_cache") == 0 or else map_contains(agent_ctx and "stream_cache_lock") == 0:
+            set ready to 0
+    return check_component_health("protocol_state" and ready)
+
+define check_economy_health with borrow ledger as Map and borrow agent_ctx as Map returning Map:
+    set ready to 1
+    if ledger == 0:
+        set ready to 0
+    else if map_contains(ledger and "blocks") == 0:
+        set ready to 0
+    if agent_ctx == 0:
+        set ready to 0
+    else:
+        if map_contains(agent_ctx and "dex_engine") == 0:
+            set ready to 0
+        if map_contains(agent_ctx and "deployed_tokens") == 0:
+            set ready to 0
+    return check_component_health("economy" and ready)
+
+define check_bft_health with borrow bft_node as Map returning Map:
+    set ready to 0
+    if bft_node != 0:
+        if map_contains(bft_node and "validators") == 1 and also map_contains(bft_node and "log") == 1:
+            set ready to 1
+    return check_component_health("bft" and ready)
 
 define check_dht_health with dht as Int returning Map:
     set result to create_map()
@@ -102,18 +197,87 @@ define check_ipc_health with ipc_port as Int returning Map:
 # Full Health Report
 # ================================================================
 
-define run_health_check with dht as Int and borrow raft_node as Map and ipc_port as Int returning Map:
+define run_health_check with dht as Int and borrow raft_node as Map and ipc_port as Int and borrow identity as Map and relay_node as Int and msg_store as Int and borrow ledger as Map and name_reg as Int and borrow agent_ctx as Map and borrow bft_node as Map returning Map:
     set report to create_map()
     set checks to create_list()
 
     set crypto_h to check_crypto_health()
     set ok to append_list(checks and crypto_h)
 
+    set identity_h to check_identity_health(identity)
+    set ok to append_list(checks and identity_h)
+
+    set storage_h to check_storage_health()
+    set ok to append_list(checks and storage_h)
+
     set dht_h to check_dht_health(dht)
     set ok to append_list(checks and dht_h)
 
     set raft_h to check_raft_health(raft_node)
     set ok to append_list(checks and raft_h)
+
+    set bft_h to check_bft_health(bft_node)
+    set ok to append_list(checks and bft_h)
+
+    set relay_ready to 0
+    if relay_node != 0:
+        set relay_ready to 1
+    set relay_h to check_component_health("relay" and relay_ready)
+    set ok to append_list(checks and relay_h)
+
+    set messaging_ready to 0
+    if msg_store != 0:
+        set messaging_ready to 1
+    set messaging_h to check_component_health("messaging" and messaging_ready)
+    set ok to append_list(checks and messaging_h)
+
+    set economy_h to check_economy_health(ledger and agent_ctx)
+    set ok to append_list(checks and economy_h)
+
+    set names_ready to 0
+    if name_reg != 0:
+        set names_ready to 1
+    set names_h to check_component_health("names" and names_ready)
+    set ok to append_list(checks and names_h)
+
+    set agent_h to check_agent_health(agent_ctx)
+    set ok to append_list(checks and agent_h)
+
+    set protocol_state_h to check_protocol_state_health(agent_ctx)
+    set ok to append_list(checks and protocol_state_h)
+
+    set sessions_h to check_runtime_service_health(agent_ctx and "sessions" and "sessions")
+    set ok to append_list(checks and sessions_h)
+
+    set search_h to check_runtime_service_health(agent_ctx and "search" and "search")
+    set ok to append_list(checks and search_h)
+
+    set pool_h to check_runtime_service_health(agent_ctx and "pool" and "pool")
+    set ok to append_list(checks and pool_h)
+
+    set media_h to check_runtime_service_health(agent_ctx and "media" and "media")
+    set ok to append_list(checks and media_h)
+
+    set onion_h to check_runtime_service_health(agent_ctx and "onion" and "onion")
+    set ok to append_list(checks and onion_h)
+
+    set p2p_h to check_runtime_service_health(agent_ctx and "p2p" and "p2p")
+    set ok to append_list(checks and p2p_h)
+
+    set gitdec_h to check_runtime_service_health(agent_ctx and "gitdec" and "gitdec")
+    set ok to append_list(checks and gitdec_h)
+
+    set social_h to check_runtime_service_health(agent_ctx and "social" and "social")
+    set ok to append_list(checks and social_h)
+
+    set scheduler_h to check_runtime_service_health(agent_ctx and "scheduler" and "scheduler")
+    set ok to append_list(checks and scheduler_h)
+
+    set web_h to check_runtime_service_health(agent_ctx and "web" and "web")
+    set ok to append_list(checks and web_h)
+
+    set host_h to check_runtime_service_health(agent_ctx and "host_election" and "host_election")
+    set ok to append_list(checks and host_h)
 
     set net_h to check_network_health()
     set ok to append_list(checks and net_h)

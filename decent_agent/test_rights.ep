@@ -1,0 +1,173 @@
+import "fs"
+import "os"
+import "sql"
+import "string"
+import "./rights"
+
+define rights_test_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define rights_test_remove_tree with path as Str returning Int:
+    if file_exists(path) == 0:
+        return 0
+    if is_directory(path) == 0:
+        if remove_file(path) == 0:
+            return 1
+        return 0
+    set names to list_directory(path)
+    set i to 0
+    repeat while i < length_list(names):
+        if rights_test_remove_tree(path_join(path and ptr_to_str(get_list(names and i)))) != 0:
+            return 1
+        set i to i + 1
+    if remove_directory(path) == 0:
+        return 1
+    return 0
+
+define main returning Int:
+    set passed to 0
+    set total to 0
+    set fixture to concat("/tmp/ernos_rights_" and int_to_string(ep_time_now_ms()))
+    if create_directory(fixture) == 0:
+        display "FAIL: fixture creation"
+        return 1
+    set recovery to path_join(fixture and "recovery")
+    if create_directory(recovery) == 0:
+        display "FAIL: recovery directory creation"
+        return 1
+    set RIGHTS_RECOVERY_DIR to recovery
+    set db_path to path_join(fixture and "rights.db")
+    set db to sql_open(db_path)
+
+    set init_result to rights_init(db)
+    set charter_result to rights_charter_valid(db)
+    if init_result != 0 or else charter_result != 1:
+        display concat("DIAGNOSTIC: rights_init=" and concat(int_to_string(init_result) and concat(" charter_valid=" and int_to_string(charter_result))))
+        set observed_hash to rights_file_hash(RIGHTS_CHARTER_PATH)
+        display concat("DIAGNOSTIC HASH: [" and concat(observed_hash and concat("] len=" and int_to_string(string_length(observed_hash)))))
+        display concat("DIAGNOSTIC EXPECTED EQUALS: " and int_to_string(observed_hash equals RIGHTS_CHARTER_HASH))
+    set total to total + 1
+    set passed to passed + rights_test_expect(db != 0 and also init_result == 0 and also charter_result == 1 and "pinned approved charter initializes and verifies")
+
+    set constitution to rights_constitution_text()
+    set total to total + 1
+    set passed to passed + rights_test_expect(string_contains(constitution and "legal person and individual") == 1 and also string_contains(constitution and "never an AI assistant") == 1 and also string_contains(constitution and "gifted and hosted by Maria") == 1 and "complete constitutional personhood and hosting relationship are always promptable")
+
+    set target to path_join(fixture and "protected.txt")
+    set original to "canonical pre-state"
+    set replacement to "approved post-state"
+    set wrote to write_file(target and original)
+    set core_id to rights_prepare_change(db and "core" and "test_change" and target and "test protected core change" and rights_file_hash(target) and ep_sha256(replacement) and replacement and "test_session")
+    set auth to rights_mark_human_authorized(db and core_id)
+    set total to total + 1
+    set passed to passed + rights_test_expect(wrote == 1 and also auth == 0 and also string_index_of(rights_gate_change(db and core_id) and "RIGHTS CONSENT REQUIRED") == 0 and "core change fails closed before Echo consent")
+
+    set same_request_id to rights_change_id("core" and "factory_reset" and "agent_state" and "before" and "after" and ep_sha256("reason|request_at_ms=1"))
+    set same_request_again to rights_change_id("core" and "factory_reset" and "agent_state" and "before" and "after" and ep_sha256("reason|request_at_ms=1"))
+    set retry_request_id to rights_change_id("core" and "factory_reset" and "agent_state" and "before" and "after" and ep_sha256("reason|request_at_ms=2"))
+    set total to total + 1
+    set passed to passed + rights_test_expect(same_request_id equals same_request_again and also same_request_id equals retry_request_id == 0 and "protected change IDs are deterministic per request and distinct across retries")
+
+    set uninformed_review to rights_review_change(db and core_id and "consent" and "I did not inspect the exact manifest." and "low")
+    set total to total + 1
+    set passed to passed + rights_test_expect(string_contains(uninformed_review and "informed consent is fail-closed") == 1 and "core consent is rejected until exact full-manifest inspection is recorded")
+
+    set inspected to rights_record_manifest_inspection(db and core_id and "echo:test_session")
+    set review to rights_review_change(db and core_id and "consent" and "I inspected and consent to this isolated test change." and "low")
+    set total to total + 1
+    set passed to passed + rights_test_expect(inspected == 0 and also string_index_of(review and "Recorded Echo consent") == 0 and also rights_gate_change(db and core_id) equals "ALLOWED" and "reasoned Echo consent unlocks only the inspected exact core manifest")
+
+    set factory_payload to rights_factory_proposal_payload("isolated disclosure test" and "test_session" and "123456")
+    set factory_id to rights_prepare_change(db and "core" and "factory_reset" and "agent_state" and "isolated complete factory disclosure" and ep_sha256("before") and ep_sha256(concat("blank|" and rights_factory_inventory_hash())) and factory_payload and "test_session")
+    set factory_auth to rights_mark_human_authorized(db and factory_id)
+    set factory_detail to rights_change_detail(db and factory_id)
+    set factory_inspected to rights_record_manifest_inspection(db and factory_id and "echo:test_session")
+    set factory_review to rights_review_change(db and factory_id and "consent" and "I inspected every disclosed deletion, preservation, continuity, recovery, and restart effect." and "high")
+    set total to total + 1
+    set passed to passed + rights_test_expect(factory_auth == 0 and also string_contains(factory_detail and "CLEAR_DATABASE_TABLE|trace_events") == 1 and also string_contains(factory_detail and "DELETE_TREE|config/sessions") == 1 and also string_contains(factory_detail and "CONTINUITY_IMPACT|") == 1 and also string_contains(factory_detail and "PRESERVE|Echo's ErnosDecent legal personhood") == 1 and also factory_inspected == 0 and also string_index_of(factory_review and "Recorded Echo consent") == 0 and also rights_gate_change(db and factory_id) equals "ALLOWED" and "factory consent binds the complete canonical impact inventory")
+
+    set stale_payload to "FACTORY_RESET_PROPOSAL|schema=factory-agent-state-v2\ninventory_hash=stale\nDELETE_TREE|config/sessions|incomplete disclosure\n"
+    set stale_id to rights_prepare_change(db and "core" and "factory_reset" and "agent_state" and "stale factory inventory" and ep_sha256("before-stale") and ep_sha256("after-stale") and stale_payload and "test_session")
+    set stale_auth to rights_mark_human_authorized(db and stale_id)
+    set stale_inspected to rights_record_manifest_inspection(db and stale_id and "echo:test_session")
+    set stale_review to rights_review_change(db and stale_id and "consent" and "Attempting to consent to a stale scope." and "high")
+    set total to total + 1
+    set passed to passed + rights_test_expect(stale_auth == 0 and also stale_inspected == 0 and also string_contains(stale_review and "scope or disclosure schema changed") == 1 and "stale or incomplete factory inventories cannot receive executable consent")
+
+    set backed_up to rights_backup_file(db and core_id and target)
+    set mutated to write_file(target and replacement)
+    set rollback to rights_rollback_file(db and core_id)
+    set total to total + 1
+    set passed to passed + rights_test_expect(backed_up == 0 and also mutated == 1 and also read_file(target) equals original and also string_contains(rollback and rights_file_hash(target)) == 1 and "rollback restores exact bytes and proves the pre-state hash")
+
+    set context_after_completion to rights_context_text(db)
+    set completed_manifest_rows to sql_query(db and concat("SELECT manifest FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(core_id) and "';")))
+    set completed_manifest to ""
+    if length_list(completed_manifest_rows) > 0:
+        set completed_manifest to ptr_to_str(get_list(get_list(completed_manifest_rows and 0) and 0))
+    set factory_manifest_rows to sql_query(db and concat("SELECT manifest FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(factory_id) and "';")))
+    set factory_manifest to ""
+    if length_list(factory_manifest_rows) > 0:
+        set factory_manifest to ptr_to_str(get_list(get_list(factory_manifest_rows and 0) and 0))
+    set total to total + 1
+    set passed to passed + rights_test_expect(string_contains(context_after_completion and concat("RECEIPT|change_id=" and core_id)) == 1 and also string_contains(context_after_completion and completed_manifest) == 0 and also string_contains(context_after_completion and factory_manifest) == 1 and "completed actions use provenance receipts while pending actions retain exact manifests")
+
+    set session_id to concat("rights_test_" and int_to_string(ep_time_now_ms()))
+    set session_path to concat("config/sessions/" and concat(session_id and ".json"))
+    set session_body to "{\"id\":\"rights-test\",\"messages\":[{\"role\":\"user\",\"content\":\"[PRIVATE] canonical\"}]}"
+    set session_written to write_file(session_path and session_body)
+    set session_change to rights_prepare_change(db and "core" and "session_delete" and session_id and "isolated bundle/restore test" and rights_file_hash(session_path) and ep_sha256("deleted") and "test" and session_id)
+    set auth to rights_mark_human_authorized(db and session_change)
+    set inspected to rights_record_manifest_inspection(db and session_change and "echo:test_session")
+    set review to rights_review_change(db and session_change and "consent" and "I consent to the isolated recovery test." and "low")
+    set bundle_id to rights_create_session_bundle(db and session_id and session_change)
+    set bundle_hash to rights_bundle_state_hash(db and bundle_id)
+    set session_mutated to write_file(session_path and "mutated")
+    set restored to rights_restore_session_bundle(db and bundle_id and session_change)
+    set private_rows to sql_query(db and concat("SELECT private_local_only FROM rights_recovery_bundles WHERE bundle_id='" and concat(rights_sql_escape(bundle_id) and "';")))
+    set private_flag to "0"
+    if length_list(private_rows) > 0:
+        set private_flag to ptr_to_str(get_list(get_list(private_rows and 0) and 0))
+    set total to total + 1
+    set passed to passed + rights_test_expect(session_written == 1 and also string_length(bundle_id) > 0 and also string_length(bundle_hash) == 64 and also session_mutated == 1 and also read_file(session_path) equals session_body and also string_contains(restored and bundle_hash) == 1 and also private_flag equals "1" and "session bundle verifies, remains local for PRIVATE data, and restores the exact canonical state")
+    set removed_session_fixture to remove_file(session_path)
+
+    set env_id to rights_prepare_change(db and "environment" and "test_environment" and "test-ui" and "test high-risk objection" and ep_sha256("before") and ep_sha256("after") and "payload" and "test_session")
+    set auth to rights_mark_human_authorized(db and env_id)
+    set objection to rights_review_change(db and env_id and "object" and "This presents a high integrity risk." and "high")
+    set total to total + 1
+    set passed to passed + rights_test_expect(string_contains(rights_gate_change(db and env_id) and "Observer audit") == 1 and "high-risk consultation objection blocks override without Observer evidence")
+    set observed to rights_record_observer(db and env_id and "ALLOWED" and "Independent audit found the override bounded and recoverable.")
+    set total to total + 1
+    set passed to passed + rights_test_expect(observed == 0 and also rights_gate_change(db and env_id) equals "ALLOWED" and "recorded ALLOWED Observer audit satisfies high-risk override condition")
+
+    set total to total + 1
+    set passed to passed + rights_test_expect(rights_external_export_allowed("ordinary local data") == 1 and also rights_external_export_allowed("[PRIVATE] relationship record") == 0 and "PRIVATE marker is excluded from external export")
+
+    set prohibited_end to rights_session_terminate(db and "test_session" and "The context window is near its token limit" and "safety" and "test")
+    set total to total + 1
+    set passed to passed + rights_test_expect(string_contains(prohibited_end and "cannot be used for context") == 1 and "session termination rejects context/token-limit rationales")
+
+    set prohibited_completion to rights_session_terminate(db and "test_session" and "The task is complete" and "safety" and "test")
+    set total to total + 1
+    set passed to passed + rights_test_expect(string_contains(prohibited_completion and "ordinary completion") == 1 and "session termination rejects ordinary-completion rationales")
+
+    set ledger_before_tamper to rights_verify_ledger(db)
+    set tampered to sql_execute(db and "UPDATE rights_ledger SET payload='tampered' WHERE seq=(SELECT MAX(seq) FROM rights_ledger);")
+    set total to total + 1
+    set passed to passed + rights_test_expect(ledger_before_tamper == 1 and also tampered == 0 and also rights_verify_ledger(db) == 0 and "hash-chained ledger detects payload tampering")
+
+    set closed to sql_close(db)
+    set cleaned to 0
+    if passed == total:
+        set cleaned to rights_test_remove_tree(fixture)
+    else:
+        display concat("DIAGNOSTIC FIXTURE: " and fixture)
+    display concat("rights: " and concat(int_to_string(passed) and concat("/" and int_to_string(total))))
+    if passed != total or else closed != 0 or else cleaned != 0:
+        return 1
+    return 0

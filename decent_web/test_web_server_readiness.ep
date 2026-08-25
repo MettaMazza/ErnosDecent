@@ -1,0 +1,83 @@
+import "web_server"
+import "collections"
+import "string"
+import "net"
+
+define web_ready_pass with label as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("  [PASS] " and label)
+        return 1
+    display concat("  [FAIL] " and label)
+    return 0
+
+define web_ready_free_port with start_port as Int returning Int:
+    set port to start_port
+    repeat while port <= 65000:
+        set fd to ep_net_listen_loopback(port)
+        if fd >= 0:
+            set ok to ep_net_close(fd)
+            return port
+        set port to port + 1
+    return 0
+
+define main returning Int:
+    display "Web listener readiness tests"
+    set passed to 0
+    set total to 0
+
+    set local_create to web_gitdec_outcome_json("gitdec:repo_created_local,id:repo,network_error:812" and "gitdec_create_ok" and "gitdec_create_error" and "gitdec:repo_created," and "gitdec:repo_created_local,")
+    set total to total + 1
+    set passed to passed + web_ready_pass("GitDec local durability is not reported as remote success" and string_contains(local_create and "\"ok\":true") == 1 and also string_contains(local_create and "\"scope\":\"local\"") == 1 and also string_contains(local_create and "\"network_status\":\"unavailable\"") == 1)
+
+    set clone_error to web_gitdec_outcome_json("gitdec:error,reason:network_unavailable,code:812" and "gitdec_clone_ok" and "gitdec_clone_error" and "gitdec:clone_ok" and "")
+    set total to total + 1
+    set passed to passed + web_ready_pass("GitDec clone capability failure stays an error" and string_contains(clone_error and "\"type\":\"gitdec_clone_error\"") == 1 and also string_contains(clone_error and "\"ok\":false") == 1 and also string_contains(clone_error and "gitdec_clone_ok") == 0)
+
+    set collab_local to web_gitdec_outcome_json("gitdec:collab_added_local,network_error:812" and "gitdec_collab_ok" and "gitdec_collab_error" and "gitdec:collab_added" and "gitdec:collab_added_local,")
+    set total to total + 1
+    set passed to passed + web_ready_pass("local prefix wins over overlapping remote prefix" and string_contains(collab_local and "\"scope\":\"local\"") == 1 and also string_contains(collab_local and "local_and_remote") == 0)
+
+    set empty_error to web_gitdec_outcome_json("" and "gitdec_create_ok" and "gitdec_create_error" and "gitdec:repo_created," and "gitdec:repo_created_local,")
+    set total to total + 1
+    set passed to passed + web_ready_pass("empty daemon response cannot become success" and string_contains(empty_error and "error:empty_daemon_response") == 1 and also string_contains(empty_error and "\"ok\":false") == 1)
+
+    set total to total + 1
+    set passed to passed + web_ready_pass("GitDec reference allowlist accepts only declared public guides" and web_gitdec_reference_file_allowed("README.md") == 1 and also web_gitdec_reference_file_allowed("docs/gitdec_user_guide.md") == 1)
+    set total to total + 1
+    set passed to passed + web_ready_pass("GitDec reference allowlist rejects arbitrary local paths" and web_gitdec_reference_file_allowed("config/identity.json") == 0 and also web_gitdec_reference_file_allowed("../README.md") == 0)
+
+    set total to total + 1
+    set passed to passed + web_ready_pass("only absent issue and PR state files are valid empty repository state" and web_gitdec_optional_state_file("issues.json") == 1 and also web_gitdec_optional_state_file("pull_requests.json") == 1 and also web_gitdec_optional_state_file("gitdec.json") == 0 and also web_gitdec_optional_state_file("README.md") == 0)
+
+    set invalid_rc to start_web_server(0 and 5000)
+    set total to total + 1
+    set passed to passed + web_ready_pass("invalid Web port rejected" and invalid_rc != 0)
+
+    set conflict_port to web_ready_free_port(51000)
+    set blocker to ep_net_listen_loopback(conflict_port)
+    set conflict_rc to start_web_server(conflict_port and 5000)
+    set total to total + 1
+    set passed to passed + web_ready_pass("occupied Web port fails synchronously" and conflict_rc != 0)
+    set total to total + 1
+    set passed to passed + web_ready_pass("conflicting listener remains owned by test" and blocker >= 0)
+    if blocker >= 0:
+        set ok to ep_net_close(blocker)
+
+    set live_port to web_ready_free_port(52000)
+    set start_rc to start_web_server(live_port and 5000)
+    set total to total + 1
+    set passed to passed + web_ready_pass("Web start returns after listener bind" and start_rc == 0)
+    set client_fd to ep_net_connect("127.0.0.1" and live_port)
+    set total to total + 1
+    set passed to passed + web_ready_pass("verified Web listener accepts TCP" and client_fd >= 0)
+    if client_fd >= 0:
+        set sent to ep_net_send(client_fd and "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        set response to ep_net_recv(client_fd and 4096)
+        set total to total + 1
+        set passed to passed + web_ready_pass("verified Web listener serves HTTP" and string_contains(response and "HTTP/1.1 200 OK") == 1)
+        set ok to ep_net_close(client_fd)
+
+    display f"Web readiness: {passed}/{total} passed"
+    if passed != total:
+        return 1
+    return 0

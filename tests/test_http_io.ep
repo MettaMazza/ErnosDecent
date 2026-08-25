@@ -1,0 +1,153 @@
+import "string"
+import "collections"
+import "net"
+import "../stdlib/http"
+
+set http_tests_passed to 0
+set http_tests_failed to 0
+
+define http_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("  PASS: " and label)
+        set http_tests_passed to http_tests_passed + 1
+        return 1
+    display concat("  FAIL: " and label)
+    set http_tests_failed to http_tests_failed + 1
+    return 0
+
+define http_large_response_server with listen_fd as Int and body as Str returning Int:
+    set client_fd to net_accept(listen_fd)
+    if client_fd < 0:
+        return HTTP_IO_ACCEPT_FAILED
+    return send_response(client_fd and 200 and "text/plain" and body)
+
+define http_timeout_server with listen_fd as Int and chan as Int returning Int:
+    set client_fd to net_accept(listen_fd)
+    if client_fd < 0:
+        return HTTP_IO_ACCEPT_FAILED
+    return http_server_client_handler_with_timeout(client_fd and chan and 60)
+
+define http_handler_result_server with listen_fd as Int and request_chan as Int and result_chan as Int returning Int:
+    set client_fd to net_accept(listen_fd)
+    if client_fd < 0:
+        send HTTP_IO_ACCEPT_FAILED to result_chan
+        return HTTP_IO_ACCEPT_FAILED
+    set handler_result to http_server_client_handler_with_timeout(client_fd and request_chan and 1000)
+    send handler_result to result_chan
+    return handler_result
+
+define main returning Int:
+    display "HTTP I/O and framing tests"
+
+    set parsed to http_parse_content_length("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12")
+    set ok to http_expect(map_get_val(parsed and "valid") == 1 and also map_get_val(parsed and "value") == 12 and "strict Content-Length parses")
+    set duplicate to http_parse_content_length("POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2")
+    set ok to http_expect(map_get_val(duplicate and "valid") == 0 and "duplicate Content-Length is rejected")
+    set nondigit to http_parse_content_length("POST / HTTP/1.1\r\nContent-Length: 1x")
+    set ok to http_expect(map_get_val(nondigit and "valid") == 0 and "nondigit Content-Length is rejected")
+    set chunked to http_parse_content_length("POST / HTTP/1.1\r\nTransfer-Encoding: chunked")
+    set ok to http_expect(map_get_val(chunked and "valid") == 0 and "unsupported Transfer-Encoding is rejected")
+    set absent to http_parse_content_length("GET / HTTP/1.1\r\nHost: localhost")
+    set ok to http_expect(map_get_val(absent and "valid") == 1 and also map_get_val(absent and "present") == 0 and "missing Content-Length means an empty body")
+
+    set large_body to ""
+    set bi to 0
+    repeat while bi < 2048:
+        set large_body to concat(large_body and "0123456789ABCDEF")
+        set bi to bi + 1
+    set listener to net_listen(19101)
+    if listener < 0:
+        set ok to http_expect(0 and "large-response listener starts")
+    else:
+        spawn http_large_response_server(listener and large_body)
+        set client to net_connect("127.0.0.1" and 19101)
+        if client < 0:
+            set ok to http_expect(0 and "large-response client connects")
+        else:
+            set response to ""
+            set reading to 1
+            repeat while reading == 1:
+                set chunk to net_recv(client and 65536)
+                if string_length(chunk) == 0:
+                    set reading to 0
+                else:
+                    set response to concat(response and chunk)
+            set body_at to string_index_of(response and "\r\n\r\n")
+            set response_body to ""
+            if body_at >= 0:
+                set response_body to substring(response and body_at + 4 and string_length(response) - body_at - 4)
+            set ok to http_expect(starts_with(response and "HTTP/1.1 200 OK") == 1 and "response has the requested status")
+            set ok to http_expect(string_length(response_body) == 32768 and also response_body equals large_body and "complete 32768-byte response body arrives")
+            set closed to net_close(client)
+            set ok to http_expect(closed == 0 and "response client closes cleanly")
+        set listener_closed to net_close(listener)
+        set ok to http_expect(listener_closed == 0 and "response listener closes cleanly")
+
+    set timeout_listener to net_listen(19102)
+    if timeout_listener < 0:
+        set ok to http_expect(0 and "timeout listener starts")
+    else:
+        set timeout_chan to channel
+        spawn http_timeout_server(timeout_listener and timeout_chan)
+        set timeout_client to net_connect("127.0.0.1" and 19102)
+        if timeout_client < 0:
+            set ok to http_expect(0 and "timeout client connects")
+        else:
+            # Send nothing. The server must respond with a bounded, explicit 408.
+            set timeout_response to net_recv(timeout_client and 4096)
+            set ok to http_expect(starts_with(timeout_response and "HTTP/1.1 408 Request Timeout") == 1 and "idle request receives explicit 408 timeout")
+            set closed to net_close(timeout_client)
+            set ok to http_expect(closed == 0 and "timeout client closes cleanly")
+        set listener_closed to net_close(timeout_listener)
+        set ok to http_expect(listener_closed == 0 and "timeout listener closes cleanly")
+
+    # A readable EOF before the request is complete is a disconnect, not timeout.
+    set disconnect_listener to net_listen(19103)
+    if disconnect_listener < 0:
+        set ok to http_expect(0 and "disconnect listener starts")
+    else:
+        set request_chan to channel
+        set result_chan to channel
+        spawn http_handler_result_server(disconnect_listener and request_chan and result_chan)
+        set disconnect_client to net_connect("127.0.0.1" and 19103)
+        if disconnect_client < 0:
+            set ok to http_expect(0 and "disconnect client connects")
+        else:
+            set sent to http_send_all(disconnect_client and "GET / HTTP/1.1\r\nHost: incomplete")
+            set closed to net_close(disconnect_client)
+            set ok to http_expect(sent == 1 and also closed == 0 and "client sends an intentionally incomplete request then disconnects")
+            set handler_result to receive from result_chan
+            set ok to http_expect(handler_result == HTTP_IO_PEER_DISCONNECTED and "incomplete EOF is reported as peer disconnect")
+        set listener_closed to net_close(disconnect_listener)
+        set ok to http_expect(listener_closed == 0 and "disconnect listener closes cleanly")
+
+    # Exercise strict framing through the real handler, not only the parser.
+    set malformed_listener to net_listen(19104)
+    if malformed_listener < 0:
+        set ok to http_expect(0 and "malformed-request listener starts")
+    else:
+        set request_chan2 to channel
+        set result_chan2 to channel
+        spawn http_handler_result_server(malformed_listener and request_chan2 and result_chan2)
+        set malformed_client to net_connect("127.0.0.1" and 19104)
+        if malformed_client < 0:
+            set ok to http_expect(0 and "malformed-request client connects")
+        else:
+            set malformed_request to "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n"
+            set sent to http_send_all(malformed_client and malformed_request)
+            set malformed_response to net_recv(malformed_client and 4096)
+            set ok to http_expect(sent == 1 and also starts_with(malformed_response and "HTTP/1.1 400 Bad Request") == 1 and "ambiguous request receives explicit 400")
+            set handler_result to receive from result_chan2
+            set ok to http_expect(handler_result == HTTP_IO_MALFORMED_REQUEST and "handler propagates malformed-request error")
+            set closed to net_close(malformed_client)
+        set listener_closed to net_close(malformed_listener)
+        set ok to http_expect(listener_closed == 0 and "malformed-request listener closes cleanly")
+
+    set ok to http_expect(http_send_all(0 - 1 and "unsent") == 0 and "exact-write helper rejects an unsent buffer")
+    set invalid_response to send_response(0 - 1 and 200 and "text/plain" and "unsent")
+    set ok to http_expect(invalid_response == HTTP_IO_SEND_FAILED and "response reports send failure instead of close success")
+
+    display f"HTTP I/O: {http_tests_passed} passed, {http_tests_failed} failed"
+    if http_tests_failed > 0:
+        return 1
+    return 0

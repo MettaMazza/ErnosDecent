@@ -1,0 +1,124 @@
+import "web_server"
+import "string"
+import "fs"
+import "net"
+import "websocket"
+
+set web_truth_passed to 0
+set web_truth_failed to 0
+
+define web_truth_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("  PASS: " and label)
+        set web_truth_passed to web_truth_passed + 1
+        return 1
+    display concat("  FAIL: " and label)
+    set web_truth_failed to web_truth_failed + 1
+    return 0
+
+define web_truth_remove with path as Str returning Int:
+    if file_exists(path) == 0:
+        return 1
+    if remove_file(path) == 0 or else file_exists(path) == 1:
+        return 0
+    return 1
+
+define web_truth_free_port with start_port as Int returning Int:
+    set port to start_port
+    repeat while port <= 65000:
+        set probe to ep_net_listen(port)
+        if probe >= 0:
+            set closed to ep_net_close(probe)
+            if closed != 0:
+                display "  ERROR: receipt test could not close its port probe"
+                return 0
+            return port
+        set port to port + 1
+    return 0
+
+define web_truth_send_queued_then_ack with port as Int and receipt_id as Str returning Int:
+    set slept to ep_sleep_ms(50)
+    set fd to ep_net_connect("127.0.0.1" and port)
+    if fd < 0:
+        display "  ERROR: receipt test client could not connect"
+        return 1
+    if ws_send_text(fd and "{\"type\":\"get_status\"}") != 1:
+        display "  ERROR: receipt test client could not send queued input"
+        set closed to ep_net_close(fd)
+        return 1
+    set exact_ack to concat("{\"type\":\"delivery_ack\",\"delivery_id\":\"" and concat(receipt_id and "\"}"))
+    if ws_send_text(fd and exact_ack) != 1:
+        display "  ERROR: receipt test client could not send its ACK"
+        set closed to ep_net_close(fd)
+        return 1
+    set closed to ep_net_close(fd)
+    if closed != 0:
+        display "  ERROR: receipt test client close failed"
+        return 1
+    return 0
+
+define main returning Int:
+    display "Web platform truth and delivery receipt tests"
+
+    set mixed to "{\"discord\":{\"enabled\":false,\"token\":\"tok\",\"channel\":\"123\",\"status\":\"ONLINE\",\"admin_id\":\"7\",\"admin_role_id\":\"8\"},\"telegram\":{\"enabled\":true},\"whatsapp\":{\"enabled\":true}}"
+    set canonical to web_platform_config_canonical(mixed and 1)
+    set ok to web_truth_expect(string_contains(canonical and "\"discord\"") == 1 and also string_contains(canonical and "telegram") == 0 and also string_contains(canonical and "whatsapp") == 0 and "canonical config exposes only the managed Discord bridge")
+    set ok to web_truth_expect(string_contains(canonical and "\"status\":\"OFFLINE\"") == 1 and also string_contains(canonical and "\"admin_id\":\"7\"") == 1 and "browser status is ignored while access fields are preserved")
+    set ok to web_truth_expect(string_length(web_platform_config_canonical("{}" and 1)) == 0 and "missing Discord object is rejected")
+    set ok to web_truth_expect(string_length(web_platform_config_canonical("{\"discord\":{\"enabled\":true,\"token\":\"\",\"channel\":\"\"}}" and 1)) == 0 and "enabled bridge requires credentials")
+    set ok to web_truth_expect(string_length(web_platform_config_canonical("{\"discord\":{\"enabled\":true,\"token\":\"tok\",\"channel\":\"12x\"}}" and 1)) == 0 and "non-decimal Discord channel is rejected")
+    set enabled to web_platform_config_canonical("{\"discord\":{\"enabled\":true,\"token\":\"tok\",\"channel\":\"123456\",\"status\":\"ONLINE\"}}" and 0)
+    set ok to web_truth_expect(string_contains(enabled and "\"enabled\":true") == 1 and also string_contains(enabled and "\"status\":\"ONLINE\"") == 1 and "manager-reported ONLINE state survives verified load")
+
+    set temp_path to concat("/tmp/ernos_web_platform_" and concat(keys_random_hex(8) and ".json"))
+    set ok to web_truth_expect(web_platform_atomic_write(temp_path and canonical) == 1 and also string_equals(read_file(temp_path) and canonical) == 1 and "Discord config write is atomic and read-back verified")
+    set ok to web_truth_expect(string_equals(web_platform_load_config(temp_path) and canonical) == 1 and "stored Discord config is parsed and canonicalized")
+    set ok to web_truth_expect(web_platform_atomic_write("/dev/null/blocked/platforms.json" and canonical) == 0 and "unwritable Discord config path reports failure")
+    set ok to web_truth_expect(web_truth_remove(temp_path) == 1 and "platform test artifact is removed")
+
+    set ok to web_truth_expect(web_run_checked_command("true") == 0 and "checked command returns the real zero status")
+    set ok to web_truth_expect(web_run_checked_command("false") != 0 and "checked command returns the real failure status")
+    set success_response to web_platform_response_json("platforms_saved" and 1 and "verified" and canonical)
+    set failure_response to web_platform_response_json("platforms_saved" and 0 and "failed" and canonical)
+    set ok to web_truth_expect(string_contains(success_response and "\"success\":true") == 1 and also string_contains(failure_response and "\"success\":false") == 1 and "save responses preserve actual outcome")
+
+    set outbox_receipt to web_delivery_receipt_id("outbox" and 42 and "turn-abc|1")
+    set trace_receipt to web_delivery_receipt_id("trace" and 9 and "session-abc|100|mid_message|body")
+    set ok to web_truth_expect(string_index_of(outbox_receipt and "outbox:42:") == 0 and also string_index_of(trace_receipt and "trace:9:") == 0 and also outbox_receipt equals web_delivery_receipt_id("outbox" and 42 and "turn-abc|1") and "durable row identity produces stable namespaced receipts")
+    set ok to web_truth_expect(string_length(web_delivery_receipt_id("other" and 42 and "id")) == 0 and also string_length(web_delivery_receipt_id("outbox" and 0 and "id")) == 0 and also string_length(web_delivery_receipt_id("outbox" and 42 and "")) == 0 and "invalid receipt namespaces, row IDs, and identities are rejected")
+    set begin_frame to web_delivery_envelope_json("delivery_begin" and outbox_receipt)
+    set ok to web_truth_expect(string_contains(begin_frame and outbox_receipt) == 1 and "delivery envelope carries the stable receipt ID")
+    set exact_ack to concat("{\"type\":\"delivery_ack\",\"delivery_id\":\"" and concat(outbox_receipt and "\"}"))
+    set wrong_type_ack to concat("{\"type\":\"other\",\"delivery_id\":\"" and concat(outbox_receipt and "\"}"))
+    set ok to web_truth_expect(web_browser_ack_matches(exact_ack and outbox_receipt) == 1 and "exact browser receipt is accepted")
+    set ok to web_truth_expect(web_browser_ack_matches("{\"type\":\"delivery_ack\",\"delivery_id\":\"outbox:41:bad\"}" and outbox_receipt) == 0 and also web_browser_ack_matches(wrong_type_ack and outbox_receipt) == 0 and also web_browser_ack_matches("not-json" and outbox_receipt) == 0 and "mismatched, wrong-type, and malformed receipts are rejected")
+
+    # A browser can send dashboard requests while a long turn runs. Those frames are
+    # ahead of the later delivery ACK in TCP order and must survive the ACK barrier.
+    set receipt_port to web_truth_free_port(54000)
+    set receipt_listener to 0 - 1
+    set receipt_server_fd to 0 - 1
+    set queued_ack_ok to 0
+    if receipt_port > 0:
+        set receipt_listener to ep_net_listen(receipt_port)
+    if receipt_listener >= 0:
+        spawn web_truth_send_queued_then_ack(receipt_port and outbox_receipt)
+        set receipt_server_fd to ep_net_accept(receipt_listener)
+    if receipt_server_fd >= 0:
+        set pending_frames to create_list()
+        set wait_ok to web_wait_browser_ack(receipt_server_fd and outbox_receipt and pending_frames)
+        if wait_ok == 1 and also length_list(pending_frames) == 1 and also ptr_to_str(get_list(pending_frames and 0)) equals "{\"type\":\"get_status\"}":
+            set queued_ack_ok to 1
+        set closed to ep_net_close(receipt_server_fd)
+        if closed != 0:
+            set queued_ack_ok to 0
+    if receipt_listener >= 0:
+        set closed to ep_net_close(receipt_listener)
+        if closed != 0:
+            set queued_ack_ok to 0
+    set ok to web_truth_expect(queued_ack_ok == 1 and "application frames queued ahead of an ACK are preserved for later dispatch")
+
+    display f"Web truth tests: {web_truth_passed} passed, {web_truth_failed} failed"
+    if web_truth_failed > 0:
+        return 1
+    return 0

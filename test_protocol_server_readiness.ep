@@ -1,0 +1,193 @@
+# ErnosDecent -- protocol listener readiness tests
+# Proves synchronous bind success, deterministic conflict failure, and rollback.
+
+import "./protocol_server"
+import "collections"
+import "string"
+import "net"
+
+define readiness_pass_if with label as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("  [PASS] " and label)
+        return 1
+    display concat("  [FAIL] " and label)
+    return 0
+
+define readiness_find_free_base with start_port as Int returning Int:
+    set candidate to start_port
+    repeat while candidate <= 65000:
+        set bound to protocol_bind_listeners(candidate and candidate + 1 and candidate + 2)
+        if map_get_val(bound and "error") == PROTO_ERR_NONE:
+            set close_rc to protocol_close_bound_listeners(bound)
+            free_map(bound)
+            if close_rc == PROTO_ERR_NONE:
+                return candidate
+        else:
+            free_map(bound)
+        set candidate to candidate + 3
+    return 0
+
+define main returning Int:
+    display "Protocol server readiness tests"
+    set passed to 0
+    set total to 0
+
+    # Invalid configuration is rejected without touching the network.
+    set invalid_low to protocol_bind_listeners(0 and 30001 and 30002)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("zero port rejected" and map_get_val(invalid_low and "error") == PROTO_ERR_INVALID_PORT)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("invalid-port result identifies P2P" and (ptr_to_str(map_get_val(invalid_low and "failed_service")) equals "p2p"))
+    free_map(invalid_low)
+
+    set invalid_high to protocol_bind_listeners(30000 and 65536 and 30002)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("out-of-range port rejected" and map_get_val(invalid_high and "error") == PROTO_ERR_INVALID_PORT)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("invalid-port result identifies DHT" and (ptr_to_str(map_get_val(invalid_high and "failed_service")) equals "dht"))
+    free_map(invalid_high)
+
+    # Successful binding returns all three real listeners, and closing them makes
+    # the same ports immediately reusable.
+    set success_base to readiness_find_free_base(28000)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("found a free three-port range" and success_base > 0)
+    if success_base > 0:
+        set success to protocol_bind_listeners(success_base and success_base + 1 and success_base + 2)
+        set total to total + 1
+        set passed to passed + readiness_pass_if("three-listener bind succeeds" and map_get_val(success and "error") == PROTO_ERR_NONE)
+        set total to total + 1
+        set passed to passed + readiness_pass_if("P2P listener descriptor is valid" and map_get_val(success and "p2p_fd") >= 0)
+        set total to total + 1
+        set passed to passed + readiness_pass_if("DHT listener descriptor is valid" and map_get_val(success and "dht_fd") >= 0)
+        set total to total + 1
+        set passed to passed + readiness_pass_if("relay listener descriptor is valid" and map_get_val(success and "relay_fd") >= 0)
+        set close_rc to protocol_close_bound_listeners(success)
+        set total to total + 1
+        set passed to passed + readiness_pass_if("all successful listeners close" and close_rc == PROTO_ERR_NONE)
+        set close_again_rc to protocol_close_bound_listeners(success)
+        set total to total + 1
+        set passed to passed + readiness_pass_if("listener cleanup is idempotent" and close_again_rc == PROTO_ERR_NONE)
+        free_map(success)
+        set rebound to protocol_bind_listeners(success_base and success_base + 1 and success_base + 2)
+        set total to total + 1
+        set passed to passed + readiness_pass_if("closed port range is reusable" and map_get_val(rebound and "error") == PROTO_ERR_NONE)
+        set ok to protocol_close_bound_listeners(rebound)
+        free_map(rebound)
+
+    # A DHT conflict happens after P2P has bound. The helper must close that P2P
+    # listener before it returns the failure.
+    set dht_base to readiness_find_free_base(32000)
+    set dht_blocker to ep_net_listen(dht_base + 1)
+    set dht_failure to protocol_bind_listeners(dht_base and dht_base + 1 and dht_base + 2)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("DHT port conflict fails startup" and map_get_val(dht_failure and "error") == PROTO_ERR_LISTEN_FAILED)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("DHT conflict is identified" and (ptr_to_str(map_get_val(dht_failure and "failed_service")) equals "dht"))
+    set p2p_probe to ep_net_listen(dht_base)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("P2P listener rolls back after DHT conflict" and p2p_probe >= 0)
+    if p2p_probe >= 0:
+        set ok to ep_net_close(p2p_probe)
+    if dht_blocker >= 0:
+        set ok to ep_net_close(dht_blocker)
+    free_map(dht_failure)
+
+    # A relay conflict happens after both earlier binds. Both must be reusable while
+    # the conflicting relay listener remains held by the test.
+    set relay_base to readiness_find_free_base(36000)
+    set relay_blocker to ep_net_listen(relay_base + 2)
+    set relay_failure to protocol_bind_listeners(relay_base and relay_base + 1 and relay_base + 2)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("relay port conflict fails startup" and map_get_val(relay_failure and "error") == PROTO_ERR_LISTEN_FAILED)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("relay conflict is identified" and (ptr_to_str(map_get_val(relay_failure and "failed_service")) equals "relay"))
+    set p2p_probe2 to ep_net_listen(relay_base)
+    set dht_probe2 to ep_net_listen(relay_base + 1)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("P2P listener rolls back after relay conflict" and p2p_probe2 >= 0)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("DHT listener rolls back after relay conflict" and dht_probe2 >= 0)
+    if p2p_probe2 >= 0:
+        set ok to ep_net_close(p2p_probe2)
+    if dht_probe2 >= 0:
+        set ok to ep_net_close(dht_probe2)
+    if relay_blocker >= 0:
+        set ok to ep_net_close(relay_blocker)
+    free_map(relay_failure)
+
+    # Duplicate configured ports deterministically conflict and still roll back.
+    set duplicate_base to readiness_find_free_base(40000)
+    set duplicate_failure to protocol_bind_listeners(duplicate_base and duplicate_base and duplicate_base + 1)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("duplicate configured ports fail startup" and map_get_val(duplicate_failure and "error") == PROTO_ERR_LISTEN_FAILED)
+    set duplicate_probe to ep_net_listen(duplicate_base)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("duplicate-port failure releases first listener" and duplicate_probe >= 0)
+    if duplicate_probe >= 0:
+        set ok to ep_net_close(duplicate_probe)
+    free_map(duplicate_failure)
+
+    # The public launcher exposes the synchronous failure and launches no workers.
+    set start_base to readiness_find_free_base(44000)
+    set start_blocker to ep_net_listen(start_base)
+    set launch_dht to create_map()
+    set launch_relay to create_map()
+    set launch_store to create_map()
+    set start_rc to start_protocol_servers(0 and 0 and borrow launch_dht and borrow launch_relay and start_base and start_base + 1 and start_base + 2 and cast_borrow_to_map(launch_store) and 0 and 0 and 0 and 0)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("public launcher returns bind failure" and start_rc == PROTO_ERR_LISTEN_FAILED)
+    if start_blocker >= 0:
+        set ok to ep_net_close(start_blocker)
+    free_map(launch_dht)
+    free_map(launch_relay)
+    free_map(launch_store)
+
+    # Message delivery completion requires a canonical, exactly correlated durable
+    # receipt. Legacy delimiter payloads, another id, NACK, or receive failure must
+    # never become success.
+    set expected_message_id to msg_generate_id()
+    set wrong_message_id to msg_generate_id()
+    set stored_receipt_wire to msg_receipt_serialize(expected_message_id and MSG_RECEIPT_STORED and MSG_ERR_NONE)
+    set duplicate_receipt_wire to msg_receipt_serialize(expected_message_id and MSG_RECEIPT_DUPLICATE and MSG_ERR_NONE)
+    set rejected_receipt_wire to msg_receipt_serialize(expected_message_id and MSG_RECEIPT_REJECTED and MSG_ERR_REMOTE_REJECTED)
+    set ack_probe to create_map()
+    set ok to msg_map_put_int_checked(ack_probe and "error" and NOISE_NET_ERR_NONE)
+    set ok to msg_map_put_str_checked(ack_probe and "msg_type" and "MSG_ACK")
+    set ok to msg_map_put_str_checked(ack_probe and "plaintext" and stored_receipt_wire)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("canonical stored-message receipt accepted" and protocol_message_ack_matches(ack_probe and expected_message_id) == 1)
+    set ok to msg_map_put_str_checked(ack_probe and "plaintext" and duplicate_receipt_wire)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("canonical duplicate-message receipt accepted" and protocol_message_ack_matches(ack_probe and expected_message_id) == 1)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("wrong message-id receipt rejected" and protocol_message_ack_matches(ack_probe and wrong_message_id) == 0)
+    set legacy_receipt_wire to concat(expected_message_id and "|stored")
+    set ok to msg_map_put_str_checked(ack_probe and "plaintext" and legacy_receipt_wire)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("legacy delimiter receipt rejected" and protocol_message_ack_matches(ack_probe and expected_message_id) == 0)
+    set ok to msg_map_put_str_checked(ack_probe and "plaintext" and rejected_receipt_wire)
+    set ok to msg_map_put_str_checked(ack_probe and "msg_type" and "MSG_NACK")
+    set total to total + 1
+    set passed to passed + readiness_pass_if("canonical rejection cannot satisfy delivery" and protocol_message_ack_matches(ack_probe and expected_message_id) == 0)
+    set ok to msg_map_put_str_checked(ack_probe and "msg_type" and "MSG_ACK")
+    set ok to msg_map_put_str_checked(ack_probe and "plaintext" and stored_receipt_wire)
+    set ok to msg_map_put_int_checked(ack_probe and "error" and NOISE_NET_ERR_RECV_FAILED)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("receive error cannot satisfy message receipt" and protocol_message_ack_matches(ack_probe and expected_message_id) == 0)
+
+    # Block/BFT acknowledgements are fixed opaque hashes rather than structured
+    # message receipts, so they continue to use the generic exact matcher.
+    set ok to msg_map_put_int_checked(ack_probe and "error" and NOISE_NET_ERR_NONE)
+    set ok to msg_map_put_str_checked(ack_probe and "msg_type" and "BLOCK_ACK")
+    set ok to msg_map_put_str_checked(ack_probe and "plaintext" and "applied|block-hash")
+    set total to total + 1
+    set passed to passed + readiness_pass_if("generic block ACK exact match accepted" and protocol_ack_matches(ack_probe and "BLOCK_ACK" and "applied|block-hash" and "duplicate|block-hash") == 1)
+    set total to total + 1
+    set passed to passed + readiness_pass_if("generic block ACK mismatch rejected" and protocol_ack_matches(ack_probe and "BLOCK_ACK" and "applied|other-hash" and "duplicate|other-hash") == 0)
+    free_map(ack_probe)
+
+    display f"Protocol readiness: {passed}/{total} passed"
+    if passed != total:
+        return 1
+    return 0

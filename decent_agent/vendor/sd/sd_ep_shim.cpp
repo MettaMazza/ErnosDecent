@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <time.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -29,6 +30,37 @@
 static pthread_mutex_t g_sd_mutex = PTHREAD_MUTEX_INITIALIZER;
 static sd_ctx_t* g_sd_ctx = NULL;
 static char g_sd_model[2048] = "";
+
+static double sd_ep_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+typedef struct {
+    double started_ms;
+    double first_step_ms;
+    double last_step_ms;
+    int last_step;
+    int total_steps;
+    int expected_steps;
+} sd_ep_progress_state_t;
+
+static void sd_ep_progress(int step, int steps, float time, void* data) {
+    sd_ep_progress_state_t* state = (sd_ep_progress_state_t*)data;
+    if (!state) return;
+    /* The library also reports lazy weight-upload progress through this callback.
+     * Only sampler progress has the configured diffusion-step denominator. */
+    if (steps != state->expected_steps) return;
+    double now = sd_ep_now_ms();
+    if (state->first_step_ms == 0.0) state->first_step_ms = now;
+    double step_ms = state->last_step_ms > 0.0 ? now - state->last_step_ms : now - state->started_ms;
+    state->last_step_ms = now;
+    state->last_step = step;
+    state->total_steps = steps;
+    fprintf(stderr, "[ImageGen timing] denoise step=%d/%d callback_ms=%.1f library_s=%.3f\n",
+            step, steps, step_ms, (double)time);
+}
 
 /* Load (or reuse a cached) context. Two modes:
  *  - single-file (SD1.5/SDXL): model_path set, encoders empty — CLIP+VAE are built in.
@@ -63,15 +95,46 @@ static sd_ctx_t* sd_ep_ctx_for(const char* model_path, const char* diffusion_mod
     } else {
         cp.model_path = model_path;   /* single-file checkpoint (SD1.5/SDXL): CLIP+VAE built in */
     }
+    /* Exact Metal execution accelerators only: these change kernels/load strategy,
+     * never dimensions, diffusion steps, sampler, cache approximation, or weights.
+     * Live 1024px isolation found mmap crashes this dylib and both direct-convolution
+     * modes are neutral/slower, so those remain off; eager upload + attention won. */
+    cp.enable_mmap = false;
+    cp.flash_attn = true;
+    cp.diffusion_flash_attn = true;
+    cp.diffusion_conv_direct = false;
+    cp.vae_conv_direct = false;
+    cp.eager_load = true;
+    double load_started_ms = sd_ep_now_ms();
     g_sd_ctx = new_sd_ctx(&cp);
+    double load_ms = sd_ep_now_ms() - load_started_ms;
     if (g_sd_ctx != NULL) {
         strncpy(g_sd_model, key, sizeof(g_sd_model) - 1);
         g_sd_model[sizeof(g_sd_model) - 1] = '\0';
-        fprintf(stderr, "[ImageGen shim] ctx loaded OK\n");
+        fprintf(stderr, "[ImageGen shim] ctx loaded OK in %.1f ms (mmap=0 eager=1 flash=1 diffusion_flash=1 diffusion_conv_direct=0 vae_conv_direct=0)\n", load_ms);
     } else {
         fprintf(stderr, "[ImageGen shim] new_sd_ctx FAILED (rc 3 path) — check the weight file paths above\n");
     }
     return g_sd_ctx;
+}
+
+/* Load and retain the configured model without running diffusion. The node invokes
+ * this once on a background worker after startup, so the first user render does not
+ * pay model parsing, Metal allocation, and eager parameter upload. */
+extern "C" long long sd_ep_preload(long long model_path_ll,
+                    long long diffusion_model_ll,
+                    long long clip_l_ll,
+                    long long t5xxl_ll,
+                    long long vae_ll) {
+    const char* model_path       = (const char*)model_path_ll;
+    const char* diffusion_model = (const char*)diffusion_model_ll;
+    const char* clip_l           = (const char*)clip_l_ll;
+    const char* t5xxl            = (const char*)t5xxl_ll;
+    const char* vae              = (const char*)vae_ll;
+    pthread_mutex_lock(&g_sd_mutex);
+    sd_ctx_t* ctx = sd_ep_ctx_for(model_path, diffusion_model, clip_l, t5xxl, vae);
+    pthread_mutex_unlock(&g_sd_mutex);
+    return ctx != NULL ? 0 : 3;
 }
 
 /* Flat entry point EP calls over FFI. extern "C" keeps the symbol unmangled — this file
@@ -135,7 +198,21 @@ extern "C" long long sd_ep_generate(long long model_path_ll,
     int num_images = 0;
     fprintf(stderr, "[ImageGen shim] generating %dx%d steps=%d cfg=%d seed=%lld\n",
             width, height, steps, cfg, (long long)seed);
+    sd_ep_progress_state_t progress;
+    memset(&progress, 0, sizeof(progress));
+    progress.started_ms = sd_ep_now_ms();
+    progress.expected_steps = steps;
+    sd_set_progress_callback(sd_ep_progress, &progress);
     bool ok = generate_image(ctx, &gp, &images, &num_images);
+    double generated_ms = sd_ep_now_ms();
+    sd_set_progress_callback(NULL, NULL);
+    fprintf(stderr,
+            "[ImageGen timing] conditioning_to_first_step_ms=%.1f denoise_callback_span_ms=%.1f post_denoise_ms=%.1f generate_total_ms=%.1f callbacks=%d/%d\n",
+            progress.first_step_ms > 0.0 ? progress.first_step_ms - progress.started_ms : -1.0,
+            progress.first_step_ms > 0.0 && progress.last_step_ms > 0.0 ? progress.last_step_ms - progress.first_step_ms : -1.0,
+            progress.last_step_ms > 0.0 ? generated_ms - progress.last_step_ms : -1.0,
+            generated_ms - progress.started_ms,
+            progress.last_step, progress.total_steps);
 
     int rc = 0;
     if (!ok || num_images < 1 || images == NULL || images[0].data == NULL) {
@@ -143,12 +220,14 @@ extern "C" long long sd_ep_generate(long long model_path_ll,
         rc = 4;  /* generation produced no image */
     } else {
         int stride = (int)(images[0].width * images[0].channel);
+        double png_started_ms = sd_ep_now_ms();
         int wrote = stbi_write_png(out_png_path,
                                    (int)images[0].width,
                                    (int)images[0].height,
                                    (int)images[0].channel,
                                    images[0].data,
                                    stride);
+        fprintf(stderr, "[ImageGen timing] png_encode_write_ms=%.1f\n", sd_ep_now_ms() - png_started_ms);
         rc = wrote ? 0 : 5;  /* PNG write failed */
     }
 
@@ -164,6 +243,12 @@ extern "C" long long sd_ep_generate(long long model_path_ll,
 }
 
 #else  /* !SD_EP_HAVE_LIB — stub so the build always links */
+
+extern "C" long long sd_ep_preload(long long model_path, long long diffusion_model,
+                    long long clip_l, long long t5xxl, long long vae) {
+    (void)model_path; (void)diffusion_model; (void)clip_l; (void)t5xxl; (void)vae;
+    return 99;
+}
 
 extern "C" long long sd_ep_generate(long long model_path, long long diffusion_model,
                    long long clip_l, long long t5xxl, long long vae,

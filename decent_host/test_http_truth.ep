@@ -1,0 +1,51 @@
+# Focused tests for the standalone static HTTP server's failure contract.
+
+import "string"
+import "./http"
+
+set http_truth_passed to 0
+set http_truth_failed to 0
+
+define http_truth_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        set http_truth_passed to http_truth_passed + 1
+        return 1
+    display concat("FAIL: " and label)
+    set http_truth_failed to http_truth_failed + 1
+    return 0
+
+define main returning Int:
+    set valid to "GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    set ok to http_truth_expect(http_parse_request_path(valid) equals "/index.html" and "valid origin-form request path parses")
+
+    set extra_token to "GET /index.html HTTP/1.1 extra\r\n\r\n"
+    set bare_target to "GET index.html HTTP/1.1\r\n\r\n"
+    set bad_version to "GET /index.html HTTP/9.9\r\n\r\n"
+    set ok to http_truth_expect(string_length(http_parse_request_path(extra_token)) == 0 and also string_length(http_parse_request_path(bare_target)) == 0 and also string_length(http_parse_request_path(bad_version)) == 0 and "malformed request lines are rejected")
+
+    set injected to http_build_response(200 and "text/html\r\nX-Forged: yes" and "body")
+    set unsupported_status to http_build_response(201 and "text/plain" and "body")
+    set ok to http_truth_expect(string_length(injected) == 0 and also string_length(unsupported_status) == 0 and "response splitting and undocumented statuses fail closed")
+
+    set response to http_build_response(200 and "text/plain" and "hello")
+    set ok to http_truth_expect(string_contains(response and "Content-Length: 5") == 1 and also string_contains(response and "Connection: close") == 1 and "response framing declares the exact body length")
+
+    set ok to http_truth_expect(http_send_all(0 - 1 and "unsent") == 0 and "invalid socket cannot become a successful send")
+    set mapper to static_create_mapper()
+    set ok to http_truth_expect(mapper != 0 and also map_contains(mapper and "routes") == 1 and also map_get_val(mapper and "routes") != 0 and "static mapper creation publishes complete state")
+    set add_result to static_add_route(mapper and "/truth" and "observable")
+    set routes to map_get_val(mapper and "routes")
+    set ok to http_truth_expect(add_result == STATIC_ERR_NONE and also map_contains(routes and "/truth") == 1 and also (map_get_val(routes and "/truth") equals "observable") and "static route success has an observable insertion postcondition")
+    set invalid_mapper to create_map()
+    set ok to http_truth_expect(static_add_route(invalid_mapper and "/truth" and "must-not-appear") == STATIC_ERR_INVALID_STATE and also map_contains(invalid_mapper and "/truth") == 0 and "static route rejects missing mapper state")
+    set ok to http_truth_expect(static_get_content(invalid_mapper and "/truth") equals "" and "static lookup fails closed on invalid mapper state")
+    set ok to http_truth_expect(http_server_step(0 - 1 and mapper) == HTTP_ERR_ACCEPT_FAILED and "accept failure is externally visible")
+    free_map(invalid_mapper)
+    free_map(routes)
+    free_map(mapper)
+
+    display f"HTTP truth: {http_truth_passed} passed, {http_truth_failed} failed"
+    if http_truth_failed > 0:
+        return 1
+    return 0

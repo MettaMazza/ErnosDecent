@@ -37,7 +37,10 @@ assert_contains() {
 ipc_cmd() {
     local port="$1"
     local cmd="$2"
-    echo "$cmd" | nc -w 2 127.0.0.1 "$port" 2>/dev/null
+    local token
+    token=$(tr -d '\r\n ' < "$HOME/.ernosdecent/ipc-token" 2>/dev/null) || return 1
+    [ -n "$token" ] || return 1
+    printf 'AUTH %s %s\n' "$token" "$cmd" | nc -w 2 127.0.0.1 "$port" 2>/dev/null
 }
 
 cleanup() {

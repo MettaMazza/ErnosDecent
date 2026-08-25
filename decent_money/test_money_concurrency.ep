@@ -1,0 +1,289 @@
+# Focused shared-state concurrency, lock failure, and conservation tests.
+
+import "string"
+import "collections"
+import "../decent_id/keys"
+import "token"
+import "nft"
+import "exchange"
+import "contracts"
+import "ledger"
+
+set MONEY_CONC_TOTAL to 0
+set MONEY_CONC_TOKEN to create_map()
+set MONEY_CONC_NFT to create_map()
+set MONEY_CONC_NFT_SOURCE to ""
+set MONEY_CONC_DEX to create_map()
+set MONEY_CONC_DEX_A to create_map()
+set MONEY_CONC_DEX_B to create_map()
+set MONEY_CONC_CONTRACT to create_map()
+set MONEY_CONC_LEDGER to create_map()
+set MONEY_CONC_LEDGER_TXS_A to create_list()
+set MONEY_CONC_LEDGER_TXS_B to create_list()
+set MONEY_CONC_LEDGER_VALIDATOR to ""
+set MONEY_CONC_LEDGER_SIG_A to ""
+set MONEY_CONC_LEDGER_SIG_B to ""
+set MONEY_CONC_LEDGER_ROOT to ""
+
+define money_concurrency_expect with condition as Int and label as Str returning Int:
+    set MONEY_CONC_TOTAL to MONEY_CONC_TOTAL + 1
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define money_token_transfer_worker with worker_index as Int and done as Int returning Int:
+    set result to token_transfer(MONEY_CONC_TOKEN and "alice" and "bob" and 1)
+    send result to done
+    return 0
+
+define money_token_allowance_worker with worker_index as Int and done as Int returning Int:
+    set result to token_transfer_from(MONEY_CONC_TOKEN and "spender" and "alice" and "carol" and 1)
+    send result to done
+    return 0
+
+define money_nft_mint_worker with worker_index as Int and done as Int returning Int:
+    set owner to concat("mint_owner_" and int_to_string(worker_index))
+    set result to nft_mint(MONEY_CONC_NFT and owner and 1 and concat("meta:" and int_to_string(worker_index)) and 250)
+    send result to done
+    return 0
+
+define money_nft_transfer_worker with worker_index as Int and done as Int returning Int:
+    set next_owner to concat("transfer_owner_" and int_to_string(worker_index))
+    set result to nft_transfer(MONEY_CONC_NFT and MONEY_CONC_NFT_SOURCE and next_owner and 1)
+    send result to done
+    return 0
+
+define money_dex_swap_worker with worker_index as Int and done as Int returning Int:
+    set result to dex_swap_amm(MONEY_CONC_DEX and MONEY_CONC_DEX_A and MONEY_CONC_DEX_B and 100 and "provider")
+    send result to done
+    return 0
+
+define money_contract_worker with worker_index as Int and done as Int returning Int:
+    set args to create_list()
+    set result to contract_call(MONEY_CONC_CONTRACT and "increment" and args and "caller" and 1000)
+    set status to CONTRACT_ERR_MUTATION
+    if result != 0:
+        set status to map_get_val(result and "status")
+        set released_result to free_map(result)
+    send status to done
+    return 0
+
+define money_ledger_worker with worker_index as Int and done as Int returning Int:
+    set result to LEDGER_ERR_MALFORMED
+    if worker_index == 0:
+        set result to ledger_add_block(MONEY_CONC_LEDGER and MONEY_CONC_LEDGER_TXS_A and MONEY_CONC_LEDGER_VALIDATOR and MONEY_CONC_LEDGER_SIG_A and MONEY_CONC_LEDGER_ROOT)
+    else:
+        set result to ledger_add_block(MONEY_CONC_LEDGER and MONEY_CONC_LEDGER_TXS_B and MONEY_CONC_LEDGER_VALIDATOR and MONEY_CONC_LEDGER_SIG_B and MONEY_CONC_LEDGER_ROOT)
+    send result to done
+    return 0
+
+define money_build_spend with genesis_tx_id as Str and recipient as Str and owner_public as Str and owner_secret as Str returning Map:
+    set bundle to create_map()
+    set inputs to create_list()
+    set input to create_map()
+    set outputs to create_list()
+    set recipient_output to create_map()
+    set change_output to create_map()
+    if bundle == 0 or else inputs == 0 or else input == 0 or else outputs == 0 or else recipient_output == 0 or else change_output == 0:
+        return 0
+    set ok to map_insert(input and "tx_id" and genesis_tx_id)
+    set ok to map_insert(input and "output_index" and 0)
+    set ok to append_list(inputs and input)
+    set ok to map_insert(recipient_output and "recipient" and recipient)
+    set ok to map_insert(recipient_output and "amount" and 100)
+    set ok to map_insert(recipient_output and "index" and 0)
+    set ok to append_list(outputs and recipient_output)
+    set ok to map_insert(change_output and "recipient" and owner_public)
+    set ok to map_insert(change_output and "amount" and 999900)
+    set ok to map_insert(change_output and "index" and 1)
+    set ok to append_list(outputs and change_output)
+    set tx to ledger_create_tx(inputs and outputs and 0)
+    set tx_id to ptr_to_str(map_get_val(tx and "id"))
+    set tx_signature to sign_message(tx_id and owner_secret)
+    set ok to map_insert(input and "signature" and map_get_val(tx_signature and "signature"))
+    set txs to create_list()
+    set ok to append_list(txs and tx)
+    set ok to map_insert(bundle and "tx_id" and tx_id)
+    set ok to map_insert(bundle and "transactions" and txs)
+    return bundle
+
+define main returning Int:
+    set passed to 0
+    if init_crypto() != 0:
+        display "FAIL: crypto initialization"
+        return 1
+
+    # Token transfers and allowance consumption are exact under contention.
+    set MONEY_CONC_TOKEN to token_create("Concurrent" and "CON" and 0 and 1000 and "alice")
+    set done to create_channel()
+    set i to 0
+    repeat while i < 64:
+        spawn money_token_transfer_worker(i and done)
+        set i to i + 1
+    set success to 0
+    set i to 0
+    repeat while i < 64:
+        set worker_result to receive from done
+        if worker_result == TOKEN_ERR_NONE:
+            set success to success + 1
+        set i to i + 1
+    set passed to passed + money_concurrency_expect(success == 64 and also token_balance_of(MONEY_CONC_TOKEN and "alice") == 936 and also token_balance_of(MONEY_CONC_TOKEN and "bob") == 64 and "concurrent token transfers preserve every debit and credit")
+
+    set approve_error to token_approve(MONEY_CONC_TOKEN and "alice" and "spender" and 32)
+    set allowance_done to create_channel()
+    set i to 0
+    repeat while i < 64:
+        spawn money_token_allowance_worker(i and allowance_done)
+        set i to i + 1
+    set success to 0
+    set i to 0
+    repeat while i < 64:
+        set worker_result to receive from allowance_done
+        if worker_result == TOKEN_ERR_NONE:
+            set success to success + 1
+        set i to i + 1
+    set passed to passed + money_concurrency_expect(approve_error == TOKEN_ERR_NONE and also success == 32 and also token_allowance(MONEY_CONC_TOKEN and "alice" and "spender") == 0 and also token_balance_of(MONEY_CONC_TOKEN and "alice") + token_balance_of(MONEY_CONC_TOKEN and "bob") + token_balance_of(MONEY_CONC_TOKEN and "carol") == 1000 and "concurrent allowance spend is bounded and supply-conserving")
+
+    set saved_token_lock to TOKEN_STATE_LOCK
+    set alice_before_lock_failure to token_balance_of(MONEY_CONC_TOKEN and "alice")
+    set TOKEN_STATE_LOCK to 0
+    set token_lock_error to token_transfer(MONEY_CONC_TOKEN and "alice" and "bob" and 1)
+    set TOKEN_STATE_LOCK to saved_token_lock
+    set passed to passed + money_concurrency_expect(token_lock_error == TOKEN_ERR_LOCK and also token_balance_of(MONEY_CONC_TOKEN and "alice") == alice_before_lock_failure and "unavailable token lock fails without mutation")
+
+    # Exactly one concurrent mint/transfer can win for one token id.
+    set MONEY_CONC_NFT to nft_create_collection("Concurrent NFT" and "CNFT" and "creator")
+    set nft_done to create_channel()
+    set i to 0
+    repeat while i < 32:
+        spawn money_nft_mint_worker(i and nft_done)
+        set i to i + 1
+    set success to 0
+    set i to 0
+    repeat while i < 32:
+        set worker_result to receive from nft_done
+        if worker_result == NFT_ERR_NONE:
+            set success to success + 1
+        set i to i + 1
+    set MONEY_CONC_NFT_SOURCE to nft_owner_of(MONEY_CONC_NFT and 1)
+    set passed to passed + money_concurrency_expect(success == 1 and also string_length(MONEY_CONC_NFT_SOURCE) > 0 and also map_size(map_get_val(MONEY_CONC_NFT and "owners")) == 1 and also map_size(map_get_val(MONEY_CONC_NFT and "metadata")) == 1 and also map_size(map_get_val(MONEY_CONC_NFT and "creators")) == 1 and also map_size(map_get_val(MONEY_CONC_NFT and "royalties")) == 1 and "concurrent NFT mint publishes one complete record")
+
+    set nft_transfer_done to create_channel()
+    set i to 0
+    repeat while i < 32:
+        spawn money_nft_transfer_worker(i and nft_transfer_done)
+        set i to i + 1
+    set success to 0
+    set i to 0
+    repeat while i < 32:
+        set worker_result to receive from nft_transfer_done
+        if worker_result == NFT_ERR_NONE:
+            set success to success + 1
+        set i to i + 1
+    set passed to passed + money_concurrency_expect(success == 1 and also (nft_owner_of(MONEY_CONC_NFT and 1) equals MONEY_CONC_NFT_SOURCE) == 0 and "concurrent NFT transfer has one authorized winner")
+
+    set saved_nft_lock to NFT_STATE_LOCK
+    set NFT_STATE_LOCK to 0
+    set nft_lock_error to nft_mint(MONEY_CONC_NFT and "nobody" and 2 and "meta:2" and 0)
+    set NFT_STATE_LOCK to saved_nft_lock
+    set passed to passed + money_concurrency_expect(nft_lock_error == NFT_ERR_LOCK and also string_length(nft_owner_of(MONEY_CONC_NFT and 2)) == 0 and "unavailable NFT lock fails without partial mint")
+
+    # DEX holds DEX+TOKEN across every two-asset transition.
+    set MONEY_CONC_DEX_A to token_create("Asset A" and "AAA" and 0 and 100000 and "provider")
+    set MONEY_CONC_DEX_B to token_create("Asset B" and "BBB" and 0 and 100000 and "provider")
+    set MONEY_CONC_DEX to dex_create()
+    set liquidity to dex_add_liquidity(MONEY_CONC_DEX and MONEY_CONC_DEX_A and MONEY_CONC_DEX_B and 10000 and 10000 and "provider")
+    set dex_done to create_channel()
+    set i to 0
+    repeat while i < 32:
+        spawn money_dex_swap_worker(i and dex_done)
+        set i to i + 1
+    set success to 0
+    set i to 0
+    repeat while i < 32:
+        set worker_result to receive from dex_done
+        if worker_result == DEX_ERR_NONE:
+            set success to success + 1
+        set i to i + 1
+    set required_a to dex_required_balance(MONEY_CONC_DEX and "AAA" and "dex_pool")
+    set required_b to dex_required_balance(MONEY_CONC_DEX and "BBB" and "dex_pool")
+    set passed to passed + money_concurrency_expect(map_get_val(liquidity and "error") == DEX_ERR_NONE and also success == 32 and also token_balance_of(MONEY_CONC_DEX_A and "dex_pool") == required_a and also token_balance_of(MONEY_CONC_DEX_B and "dex_pool") == required_b and also token_balance_of(MONEY_CONC_DEX_A and "provider") + required_a == 100000 and also token_balance_of(MONEY_CONC_DEX_B and "provider") + required_b == 100000 and "concurrent two-token swaps preserve reserves and both supplies")
+
+    set provider_a_before_lock_failure to token_balance_of(MONEY_CONC_DEX_A and "provider")
+    set saved_dex_lock to DEX_STATE_LOCK
+    set DEX_STATE_LOCK to 0
+    set dex_lock_error to dex_swap_amm(MONEY_CONC_DEX and MONEY_CONC_DEX_A and MONEY_CONC_DEX_B and 100 and "provider")
+    set DEX_STATE_LOCK to saved_dex_lock
+    set passed to passed + money_concurrency_expect(dex_lock_error == DEX_ERR_LOCK and also token_balance_of(MONEY_CONC_DEX_A and "provider") == provider_a_before_lock_failure and "unavailable DEX lock cannot debit either token")
+
+    # Contract calls on one storage Map serialize without lost increments.
+    set contract_code to "LABEL increment\nLOAD counter current\nADD next current 1\nSET counter next\nRETURN next"
+    set MONEY_CONC_CONTRACT to contract_create(contract_code and "owner" and 1000)
+    set contract_done to create_channel()
+    set i to 0
+    repeat while i < 32:
+        spawn money_contract_worker(i and contract_done)
+        set i to i + 1
+    set success to 0
+    set i to 0
+    repeat while i < 32:
+        set worker_result to receive from contract_done
+        if worker_result == CONTRACT_ERR_NONE:
+            set success to success + 1
+        set i to i + 1
+    set passed to passed + money_concurrency_expect(success == 32 and also map_get_val(map_get_val(MONEY_CONC_CONTRACT and "storage") and "counter") equals "32" and "concurrent contract calls commit every increment exactly once")
+
+    set saved_contract_lock to CONTRACT_STATE_LOCK
+    set CONTRACT_STATE_LOCK to 0
+    set failed_contract_call to contract_call(MONEY_CONC_CONTRACT and "increment" and create_list() and "caller" and 1000)
+    set CONTRACT_STATE_LOCK to saved_contract_lock
+    set passed to passed + money_concurrency_expect(map_get_val(failed_contract_call and "status") == CONTRACT_ERR_LOCK and also map_get_val(map_get_val(MONEY_CONC_CONTRACT and "storage") and "counter") equals "32" and "unavailable contract lock cannot mutate storage")
+
+    # Conflicting blocks race for one genesis UTXO; exactly one commits.
+    set owner_keys to generate_signing_keypair()
+    set owner_public to concat(ptr_to_str(map_get_val(owner_keys and "public_key")) and "")
+    set owner_secret to concat(ptr_to_str(map_get_val(owner_keys and "secret_key")) and "")
+    set recipient_a_keys to generate_signing_keypair()
+    set recipient_b_keys to generate_signing_keypair()
+    set recipient_a to concat(ptr_to_str(map_get_val(recipient_a_keys and "public_key")) and "")
+    set recipient_b to concat(ptr_to_str(map_get_val(recipient_b_keys and "public_key")) and "")
+    set MONEY_CONC_LEDGER to ledger_create(owner_public)
+    set genesis to get_list(map_get_val(MONEY_CONC_LEDGER and "blocks") and 0)
+    set genesis_tx to get_list(map_get_val(genesis and "transactions") and 0)
+    set bundle_a to money_build_spend(ptr_to_str(map_get_val(genesis_tx and "id")) and recipient_a and owner_public and owner_secret)
+    set bundle_b to money_build_spend(ptr_to_str(map_get_val(genesis_tx and "id")) and recipient_b and owner_public and owner_secret)
+    set MONEY_CONC_LEDGER_TXS_A to map_get_val(bundle_a and "transactions")
+    set MONEY_CONC_LEDGER_TXS_B to map_get_val(bundle_b and "transactions")
+    set MONEY_CONC_LEDGER_VALIDATOR to owner_public
+    set MONEY_CONC_LEDGER_ROOT to ledger_compute_state_root_for(MONEY_CONC_LEDGER)
+    set hash_a to ledger_compute_block_hash(ptr_to_str(map_get_val(bundle_a and "tx_id")) and ptr_to_str(map_get_val(genesis and "hash")) and MONEY_CONC_LEDGER_ROOT)
+    set hash_b to ledger_compute_block_hash(ptr_to_str(map_get_val(bundle_b and "tx_id")) and ptr_to_str(map_get_val(genesis and "hash")) and MONEY_CONC_LEDGER_ROOT)
+    set sig_a to sign_message(hash_a and owner_secret)
+    set sig_b to sign_message(hash_b and owner_secret)
+    set MONEY_CONC_LEDGER_SIG_A to concat(ptr_to_str(map_get_val(sig_a and "signature")) and "")
+    set MONEY_CONC_LEDGER_SIG_B to concat(ptr_to_str(map_get_val(sig_b and "signature")) and "")
+    set ledger_done to create_channel()
+    spawn money_ledger_worker(0 and ledger_done)
+    spawn money_ledger_worker(1 and ledger_done)
+    set first_result to receive from ledger_done
+    set second_result to receive from ledger_done
+    set success to 0
+    if first_result == LEDGER_ERR_NONE:
+        set success to success + 1
+    if second_result == LEDGER_ERR_NONE:
+        set success to success + 1
+    set ledger_supply to ledger_get_balance(MONEY_CONC_LEDGER and owner_public) + ledger_get_balance(MONEY_CONC_LEDGER and recipient_a) + ledger_get_balance(MONEY_CONC_LEDGER and recipient_b)
+    set passed to passed + money_concurrency_expect(success == 1 and also length_list(map_get_val(MONEY_CONC_LEDGER and "blocks")) == 2 and also ledger_supply == 1000000 and also ledger_compute_state_root() equals ledger_compute_state_root_for(MONEY_CONC_LEDGER) and "conflicting concurrent blocks yield one conserved chain transition and exact active root")
+
+    set saved_ledger_lock to LEDGER_STATE_LOCK
+    set LEDGER_STATE_LOCK to 0
+    set ledger_lock_error to ledger_stake_coins(MONEY_CONC_LEDGER and owner_public and 1)
+    set LEDGER_STATE_LOCK to saved_ledger_lock
+    set passed to passed + money_concurrency_expect(ledger_lock_error == LEDGER_ERR_LOCK and also length_list(map_get_val(MONEY_CONC_LEDGER and "blocks")) == 2 and "unavailable ledger lock rejects mutation")
+
+    display f"RESULT: {passed}/{MONEY_CONC_TOTAL} passed"
+    if passed != MONEY_CONC_TOTAL:
+        return 1
+    return 0

@@ -1,0 +1,46 @@
+import "string"
+import "json"
+import "reply_format"
+
+define expect_equal with actual as Str and expected as Str and label as Str returning Int:
+    if actual equals expected:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and concat(label and concat(" — got: " and actual)))
+    return 0
+
+define main returning Int:
+    set passed to 0
+    set total to 0
+
+    set corrupt_right to concat("Thought $" and concat("\r" and "ightarrow$ Action"))
+    set passed to passed + expect_equal(reply_format_normalize(corrupt_right) and "Thought → Action" and "decoded JSON carriage-return arrow")
+    set total to total + 1
+
+    set passed to passed + expect_equal(reply_format_normalize("Thought $\\rightarrow$ Action $\\Rightarrow$ Result") and "Thought → Action ⇒ Result" and "escaped LaTeX arrows")
+    set total to total + 1
+
+    set passed to passed + expect_equal(reply_format_normalize("Back $\\leftarrow$ Middle $\\leftrightarrow$ End") and "Back ← Middle ↔ End" and "left and bidirectional arrows")
+    set total to total + 1
+
+    set passed to passed + expect_equal(reply_format_normalize("First\rSecond") and "First\nSecond" and "remaining carriage return becomes line break")
+    set total to total + 1
+
+    set passed to passed + expect_equal(reply_format_normalize("**Bold** and `code` stay intact") and "**Bold** and `code` stay intact" and "platform Markdown is preserved")
+    set total to total + 1
+
+    # Reproduce the complete live failure: the model emits a single-backslash LaTeX
+    # command inside reply_request JSON, json_parse turns \r into a carriage return,
+    # then the shared final-response boundary repairs it before platform delivery.
+    set raw_args to concat("[\"Thought $" and concat("\\rightarrow" and "$ Action\"]"))
+    set parsed_node to json_parse(raw_args)
+    set parsed_items to get_json_value(parsed_node)
+    set parsed_text_node to get_list(parsed_items and 0)
+    set parsed_text to get_json_value(parsed_text_node)
+    set passed to passed + expect_equal(reply_format_normalize(parsed_text) and "Thought → Action" and "live reply_request JSON decode path")
+    set total to total + 1
+
+    display concat("Reply formatting tests: " and concat(int_to_string(passed) and concat("/" and int_to_string(total))))
+    if passed != total:
+        return 1
+    return 0

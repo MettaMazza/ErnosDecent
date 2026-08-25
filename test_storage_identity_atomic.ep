@@ -1,0 +1,89 @@
+# ErnosDecent -- fail-closed identity persistence regression
+
+import "sql"
+import "string"
+import "fs"
+import "os"
+import "./storage"
+
+set ID_TESTS_PASSED to 0
+set ID_TESTS_FAILED to 0
+
+define identity_expect with name as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("  PASS: " and name)
+        set ID_TESTS_PASSED to ID_TESTS_PASSED + 1
+    else:
+        display concat("  FAIL: " and name)
+        set ID_TESTS_FAILED to ID_TESTS_FAILED + 1
+        return 0
+    return 1
+
+define identity_test_remove_tree with path as Str and depth as Int returning Int:
+    if depth > 8:
+        return 0
+    if file_exists(path) == 0:
+        return 1
+    if is_directory(path) == 0:
+        if remove_file(path) == 0 or else file_exists(path) == 1:
+            return 0
+        return 1
+    set entries to list_directory(path)
+    set entry_count to length_list(entries)
+    set entry_index to 0
+    repeat while entry_index < entry_count:
+        set child to path_join(path and get_list(entries and entry_index))
+        if identity_test_remove_tree(child and depth + 1) == 0:
+            free_list(entries)
+            return 0
+        set entry_index to entry_index + 1
+    free_list(entries)
+    if remove_directory(path) == 0 or else file_exists(path) == 1:
+        return 0
+    return 1
+
+define main returning Int:
+    display "Identity persistence atomicity regression"
+    set test_dir to concat("/tmp/ernos_identity_atomic_" and concat(int_to_string(ep_time_now_ms()) and concat("_" and int_to_string(ep_random_int(100000 and 999999)))))
+    set init_rc to storage_init(test_dir)
+    identity_expect("storage initializes" and init_rc == STORAGE_ERR_NONE)
+    if init_rc != STORAGE_ERR_NONE:
+        set cleanup_after_init_failure to identity_test_remove_tree(test_dir and 0)
+        exit_program(1)
+    set db to storage_get_db()
+
+    set baseline_rc to storage_identity_save("did:old" and "sign-pub-old" and "sign-sec-old" and "enc-pub-old" and "enc-sec-old")
+    identity_expect("complete baseline identity commits" and baseline_rc == STORAGE_ERR_NONE)
+
+    # Abort the fourth field after the first three replacements have executed.
+    # The outer transaction must roll every replacement back to the old snapshot.
+    set trigger_rc to sql_execute(db and "CREATE TRIGGER identity_force_failure BEFORE INSERT ON identity WHEN NEW.key='enc_pub' BEGIN SELECT RAISE(ABORT, 'forced identity write failure'); END;")
+    identity_expect("forced mid-save failure is installed" and trigger_rc == 0)
+    set failed_rc to storage_identity_save("did:new" and "sign-pub-new" and "sign-sec-new" and "enc-pub-new" and "enc-sec-new")
+    identity_expect("mid-save SQL failure propagates" and failed_rc == STORAGE_ERR_EXEC_FAILED)
+    set after_failure to storage_identity_load()
+    identity_expect("failed replacement leaves a complete identity" and map_get_val(after_failure and "exists") == 1)
+    identity_expect("failed replacement preserves old DID and public keys" and map_get_val(after_failure and "did") equals "did:old" and also map_get_val(after_failure and "signing_pub") equals "sign-pub-old" and also map_get_val(after_failure and "enc_pub") equals "enc-pub-old")
+    identity_expect("failed replacement preserves old private keys" and map_get_val(after_failure and "signing_sec") equals "sign-sec-old" and also map_get_val(after_failure and "enc_sec") equals "enc-sec-old")
+
+    set drop_rc to sql_execute(db and "DROP TRIGGER identity_force_failure;")
+    set retry_rc to storage_identity_save("did:new" and "sign-pub-new" and "sign-sec-new" and "enc-pub-new" and "enc-sec-new")
+    identity_expect("retry commits after the failure is removed" and drop_rc == 0 and also retry_rc == STORAGE_ERR_NONE)
+    set after_retry to storage_identity_load()
+    identity_expect("retry exposes one coherent new snapshot" and map_get_val(after_retry and "did") equals "did:new" and also map_get_val(after_retry and "signing_sec") equals "sign-sec-new" and also map_get_val(after_retry and "enc_sec") equals "enc-sec-new")
+
+    # Legacy partial rows from the former unchecked implementation must not be
+    # mistaken for a usable identity.
+    set delete_rc to sql_execute(db and "DELETE FROM identity WHERE key='enc_pub';")
+    set partial to storage_identity_load()
+    identity_expect("load rejects a partial identity snapshot" and delete_rc == 0 and also map_get_val(partial and "exists") == 0 and also map_get_val(partial and "error") == STORAGE_ERR_EXEC_FAILED)
+
+    set close_rc to storage_close()
+    identity_expect("storage closes" and close_rc == STORAGE_ERR_NONE)
+    set cleanup_rc to identity_test_remove_tree(test_dir and 0)
+    identity_expect("isolated identity fixture is removed" and cleanup_rc == 1 and also file_exists(test_dir) == 0)
+    display f"Identity tests passed: {ID_TESTS_PASSED}"
+    display f"Identity tests failed: {ID_TESTS_FAILED}"
+    if ID_TESTS_FAILED > 0:
+        exit_program(1)
+    exit_program(0)

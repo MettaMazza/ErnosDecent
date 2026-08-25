@@ -1,0 +1,177 @@
+# Focused GitDec atomic persistence, locking, authorization, and deletion tests.
+
+import "fs"
+import "os"
+import "string"
+import "collections"
+import "../decent_id/keys"
+import "../decent_id/did"
+import "./gitdec"
+
+define gitdec_test_pass with label as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define gitdec_test_remove_tree with path as Str returning Int:
+    if file_exists(path) == 0:
+        return 1
+    if is_directory(path) == 0:
+        return remove_file(path)
+    set entries to list_directory(path)
+    set count to length_list(entries)
+    set i to 0
+    repeat while i < count:
+        set child_ok to gitdec_test_remove_tree(path_join(path and get_list(entries and i)))
+        set i to i + 1
+    free_list(entries)
+    return remove_directory(path)
+
+define gitdec_test_manifest with repo_id as Str and name as Str and owner_did as Str returning Map:
+    set manifest to create_map()
+    set collaborators to create_map()
+    set refs to create_map()
+    set ok to map_insert(collaborators and owner_did and "owner")
+    set ok to map_insert(manifest and "id" and repo_id)
+    set ok to map_insert(manifest and "name" and name)
+    set ok to map_insert(manifest and "visibility" and "public")
+    set ok to map_insert(manifest and "authorized_collaborators" and collaborators)
+    set ok to map_insert(manifest and "ref_heads" and refs)
+    return manifest
+
+define main returning Int:
+    set passed to 0
+    set total to 0
+    set scratch_root to concat("/tmp/ernos_gitdec_persistence_" and concat(int_to_string(ep_time_now_ms()) and concat("_" and int_to_string(ep_random_int(100000 and 999999)))))
+    set made_scratch to create_directory(scratch_root)
+    if made_scratch == 0 or else is_directory(scratch_root) == 0:
+        display "FAIL: isolated GitDec fixture could not be created"
+        return 1
+    set storage_root to path_join(scratch_root and "storage")
+    set storage_opened to storage_init(storage_root)
+
+    set owner_keys to generate_signing_keypair()
+    set owner_pub to map_get_val(owner_keys and "public_key")
+    set owner_sec to map_get_val(owner_keys and "secret_key")
+    set owner_did to create_did_key_from_ed25519(owner_pub)
+    set manifest to gitdec_test_manifest("atomic_repo" and "Quoted \"name\"" and owner_did)
+    set manifest_path to path_join(scratch_root and "manifest.json")
+    set save_ok to gitdec_save_manifest(manifest_path and manifest)
+    set loaded_manifest to gitdec_load_manifest(manifest_path)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("manifest atomically saves and parses" and save_ok == GITDEC_ERR_NONE and also loaded_manifest != 0 and also (map_get_val(loaded_manifest and "name") equals "Quoted \"name\""))
+
+    set target_dir to path_join(scratch_root and "manifest-target")
+    set target_made to create_directory(target_dir)
+    set sentinel_path to path_join(target_dir and "sentinel")
+    set sentinel_written to write_file(sentinel_path and "preserve")
+    set failed_save to gitdec_save_manifest(target_dir and manifest)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("failed atomic rename preserves existing destination" and failed_save == GITDEC_ERR_PERSISTENCE and also is_directory(target_dir) == 1 and also (read_file(sentinel_path) equals "preserve"))
+
+    set invalid_manifest to create_map()
+    set invalid_path to path_join(scratch_root and "invalid.json")
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("invalid manifest is never persisted" and gitdec_save_manifest(invalid_path and invalid_manifest) == GITDEC_ERR_INVALID_INPUT and also file_exists(invalid_path) == 0)
+
+    set metadata_err to gitdec_mark_update_metadata("metadata_repo" and "commit_metadata")
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("update hash and pending flag commit in one SQL statement" and storage_opened == STORAGE_ERR_NONE and also metadata_err == GITDEC_ERR_NONE and also (storage_gitdec_get_last_seen("metadata_repo") equals "commit_metadata") and also storage_gitdec_count_pending() == 1)
+
+    set invalid_repo to gitdec_create_repo("../escape" and "bad" and owner_did)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("path-traversing repository id is rejected" and map_get_val(invalid_repo and "error") == GITDEC_ERR_INVALID_INPUT)
+
+    set repo_nonce to keys_random_hex(6)
+    set repo_id to concat("agenttest_" and repo_nonce)
+    set repo to gitdec_create_repo(repo_id and "Persistence Test" and owner_did)
+    set repo_path to path_join("config/gitdec/repos" and repo_id)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("repository creation commits complete directory" and map_get_val(repo and "error") == GITDEC_ERR_NONE and also is_directory(path_join(repo_path and "objects")) == 1 and also file_exists(path_join(repo_path and "gitdec.json")) == 1)
+
+    set duplicate_repo to gitdec_create_repo(repo_id and "Duplicate" and owner_did)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("duplicate repository creation does not overwrite" and map_get_val(duplicate_repo and "error") == GITDEC_ERR_ALREADY_EXISTS and also (map_get_val(gitdec_load_manifest(path_join(repo_path and "gitdec.json")) and "name") equals "Persistence Test"))
+
+    set issues_path to path_join(repo_path and "issues.json")
+    set issue_blocker_made to create_directory(issues_path)
+    set blocked_issue to gitdec_create_issue(repo_id and owner_did and "Blocked issue" and "must not claim success")
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("issue write failure returns persistence error" and issue_blocker_made == 1 and also map_get_val(blocked_issue and "error") == GITDEC_ERR_PERSISTENCE and also is_directory(issues_path) == 1)
+    set issue_blocker_removed to remove_directory(issues_path)
+
+    set issue to gitdec_create_issue(repo_id and owner_did and "Durable issue" and "body")
+    set issue_id to map_get_val(issue and "id")
+    set issue_root to gitdec_load_issues(issues_path)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("issue retry persists exactly once" and issue_blocker_removed == 1 and also map_get_val(issue and "error") == GITDEC_ERR_NONE and also (map_get_val(issue and "title") equals "Durable issue") and also string_length(map_get_val(issue and "id")) > 0 and also length_list(map_get_val(issue_root and "issues")) == 1)
+
+    set empty_body_issue to gitdec_create_issue(repo_id and owner_did and "Empty body is valid" and "")
+    set empty_body_root to gitdec_load_issues(issues_path)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("empty issue body remains present and exact under postcondition checking" and map_get_val(empty_body_issue and "error") == GITDEC_ERR_NONE and also map_contains(empty_body_issue and "body") == 1 and also (map_get_val(empty_body_issue and "body") equals "") and also length_list(map_get_val(empty_body_root and "issues")) == 2)
+
+    set lock_first to gitdec_lock_repo(repo_id)
+    set issues_before to read_file(issues_path)
+    set issues_before_hash to ep_sha256(issues_before)
+    set locked_comment to gitdec_comment_issue(repo_id and issue_id and owner_did and "blocked by lock")
+    set issues_after to read_file(issues_path)
+    set issues_after_hash to ep_sha256(issues_after)
+    set unlock_first to gitdec_unlock_repo(repo_id)
+    if lock_first != GITDEC_ERR_NONE or else locked_comment != GITDEC_ERR_PERSISTENCE or else (issues_before_hash equals issues_after_hash) == 0 or else unlock_first != GITDEC_ERR_NONE:
+        display f"lock diagnostic: first={lock_first}, blocked={locked_comment}, before_len={string_length(issues_before)}, after_len={string_length(issues_after)}, before_hash={issues_before_hash}, after_hash={issues_after_hash}, unlock={unlock_first}"
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("concurrent mutation lock prevents lost update" and lock_first == GITDEC_ERR_NONE and also locked_comment == GITDEC_ERR_PERSISTENCE and also (issues_before_hash equals issues_after_hash) and also unlock_first == GITDEC_ERR_NONE)
+
+    set pr to gitdec_create_pr(repo_id and owner_did and "Durable PR" and "feature" and "main" and "description")
+    # Allocate/parse another object before dereferencing the returned PR. This
+    # catches a returned-child lifetime bug after gitdec_create_pr has cleaned up.
+    set pr_root to gitdec_load_prs(path_join(repo_path and "pull_requests.json"))
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("pull request mutation persists before success" and map_get_val(pr and "error") == GITDEC_ERR_NONE and also (map_get_val(pr and "title") equals "Durable PR") and also string_length(map_get_val(pr and "id")) > 0 and also length_list(map_get_val(pr_root and "pull_requests")) == 1)
+
+    set empty_desc_pr to gitdec_create_pr(repo_id and owner_did and "Empty description is valid" and "empty_desc" and "main" and "")
+    set empty_desc_root to gitdec_load_prs(path_join(repo_path and "pull_requests.json"))
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("empty pull-request description remains present and exact under postcondition checking" and map_get_val(empty_desc_pr and "error") == GITDEC_ERR_NONE and also map_contains(empty_desc_pr and "description") == 1 and also (map_get_val(empty_desc_pr and "description") equals "") and also length_list(map_get_val(empty_desc_root and "pull_requests")) == 2)
+
+    set payload to "signed commit payload"
+    set signed_statement to gitdec_push_signing_payload(repo_id and owner_did and "main" and "commit_1" and payload)
+    set signature_result to sign_message(signed_statement and owner_sec)
+    set signature to map_get_val(signature_result and "signature")
+    set push_err to gitdec_push_commit(repo_id and owner_did and "main" and "commit_1" and payload and signature)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("signed commit writes object and ref before success" and push_err == GITDEC_ERR_NONE and also (gitdec_get_object(repo_id and "commit_1") equals payload) and also (gitdec_pull_ref(repo_id and "main") equals "commit_1"))
+
+    set replay_err to gitdec_push_commit(repo_id and owner_did and "replayed" and "commit_1" and payload and signature)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("commit signature cannot be replayed onto another branch" and replay_err == GITDEC_ERR_VERIFICATION_FAILED and also string_length(gitdec_pull_ref(repo_id and "replayed")) == 0)
+
+    set reader_keys to generate_signing_keypair()
+    set reader_pub to map_get_val(reader_keys and "public_key")
+    set reader_sec to map_get_val(reader_keys and "secret_key")
+    set reader_did to create_did_key_from_ed25519(reader_pub)
+    set add_reader to gitdec_add_collaborator(repo_id and owner_did and reader_did and "reader")
+    set reader_payload to "reader cannot write"
+    set reader_statement to gitdec_push_signing_payload(repo_id and reader_did and "main" and "commit_reader" and reader_payload)
+    set reader_signature_map to sign_message(reader_statement and reader_sec)
+    set reader_signature to map_get_val(reader_signature_map and "signature")
+    set reader_push to gitdec_push_commit(repo_id and reader_did and "main" and "commit_reader" and reader_payload and reader_signature)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("read-only collaborator cannot push" and add_reader == GITDEC_ERR_NONE and also reader_push == GITDEC_ERR_UNAUTHORIZED and also file_exists(path_join(path_join(repo_path and "objects") and "commit_reader")) == 0)
+
+    set delete_err to gitdec_delete_repo_files(repo_id)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("checked repository deletion removes only target tree" and delete_err == GITDEC_ERR_NONE and also file_exists(repo_path) == 0)
+
+    set storage_closed to storage_close()
+    set cleanup_after to gitdec_test_remove_tree(scratch_root)
+    set total to total + 1
+    set passed to passed + gitdec_test_pass("test artifacts are removed" and storage_closed == STORAGE_ERR_NONE and also cleanup_after == 1 and also file_exists(scratch_root) == 0)
+
+    display concat("gitdec persistence: " and concat(int_to_string(passed) and concat("/" and int_to_string(total))))
+    if passed != total:
+        return 1
+    return 0

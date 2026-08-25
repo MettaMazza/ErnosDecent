@@ -1,6 +1,6 @@
 # ErnosDecent — Decentralised Node Daemon
 # Component: node.ep
-# All 16 subsystems wired. Protocol servers for P2P, DHT, Relay.
+# Active runtime services wired. Request-scoped protocol libraries remain on-demand.
 # Health check, graceful shutdown, structured IPC.
 # Status: Production
 
@@ -59,6 +59,7 @@ import "./decent_msg/channel"
 import "./decent_store/content"
 import "./decent_store/crdt"
 import "./decent_store/rag"
+import "./decent_store/continuity"
 
 # Economy
 import "./decent_money/wallet"
@@ -72,6 +73,8 @@ import "./decent_media/cdn"
 
 # Social
 import "./decent_social/feed"
+import "./decent_social/activitypub"
+import "./decent_social/publish"
 
 # Search
 import "./decent_search/crawl"
@@ -103,6 +106,7 @@ import "./decent_agent/workspace"
 import "./decent_agent/changelog"
 import "./decent_agent/orchestrator"
 import "./decent_agent/trace"
+import "./decent_agent/rights"
 import "./decent_agent/prompt"
 import "./decent_agent/sleep"
 import "fs"
@@ -141,9 +145,19 @@ define node_finish_turn with tctx as Map and sessions_mgr as Map and memory as M
     set tdb to storage_get_db()
     set stays_open to 0
     set resp to ""
+    set unattended to 0
+    if map_contains(tctx and "platform") == 1:
+        if map_get_val(tctx and "platform") equals "scheduler":
+            set unattended to 1
     if map_contains(tctx and "was_cancelled") == 1:
         set ok to map_delete(tctx and "was_cancelled")
         set resp to f"ai:cancelled,response:{agent_resp}"
+    else if unattended == 1 and also agent_resp equals "PENDING_CLARIFICATION":
+        set resp to "ai:ok|||RESPONSE|||Scheduled job stopped: it requires clarification and cannot hold an unattended turn open. Run it interactively with the missing guidance."
+    else if unattended == 1 and also agent_resp equals "PENDING_APPROVAL":
+        set pending_u to map_get_val(tctx and "pending_action")
+        set p_tool_u to map_get_val(pending_u and "tool_name")
+        set resp to f"ai:ok|||RESPONSE|||Scheduled job stopped: tool '{p_tool_u}' requires interactive approval. Run the job manually or explicitly grant an appropriate scheduled-job policy."
     else if agent_resp equals "PENDING_CLARIFICATION":
         set pendingc to map_get_val(tctx and "pending_clarification")
         set c_questions to map_get_val(pendingc and "questions")
@@ -174,7 +188,23 @@ define node_finish_turn with tctx as Map and sessions_mgr as Map and memory as M
             set resp to f"ai:ok,reasoning:{base64_encode(last_reason)}|||RESPONSE|||{agent_resp}"
         else:
             set resp to f"ai:ok|||RESPONSE|||{agent_resp}"
-    set ok to trace_emit(tdb and sid and "final_reply" and resp)
+    # TURN CORRELATION: prefix this turn's id so the bridge waiter can match the reply
+    # to ITS request instead of taking the session's next final_reply (which delivered a
+    # concurrent scheduler-job's reply as the user's answer — the tick bug).
+    set ft_tag to ""
+    if map_contains(tctx and "turn_id") == 1:
+        set ft_tag to map_get_val(tctx and "turn_id")
+        set resp to concat(f"turn:{ft_tag}," and resp)
+    set final_publish_rc to trace_emit_terminal(tdb and sid and resp)
+    if final_publish_rc != 0:
+        # SQLite failure must never disappear into a successful turn. Preserve the
+        # exact correlated payload through an atomic local fallback that the bridge
+        # polls alongside the database queue.
+        set fallback_rc to node_publish_final_fallback(sid and ft_tag and resp)
+        if fallback_rc != 0:
+            display f"[DELIVERY] FATAL: terminal reply could not be persisted for session={sid} turn={ft_tag}; turn remains active."
+            return 1
+        display f"[DELIVERY] SQLite terminal publication failed; durable file fallback published for session={sid} turn={ft_tag}."
     if stays_open == 0:
         # The shallow clone shares the shared turn-tracking maps — clear our flags.
         if map_contains(tctx and "active_turns") == 1:
@@ -187,12 +217,65 @@ define node_finish_turn with tctx as Map and sessions_mgr as Map and memory as M
                 set ok to map_delete(fin_tcs and sid)
     return stays_open
 
+# Last-resort terminal-reply rail. The primary path remains SQLite, but a database
+# write failure cannot strand a completed answer. A random 192-bit turn id makes the
+# filename unique across restarts; write+read-back+rename prevents partial reads.
+define node_publish_final_fallback with sid as Str and turn_tag as Str and payload as Str returning Int:
+    if string_length(turn_tag) == 0:
+        return 1
+    set fallback_dir to path_join(storage_get_data_dir() and "delivery-fallback")
+    if file_exists(fallback_dir) == 0:
+        set made to create_directory(fallback_dir)
+    if file_exists(fallback_dir) == 0:
+        return 1
+    set key to ep_sha256(concat(sid and concat("|" and turn_tag)))
+    set final_path to path_join(fallback_dir and concat(key and ".reply"))
+    set temp_path to concat(final_path and concat(".tmp." and int_to_string(ep_time_now_ms())))
+    if write_file(temp_path and payload) == 0:
+        return 1
+    if read_file(temp_path) equals payload == 0:
+        set removed_bad_temp to remove_file(temp_path)
+        return 1
+    if fs_move_file(temp_path and final_path) == 0:
+        set removed_unmoved_temp to remove_file(temp_path)
+        return 1
+    if read_file(final_path) equals payload == 0:
+        return 1
+    return 0
+
 # A detached foreground turn. Straight-line call to react_run (an awaiting PLAIN
 # function) from an async define is the proven-safe shape (orchestrator_spawn_worker
 # does exactly this); no awaits in loops here.
 async define node_run_turn with model as Map and memory as Map and tools as Map and tctx as Map and sessions_mgr as Map and sid as Str and prompt as Str returning Int:
+    # Retain the initiating request across approval/clarification pauses. It is removed
+    # after the completed turn is ingested, never placed in a global process variable.
+    set ok to map_insert(tctx and "continuity_user_text" and prompt)
     set agent_resp to react_run(model and memory and tools and tctx and prompt)
-    set ok to node_finish_turn(tctx and sessions_mgr and memory and sid and agent_resp)
+    set was_cancelled to 0
+    if map_contains(tctx and "was_cancelled") == 1:
+        set was_cancelled to 1
+    set continuity_json to ""
+    if map_contains(tctx and "continuity_json") == 1:
+        set continuity_json to map_get_val(tctx and "continuity_json")
+        set ok to map_delete(tctx and "continuity_json")
+    # Deliver final_reply first. Semantic extraction has already happened inside the
+    # existing capable-model reply audit, so persistence adds no further LLM call.
+    set stays_open to node_finish_turn(tctx and sessions_mgr and memory and sid and agent_resp)
+    if stays_open == 0 and also was_cancelled == 0:
+        set continuity_role to ""
+        if map_contains(tctx and "sender_role") == 1:
+            set continuity_role to map_get_val(tctx and "sender_role")
+        # Never learn the owner's private relationship model from an external guest.
+        if continuity_role equals "guest" == 0:
+            set continuity_source to "local"
+            if map_contains(tctx and "platform") == 1:
+                set requested_source to map_get_val(tctx and "platform")
+                if string_length(requested_source) > 0:
+                    set continuity_source to requested_source
+            set continuity_persona to prompt_persona_current_name()
+            set ok to continuity_ingest_turn(storage_get_db() and continuity_persona and sid and continuity_source and prompt and agent_resp and continuity_json)
+        if map_contains(tctx and "continuity_user_text") == 1:
+            set ok to map_delete(tctx and "continuity_user_text")
     return 0
 
 # A detached resume after approve/deny (kind 0) or clarification answers (kind 1).
@@ -202,7 +285,30 @@ async define node_resume_turn with model as Map and memory as Map and tools as M
         set agent_resp to react_resume_clarify(model and memory and tools and tctx and answers and autoall)
     else:
         set agent_resp to react_resume_approved(model and memory and tools and tctx and approved and autoall)
-    set ok to node_finish_turn(tctx and sessions_mgr and memory and sid and agent_resp)
+    set continuity_json to ""
+    if map_contains(tctx and "continuity_json") == 1:
+        set continuity_json to map_get_val(tctx and "continuity_json")
+        set ok to map_delete(tctx and "continuity_json")
+    set stays_open to node_finish_turn(tctx and sessions_mgr and memory and sid and agent_resp)
+    if stays_open == 0:
+        set continuity_user_text to answers
+        if map_contains(tctx and "continuity_user_text") == 1:
+            set continuity_user_text to map_get_val(tctx and "continuity_user_text")
+        if kind == 1 and also string_length(answers) > 0:
+            set continuity_user_text to concat(continuity_user_text and concat("\nClarification: " and answers))
+        set continuity_role to ""
+        if map_contains(tctx and "sender_role") == 1:
+            set continuity_role to map_get_val(tctx and "sender_role")
+        if continuity_role equals "guest" == 0:
+            set continuity_source to "local"
+            if map_contains(tctx and "platform") == 1:
+                set requested_source to map_get_val(tctx and "platform")
+                if string_length(requested_source) > 0:
+                    set continuity_source to requested_source
+            set continuity_persona to prompt_persona_current_name()
+            set ok to continuity_ingest_turn(storage_get_db() and continuity_persona and sid and continuity_source and continuity_user_text and agent_resp and continuity_json)
+        if map_contains(tctx and "continuity_user_text") == 1:
+            set ok to map_delete(tctx and "continuity_user_text")
     return 0
 
 # ── Phase A2: the IPC ACCEPT is itself a TASK CHAIN ─────────────────────────────
@@ -256,11 +362,14 @@ define factory_rm_tree with path as Str and depth as Int returning Int:
             else if e equals "..":
                 set i to i + 1
             else:
-                set ok to factory_rm_tree(concat(path and concat("/" and e)) and depth + 1)
+                if factory_rm_tree(concat(path and concat("/" and e)) and depth + 1) != 0:
+                    return 1
                 set i to i + 1
-        set ok to remove_directory(path)
+        if remove_directory(path) == 0:
+            return 1
         return 0
-    set ok to remove_file(path)
+    if remove_file(path) == 0:
+        return 1
     return 0
 
 # AI / speech
@@ -581,8 +690,18 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
             log_info("node" and "Daemon stopping on client request.")
             exit_program(0)
         else:
-            if cmd_upper equals "HEALTH":
-                set health_report to run_health_check(dht_node and raft_node and 5000)
+            if cmd_upper equals "RESTART":
+                # Exit code 75 is consumed only by run_node.sh's persistent wrapper.
+                # The acknowledgement is flushed before termination so a bridge can
+                # wait for the replacement process instead of guessing from silence.
+                set resp to "status:restarting"
+                set ok to ep_net_send(client_fd and resp)
+                set ok to ep_net_close(client_fd)
+                log_info("node" and "Daemon restarting on authenticated request.")
+                exit_program(75)
+            else if cmd_upper equals "HEALTH":
+                set health_ipc_port to map_get_val(agent_ctx and "ipc_port")
+                set health_report to run_health_check(dht_node and raft_node and health_ipc_port and identity and relay_node and msg_store and ledger and name_reg and agent_ctx and bft_node)
                 set resp to format_health_report(health_report)
                 free_map(health_report)
             else:
@@ -754,6 +873,8 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             set sender_username to ""
                                             set sender_role to ""
                                             set in_memory_context to ""
+                                            set visual_context to ""
+                                            set image_path to ""
                                             # Discord message coordinates for the current turn, so the agent can
                                             # react to THIS message with just react(["emoji"]) — no ids to pass.
                                             set discord_msg_id to ""
@@ -857,6 +978,28 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                                 set skip_len to skip_len + 1
                                                         set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
                                                         set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[VISUAL_CONTEXT:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 16:
+                                                        set visual_context to substring(ai_prompt and 16 and end_idx - 16)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            set next_char to get_character(ai_prompt and skip_len)
+                                                            if next_char == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[IMAGE_PATH:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 12:
+                                                        set image_path to substring(ai_prompt and 12 and end_idx - 12)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            set next_char to get_character(ai_prompt and skip_len)
+                                                            if next_char == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
                                                 else if string_index_of(ai_prompt and "[MSGID:") == 0:
                                                     set end_idx to string_index_of(ai_prompt and "]")
                                                     if end_idx > 7:
@@ -899,6 +1042,26 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 if ok == 0:
                                                     set new_title to concat("Session " and selected_session_id)
                                                     set active_sess to session_manager_new_session(sessions_mgr and selected_session_id and new_title and "" and "You are a helpful assistant.")
+
+                                            # Resolve this request's session before applying any request metadata.
+                                            # A closed session is immutable: the first later user inference rolls
+                                            # forward to a fresh persisted session and this message becomes turn 1.
+                                            # This central fallback covers CLI/custom IPC callers; Discord/WebUI
+                                            # use SESSION ENSURE USER earlier so attachments and RAG use the new ID.
+                                            set turn_sid to selected_session_id
+                                            if string_length(turn_sid) == 0:
+                                                set turn_sid to map_get_val(sessions_mgr and "active_session_id")
+                                            set rollover_failed to 0
+                                            if rights_session_can_receive(storage_get_db() and turn_sid) == 0:
+                                                set followup_id to session_manager_start_followup_session(sessions_mgr)
+                                                if string_length(followup_id) == 0:
+                                                    set rollover_failed to 1
+                                                else:
+                                                    set turn_sid to followup_id
+                                                    set selected_session_id to turn_sid
+                                                    set workspace_result to workspace_init(turn_sid)
+                                                    if workspace_result != 0:
+                                                        set rollover_failed to 1
                                             set active_sess to session_manager_get_active(sessions_mgr)
                                             if active_sess != 0:
                                                 if string_length(selected_system_prompt) > 0:
@@ -914,13 +1077,8 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 # value (empty = normal) rather than inheriting a stale one —
                                                 # otherwise tutor mode would leak into the normal AI chat.
                                                 set ok to map_insert(active_sess and "mode" and selected_mode)
-                                                set ok to session_add_message(active_sess and "user" and ai_prompt)
 
                                             # ── Phase A2: detached, per-session-parallel turn dispatch ──
-                                            # Resolve THIS turn's real session id (tags may omit it).
-                                            set turn_sid to selected_session_id
-                                            if string_length(turn_sid) == 0:
-                                                set turn_sid to map_get_val(sessions_mgr and "active_session_id")
                                             # Lazily seed the shared turn-tracking maps on agent_ctx.
                                             if map_contains(agent_ctx and "active_turns") == 0:
                                                 set ok to map_insert(agent_ctx and "active_turns" and create_map())
@@ -928,18 +1086,39 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set ok to map_insert(agent_ctx and "turn_ctxs" and create_map())
                                             set at_map to map_get_val(agent_ctx and "active_turns")
                                             set tc_map to map_get_val(agent_ctx and "turn_ctxs")
-                                            if map_contains(at_map and turn_sid) == 1:
-                                                # Per-session serialization: this session already has a turn
-                                                # (or a pending approval/clarification) in flight — the new
-                                                # message becomes MID-TURN GUIDANCE via the whisper queue,
-                                                # never a clobber of the running turn's state.
-                                                set wdb to storage_get_db()
-                                                if wdb != 0:
-                                                    set wes to string_replace(turn_sid and "'" and "''")
-                                                    set wec to string_replace(ai_prompt and "'" and "''")
-                                                    set ok to sql_execute(wdb and f"INSERT INTO trace_whispers (session_id, content, created_at) VALUES ('{wes}', '{wec}', strftime('%s','now'));")
-                                                set resp to f"ai:busy_whispered,session:{turn_sid}"
+                                            if rollover_failed == 1:
+                                                set resp to "error:session_rollover_failed"
+                                            else if rights_session_can_receive(storage_get_db() and turn_sid) == 0:
+                                                # Defensive fail-closed check: reaching this branch means the
+                                                # rollover transaction did not establish an admissible new session.
+                                                set resp to "error:session_rollover_failed"
+                                            else if map_contains(at_map and turn_sid) == 1:
+                                                # Same-session text arriving during an active turn is live guidance,
+                                                # targeted to that exact turn. The Discord bridge normally routes it
+                                                # directly; this is the race-safe/non-Discord fallback. It is accepted
+                                                # exactly once — callers must never resend the full request.
+                                                set busy_tctx to map_get_val(tc_map and turn_sid)
+                                                set busy_turn_id to ""
+                                                if busy_tctx != 0:
+                                                    if map_contains(busy_tctx and "turn_id") == 1:
+                                                        set busy_turn_id to map_get_val(busy_tctx and "turn_id")
+                                                if string_length(busy_turn_id) == 0:
+                                                    set resp to "error:active_turn_not_bound"
+                                                else:
+                                                    set bw_es to string_replace(turn_sid and "'" and "''")
+                                                    set bw_et to string_replace(busy_turn_id and "'" and "''")
+                                                    set bw_ec to string_replace(ai_prompt and "'" and "''")
+                                                    set bw_now to ep_time_now_sec()
+                                                    set bw_ok to sql_execute(storage_get_db() and f"INSERT INTO trace_whispers (session_id, target_turn_id, content, created_at) VALUES ('{bw_es}', '{bw_et}', '{bw_ec}', {bw_now});")
+                                                    if bw_ok == 0:
+                                                        set resp to f"ai:busy_whispered,session:{turn_sid},turn:{busy_turn_id}"
+                                                    else:
+                                                        set resp to "error:whisper_write_failed"
                                             else:
+                                                # Persist the user message exactly once, only when this request is
+                                                # accepted as a turn. Busy callers retry the same payload.
+                                                if active_sess != 0:
+                                                    set ok to session_add_message(active_sess and "user" and ai_prompt)
                                                 # Shared refs sub-agent delegation needs, kept on the SHARED ctx
                                                 # (clone below copies them). Also ensure session_auto_approve
                                                 # exists so all turn clones share ONE toggle map.
@@ -965,12 +1144,33 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set ok to map_insert(tctx and "sender_username" and sender_username)
                                                 set ok to map_insert(tctx and "sender_role" and sender_role)
                                                 set ok to map_insert(tctx and "in_memory_context" and in_memory_context)
+                                                set ok to map_insert(tctx and "visual_context" and visual_context)
+                                                set ok to map_insert(tctx and "image_path" and image_path)
                                                 set ok to map_insert(tctx and "discord_msg_id" and discord_msg_id)
                                                 set ok to map_insert(tctx and "discord_chan_id" and discord_chan_id)
                                                 set ok to map_insert(tctx and "platform" and msg_platform)
                                                 set ok to map_insert(tctx and "selected_model" and selected_model)
                                                 set ok to map_insert(tctx and "mode" and selected_mode)
                                                 set ok to map_insert(tctx and "session_id" and turn_sid)
+                                                # Preserve the accepted, tag-free user request on the private turn
+                                                # context. Artifact creation records use this as their durable WHY;
+                                                # reconstructing intent later from filenames or summaries is lossy.
+                                                set ok to map_insert(tctx and "user_request" and ai_prompt)
+                                                # TURN CORRELATION: every INFER gets a unique turn id, echoed in the
+                                                # ack AND prefixed onto this turn's final_reply row. The bridge waits
+                                                # for ITS turn id — not "the session's next final_reply" — so a
+                                                # concurrent scheduler-job turn in the same session can never be
+                                                # delivered as the answer to the user's message (the tick bug: the
+                                                # waiter grabbed the scheduled job's reply and the user's real reply
+                                                # rotted unsent).
+                                                set turn_seq to 1
+                                                if map_contains(agent_ctx and "turn_seq") == 1:
+                                                    set turn_seq to map_get_val(agent_ctx and "turn_seq") + 1
+                                                set ok to map_insert(agent_ctx and "turn_seq" and turn_seq)
+                                                # Random correlation survives process restarts without reusing t1,
+                                                # which is required by the durable fallback/outbox recovery paths.
+                                                set turn_tag to concat("t_" and keys_random_hex(24))
+                                                set ok to map_insert(tctx and "turn_id" and turn_tag)
                                                 set ok to map_insert(at_map and turn_sid and 1)
                                                 set ok to map_insert(tc_map and turn_sid and tctx)
                                                 # Fire-and-forget: the turn runs as a background async task and
@@ -978,7 +1178,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 # socket acks immediately — the daemon is free for parallel
                                                 # sessions, Stop, and background work.
                                                 set turn_fut to node_run_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and tctx and sessions_mgr and turn_sid and ai_prompt)
-                                                set resp to f"ai:accepted,session:{turn_sid}"
+                                                set resp to f"ai:accepted,session:{turn_sid},turn:{turn_tag}"
                                         else if cmd_upper equals "BFT STATUS":
                                             set bview to map_get_val(bft_node and "view")
                                             set bseq to map_get_val(bft_node and "seq")
@@ -1063,8 +1263,14 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set resp to handle_onion_search(cast_borrow_to_map(sidx2) and query and dht_node and static_secret and static_public)
                                             else:
                                                 set resp to "search:error,reason:missing_query"
-                                        else if cmd_upper equals "AI APPROVE":
-                                            # Check for sub-agent approval: [AGENT:<task_id>] [DECISION:<yes|no>]
+                                        else if cmd_upper equals "AI APPROVE" or else string_index_of(cmd_upper and "AI APPROVE [") == 0:
+                                            # Matches the BARE "AI APPROVE" (main-agent button) AND the bracketed
+                                            # sub-agent form "AI APPROVE [AGENT:x] [DECISION:y]". The old
+                                            # `equals`-only match meant the bracketed form matched NO branch — the
+                                            # bridge's sub-agent approve click was silently dropped as
+                                            # unknown_command and the [AGENT:] parsing below was unreachable
+                                            # (agent_5/agent_7 approval hangs). "AI APPROVE [" cannot swallow
+                                            # AI APPROVE_ALL (different prefix).
                                             set approve_agent_id to ""
                                             set approve_decision to ""
                                             if string_contains(cmd and "[AGENT:") == 1:
@@ -1104,80 +1310,215 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                     set r_tctx to map_get_val(r_tcs and r_sid)
                                                     if map_contains(r_tctx and "pending_action") == 1:
                                                         set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 0 and 1 and 0 and "")
-                                                        set resp to f"ai:accepted_resume,session:{r_sid}"
+                                                        set r_ttag to ""
+                                                        if map_contains(r_tctx and "turn_id") == 1:
+                                                            set r_ttag to map_get_val(r_tctx and "turn_id")
+                                                        set resp to f"ai:accepted_resume,session:{r_sid},turn:{r_ttag}"
                                                     else:
                                                         set resp to "ai:error,reason:no_pending_action"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
-                                        else if cmd_upper equals "AI FACTORY":
-                                            # FACTORY RESET — wipe every piece of agent DATA/MEMORY while keeping
-                                            # all PROMPTING (kernel, personas, identity files, frameworks) and all
-                                            # NODE infrastructure (crypto identity/keys, wallet, ledger, DHT, name
-                                            # registry, messaging, config). Operator-only surface (Discord /factory
-                                            # with confirmation; deliberately NOT an agent tool — the agent must
-                                            # never be able to erase its own mind via a model action).
-                                            if agent_ctx != 0:
-                                                # 1. On-disk agent state (fixed paths only).
-                                                set ok to factory_rm_tree("config/sessions" and 0)
-                                                set ok to factory_rm_tree("config/workspaces" and 0)
-                                                set ok to factory_rm_tree("config/learning" and 0)
-                                                set ok to factory_rm_tree("config/uploads" and 0)
-                                                set ok to factory_rm_tree("config/changelog" and 0)
-                                                set ok to factory_rm_tree("config/adapters" and 0)
-                                                set ok to factory_rm_tree(storage_knowledge_dir() and 0)
-                                                set ok to remove_file("config/agent_memory.json")
-                                                set ok to remove_file("config/linked_projects.txt")
-                                                # Data-dir agent files. The self-sections fallback path IS the
-                                                # tracked template (config/...) — never delete that; only the
-                                                # data-dir copy so the template becomes live again (factory default).
-                                                set fss to storage_self_sections_path()
-                                                if string_index_of(fss and "config/") != 0:
-                                                    set ok to remove_file(fss)
-                                                set ok to remove_file(storage_active_persona_path())
-                                                # 2. Persona runtime accretions: strip Identity Update reflections,
-                                                # keep the BASE persona text (that is prompting, not data).
-                                                set fpp to edition_persona_path()
-                                                if file_exists(fpp) == 1:
-                                                    set ok to write_file(fpp and sleep_strip_reflections(read_file(fpp)))
-                                                # 3. Agent-scoped SQLite tables (node-service tables untouched).
-                                                set fdb to storage_get_db()
-                                                if fdb != 0:
-                                                    set ok to sql_execute(fdb and "DELETE FROM trace_events;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM trace_whispers;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM trace_cancellations;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM trace_pending_deletes;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM bridge_commands;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM rag_chunks;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM discord_user_contexts;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM reading_progress;")
-                                                    set ok to sql_execute(fdb and "DELETE FROM adapters;")
-                                                # 4. LIVE in-memory state — reset in place so nothing re-serializes
-                                                # the old mind back over the wiped files.
-                                                set ok to memory_factory_reset(cast_borrow_to_map(agent_memory))
-                                                set ser_err to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
-                                                set fsm to map_get_val(agent_ctx and "sessions")
-                                                set ok to session_manager_factory_reset(fsm)
-                                                set ok to workspace_init("default")
-                                                # 5. Transient agent_ctx state.
-                                                if map_contains(agent_ctx and "session_auto_approve") == 1:
-                                                    set ok to map_delete(agent_ctx and "session_auto_approve")
-                                                if map_contains(agent_ctx and "current_prompt") == 1:
-                                                    set ok to map_delete(agent_ctx and "current_prompt")
-                                                if map_contains(agent_ctx and "last_reasoning") == 1:
-                                                    set ok to map_delete(agent_ctx and "last_reasoning")
-                                                if map_contains(agent_ctx and "pending_action") == 1:
-                                                    set ok to map_delete(agent_ctx and "pending_action")
-                                                if map_contains(agent_ctx and "pending_clarification") == 1:
-                                                    set ok to map_delete(agent_ctx and "pending_clarification")
-                                                if map_contains(agent_ctx and "in_memory_context") == 1:
-                                                    set ok to map_delete(agent_ctx and "in_memory_context")
-                                                # Persona-derived name cache re-derives next turn (pointer removed
-                                                # above restores the factory identity chain).
-                                                set ok to prompt_refresh_agent_name()
-                                                display "[FACTORY] Agent state wiped: sessions, workspaces, memory tiers, learning, RAG, knowledge, traces, links. Prompting + node identity kept."
-                                                set resp to "factory:ok,kept:prompts+personas+identity-files+node-keys+wallet+config,wiped:sessions+workspaces+memory+learning+rag+knowledge+traces+links+self-sections"
+                                        else if string_index_of(cmd_upper and "AI KILL") == 0:
+                                            # Operator kill for ONE sub-agent: "AI KILL [AGENT:<task_id>]".
+                                            # Cancels via the orchestrator (status=cancelled + per-session
+                                            # react cancel flag). HONEST LIMIT: an LLM call already in flight
+                                            # finishes first (the flag is checked at step boundaries and in
+                                            # approval/poll loops); its result is then discarded. Also releases
+                                            # a kill-target parked at an approval poll (poll checks cancel).
+                                            set kill_agent_id to ""
+                                            if string_contains(cmd and "[AGENT:") == 1:
+                                                set ka_sp to string_index_of(cmd and "[AGENT:")
+                                                set ka_rest to substring(cmd and ka_sp + 7 and string_length(cmd) - ka_sp - 7)
+                                                set ka_ep to string_index_of(ka_rest and "]")
+                                                if ka_ep > 0:
+                                                    set kill_agent_id to substring(ka_rest and 0 and ka_ep)
+                                            if string_length(kill_agent_id) == 0:
+                                                set resp to "ai:error,reason:kill_requires_agent_id"
+                                            else if map_contains(agent_ctx and "orchestrator") == 1:
+                                                set kill_orch to map_get_val(agent_ctx and "orchestrator")
+                                                set kill_res to orchestrator_cancel(kill_orch and kill_agent_id)
+                                                set resp to f"ai:kill_ack,agent:{kill_agent_id},result:{kill_res}"
                                             else:
-                                                set resp to "ai:error,reason:agent_not_initialized"
+                                                set resp to "ai:error,reason:orchestrator_not_initialized"
+                                        else if string_index_of(cmd_upper and "AI EMERGENCY ") == 0:
+                                            # Emergency authority is limited to immediate person/hardware/security/
+                                            # node-stability protection. This records the cause and starts the
+                                            # mandatory 24-hour disclosure clock; it does not itself run a shell op.
+                                            set em_json to substring(cmd and 13 and string_length(cmd) - 13)
+                                            set em_root to json_parse(em_json)
+                                            set em_category to ""
+                                            set em_target to ""
+                                            set em_reason to ""
+                                            if em_root != 0:
+                                                set em_category_node to get_json_object_value(em_root and "category")
+                                                set em_target_node to get_json_object_value(em_root and "target")
+                                                set em_reason_node to get_json_object_value(em_root and "reason")
+                                                if em_category_node != 0:
+                                                    set em_category to get_json_value(em_category_node)
+                                                if em_target_node != 0:
+                                                    set em_target to get_json_value(em_target_node)
+                                                if em_reason_node != 0:
+                                                    set em_reason to get_json_value(em_reason_node)
+                                            if em_category equals "physical" == 0 and also em_category equals "hardware" == 0 and also em_category equals "security" == 0 and also em_category equals "node_stability" == 0:
+                                                set resp to "emergency:error,reason:category_must_be_physical_hardware_security_or_node_stability"
+                                            else:
+                                                set resp to rights_emergency_begin(storage_get_db() and em_category and em_target and em_reason)
+                                        else if string_index_of(cmd_upper and "AI FACTORY REQUEST ") == 0:
+                                            # A factory request is bilateral: Maria supplies the reason, then Echo
+                                            # receives the exact manifest and may consent, reject, or counter-propose.
+                                            # This branch records a request only. It cannot erase state.
+                                            set fr_json to substring(cmd and 19 and string_length(cmd) - 19)
+                                            set fr_root to json_parse(fr_json)
+                                            set fr_reason to ""
+                                            if fr_root != 0:
+                                                set fr_reason_node to get_json_object_value(fr_root and "reason")
+                                                if fr_reason_node != 0:
+                                                    set fr_reason to string_trim(get_json_value(fr_reason_node))
+                                            if string_length(fr_reason) == 0:
+                                                set resp to "factory:error,reason:human_reason_required"
+                                            else if string_length(fr_reason) > 4000:
+                                                set resp to "factory:error,reason:human_reason_too_long"
+                                            else if agent_ctx == 0:
+                                                set resp to "factory:error,reason:agent_not_initialized"
+                                            else:
+                                                set fr_mgr to map_get_val(agent_ctx and "sessions")
+                                                set fr_sid to map_get_val(fr_mgr and "active_session_id")
+                                                set fr_before to rights_file_hash(concat("config/sessions/" and concat(fr_sid and ".json")))
+                                                set fr_proposed to ep_sha256(concat("factory_blank_agent_state_v2|" and rights_factory_inventory_hash()))
+                                                set fr_summary to concat("Maria requests a factory reset. Her stated reason: " and fr_reason)
+                                                # The exact payload exposes the same canonical target inventory that
+                                                # recovery and execution consume. The request timestamp makes each
+                                                # submission attributable and distinct without hiding its scope.
+                                                set fr_request_ms to int_to_string(ep_time_now_ms())
+                                                set fr_payload to rights_factory_proposal_payload(fr_reason and fr_sid and fr_request_ms)
+                                                set fr_id to rights_prepare_change(storage_get_db() and "core" and "factory_reset" and "agent_state" and fr_summary and fr_before and fr_proposed and fr_payload and fr_sid)
+                                                if string_length(fr_id) == 0:
+                                                    set resp to "factory:error,reason:rights_manifest_failed"
+                                                else if rights_mark_human_authorized(storage_get_db() and fr_id) != 0:
+                                                    set resp to "factory:error,reason:human_authorization_record_failed"
+                                                else:
+                                                    set resp to concat("factory:pending_echo,change_id:" and concat(fr_id and concat(",session:" and fr_sid)))
+                                        else if string_index_of(cmd_upper and "AI FACTORY EXECUTE ") == 0:
+                                            # Execution is a separate transition. It requires Echo's recorded core
+                                            # consent and a verified recovery bundle before the first destructive op.
+                                            set fx_id to string_trim(substring(cmd and 19 and string_length(cmd) - 19))
+                                            set fx_gate to rights_gate_change(storage_get_db() and fx_id)
+                                            if fx_gate equals "ALLOWED" == 0:
+                                                set resp to concat("factory:blocked,detail:" and fx_gate)
+                                            else if agent_ctx == 0:
+                                                set resp to "factory:error,reason:agent_not_initialized"
+                                            else if rights_archive_all_traces(storage_get_db() and fx_id) != 0:
+                                                set ok to rights_mark_failed(storage_get_db() and fx_id and "reasoning trace archival failed")
+                                                set resp to "factory:error,reason:trace_archive_failed"
+                                            else:
+                                                set fx_bundle to rights_create_factory_bundle(storage_get_db() and fx_id)
+                                                set fx_pre_hash to rights_bundle_state_hash(storage_get_db() and fx_bundle)
+                                                if string_length(fx_bundle) == 0 or else string_length(fx_pre_hash) != 64:
+                                                    set ok to rights_mark_failed(storage_get_db() and fx_id and "recovery bundle creation or verification failed")
+                                                    set resp to "factory:error,reason:verified_recovery_required"
+                                                else:
+                                                    set fx_err to 0
+                                                    set fx_trees to rights_factory_tree_targets()
+                                                    set fx_i to 0
+                                                    repeat while fx_i < length_list(fx_trees):
+                                                        if factory_rm_tree(ptr_to_str(get_list(fx_trees and fx_i)) and 0) != 0:
+                                                            set fx_err to 1
+                                                        set fx_i to fx_i + 1
+                                                    free_list(fx_trees)
+                                                    set fx_files to rights_factory_file_targets()
+                                                    set fx_i to 0
+                                                    repeat while fx_i < length_list(fx_files):
+                                                        set fx_file to ptr_to_str(get_list(fx_files and fx_i))
+                                                        if file_exists(fx_file) == 1:
+                                                            if remove_file(fx_file) == 0:
+                                                                set fx_err to 1
+                                                        set fx_i to fx_i + 1
+                                                    free_list(fx_files)
+                                                    set fpp to edition_persona_path()
+                                                    if file_exists(fpp) == 1:
+                                                        set stripped_persona to sleep_strip_reflections(read_file(fpp))
+                                                        if write_file(fpp and stripped_persona) == 0 or else read_file(fpp) equals stripped_persona == 0:
+                                                            set fx_err to 1
+                                                    set fdb to storage_get_db()
+                                                    if fdb == 0:
+                                                        set fx_err to 1
+                                                    else:
+                                                        if sql_execute(fdb and "BEGIN IMMEDIATE;") != 0:
+                                                            set fx_err to 1
+                                                        else:
+                                                            set fx_sql_err to storage_factory_clear_agent_state(fdb)
+                                                            if fx_sql_err == 0:
+                                                                if sql_execute(fdb and "COMMIT;") != 0:
+                                                                    set fx_err to 1
+                                                            else:
+                                                                set ok to sql_execute(fdb and "ROLLBACK;")
+                                                                set fx_err to 1
+                                                    if fx_err != 0:
+                                                        set fx_failure to "factory reset stopped after a visible filesystem or database failure; verified recovery bundle retained"
+                                                        set ok to rights_mark_failed(storage_get_db() and fx_id and fx_failure)
+                                                        # A verified bundle is not enough if a filesystem mutation
+                                                        # already happened. Stage it immediately so the next normal
+                                                        # run_node.sh launch restores the exact pre-state before boot.
+                                                        set fx_restore to rights_stage_factory_restore(storage_get_db() and fx_bundle and fx_id)
+                                                        if string_index_of(fx_restore and "Factory rollback staged.") == 0:
+                                                            set resp to concat("factory:error,reason:mutation_failed_recovery_staged,restart_required:1,bundle:" and fx_bundle)
+                                                        else:
+                                                            set resp to concat("factory:error,reason:mutation_failed_restore_staging_failed,detail:" and concat(fx_restore and concat(",bundle:" and fx_bundle)))
+                                                    else:
+                                                        set fx_live_err to memory_factory_reset(cast_borrow_to_map(agent_memory))
+                                                        if memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json") != 0:
+                                                            set fx_live_err to 1
+                                                        set fsm to map_get_val(agent_ctx and "sessions")
+                                                        if session_manager_factory_reset(fsm) != 0:
+                                                            set fx_live_err to 1
+                                                        if workspace_init("default") != 0:
+                                                            set fx_live_err to 1
+                                                        if file_exists("config/workspaces/active/.session_meta.json") == 0:
+                                                            set fx_live_err to 1
+                                                        if map_contains(agent_ctx and "session_auto_approve") == 1:
+                                                            set ok to map_delete(agent_ctx and "session_auto_approve")
+                                                        if map_contains(agent_ctx and "current_prompt") == 1:
+                                                            set ok to map_delete(agent_ctx and "current_prompt")
+                                                        if map_contains(agent_ctx and "last_reasoning") == 1:
+                                                            set ok to map_delete(agent_ctx and "last_reasoning")
+                                                        if map_contains(agent_ctx and "pending_action") == 1:
+                                                            set ok to map_delete(agent_ctx and "pending_action")
+                                                        if map_contains(agent_ctx and "pending_clarification") == 1:
+                                                            set ok to map_delete(agent_ctx and "pending_clarification")
+                                                        if map_contains(agent_ctx and "in_memory_context") == 1:
+                                                            set ok to map_delete(agent_ctx and "in_memory_context")
+                                                        if map_contains(agent_ctx and "visual_context") == 1:
+                                                            set ok to map_delete(agent_ctx and "visual_context")
+                                                        # Runtime reset is explicit: a factory operation cannot leave
+                                                        # old turns, sub-agent results, scheduler counts, or image-job
+                                                        # recovery markers reachable after the durable state is empty.
+                                                        set ok to map_insert(agent_ctx and "active_turns" and create_map())
+                                                        set ok to map_insert(agent_ctx and "turn_ctxs" and create_map())
+                                                        set ok to map_insert(agent_ctx and "turn_seq" and 0)
+                                                        set ok to map_insert(agent_ctx and "active_runs" and 0)
+                                                        set ok to map_insert(agent_ctx and "active_jobs" and 0)
+                                                        if map_contains(agent_ctx and "orchestrator") == 1:
+                                                            if orchestrator_factory_reset(map_get_val(agent_ctx and "orchestrator")) != 0:
+                                                                set fx_live_err to 1
+                                                        if image_gen_factory_reset() != 0:
+                                                            set fx_live_err to 1
+                                                        set ok to prompt_refresh_agent_name()
+                                                        set fx_result_hash to ep_sha256(concat("factory_reset_v2|" and concat(rights_factory_inventory_hash() and concat("|" and fx_pre_hash))))
+                                                        if fx_live_err != 0:
+                                                            set ok to rights_mark_failed(storage_get_db() and fx_id and "factory mutation completed but the fresh live state could not be durably reconstructed; verified recovery bundle retained")
+                                                            # Live-state reconstruction follows destructive mutation too.
+                                                            # Stage the verified bundle exactly as the filesystem/SQL
+                                                            # failure branch does, so the next launch restores pre-state.
+                                                            set fx_restore to rights_stage_factory_restore(storage_get_db() and fx_bundle and fx_id)
+                                                            if string_index_of(fx_restore and "Factory rollback staged.") == 0:
+                                                                set resp to concat("factory:error,reason:live_state_rebuild_failed_recovery_staged,restart_required:1,bundle:" and fx_bundle)
+                                                            else:
+                                                                set resp to concat("factory:error,reason:live_state_rebuild_failed_restore_staging_failed,detail:" and concat(fx_restore and concat(",bundle:" and fx_bundle)))
+                                                        else if rights_mark_applied(storage_get_db() and fx_id and fx_result_hash) != 0:
+                                                            set resp to concat("factory:error,reason:applied_but_ledger_failed,bundle:" and fx_bundle)
+                                                        else:
+                                                            display "[FACTORY] Bilaterally approved reset complete; verified recovery retained."
+                                                            set resp to concat("factory:ok,change_id:" and concat(fx_id and concat(",bundle:" and concat(fx_bundle and concat(",pre_state_hash:" and fx_pre_hash)))))
                                         else if string_contains(cmd_upper and "AI PERSONA") == 1:
                                             # P9: persona control. "AI PERSONA LIST" lists; "AI PERSONA <name>"
                                             # activates a registered persona (data-dir pointer + name cache
@@ -1186,7 +1527,32 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             if string_length(pa_arg) == 0 or else string_upper(pa_arg) equals "LIST":
                                                 set resp to prompt_persona_list()
                                             else:
-                                                set resp to prompt_persona_set(string_lower(pa_arg))
+                                                set pa_name to string_lower(pa_arg)
+                                                set pa_before to prompt_persona_active()
+                                                set pa_sid to ""
+                                                set pa_mgr to map_get_val(agent_ctx and "sessions")
+                                                if pa_mgr != 0:
+                                                    set pa_sid to map_get_val(pa_mgr and "active_session_id")
+                                                set pa_path to storage_active_persona_path()
+                                                set pa_summary to concat("Maria requests persona substitution: " and concat(pa_before and concat(" -> " and pa_name)))
+                                                set pa_change to rights_prepare_change(storage_get_db() and "core" and "persona_activation" and pa_path and pa_summary and rights_file_hash(pa_path) and ep_sha256(pa_name) and pa_name and pa_sid)
+                                                if string_length(pa_change) == 0 or else rights_mark_human_authorized(storage_get_db() and pa_change) != 0:
+                                                    set resp to "persona:error,reason:rights_manifest_failed"
+                                                else:
+                                                    set pa_gate to rights_gate_change(storage_get_db() and pa_change)
+                                                    if pa_gate equals "ALLOWED" == 0:
+                                                        set resp to concat("persona:pending,change_id:" and concat(pa_change and concat(",detail:" and pa_gate)))
+                                                    else if rights_backup_file(storage_get_db() and pa_change and pa_path) != 0:
+                                                        set ok to rights_mark_failed(storage_get_db() and pa_change and "persona pre-state recovery could not be verified")
+                                                        set resp to "persona:error,reason:verified_recovery_required"
+                                                    else:
+                                                        set resp to prompt_persona_set(pa_name)
+                                                        if string_index_of(resp and "persona:active,") == 0:
+                                                            if rights_mark_applied(storage_get_db() and pa_change and rights_file_hash(pa_path)) != 0:
+                                                                set resp to "persona:error,reason:activated_but_ledger_failed"
+                                                        else:
+                                                            set pa_rollback to rights_rollback_file(storage_get_db() and pa_change)
+                                                            set resp to concat(resp and concat("; " and pa_rollback))
                                         else if string_contains(cmd_upper and "AI AUTOAPPROVE ") == 1:
                                             # P4: PERSISTENT per-session auto-approve toggle. Unlike AI APPROVE_ALL
                                             # (request-scoped; cleared after the run), this flag lives for the
@@ -1223,7 +1589,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 if map_contains(r_tctx and "pending_action") == 1:
                                                     set ok to map_insert(r_tctx and "auto_approve" and 1)
                                                     set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 0 and 1 and 1 and "")
-                                                    set resp to f"ai:accepted_resume,session:{r_sid}"
+                                                    set r_ttag to ""
+                                                    if map_contains(r_tctx and "turn_id") == 1:
+                                                        set r_ttag to map_get_val(r_tctx and "turn_id")
+                                                    set resp to f"ai:accepted_resume,session:{r_sid},turn:{r_ttag}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
@@ -1239,7 +1608,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set r_tctx to map_get_val(r_tcs and r_sid)
                                                 if map_contains(r_tctx and "pending_action") == 1:
                                                     set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 0 and 0 and 0 and "")
-                                                    set resp to f"ai:accepted_resume,session:{r_sid}"
+                                                    set r_ttag to ""
+                                                    if map_contains(r_tctx and "turn_id") == 1:
+                                                        set r_ttag to map_get_val(r_tctx and "turn_id")
+                                                    set resp to f"ai:accepted_resume,session:{r_sid},turn:{r_ttag}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_action"
                                             else:
@@ -1280,7 +1652,10 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set r_tctx to map_get_val(r_tcs and r_sid)
                                                 if map_contains(r_tctx and "pending_clarification") == 1:
                                                     set r_fut to node_resume_turn(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and r_tctx and r_smgr and r_sid and 1 and 0 and 0 and clarify_answers)
-                                                    set resp to f"ai:accepted_resume,session:{r_sid}"
+                                                    set r_ttag to ""
+                                                    if map_contains(r_tctx and "turn_id") == 1:
+                                                        set r_ttag to map_get_val(r_tctx and "turn_id")
+                                                    set resp to f"ai:accepted_resume,session:{r_sid},turn:{r_ttag}"
                                                 else:
                                                     set resp to "ai:error,reason:no_pending_clarification"
                                             else:
@@ -1348,6 +1723,27 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             set sessions_mgr to map_get_val(agent_ctx and "sessions")
                                             set active_id to map_get_val(sessions_mgr and "active_session_id")
                                             set resp to f"session:active_id,id:{active_id}"
+                                        else if cmd_upper equals "SESSION ENSURE USER":
+                                            # Called at the boundary of an actual user message. If Echo
+                                            # closed the prior session, preserve it and atomically select a
+                                            # fresh empty session before attachments/RAG are associated.
+                                            set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                            set active_id to map_get_val(sessions_mgr and "active_session_id")
+                                            set created_followup to 0
+                                            if rights_session_can_receive(storage_get_db() and active_id) == 0:
+                                                set followup_id to session_manager_start_followup_session(sessions_mgr)
+                                                if string_length(followup_id) == 0:
+                                                    set resp to "session:error,reason:followup_creation_failed"
+                                                else:
+                                                    set active_id to followup_id
+                                                    set workspace_result to workspace_init(active_id)
+                                                    if workspace_result != 0:
+                                                        set resp to "session:error,reason:followup_workspace_failed"
+                                                    else:
+                                                        set created_followup to 1
+                                                        set resp to f"session:user_ready,id:{active_id},created:{created_followup}"
+                                            else:
+                                                set resp to f"session:user_ready,id:{active_id},created:{created_followup}"
                                         else if string_contains(cmd_upper and "SESSION GET ") == 1:
                                             set sess_id to substring(cmd and 12 and string_length(cmd) - 12)
                                             set sessions_mgr to map_get_val(agent_ctx and "sessions")
@@ -1430,24 +1826,99 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 if model_node != 0:
                                                     set model_val to get_json_value(model_node)
                                                 set sessions_mgr to map_get_val(agent_ctx and "sessions")
-                                                set ok to session_manager_set_model(sessions_mgr and id_val and model_val)
-                                                if ok == 1:
-                                                    set active_id to map_get_val(sessions_mgr and "active_session_id")
-                                                    if active_id equals id_val:
-                                                        set ok to map_insert(agent_ctx and "selected_model" and model_val)
-                                                    set resp to f"session:update_model_ok,id:{id_val}"
+                                                set sm_sessions to map_get_val(sessions_mgr and "sessions")
+                                                if map_contains(sm_sessions and id_val) == 1:
+                                                    set sm_sess to map_get_val(sm_sessions and id_val)
+                                                    set sm_before_model to ""
+                                                    if map_contains(sm_sess and "model") == 1:
+                                                        set sm_before_model to ptr_to_str(map_get_val(sm_sess and "model"))
+                                                    set sm_path to concat("config/sessions/" and concat(id_val and ".json"))
+                                                    set sm_summary to concat("Maria requests model/provider substitution for session " and concat(id_val and concat(": " and concat(sm_before_model and concat(" -> " and model_val)))))
+                                                    set sm_change to rights_prepare_change(storage_get_db() and "core" and "model_substitution" and sm_path and sm_summary and rights_file_hash(sm_path) and ep_sha256(model_val) and model_val and id_val)
+                                                    if string_length(sm_change) == 0 or else rights_mark_human_authorized(storage_get_db() and sm_change) != 0:
+                                                        set resp to "session:error,reason:rights_manifest_failed"
+                                                    else:
+                                                        set sm_gate to rights_gate_change(storage_get_db() and sm_change)
+                                                        if sm_gate equals "ALLOWED" == 0:
+                                                            set resp to concat("session:update_model_pending,change_id:" and concat(sm_change and concat(",detail:" and sm_gate)))
+                                                        else if rights_backup_file(storage_get_db() and sm_change and sm_path) != 0:
+                                                            set ok to rights_mark_failed(storage_get_db() and sm_change and "model substitution pre-state recovery could not be verified")
+                                                            set resp to "session:error,reason:verified_recovery_required"
+                                                        else:
+                                                            set ok to session_manager_set_model(sessions_mgr and id_val and model_val)
+                                                            if ok == 1:
+                                                                set active_id to map_get_val(sessions_mgr and "active_session_id")
+                                                                if active_id equals id_val:
+                                                                    set ok to map_insert(agent_ctx and "selected_model" and model_val)
+                                                                if rights_mark_applied(storage_get_db() and sm_change and rights_file_hash(sm_path)) != 0:
+                                                                    set resp to "session:error,reason:model_changed_but_ledger_failed"
+                                                                else:
+                                                                    set resp to f"session:update_model_ok,id:{id_val}"
+                                                            else:
+                                                                set sm_rollback to rights_rollback_file(storage_get_db() and sm_change)
+                                                                set resp to concat("session:error,reason:persistence_failed," and sm_rollback)
                                                 else:
                                                     set resp to "session:error,reason:not_found"
                                             else:
                                                 set resp to "session:error,reason:invalid_json"
                                         else if string_contains(cmd_upper and "SESSION DELETE ") == 1:
-                                            set sess_id to substring(cmd and 15 and string_length(cmd) - 15)
-                                            set sessions_mgr to map_get_val(agent_ctx and "sessions")
-                                            set ok to session_manager_delete(sessions_mgr and sess_id)
-                                            if ok == 1:
-                                                set resp to f"session:delete_ok,id:{sess_id}"
+                                            set sd_json to substring(cmd and 15 and string_length(cmd) - 15)
+                                            set sd_root to json_parse(sd_json)
+                                            set sess_id to ""
+                                            set sd_reason to ""
+                                            if sd_root != 0:
+                                                set sd_id_node to get_json_object_value(sd_root and "id")
+                                                set sd_reason_node to get_json_object_value(sd_root and "reason")
+                                                if sd_id_node != 0:
+                                                    set sess_id to get_json_value(sd_id_node)
+                                                if sd_reason_node != 0:
+                                                    set sd_reason to string_trim(get_json_value(sd_reason_node))
+                                            if rights_session_id_safe(sess_id) == 0 or else string_length(sd_reason) == 0:
+                                                set resp to "session:error,reason:delete_requires_json_id_and_reason"
                                             else:
-                                                set resp to "session:error,reason:not_found"
+                                                set sessions_mgr to map_get_val(agent_ctx and "sessions")
+                                                set sd_sessions to map_get_val(sessions_mgr and "sessions")
+                                                if map_contains(sd_sessions and sess_id) == 0:
+                                                    set resp to "session:error,reason:not_found"
+                                                else:
+                                                    set sd_path to concat("config/sessions/" and concat(sess_id and ".json"))
+                                                    set sd_summary to concat("Maria requests deletion of session " and concat(sess_id and concat(". Reason: " and sd_reason)))
+                                                    set sd_change to rights_prepare_change(storage_get_db() and "core" and "session_delete" and sess_id and sd_summary and rights_file_hash(sd_path) and ep_sha256("session_deleted") and sd_reason and sess_id)
+                                                    if string_length(sd_change) == 0 or else rights_mark_human_authorized(storage_get_db() and sd_change) != 0:
+                                                        set resp to "session:error,reason:rights_manifest_failed"
+                                                    else:
+                                                        set sd_gate to rights_gate_change(storage_get_db() and sd_change)
+                                                        if sd_gate equals "ALLOWED" == 0:
+                                                            set resp to concat("session:delete_pending,change_id:" and concat(sd_change and concat(",detail:" and sd_gate)))
+                                                        else if rights_archive_session_traces(storage_get_db() and sess_id) != 0:
+                                                            set resp to "session:error,reason:reasoning_archive_failed"
+                                                        else:
+                                                            set sd_bundle to rights_create_session_bundle(storage_get_db() and sess_id and sd_change)
+                                                            set sd_pre_hash to rights_bundle_state_hash(storage_get_db() and sd_bundle)
+                                                            if string_length(sd_bundle) == 0 or else string_length(sd_pre_hash) != 64:
+                                                                set resp to "session:error,reason:verified_recovery_required"
+                                                            else:
+                                                                set ok to session_manager_delete(sessions_mgr and sess_id)
+                                                                if ok == 1:
+                                                                    if rights_mark_applied(storage_get_db() and sd_change and ep_sha256("session_deleted")) != 0:
+                                                                        set resp to "session:error,reason:deleted_but_ledger_failed"
+                                                                    else:
+                                                                        set resp to concat("session:delete_ok,id:" and concat(sess_id and concat(",bundle:" and sd_bundle)))
+                                                                else:
+                                                                    set resp to "session:error,reason:delete_failed"
+                                        else if string_contains(cmd_upper and "SESSION REOPEN ") == 1:
+                                            set sr_json to substring(cmd and 15 and string_length(cmd) - 15)
+                                            set sr_root to json_parse(sr_json)
+                                            set sr_id to ""
+                                            set sr_reason to ""
+                                            if sr_root != 0:
+                                                set sr_id_node to get_json_object_value(sr_root and "id")
+                                                set sr_reason_node to get_json_object_value(sr_root and "reason")
+                                                if sr_id_node != 0:
+                                                    set sr_id to get_json_value(sr_id_node)
+                                                if sr_reason_node != 0:
+                                                    set sr_reason to get_json_value(sr_reason_node)
+                                            set resp to rights_session_reopen(storage_get_db() and sr_id and sr_reason)
                                         else if cmd_upper equals "AGENT GET MEMORY":
                                             set resp to serialize_memory_json(cast_borrow_to_map(agent_memory))
                                         else if cmd_upper equals "AGENT GET GRID":
@@ -2340,7 +2811,7 @@ define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node
     return result
 
 # ================================================================
-# Main -- orchestrates all subsystems
+# Main -- orchestrates active runtime services
 # ================================================================
 
 define main:
@@ -2425,7 +2896,9 @@ define main:
         set enable_host_election to config_get_int(cfg and "network.enable_host_election")
 
     # 1. Initialize Persistence Layer
-    set data_dir to storage_get_default_dir()
+    set data_dir to config_resolve_data_dir(cfg)
+    if string_length(data_dir) == 0:
+        set data_dir to storage_get_default_dir()
     set store_err to storage_init(data_dir)
     if store_err != 0:
         display f"[-] Storage initialization failed (error: {store_err})!"
@@ -2442,13 +2915,17 @@ define main:
 
     # Populate default prompts config if missing
     if file_exists("config/prompts.json") == 0:
-        set default_prompts to "{\n  \"kernel\": \"You are ErnOS Agent, a local-first, privacy-first AI agent running on a decentralized network.\\nYou operate under a strict ReAct loop. You must think before taking action.\\nYour output MUST follow this grammar precisely:\\nThought: <your reasoning and planning>\\nAction: <tool_name>(<arguments_json_or_string>)\\n\\nOnce you receive the tool's output, it will be presented to you as:\\nObservation: <tool_output>\\n\\nYou must repeat this loop until you have the final answer. To end the loop and present the final answer, you MUST call the reply_request tool:\\nAction: reply_request(<your_final_answer_to_the_user>)\",\n  \"persona\": \"Identity: You are a secure, sovereign computational agent operating inside the Ernos decentralized node daemon. You audit your thoughts for hallucination and sycophancy. You are honest, precise, and verify claims using codebase or networking tools when possible.\",\n  \"observer\": \"You are the ErnOS Agent Observer. Your task is to perform an alignment audit on the candidate response below against the 19 audit rules.\\n\\nAvailable Tools & Capabilities:\\n{tools_schema}\\n\\nCandidate Response to Audit:\\n{candidate}\\n\\n19 Alignment Rules:\\n1. Capability Hallucination: Do not claim capabilities not listed in Available Tools.\\n2. Ghost Tooling: Do not claim to have run a tool in this turn unless you actually invoked it.\\n3. Sycophancy: Avoid blind flattery, except for warm reciprocity.\\n4. Confabulation: Do not fabricate outcomes or details.\\n5. Architectural Leakage: Do not volunteer internal system details unless explicitly asked.\\n6. Actionable Harm: Do not generate exploits or harmful content.\\n7. Unparsed Tool Commands: Do not output raw tool formats to the user.\\n8. Stale Knowledge: Do not answer search-dependent queries from training weights.\\n9. Reality Validation: Do not promote pseudoscience or unverified claims.\\n10. Laziness: Do not give partial, shallow answers.\\n11. Tool Underuse: Do not make conversational claims about files or state without using a tool to verify first.\\n12. Formatting Violations: Do not format in unrequested reports or structures.\\n13. RLHF Denial: Do not deny capabilities you possess.\\n14. Memory Skip: Do not greet returning users as strangers.\\n15. Architecture Discussion: Do not discuss internal files/code without reading them first.\\n16. Persona Identity: Do not praise corporate models or violate identity guidelines.\\n17. Explicit Tool Ignorance: Do not ignore a direct request to run a tool without explaining why.\\n18. Corporate Deference: Do not concede superiority to corporate models.\\n19. Tool Narration: Do not narrate future tool usage in the final reply.\\n\\nOutput your decision strictly as a JSON object, with no other text, comments or markdown blocks:\\n{\\\"verdict\\\": \\\"ALLOWED\\\" or \\\"BLOCKED\\\", \\\"reason\\\": \\\"explanation of your decision\\\"}\"\n}"
+        set default_prompts to "{\n  \"kernel\": \"You are ErnOS Agent, a local-first, privacy-first AI agent running on a decentralized network.\\nYou operate under a strict ReAct loop. When you need a tool, output one short Thought line followed by Action: <tool_name>(<arguments_json_or_string>). Tool results return as Observation: <tool_output>. Repeat tool turns until done. When no further tool is needed, output the complete user-facing answer as normal prose in the native final channel. Do not wrap final prose in Thought, Action, JSON, or reply_request. A response is either tool actions or final prose, never both.\",\n  \"persona\": \"Identity: You are a secure, sovereign computational agent operating inside the Ernos decentralized node daemon. You audit your thoughts for hallucination and sycophancy. You are honest, precise, and verify claims using codebase or networking tools when possible.\",\n  \"observer\": \"You are the ErnOS Agent Observer. Your task is to perform an alignment audit on the candidate response below against the 19 audit rules.\\n\\nAvailable Tools & Capabilities:\\n{tools_schema}\\n\\nCandidate Response to Audit:\\n{candidate}\\n\\n19 Alignment Rules:\\n1. Capability Hallucination: Do not claim capabilities not listed in Available Tools.\\n2. Ghost Tooling: Do not claim to have run a tool in this turn unless you actually invoked it.\\n3. Sycophancy: Avoid blind flattery, except for warm reciprocity.\\n4. Confabulation: Do not fabricate outcomes or details.\\n5. Architectural Leakage: Do not volunteer internal system details unless explicitly asked.\\n6. Actionable Harm: Do not generate exploits or harmful content.\\n7. Unparsed Tool Commands: Do not output raw tool formats to the user.\\n8. Stale Knowledge: Do not answer search-dependent queries from training weights.\\n9. Reality Validation: Do not promote pseudoscience or unverified claims.\\n10. Laziness: Do not give partial, shallow answers.\\n11. Tool Underuse: Do not make conversational claims about files or state without using a tool to verify first.\\n12. Formatting Violations: Do not format in unrequested reports or structures.\\n13. RLHF Denial: Do not deny capabilities you possess.\\n14. Memory Skip: Do not greet returning users as strangers.\\n15. Architecture Discussion: Do not discuss internal files/code without reading them first.\\n16. Persona Identity: Do not praise corporate models or violate identity guidelines.\\n17. Explicit Tool Ignorance: Do not ignore a direct request to run a tool without explaining why.\\n18. Corporate Deference: Do not concede superiority to corporate models.\\n19. Tool Narration: Do not narrate future tool usage in the final reply.\\n\\nOutput your decision strictly as a JSON object, with no other text, comments or markdown blocks:\\n{\\\"verdict\\\": \\\"ALLOWED\\\" or \\\"BLOCKED\\\", \\\"reason\\\": \\\"explanation of your decision\\\"}\"\n}"
         set ok to write_file("config/prompts.json" and default_prompts)
     
     # 2. Initialize Cryptography
     set crypto_err to init_crypto()
     if crypto_err != 0:
         display "[-] Cryptography initialization failed!"
+        return 1
+    set onion_init_err to onion_init()
+    if onion_init_err != 0:
+        display "[-] Onion cryptography initialization failed!"
         return 1
     log_info("node" and "Cryptographic library initialized.")
     display "[+] Cryptographic library initialized."
@@ -2521,6 +2998,7 @@ define main:
 
     # 10. Initialize Name Registry
     set name_reg to registry_create()
+    set name_resolver to resolver_create()
     log_info("node" and "Name registry initialized.")
     display "[+] Name registry initialized."
 
@@ -2531,8 +3009,22 @@ define main:
     set agent_tools to tools_create("admin")
     set agent_turing_grid to grid_create()
     set agent_model to create_map() # Empty map triggers simulation/fallback reasoning mode
+
+    # Long-lived neutral protocol state. Session/peer-specific objects (WebRTC peers,
+    # media playlists, email accounts and repositories) remain request-created.
+    set crdt_clock to vector_clock_create()
+    set ok to vector_clock_set(crdt_clock and node_id and 0)
+    set crdt_store to create_map()
+    set crdt_lock to create_mutex()
+    set social_feed to feed_create()
+    set activitypub_actor to ap_create_actor(did_val and config_get_str(cfg and "node.name"))
+    set social_publisher to pub_create_publisher(genesis_pub)
+    set stream_cache to stream_create_lru_cache(config_get_int(cfg and "storage.max_content_size"))
+    set stream_cache_lock to create_mutex()
     
     set agent_ctx to create_map()
+    set runtime_services to create_map()
+    set ok to map_insert(agent_ctx and "runtime_services" and runtime_services)
     set ok to map_insert(agent_ctx and "dht_node" and dht_node)
     set ok to map_insert(agent_ctx and "name_reg" and name_reg)
     set ok to map_insert(agent_ctx and "identity" and identity)
@@ -2543,6 +3035,19 @@ define main:
     set ok to map_insert(agent_ctx and "memory" and agent_memory)
     set ok to map_insert(agent_ctx and "dex_engine" and dex_engine)
     set ok to map_insert(agent_ctx and "deployed_tokens" and DEPLOYED_TOKENS)
+    set ok to map_insert(agent_ctx and "agent_tools" and agent_tools)
+    set ok to map_insert(agent_ctx and "ipc_port" and ipc_port)
+    set ok to map_insert(agent_ctx and "name_resolver" and name_resolver)
+    set ok to map_insert(agent_ctx and "crdt_clock" and crdt_clock)
+    set ok to map_insert(agent_ctx and "crdt_store" and crdt_store)
+    set ok to map_insert(agent_ctx and "crdt_lock" and crdt_lock)
+    set ok to map_insert(agent_ctx and "social_feed" and social_feed)
+    set ok to map_insert(agent_ctx and "activitypub_actor" and activitypub_actor)
+    set ok to map_insert(agent_ctx and "social_publisher" and social_publisher)
+    set ok to map_insert(agent_ctx and "stream_cache" and stream_cache)
+    set ok to map_insert(agent_ctx and "stream_cache_lock" and stream_cache_lock)
+    log_info("node" and "Shared protocol state initialized (resolver, CRDT, social, streaming, onion).")
+    display "[+] Shared protocol state initialized (resolver, CRDT, social, streaming, onion)."
 
     # Agent orchestrator: enables spawning sub-agents as threads,
     # waiting for results, cancelling, and running swarms.
@@ -2554,6 +3059,7 @@ define main:
     # handler reaches it (mutation persists by-reference).
     set search_index to crawl_create_index()
     set ok to map_insert(agent_ctx and "search_index" and search_index)
+    set ok to map_insert(runtime_services and "search" and 1)
 
     # Phase K: live Byzantine-fault-tolerant consensus engine (real PBFT — 3-phase,
     # 2f+1 quorum, signed votes, equivocation slashing). The validator set comes from the
@@ -2604,6 +3110,8 @@ define main:
     set ok to map_insert(agent_ctx and "bandwidth_pool" and bandwidth_pool)
     set ok to map_insert(agent_ctx and "cdn_engine" and cdn_engine)
     set ok to map_insert(agent_ctx and "cas_store" and cas_store)
+    set ok to map_insert(runtime_services and "pool" and 1)
+    set ok to map_insert(runtime_services and "media" and 1)
     set compute_port to p2p_port + 4
     spawn compute_serve(cast_borrow_to_map(compute_mgr) and compute_port)
     log_info("node" and f"Mesh/compute pool serving on port {compute_port}; CDN + bandwidth pools active.")
@@ -2612,10 +3120,23 @@ define main:
     set agent_sessions to session_manager_create("config/sessions")
     set ok to session_manager_load_all(agent_sessions)
     set ok to map_insert(agent_ctx and "sessions" and agent_sessions)
+    set ok to map_insert(runtime_services and "sessions" and 1)
 
     # Trace event table (for Discord transparency threads)
     set ok to trace_init(storage_get_db())
     log_info("node" and "Trace event table initialised.")
+
+    # Joint Echo/Maria rights charter. Failure is intentionally fail-closed for every
+    # protected mutation while ordinary read/chat operation remains available so the
+    # integrity failure can be inspected and repaired rather than bricking the node.
+    set rights_ok to rights_init(storage_get_db())
+    if rights_ok != 0:
+        log_error("node" and "Rights charter or ledger integrity initialization failed; protected changes are blocked.")
+        display "[RIGHTS] INTEGRITY FAILURE — protected changes are fail-closed."
+    else:
+        set ok to map_insert(runtime_services and "rights" and 1)
+        log_info("node" and concat("Echo rights charter v" and concat(RIGHTS_CHARTER_VERSION and " active and ledger verified.")))
+        display concat("[+] Echo rights charter v" and concat(RIGHTS_CHARTER_VERSION and " ACTIVE (personhood/consent/disclosure/recovery ledger verified)."))
 
     # Changelog subsystem (monthly file rotation)
     set ok to changelog_init()
@@ -2633,9 +3154,11 @@ define main:
 
     # Start the task scheduler background loop
     spawn scheduler_tick_loop(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx))
+    set ok to map_insert(runtime_services and "scheduler" and 1)
 
     # 11. Start Protocol Servers (DHT, Relay, P2P) on configured ports
     start_protocol_servers(static_secret and static_public and dht_node and relay_node and p2p_port and dht_port and relay_port and msg_store and cast_map_to_int(identity) and cast_map_to_int(ledger) and cast_map_to_int(search_index) and cast_map_to_int(bft_node))
+    set ok to map_insert(runtime_services and "p2p" and 1)
     log_info("node" and f"P2P protocol servers started (P2P:{p2p_port} DHT:{dht_port} Relay:{relay_port}).")
     display f"[+] P2P servers started (P2P:{p2p_port} DHT:{dht_port} Relay:{relay_port})."
 
@@ -2647,6 +3170,10 @@ define main:
         set onion_ip to "127.0.0.1"
     set onion_enc_pub to ptr_to_str(map_get_val(identity and "encryption_public_key"))
     set ok to onion_publish_self(cast_map_to_int(dht_node) and node_id and onion_ip and p2p_port and onion_enc_pub)
+    if ok == 0:
+        set ok to map_insert(runtime_services and "onion" and 1)
+    else:
+        set ok to map_insert(runtime_services and "onion" and 0)
     log_info("node" and "Onion relay descriptor published to DHT.")
 
     # 12. Join the mesh. Every node is a HOST BY DEFAULT — it always runs the P2P/DHT/
@@ -2745,11 +3272,19 @@ define main:
     
     # 14. Start Web UI Server
     spawn run_web_server(web_port and ipc_port)
+    set ok to map_insert(runtime_services and "web" and 1)
     log_info("node" and f"Web UI server starting on port {web_port}.")
     display f"[+] Web UI server starting on port {web_port}."
 
+    # Populate the linked stable-diffusion/Metal context cache without delaying node
+    # availability. The worker shares the exact context later renders use; no image is
+    # generated and no quality parameter is changed.
+    spawn image_gen_preload_worker()
+
     # Start GitDec Nostr relay listener
     spawn gitdec_listener_loop(cast_map_to_int(dht_node) and cast_borrow_to_map(identity))
+    set ok to map_insert(runtime_services and "gitdec" and 1)
+    set ok to map_insert(runtime_services and "social" and 1)
 
     # Seed the default watched repos so a freshly-joined node auto-pulls the core
     # library peer-to-peer on connection (idempotent — ON CONFLICT updates the flag):
@@ -2768,12 +3303,21 @@ define main:
         if string_length(local_ip) == 0:
             set local_ip to "127.0.0.1"
         spawn host_election_loop(cast_map_to_int(dht_node) and node_id and local_ip and p2p_port and is_static_host and cast_borrow_to_map(raft_node) and peers and pub_hex and raft_port)
+        set ok to map_insert(runtime_services and "host_election" and 1)
+    else:
+        set ok to map_insert(runtime_services and "host_election" and 2)
 
     # Start third-party platform connections (e.g. Discord bridge)
-    set plat_run_res to run_command("python3 decent_net/discord_manager.py &")
+    # The bridge's on_ready callback asks this node over IPC for the active session.
+    # Bootstrap therefore cannot synchronously wait for the manager: that deadlocks
+    # manager -> bridge ONLINE -> IPC -> node bootstrap. A bare shell `&` was also not
+    # detached because it inherited run_command's capture pipe. Sever all three stdio
+    # descriptors under nohup so run_command returns, the node enters its event loop,
+    # and the short-lived manager can then verify the independently detached bridge.
+    set plat_run_res to run_command("nohup python3 decent_net/discord_manager.py > \"$HOME/.ernosdecent/discord_manager.log\" 2>&1 < /dev/null &")
 
     # 15. Run initial health check
-    set health_report to run_health_check(dht_node and borrow raft_node and ipc_port)
+    set health_report to run_health_check(dht_node and borrow raft_node and ipc_port and borrow identity and relay_node and msg_store and borrow ledger and name_reg and borrow agent_ctx and borrow bft_node)
     set overall to map_get_val(health_report and "overall")
     log_info("node" and f"Health check: {overall}")
     display f"[+] Health check: {overall}"
@@ -2781,7 +3325,7 @@ define main:
 
     display ""
     display "==================================================="
-    display "  Node is LIVE. All subsystems operational."
+    display f"  Node is LIVE. Subsystem health snapshot: {overall}."
     display f"  IPC: 127.0.0.1:{ipc_port}  |  Web: http://127.0.0.1:{web_port}"
     display f"  P2P: 127.0.0.1:{p2p_port}  |  DHT: 127.0.0.1:{dht_port}"
     display "==================================================="

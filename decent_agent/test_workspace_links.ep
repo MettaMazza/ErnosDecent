@@ -1,0 +1,114 @@
+import "./workspace_links"
+import "os"
+import "fs"
+import "string"
+import "collections"
+
+define workspace_links_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("  PASS: " and label)
+        return 1
+    display concat("  FAIL: " and label)
+    return 0
+
+define main returning Int:
+    display "Workspace links confinement and persistence tests"
+    set passed to 0
+    set total to 0
+
+    set config_made to create_directory("config")
+    set project_made to create_directory("project")
+    set sub_made to create_directory("project/sub")
+    set outside_made to create_directory("outside")
+    set project_written to write_file("project/sub/file.txt" and "inside")
+    set outside_written to write_file("outside/secret.txt" and "outside")
+    set fixture_ok to config_made != 0 and also project_made != 0 and also sub_made != 0 and also outside_made != 0 and also project_written != 0 and also outside_written != 0
+    set total to total + 1
+    set passed to passed + workspace_links_expect(fixture_ok and "isolated filesystem fixture created")
+
+    set total to total + 1
+    set passed to passed + workspace_links_expect(links_clear_active() == 1 and "clear-active is idempotently successful with no registry")
+
+    set canonical_project to workspace_canonical_existing_path("project")
+    set canonical_file to workspace_canonical_existing_path("project/sub/file.txt")
+    set add_result to links_add("project" and "My Project")
+    set total to total + 1
+    set passed to passed + workspace_links_expect((add_result equals "ok:my_project") and also (links_active_path() equals canonical_project) and also string_contains(read_file(wl_path()) and canonical_project) == 1 and "linking stores and activates the canonical absolute directory")
+
+    set duplicate_result to links_add(canonical_project and "Ignored Rename")
+    set loaded_once to links_load()
+    set total to total + 1
+    set passed to passed + workspace_links_expect((duplicate_result equals "ok:my_project") and also length_list(map_get_val(loaded_once and "ids")) == 1 and "canonical duplicate returns the durable existing link without duplication")
+
+    set total to total + 1
+    set passed to passed + workspace_links_expect((links_resolve("sub/file.txt") equals canonical_file) and also (read_file(links_resolve("sub/file.txt")) equals "inside") and "relative resolution returns the direct canonical descendant")
+
+    set total to total + 1
+    set passed to passed + workspace_links_expect(string_length(links_resolve("../outside/secret.txt")) == 0 and also string_length(links_resolve("sub/../../outside/secret.txt")) == 0 and also string_length(links_resolve(canonical_file)) == 0 and "relative resolution rejects traversal and absolute input")
+
+    set canonical_outside to workspace_canonical_existing_path("outside")
+    set symlink_command to concat("ln -s '" and concat(canonical_outside and "' project/escape"))
+    set symlink_output to run_command(symlink_command)
+    set symlink_fixture to is_directory("project/escape")
+    set total to total + 1
+    set passed to passed + workspace_links_expect(symlink_fixture == 1 and also string_length(links_resolve("escape/secret.txt")) == 0 and also links_is_linked_path("project/escape/secret.txt") == 0 and "symlinked descendants cannot escape the linked root")
+
+    set total to total + 1
+    set passed to passed + workspace_links_expect(links_is_linked_path(canonical_file) == 1 and also links_is_linked_path(canonical_outside) == 0 and "linked-path scope uses canonical component boundaries")
+
+    set quoted_cmd to concat("ls '" and concat(canonical_project and "'"))
+    set child_cmd to concat("cat " and canonical_file)
+    set new_child_cmd to concat("touch " and concat(canonical_project and "/new.txt"))
+    set prefix_cmd to concat("ls " and concat(canonical_project and "-evil"))
+    set embedded_cmd to concat("echo x" and canonical_project)
+    set traversal_cmd to concat("cat " and concat(canonical_project and "/../outside/secret.txt"))
+    set total to total + 1
+    set passed to passed + workspace_links_expect(links_cmd_references_linked(quoted_cmd) == 1 and also links_cmd_references_linked(child_cmd) == 1 and also links_cmd_references_linked(new_child_cmd) == 1 and also links_cmd_references_linked(prefix_cmd) == 0 and also links_cmd_references_linked(embedded_cmd) == 0 and also links_cmd_references_linked(traversal_cmd) == 0 and "command references require full confined path tokens")
+
+    set good_content to read_file(wl_path())
+    set good_map to links_load()
+    set malformed_written to write_file(wl_path() and "@active=missing\nbad|record\n")
+    set malformed_map to links_load()
+    set total to total + 1
+    set passed to passed + workspace_links_expect(malformed_written != 0 and also map_get_val(malformed_map and "valid") == 0 and also string_length(links_active_path()) == 0 and also links_set_active("my_project") == 0 and also links_remove("my_project") == 0 and "malformed registry data fails closed without false mutation success")
+
+    set restored to write_file(wl_path() and good_content)
+    set restored_map to links_load()
+    set total to total + 1
+    set passed to passed + workspace_links_expect(restored != 0 and also map_get_val(restored_map and "valid") == 1 and also links_set_active("my_project") == 1 and "a valid registry reloads and idempotent set-active succeeds")
+
+    set tracker_removed to remove_file(wl_path())
+    set guard_written to write_file("outside/registry-target.txt" and "unchanged")
+    set registry_target to workspace_canonical_existing_path("outside/registry-target.txt")
+    set registry_link_cmd to concat("ln -s '" and concat(registry_target and "' config/linked_projects.txt"))
+    set registry_link_output to run_command(registry_link_cmd)
+    set total to total + 1
+    set passed to passed + workspace_links_expect(tracker_removed != 0 and also guard_written != 0 and also file_exists(wl_path()) == 1 and also map_get_val(links_load() and "valid") == 0 and also links_save(good_map) == 0 and also (read_file(registry_target) equals "unchanged") and "symlinked registry files are rejected and never overwritten")
+
+    set registry_link_removed to remove_file(wl_path())
+    set direct_restored to write_file(wl_path() and good_content)
+    set total to total + 1
+    set passed to passed + workspace_links_expect(registry_link_removed != 0 and also direct_restored != 0 and also links_clear_active() == 1 and also links_clear_active() == 1 and also string_length(links_active_path()) == 0 and "clear-active durably succeeds and remains idempotent")
+
+    set total to total + 1
+    set passed to passed + workspace_links_expect(links_set_active("missing") == 0 and also links_remove("missing") == 0 and "unknown set/remove operations report failure")
+
+    set active_again to links_set_active("my_project")
+    set project_file_removed to remove_file("project/sub/file.txt")
+    set escape_removed to remove_file("project/escape")
+    set sub_removed to remove_directory("project/sub")
+    set project_removed to remove_directory("project")
+    set replacement_link_cmd to concat("ln -s '" and concat(canonical_outside and "' project"))
+    set replacement_output to run_command(replacement_link_cmd)
+    set total to total + 1
+    set passed to passed + workspace_links_expect(active_again == 1 and also project_file_removed != 0 and also escape_removed != 0 and also sub_removed != 0 and also project_removed != 0 and also is_directory("project") == 1 and also string_length(links_active_path()) == 0 and also links_is_linked_path("project/secret.txt") == 0 and "replacing a linked directory with a symlink revokes its active scope")
+
+    set removed_stale to links_remove("my_project")
+    set final_map to links_load()
+    set total to total + 1
+    set passed to passed + workspace_links_expect(removed_stale == 1 and also map_get_val(final_map and "valid") == 1 and also length_list(map_get_val(final_map and "ids")) == 0 and also links_remove("my_project") == 0 and "stale links remain removable and removal is durably truthful")
+
+    display concat("Workspace links results: " and concat(int_to_string(passed) and concat("/" and int_to_string(total))))
+    if passed != total:
+        return 1
+    return 0

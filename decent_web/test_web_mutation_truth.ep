@@ -1,0 +1,182 @@
+import "web_server"
+import "string"
+import "fs"
+import "net"
+
+set mutation_truth_passed to 0
+set mutation_truth_failed to 0
+
+define mutation_truth_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("  PASS: " and label)
+        set mutation_truth_passed to mutation_truth_passed + 1
+        return 1
+    display concat("  FAIL: " and label)
+    set mutation_truth_failed to mutation_truth_failed + 1
+    return 0
+
+define mutation_truth_remove with path as Str returning Int:
+    if file_exists(path) == 0:
+        return 1
+    if is_directory(path) == 1:
+        return 0
+    if remove_file(path) == 0 or else file_exists(path) == 1:
+        return 0
+    return 1
+
+define mutation_truth_valid_system_json returning Str:
+    set raw to "{\"node_name\":\"truth-node\",\"node_data_dir\":\"/tmp/ernos-truth\",\"node_log_level\":\"info\","
+    set raw to concat(raw and "\"network_listen_address\":\"127.0.0.1\",\"network_p2p_port\":19100,\"network_dht_port\":19101,")
+    set raw to concat(raw and "\"network_relay_port\":19102,\"network_ipc_port\":15000,\"network_web_port\":18088,")
+    set raw to concat(raw and "\"network_max_connections\":512,\"network_max_message_size\":2097152,\"network_seed_addr\":\"\",\"network_seed_port\":0,")
+    set raw to concat(raw and "\"network_enable_host_election\":0,\"network_is_static_host\":1,\"consensus_raft_port\":19103,")
+    set raw to concat(raw and "\"consensus_election_timeout_ms\":3000,\"consensus_heartbeat_interval_ms\":1000,")
+    set raw to concat(raw and "\"security_rate_limit_per_minute\":200,\"security_ban_threshold\":20,\"security_ban_duration_sec\":900,")
+    set raw to concat(raw and "\"storage_max_content_size\":209715200,\"storage_dht_ttl_sec\":172800}")
+    return raw
+
+define mutation_truth_free_port with start_port as Int returning Int:
+    set port to start_port
+    repeat while port <= 65000:
+        set probe to ep_net_listen(port)
+        if probe >= 0:
+            set closed to ep_net_close(probe)
+            if closed == 0:
+                return port
+            return 0
+        set port to port + 1
+    return 0
+
+define mutation_truth_send_frame with port as Int and frame as Str returning Int:
+    set slept to ep_sleep_ms(50)
+    set fd to ep_net_connect("127.0.0.1" and port)
+    if fd < 0:
+        return 1
+    set sent to web_ipc_send_complete(fd and frame)
+    set closed to ep_net_close(fd)
+    if sent != 1 or else closed != 0:
+        return 1
+    return 0
+
+define main returning Int:
+    display "Web mutation truth and configuration round-trip tests"
+
+    set test_token to "0123456789abcdef0123456789abcdef0123456789abcdef"
+    set ipc_frame to web_ipc_request_frame(test_token and "STATUS")
+    set ok to mutation_truth_expect(ipc_frame equals concat("ERNOS_IPC/1 60\nAUTH " and concat(test_token and " STATUS")) and "Web IPC emits the mandatory exact byte-length request frame")
+    set ok to mutation_truth_expect(string_length(web_ipc_request_frame("short" and "STATUS")) == 0 and also string_length(web_ipc_request_frame(test_token and "")) == 0 and "invalid IPC tokens and empty commands fail before connection")
+    set frame_port to mutation_truth_free_port(54500)
+    set frame_listener to 0 - 1
+    set frame_server_fd to 0 - 1
+    set frame_received to ""
+    if frame_port > 0:
+        set frame_listener to ep_net_listen(frame_port)
+    if frame_listener >= 0:
+        spawn mutation_truth_send_frame(frame_port and ipc_frame)
+        set frame_server_fd to ep_net_accept(frame_listener)
+    if frame_server_fd >= 0:
+        set frame_received to ep_net_recv(frame_server_fd and 4096)
+        set closed to ep_net_close(frame_server_fd)
+    if frame_listener >= 0:
+        set closed to ep_net_close(frame_listener)
+    set ok to mutation_truth_expect(frame_received equals ipc_frame and "checked raw IPC send transmits the complete frame")
+
+    set exact_session to web_session_mutation_result_json("session:rename_ok,id:session_7" and "session_rename_result" and "session:rename_ok,id:" and "session_7")
+    set wrong_session to web_session_mutation_result_json("session:rename_ok,id:session_8" and "session_rename_result" and "session:rename_ok,id:" and "session_7")
+    set empty_session to web_session_mutation_result_json("" and "session_rename_result" and "session:rename_ok,id:" and "session_7")
+    set ok to mutation_truth_expect(string_contains(exact_session and "\"success\":true") == 1 and also string_contains(wrong_session and "\"success\":false") == 1 and also string_contains(empty_session and "error:empty_daemon_response") == 1 and "session mutations require the exact operation and session ID acknowledgement")
+
+    set ok to mutation_truth_expect(web_starts_with("msg:stored_local,id:1" and "msg:stored_local,") == 1 and also web_starts_with("msg:error,reason:failed" and "msg:stored_local,") == 0 and "local message persistence accepts only the documented stored_local acknowledgement")
+    set ok to mutation_truth_expect(web_starts_with("transfer:ok,tx_id:1" and "transfer:ok,") == 1 and also web_starts_with("transfer:error,reason:rejected" and "transfer:ok,") == 0 and "transfer errors cannot become success")
+    set ok to mutation_truth_expect(web_starts_with("swap:ok,from:BTC" and "swap:ok,") == 1 and also web_starts_with("swap:error,reason:no_pool" and "swap:ok,") == 0 and "swap errors cannot become success")
+    set ok to mutation_truth_expect(web_starts_with("dht:stored,key:k" and "dht:stored,key:") == 1 and also web_starts_with("dht:error,reason:offline" and "dht:stored,key:") == 0 and "DHT errors cannot become stored")
+    set ok to mutation_truth_expect(extract_ipc_trailing_field("dht:found,key:k,value:first,second,third" and "value") equals "first,second,third" and "trailing IPC fields preserve comma-containing DHT values")
+    set ok to mutation_truth_expect(web_decimal_text_valid("999999999999999999" and 18) == 1 and also web_decimal_text_valid("9999999999999999999" and 18) == 0 and "money input bounds prevent signed-integer overflow")
+    set ok to mutation_truth_expect(web_base64_text_valid("YWJj" and 64) == 1 and also web_base64_text_valid("YW=J" and 64) == 0 and also web_base64_text_valid("abc" and 64) == 0 and "reasoning payloads require canonical base64 structure")
+
+    set wallet_ok to web_wallet_result_json("wallet_balance:77")
+    set wallet_offline to web_wallet_result_json("error:daemon_offline")
+    set wallet_malformed to web_wallet_result_json("wallet_balance:not-a-number")
+    set ok to mutation_truth_expect(string_contains(wallet_ok and "\"success\":true") == 1 and also string_contains(wallet_ok and "\"balance\":\"77\"") == 1 and "wallet success preserves the daemon balance")
+    set ok to mutation_truth_expect(string_contains(wallet_offline and "\"success\":false") == 1 and also string_contains(wallet_offline and "\"balance\":null") == 1 and also string_contains(wallet_offline and "\"balance\":\"0") == 0 and "wallet failure does not fabricate a zero balance")
+    set ok to mutation_truth_expect(string_contains(wallet_malformed and "\"success\":false") == 1 and also string_contains(wallet_malformed and "\"balance\":null") == 1 and "malformed wallet balances remain explicit failures")
+
+    set status_ok_raw to "status:active,role:follower,did:did:key:truth,term:7,peers:3,dht_size:2,is_static_host:0,enable_host_election:1,name:none,gitdec_updates:4,gitdec_network_available:0"
+    set status_ok to web_status_response_json(status_ok_raw)
+    set status_failed to web_status_response_json("error:daemon_offline")
+    set ok to mutation_truth_expect(string_contains(status_ok and "\"success\":true") == 1 and also string_contains(status_ok and "\"term\":7") == 1 and also string_contains(status_failed and "\"success\":false") == 1 and also string_contains(status_failed and "\"term\":0") == 0 and "node status errors remain explicit instead of becoming zero counters")
+
+    set pool_ok to web_pool_response_json("pool:active,compute_jobs:2,compute_pending:1,compute_workers:3,relay_registrations:4,relay_circuits:5")
+    set pool_failed to web_pool_response_json("error:daemon_offline")
+    set ok to mutation_truth_expect(string_contains(pool_ok and "\"compute_jobs\":2") == 1 and also string_contains(pool_ok and "\"relay_circuits\":5") == 1 and also string_contains(pool_ok and "bandwidth_up") == 0 and also string_contains(pool_failed and "\"success\":false") == 1 and "pool status exposes the daemon's real counters and no fabricated bandwidth fields")
+
+    set network_failed to web_network_response_json("error:daemon_offline")
+    set identity_failed to web_identity_response_json("error:daemon_offline")
+    set ok to mutation_truth_expect(string_contains(network_failed and "\"success\":false") == 1 and also string_contains(network_failed and "\"nat_mode\":\"relay\"") == 0 and also string_contains(identity_failed and "\"success\":false") == 1 and "network and identity errors do not become plausible defaults")
+    set ok to mutation_truth_expect(web_json_string_array_valid("[\"provider/model\"]") == 1 and also web_json_string_array_valid("[1]") == 0 and also web_json_string_array_valid("error:offline") == 0 and "model discovery accepts only a valid JSON string array")
+
+    set nonce to keys_random_hex(8)
+    set prompts_path to concat("/tmp/ernos_prompts_truth_" and concat(nonce and ".json"))
+    set persona_path to concat("/tmp/ernos_persona_truth_" and concat(nonce and ".txt"))
+    set prompt_raw to "{\"kernel\":\"kernel\\nline\",\"persona\":\"persona text\",\"observer\":\"observer text\"}"
+    set prompt_canonical to web_prompts_canonical(prompt_raw)
+    set ok to mutation_truth_expect(string_length(prompt_canonical) > 0 and also web_save_prompts_files(prompts_path and persona_path and prompt_raw) == 1 and also string_equals(read_file(prompts_path) and prompt_canonical) == 1 and also string_equals(read_file(persona_path) and "persona text") == 1 and "prompt and persona files save as one verified mutation")
+    set before_invalid to concat(read_file(prompts_path) and "")
+    set invalid_prompt_rc to web_save_prompts_files(prompts_path and persona_path and "{\"kernel\":1}")
+    set after_invalid_prompts to read_file(prompts_path)
+    set after_invalid_persona to read_file(persona_path)
+    set invalid_prompt_unchanged to 0
+    if invalid_prompt_rc == 0 and also string_equals(after_invalid_prompts and before_invalid) == 1 and also string_equals(after_invalid_persona and "persona text") == 1:
+        set invalid_prompt_unchanged to 1
+    set ok to mutation_truth_expect(invalid_prompt_unchanged == 1 and "invalid prompt JSON leaves both existing files unchanged")
+    set ok to web_atomic_write_text(prompts_path and "original prompts")
+    set ok to mutation_truth_expect(web_save_prompts_files(prompts_path and "/dev/null/blocked/persona.txt" and prompt_raw) == 0 and also string_equals(read_file(prompts_path) and "original prompts") == 1 and "second-file failure rolls the first prompt file back")
+    set ok to mutation_truth_expect(mutation_truth_remove(prompts_path) == 1 and also mutation_truth_remove(persona_path) == 1 and "prompt test artifacts are removed")
+
+    set cfg_defaults to config_defaults()
+    set ok to mutation_truth_expect(config_get_int(cfg_defaults and "network.enable_host_election") == 1 and also config_get_int(cfg_defaults and "network.is_static_host") == 0 and "network election booleans have explicit defaults")
+
+    set cfg_path to concat("/tmp/ernos_config_truth_" and concat(nonce and ".toml"))
+    set cfg to config_defaults()
+    set inserted to map_insert(cfg and "ai.whisper_host" and "10.20.30.40")
+    set inserted to map_insert(cfg and "ai.whisper_port" and 18090)
+    set inserted to map_insert(cfg and "network.enable_host_election" and 0)
+    set inserted to map_insert(cfg and "network.is_static_host" and 1)
+    set ok to mutation_truth_expect(config_save(cfg_path and cfg) != 0 and "base config write reports its real success")
+    set cfg_roundtrip to config_load(cfg_path)
+    set ok to mutation_truth_expect(config_get_int(cfg_roundtrip and "network.enable_host_election") == 0 and also config_get_int(cfg_roundtrip and "network.is_static_host") == 1 and "both network booleans round-trip including zero")
+    set ok to mutation_truth_expect(config_get_str(cfg_roundtrip and "ai.whisper_host") equals "10.20.30.40" and also config_get_int(cfg_roundtrip and "ai.whisper_port") == 18090 and "config_save preserves provider-owned whisper host and port")
+    set malformed_hidden_cfg to config_load(cfg_path)
+    set inserted to map_insert(malformed_hidden_cfg and "ai.whisper_host" and "bad\"host")
+    set ok to mutation_truth_expect(web_system_config_map_valid(malformed_hidden_cfg) == 0 and "malformed provider-owned settings invalidate the complete effective configuration")
+
+    set sys_raw to mutation_truth_valid_system_json()
+    set candidate_cfg to config_load(cfg_path)
+    set config_apply_rc to web_system_config_apply_json(candidate_cfg and sys_raw)
+    set config_atomic_rc to 0
+    if config_apply_rc == 1:
+        set config_atomic_rc to web_system_config_atomic_save(cfg_path and candidate_cfg)
+    set ok to mutation_truth_expect(config_apply_rc == 1 and also config_atomic_rc == 1 and "validated system configuration saves atomically")
+    set saved_cfg to config_load(cfg_path)
+    set ok to mutation_truth_expect(config_get_int(saved_cfg and "network.enable_host_election") == 0 and also config_get_int(saved_cfg and "network.is_static_host") == 1 and also config_get_str(saved_cfg and "ai.whisper_host") equals "10.20.30.40" and also config_get_int(saved_cfg and "ai.whisper_port") == 18090 and "Web save readback preserves booleans and untouched AI provider settings")
+    set before_bad_config to concat(read_file(cfg_path) and "")
+    set bad_port_raw to string_replace(sys_raw and "\"network_web_port\":18088" and "\"network_web_port\":70000")
+    set bad_port_rc to web_system_config_save_json(cfg_path and bad_port_raw)
+    set bad_port_unchanged to 0
+    if bad_port_rc == 0 and also string_equals(read_file(cfg_path) and before_bad_config) == 1:
+        set bad_port_unchanged to 1
+    set ok to mutation_truth_expect(bad_port_unchanged == 1 and "out-of-range system configuration is rejected without changing the file")
+    set bad_timeout_raw to string_replace(sys_raw and "\"consensus_heartbeat_interval_ms\":1000" and "\"consensus_heartbeat_interval_ms\":3000")
+    set bad_timeout_rc to web_system_config_save_json(cfg_path and bad_timeout_raw)
+    set bad_timeout_unchanged to 0
+    if bad_timeout_rc == 0 and also string_equals(read_file(cfg_path) and before_bad_config) == 1:
+        set bad_timeout_unchanged to 1
+    set ok to mutation_truth_expect(bad_timeout_unchanged == 1 and "heartbeat must remain below election timeout")
+    set ok to mutation_truth_expect(web_system_config_save_json("/dev/null/blocked/config.toml" and sys_raw) == 0 and "unwritable system configuration reports failure")
+    set ok to mutation_truth_expect(config_save("/dev/null/blocked/direct.toml" and cfg) == 0 and "direct config save propagates write failure")
+    set ok to mutation_truth_expect(mutation_truth_remove(cfg_path) == 1 and "configuration test artifact is removed")
+
+    display f"Web mutation truth tests: {mutation_truth_passed} passed, {mutation_truth_failed} failed"
+    if mutation_truth_failed > 0:
+        return 1
+    return 0

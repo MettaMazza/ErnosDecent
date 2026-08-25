@@ -29,6 +29,16 @@ import "scheduler_tool"
 import "../logging"
 import "../decent_net/gitdec"
 
+external define ep_run_command_bounded with cmd as Str and timeout_ms as Int and start_epoch as Int returning Str
+external define ep_cancel_epoch_get with dummy as Int returning Int
+external define ep_cancel_epoch_bump with dummy as Int returning Int
+external define ep_time_now_ms returning Int
+
+define bounded_command_cancel_worker with done_ch and start_epoch as Int:
+    set result to ep_run_command_bounded("sleep 30" and 30000 and start_epoch)
+    send result to done_ch
+    return 0
+
 define main:
     display "==================================================="
     display "  ErnOS Agent Rebuild -- Unit Test Suite"
@@ -122,6 +132,85 @@ define main:
         display "  FAIL: ReAct parser did not detect action block"
         set t2_ok to 0
 
+    # Regression: the old parser matched any `Action:` substring and scanned forward
+    # to the next `(`, turning explanatory prose into a fabricated multi-line tool name.
+    set contaminated_action to "The phrase `Action: reply_request` is only an example.\n```\nAction: fake_tool([])\n```\nAction: reply_request` call was malformed.\nAction: reply_request([\"real answer\"])"
+    set contaminated_map to react_parse_action(contaminated_action)
+    if map_get_val(contaminated_map and "found") == 1 and also map_get_val(contaminated_map and "tool_name") equals "reply_request" and also string_contains(map_get_val(contaminated_map and "args_str") and "real answer") == 1:
+        display "  Parser skipped prose/malformed markers and selected the real action"
+    else:
+        display "  FAIL: Parser accepted explanatory text or lost the later valid action"
+        set t2_ok to 0
+
+    set inline_map to react_parse_action("Commentary Action: fake_tool([]) is not protocol.")
+    if map_get_val(inline_map and "found") == 0:
+        display "  Inline Action text cannot execute a tool"
+    else:
+        display "  FAIL: Inline prose was parsed as a tool"
+        set t2_ok to 0
+
+    set reasoning_only_turn to llm_compose_turn(extract_message_from_response("{\"choices\":[{\"message\":{\"content\":\"\",\"reasoning\":\"I still need to call session_terminate after moderation.\"}}]}"))
+    set reasoning_only_split to react_extract_reasoning(reasoning_only_turn)
+    if react_is_implicit_reply("This is a complete plain-language answer.") == 1 and also react_is_implicit_reply("Thought: I still need to act") == 0 and also react_is_implicit_reply("Action: reply_request missing parentheses") == 0 and also string_length(map_get_val(reasoning_only_split and "clean")) == 0 and also string_contains(map_get_val(reasoning_only_split and "reasoning") and "session_terminate") == 1:
+        display "  Plain final prose recovers as a reply; scaffolding does not leak"
+    else:
+        display "  FAIL: Implicit-reply classification is incorrect"
+        set t2_ok to 0
+
+    set mixed_reply to "This is the complete long user-facing answer.\nAction: reply_request([\"done\"])"
+    set mixed_map to react_parse_action(mixed_reply)
+    if map_get_val(mixed_map and "found") == 1 and also react_action_prefix_is_valid(mixed_reply and map_get_val(mixed_map and "start_pos")) == 0:
+        display "  Mixed final prose plus Action is rejected before execution"
+    else:
+        display "  FAIL: Mixed final prose plus Action was accepted"
+        set t2_ok to 0
+
+    set tool_turn to "Thought: I need the current workspace.\nAction: workspace_current([])"
+    set tool_turn_map to react_parse_action(tool_turn)
+    if map_get_val(tool_turn_map and "found") == 1 and also react_action_turn_is_valid(tool_turn and map_get_val(tool_turn_map and "start_pos") and map_get_val(tool_turn_map and "end_pos")) == 1:
+        display "  One-line Thought plus tool Action remains valid"
+    else:
+        display "  FAIL: Valid tool turn prefix was rejected"
+        set t2_ok to 0
+
+    set trailing_reply to "Thought: I will create it.\nAction: generate_image([\"a luminous sprout\"])\nYour image is on its way."
+    set trailing_map to react_parse_action(trailing_reply)
+    if map_get_val(trailing_map and "found") == 1 and also react_action_turn_is_valid(trailing_reply and map_get_val(trailing_map and "start_pos") and map_get_val(trailing_map and "end_pos")) == 0:
+        display "  Tool Action plus trailing prose is rejected before dispatch"
+    else:
+        display "  FAIL: Trailing prose after an Action could trigger a real tool"
+        set t2_ok to 0
+
+    set valid_batch to "Thought: I need both facts.\nAction: workspace_current([])\nAction: list_sessions([])"
+    set valid_batch_map to react_parse_action(valid_batch)
+    if react_action_turn_is_valid(valid_batch and map_get_val(valid_batch_map and "start_pos") and map_get_val(valid_batch_map and "end_pos")) == 1:
+        display "  Whitespace-separated Action batch remains valid"
+    else:
+        display "  FAIL: Valid Action batch was rejected"
+        set t2_ok to 0
+
+    if react_tool_result_finishes_turn("generate_image" and 1 and "Your image is rendering as job 42.") == 1 and also react_tool_result_finishes_turn("generate_image" and 1 and "ERROR: model missing") == 0 and also react_tool_result_finishes_turn("session_terminate" and 1 and "Session closed by Echo. Reason: safeguarding.") == 1 and also react_tool_result_finishes_turn("session_terminate" and 1 and "Error: checkpoint failed") == 0 and also react_tool_result_finishes_turn("session_terminate" and 0 and "Session closed by Echo.") == 0 and also react_tool_result_finishes_turn("workspace_read" and 1 and "contents") == 0:
+        display "  Successful image dispatch and session closure are terminal; failures, blocked actions, and ordinary tools are not"
+    else:
+        display "  FAIL: Terminal tool policy is incorrect"
+        set t2_ok to 0
+
+    set active_kernel to prompt_get_kernel()
+    if string_contains(active_kernel and "output the complete user-facing answer as normal prose") == 1 and also string_contains(active_kernel and "MUST wrap your final response") == 0 and also string_contains(active_kernel and "MUST call the reply_request") == 0:
+        display "  Active prompt uses the native final-response contract"
+    else:
+        display "  FAIL: Active prompt still mandates terminal reply_request serialization"
+        set t2_ok to 0
+
+    set batched_text to "Action: workspace_current([])\nThe words Action: fake([]) are prose.\nAction: list_sessions([])"
+    set batched_first to react_parse_action(batched_text)
+    set batched_rest to react_slice_from_next_action(batched_text and map_get_val(batched_first and "end_pos"))
+    if string_index_of(batched_rest and "Action: list_sessions") == 0:
+        display "  Batch slicing ignores inline Action prose"
+    else:
+        display f"  FAIL: Batch slicer selected the wrong marker: {batched_rest}"
+        set t2_ok to 0
+
     if t2_ok == 1:
         display "  PASS"
         set tests_passed to tests_passed + 1
@@ -176,10 +265,11 @@ define main:
     # Standard clean response — should be ALLOWED under test mode
     set clean_audit to observer_audit(test_ctx and "Test prompt context" and "Clean reply text")
     set v1 to map_get_val(clean_audit and "verdict")
-    if v1 equals "ALLOWED":
+    set p1 to map_get_val(clean_audit and "parsed")
+    if v1 equals "ALLOWED" and also p1 == 1:
         display "  Observer correctly returned ALLOWED in test mode (inference bypassed)"
     else:
-        display f"  FAIL: Expected ALLOWED in test mode, got {v1}"
+        display f"  FAIL: Expected parsed ALLOWED in test mode, got verdict={v1}, parsed={p1}"
         set t4_ok to 0
         
     # Even a response with leaked grammar should return ALLOWED under test mode
@@ -432,14 +522,9 @@ define main:
     # TestTask will have ID job_<timestamp>
     set id_pos to string_index_of(list_res and "[job_")
     if id_pos > 0:
-        set job_id to substring(list_res and id_pos + 1 and 14)
-        display f"DEBUG TEST_AGENT: job_id='{job_id}', length={int_to_string(string_length(job_id))}"
-        set id_len to string_length(job_id)
-        set id_idx to 0
-        repeat while id_idx < id_len:
-            set c_code to get_character(job_id and id_idx)
-            display f"  char {int_to_string(id_idx)}: code={int_to_string(c_code)} ({char_from_code(c_code)})"
-            set id_idx to id_idx + 1
+        set id_tail to substring(list_res and id_pos + 1 and string_length(list_res) - id_pos - 1)
+        set id_end to string_index_of(id_tail and "]")
+        set job_id to substring(id_tail and 0 and id_end)
         set args_toggle to create_list()
         set ok to append_list(args_toggle and job_id)
         set toggle_res to operate_scheduler("toggle" and args_toggle)
@@ -672,6 +757,291 @@ define main:
         set t13_ok to 0
 
     if t13_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 14: Bounded, cancellation-aware run_command execution
+    # ===========================================================
+    display "TEST 14: Bounded run_command failure, timeout and cancellation feedback"
+    set t14_ok to 1
+
+    set tools_mgr_t14 to tools_create("admin")
+    set ctx_t14 to create_map()
+    set ok to map_insert(ctx_t14 and "sender_role" and "admin")
+
+    set success_args to create_list()
+    set ok to append_list(success_args and "printf bounded-ok")
+    set success_result to tools_execute(tools_mgr_t14 and ctx_t14 and "run_command" and success_args)
+    if string_contains(success_result and "bounded-ok") == 1 and also string_contains(success_result and "failed:") == 0:
+        display "  Successful command returns captured output"
+    else:
+        display f"  FAIL: successful bounded command result: {success_result}"
+        set t14_ok to 0
+
+    set failure_args to create_list()
+    set ok to append_list(failure_args and "ls /definitely-missing-ernos-run-command-path")
+    set failure_result to tools_execute(tools_mgr_t14 and ctx_t14 and "run_command" and failure_args)
+    if string_contains(failure_result and "exit status") == 1 and also string_contains(failure_result and "No such file") == 1 and also string_contains(failure_result and "AGENT RECOVERY REQUIRED") == 1 and also string_contains(failure_result and "do not repeat it unchanged") == 1:
+        display "  Non-zero exit captures stderr and prompts corrective reasoning"
+    else:
+        display f"  FAIL: failed command did not carry diagnostic guidance: {failure_result}"
+        set t14_ok to 0
+
+    set timeout_args to create_list()
+    set ok to append_list(timeout_args and "sleep 3")
+    set ok to append_list(timeout_args and ".")
+    set ok to append_list(timeout_args and "1")
+    set timeout_started to ep_time_now_ms()
+    set timeout_result to tools_execute(tools_mgr_t14 and ctx_t14 and "run_command" and timeout_args)
+    set timeout_elapsed to ep_time_now_ms() - timeout_started
+    if string_contains(timeout_result and "timed out after 1000 ms") == 1 and also string_contains(timeout_result and "AGENT RECOVERY REQUIRED") == 1 and also timeout_elapsed < 2500:
+        display "  Timeout terminates promptly and prompts a narrower solution"
+    else:
+        display f"  FAIL: timeout contract/result elapsed={timeout_elapsed}: {timeout_result}"
+        set t14_ok to 0
+
+    # The full process group must die, not only its parent shell. If the descendant
+    # survives the timeout it writes this marker two seconds later.
+    set marker_path to "/tmp/ernos_bounded_command_descendant_marker"
+    set cleanup_before to run_command("rm -f /tmp/ernos_bounded_command_descendant_marker")
+    set descendant_epoch to ep_cancel_epoch_get(0)
+    set descendant_result to ep_run_command_bounded("sleep 2; printf late > /tmp/ernos_bounded_command_descendant_marker" and 200 and descendant_epoch)
+    sleep_ms(2300)
+    if string_contains(descendant_result and "timed out") == 1 and also file_exists(marker_path) == 0:
+        display "  Timeout kills the complete descendant process group"
+    else:
+        display f"  FAIL: timed-out descendant survived: {descendant_result}"
+        set t14_ok to 0
+    set cleanup_after to run_command("rm -f /tmp/ernos_bounded_command_descendant_marker")
+
+    # Cancellation is a separate contract from timeout: an epoch bump must interrupt
+    # the blocking tool while it is running, well before its wall-clock deadline.
+    set cancel_channel to channel
+    set cancel_epoch to ep_cancel_epoch_get(0)
+    set cancel_started to ep_time_now_ms()
+    spawn bounded_command_cancel_worker(cancel_channel and cancel_epoch)
+    sleep_ms(150)
+    set ok to ep_cancel_epoch_bump(0)
+    set cancel_result to receive from cancel_channel
+    set cancel_result_text to ptr_to_str(cancel_result)
+    set cancel_elapsed to ep_time_now_ms() - cancel_started
+    if string_contains(cancel_result_text and "run_command cancelled") == 1 and also cancel_elapsed < 2000:
+        display "  Cancel epoch interrupts the active subprocess group"
+    else:
+        display f"  FAIL: cancellation contract/result elapsed={cancel_elapsed}: {cancel_result_text}"
+        set t14_ok to 0
+
+    if t14_ok == 1:
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 15: Provider-token compaction policy
+    # ===========================================================
+    display "TEST 15: Provider-token compaction policy"
+    set t15_ok to 1
+    if session_compaction_threshold(8192) != 6963 or else session_compaction_threshold(262144) != 222822:
+        display "  FAIL: compaction point is not exactly 85% of provider context"
+        set t15_ok to 0
+    if session_should_compress(6962 and 8192) != 0 or else session_should_compress(6963 and 8192) != 1:
+        display "  FAIL: exact threshold boundary is incorrect"
+        set t15_ok to 0
+    if session_context_approaching_compaction(6266 and 8192) != 1 or else session_context_approaching_compaction(6963 and 8192) != 0:
+        display "  FAIL: one-shot approach-warning boundary is incorrect"
+        set t15_ok to 0
+    if session_should_compress(999999 and 0) != 0:
+        display "  FAIL: missing provider metadata caused guessed compaction"
+        set t15_ok to 0
+    if t15_ok == 1:
+        display "  8192 -> 6963 and 262144 -> 222822; boundary and warning checks passed"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 16: Canonical chronological recall across compaction
+    # ===========================================================
+    display "TEST 16: Canonical chronological recall across compaction"
+    set t16_ok to 1
+    set t16_sid to concat("rights_recall_" and int_to_string(ep_time_now_ms()))
+    set t16_main to concat("config/sessions/" and concat(t16_sid and ".json"))
+    set t16_shard to concat("config/sessions/" and concat(t16_sid and "_transcript_0.json"))
+    set t16_h1 to ep_sha256("first exact message")
+    set t16_h2 to ep_sha256("second exact message")
+    set t16_h3 to ep_sha256("third exact message")
+    set t16_shard_body to concat("[{\"role\":\"user\",\"content\":\"first exact message\",\"turn_id\":\"1\",\"created_at\":\"101\",\"source_type\":\"direct\",\"source_id\":\"" and t16_sid)
+    set t16_shard_body to concat(t16_shard_body and concat("\",\"content_hash\":\"" and concat(t16_h1 and "\"},")))
+    set t16_shard_body to concat(t16_shard_body and concat("{\"role\":\"assistant\",\"content\":\"second exact message\",\"turn_id\":\"2\",\"created_at\":\"102\",\"source_type\":\"direct\",\"source_id\":\"" and t16_sid))
+    set t16_shard_body to concat(t16_shard_body and concat("\",\"content_hash\":\"" and concat(t16_h2 and "\"}]")))
+    set t16_main_body to concat("{\"id\":\"" and t16_sid)
+    set t16_main_body to concat(t16_main_body and "\",\"title\":\"Recall Test\",\"model\":\"\",\"system_prompt\":\"\",\"compression_summary\":\"\",\"session_guidance\":\"\",\"next_turn_id\":\"4\",\"messages\":[{\"role\":\"user\",\"content\":\"third exact message\",\"turn_id\":\"3\",\"created_at\":\"103\",\"source_type\":\"direct\",\"source_id\":\"")
+    set t16_main_body to concat(t16_main_body and t16_sid)
+    set t16_main_body to concat(t16_main_body and "\",\"content_hash\":\"")
+    set t16_main_body to concat(t16_main_body and t16_h3)
+    set t16_main_body to concat(t16_main_body and "\"}],\"compressed_sessions\":[\"")
+    set t16_main_body to concat(t16_main_body and concat(session_json_escape(t16_shard) and "\"]}"))
+    if write_file(t16_shard and t16_shard_body) == 0 or else write_file(t16_main and t16_main_body) == 0:
+        set t16_ok to 0
+        display "  FAIL: recall fixture could not be written"
+    else:
+        set t16_ctx to create_map()
+        set t16_page1 to tools_recall_session_turns(t16_ctx and t16_sid and 1 and 2)
+        set t16_page2 to tools_recall_session_turns(t16_ctx and t16_sid and 3 and 2)
+        if string_contains(t16_page1 and "start=1; end=2; total=3; has_more=true; next_start=3") == 0 or else string_contains(t16_page1 and "first exact message") == 0 or else string_contains(t16_page1 and t16_h1) == 0:
+            set t16_ok to 0
+            display concat("  FAIL: first canonical page malformed: " and t16_page1)
+        if string_contains(t16_page2 and "start=3; end=3; total=3; has_more=false") == 0 or else string_contains(t16_page2 and "third exact message") == 0 or else string_contains(t16_page2 and t16_h3) == 0:
+            set t16_ok to 0
+            display concat("  FAIL: second canonical page malformed: " and t16_page2)
+    if file_exists(t16_main) == 1:
+        set ok to remove_file(t16_main)
+    if file_exists(t16_shard) == 1:
+        set ok to remove_file(t16_shard)
+    if t16_ok == 1:
+        display "  Turn 1 through current state recalled in order with paging and provenance"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 17: Factory reset recreates deleted session storage
+    # ===========================================================
+    display "TEST 17: Factory live-session reconstruction"
+    set t17_ok to 1
+    set t17_dir to concat("/tmp/ernos_factory_sessions_" and int_to_string(ep_time_now_ms()))
+    set t17_mgr to session_manager_create(t17_dir)
+    set t17_old_map to map_get_val(t17_mgr and "sessions")
+    set t17_legacy to session_create_new("legacy" and "Legacy" and "" and "")
+    set ok to map_insert(t17_old_map and "legacy" and t17_legacy)
+    set t17_rc to session_manager_factory_reset(t17_mgr)
+    set t17_new_map to map_get_val(t17_mgr and "sessions")
+    if t17_rc != 0 or else file_exists(t17_dir) == 0 or else file_exists(path_join(t17_dir and "default.json")) == 0 or else string_equals(read_file(path_join(t17_dir and "active_session.txt")) and "default") == 0:
+        display "  FAIL: deleted sessions directory was not durably reconstructed"
+        set t17_ok to 0
+    if t17_new_map == t17_old_map or else map_contains(t17_new_map and "default") == 0 or else map_contains(t17_new_map and "legacy") == 1 or else string_equals(map_get_val(t17_mgr and "active_session_id") and "default") == 0:
+        display "  FAIL: fresh registry was not committed after durable verification"
+        set t17_ok to 0
+    if file_exists(path_join(t17_dir and "default.json")) == 1:
+        set ok to remove_file(path_join(t17_dir and "default.json"))
+    if file_exists(path_join(t17_dir and "active_session.txt")) == 1:
+        set ok to remove_file(path_join(t17_dir and "active_session.txt"))
+    if file_exists(t17_dir) == 1:
+        set ok to remove_directory(t17_dir)
+    if t17_ok == 1:
+        display "  Missing directory recreated; durable files verified before registry swap"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 18: Public vision boundary and stream-loop evidence gate
+    # ===========================================================
+    display "TEST 18: Vision privacy boundary and repetition evidence gate"
+    set t18_ok to 1
+    if (llm_public_content("<think>private analysis</think>Visible description") equals "Visible description") == 0:
+        display "  FAIL: completed private reasoning was not removed from public vision text"
+        set t18_ok to 0
+    if string_length(llm_public_content("<think>unfinished private analysis</think>")) != 0:
+        display "  FAIL: reasoning-only vision output became public text"
+        set t18_ok to 0
+    if (llm_public_content("Visible description") equals "Visible description") == 0:
+        display "  FAIL: ordinary final content was changed"
+        set t18_ok to 0
+    set t18_short_loop to "abcdefghabcdefghabcdefghabcdefghabcdefghabcdefgh"
+    if llm_stream_has_repetition(t18_short_loop and "") != 0:
+        display "  FAIL: short normal output can still trigger stream cancellation"
+        set t18_ok to 0
+    set t18_long_loop to ""
+    set t18_i to 0
+    repeat while t18_i < 33:
+        set t18_long_loop to concat(t18_long_loop and "abcdefgh")
+        set t18_i to t18_i + 1
+    if llm_stream_has_repetition(t18_long_loop and "") != 1:
+        display "  FAIL: a sustained 264-character repetition was not detected"
+        set t18_ok to 0
+    if t18_ok == 1:
+        display "  Private reasoning stripped; short false positive rejected; sustained loop detected"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 19: Incremental one-pass HTTP/SSE framing
+    # ===========================================================
+    display "TEST 19: Incremental one-pass HTTP/SSE framing"
+    set t19_ok to 1
+    set t19_line1 to "data: {\"choices\":[{\"delta\":{\"reasoning\":\"why \"}}]}\n\n"
+    set t19_line2 to "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n"
+    set t19_line3 to "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n"
+    set t19_done to "data: [DONE]\n\n"
+    set t19_wire to "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+    set t19_wire to concat(t19_wire and concat("34\r\n" and concat(t19_line1 and "\r\n")))
+    set t19_wire to concat(t19_wire and concat("32\r\n" and concat(t19_line2 and "\r\n")))
+    set t19_wire to concat(t19_wire and concat("48\r\n" and concat(t19_line3 and "\r\n")))
+    set t19_wire to concat(t19_wire and concat("e\r\n" and concat(t19_done and "\r\n0\r\n\r\n")))
+    set t19_decoder to ep_sse_decoder_create()
+    set t19_state to create_map()
+    set ok to map_insert(t19_state and "content" and "")
+    set ok to map_insert(t19_state and "reasoning" and "")
+    set ok to map_insert(t19_state and "prompt_tokens" and 0)
+    set ok to map_insert(t19_state and "completion_tokens" and 0)
+    set t19_a to ep_sse_decoder_feed(t19_decoder and substring(t19_wire and 0 and 19))
+    set ok to stream_apply_sse_lines(t19_a and t19_state)
+    set t19_b to ep_sse_decoder_feed(t19_decoder and substring(t19_wire and 19 and 73))
+    set ok to stream_apply_sse_lines(t19_b and t19_state)
+    set t19_c to ep_sse_decoder_feed(t19_decoder and substring(t19_wire and 92 and string_length(t19_wire) - 92))
+    set ok to stream_apply_sse_lines(t19_c and t19_state)
+    set t19_tail to ep_sse_decoder_finish(t19_decoder)
+    set ok to stream_apply_sse_lines(t19_tail and t19_state)
+    if ep_sse_decoder_error(t19_decoder) != 0 or else ep_sse_decoder_is_sse(t19_decoder) != 1:
+        display "  FAIL: fragmented chunked SSE was not framed"
+        set t19_ok to 0
+    if (map_get_val(t19_state and "content") equals "done") == 0 or else (map_get_val(t19_state and "reasoning") equals "why ") == 0:
+        display "  FAIL: deltas were lost or duplicated across socket fragments"
+        set t19_ok to 0
+    if map_get_val(t19_state and "prompt_tokens") != 7 or else map_get_val(t19_state and "completion_tokens") != 2:
+        display "  FAIL: terminal usage metadata was not preserved"
+        set t19_ok to 0
+    set ok to ep_sse_decoder_destroy(t19_decoder)
+    if t19_ok == 1:
+        display "  Fragmented headers, HTTP chunks, SSE lines and usage parsed exactly once"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 20: Exact discovered filesystem path provenance
+    # ===========================================================
+    display "TEST 20: Exact discovered filesystem path provenance"
+    set t20_ok to 1
+    set t20_root to concat("/tmp/ernos_discovered_paths_" and int_to_string(ep_time_now_ms()))
+    set t20_dir to path_join(t20_root and "Smithian-Fold-Theory-Of-Everything papers")
+    set t20_file to path_join(t20_dir and "UnisonAI_Architecture.md")
+    set ok to create_directory(t20_root)
+    set ok to create_directory(t20_dir)
+    set ok to write_file(t20_file and "exact")
+    set t20_ctx to create_map()
+    set captured to tools_capture_discovered_paths(t20_ctx and concat(t20_file and "\n"))
+    set t20_wrong to path_join(path_join(t20_root and "Smithian_Fold_Theory_Of_Everything_papers") and "UnisonAI_Architecture.md")
+    set t20_resolved to tools_resolve_read_path_for_ctx(t20_ctx and t20_wrong)
+    if captured != 1 or else (t20_resolved equals t20_file) == 0:
+        display f"  FAIL: discovery path was reconstructed instead of preserved: {t20_resolved}"
+        set t20_ok to 0
+    set ok to remove_file(t20_file)
+    set ok to remove_directory(t20_dir)
+    set ok to remove_directory(t20_root)
+    if t20_ok == 1:
+        display "  Hyphens, underscores and spaces remain byte-exact after discovery"
         display "  PASS"
         set tests_passed to tests_passed + 1
     else:

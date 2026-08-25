@@ -1,6 +1,6 @@
 # ErnosDecent — Kokoro TTS (EP-native).
 # Drives the raw kokoro-v1.0.onnx model via FFI: text -> (libespeak-ng) IPA phonemes
-# -> kokoro vocab tokens -> (libonnxruntime) Run(tokens, bm_fable style, speed) ->
+# -> kokoro vocab tokens -> (libonnxruntime) Run(tokens, VOICE style [tts_load_style], speed) ->
 # 24kHz float audio -> PCM16 WAV. This file implements the full pipeline: chunker +
 # vocab + tokenizer, libespeak-ng phonemize FFI, onnxruntime synthesis FFI, and WAV
 # output. Delivery is wired to the Web UI (tts_request) and Discord (🔊 button). Audio
@@ -108,9 +108,15 @@ define tts_ort_release_value with api as Int and val as Int returning Int:
     set ok to ep_dlcall1(tts_ort_fn(api and 96) and val)
     return 0
 
-# Load bm_fable's style vector for a token sequence of length `token_count`:
-# 256 float32 (1024 bytes) at absolute offset 13060938 + idx*1024 in voices-v1.0.bin
-# (verified: matches numpy bm_fable[idx]). Uses libc fopen/fseek/fread.
+# Load the VOICE's style vector for a token sequence of length `token_count`:
+# 256 float32 (1024 bytes) at absolute offset VOICE_BASE + idx*1024 in voices-v1.0.bin.
+# voices-v1.0.bin is a zip (npz): a voice's float data starts at its zip member's data
+# offset + 128 (the .npy header). Known bases in Maria's file (member offset + 128):
+#   am_michael = 8358940  + 128 = 8359068   (previous voice; American male)
+#   bm_fable   = 13060810 + 128 = 13060938  (CURRENT — Echo's canonical voice)
+#   bm_lewis   = 14105671 + 128 = 14105799  (British male alternative)
+# To swap voices: recompute the member's data offset (python zipfile: header_offset +
+# 30 + name_len + extra_len + 128) and change the constant below.
 define tts_load_style with token_count as Int returning Int:
     set idx to token_count
     if idx > 509:
@@ -444,10 +450,16 @@ define tts_http_send_binary with client_fd as Int and header_str as Str and body
     set ok to free_bytes(buf)
     return 1
 
-# Deterministic filename for a TTS request: djb2 hash of the text.
-# Identical message text reuses the same cached WAV; distinct text gets a
-# distinct file. Shared by the Web UI server and the node's TTS SPEAK verb so
-# both resolve the same path (under decent_web/tts/, inside the web root).
+# The active voice's tag — keep in sync with the offset constant in tts_load_style
+# (both must change together on a voice swap). Baked into cached filenames so a voice
+# change never replays stale WAVs synthesized with the previous voice.
+define tts_voice_tag returning Str:
+    return "bm_fable"
+
+# Deterministic filename for a TTS request: djb2 hash of the text + the voice tag.
+# Identical message text reuses the same cached WAV; distinct text (or a different
+# voice) gets a distinct file. Shared by the Web UI server and the node's TTS SPEAK
+# verb so both resolve the same path (under decent_web/tts/, inside the web root).
 define tts_filename_for with text as Str returning Str:
     set h to 5381
     set i to 0
@@ -455,7 +467,7 @@ define tts_filename_for with text as Str returning Str:
     repeat while i < n:
         set h to ((h * 33) + get_character(text and i)) modulo 1000000007
         set i to i + 1
-    return concat("tts_" and concat(int_to_string(h) and ".wav"))
+    return concat("tts_" and concat(tts_voice_tag() and concat("_" and concat(int_to_string(h) and ".wav"))))
 
 # Binary-safe read of a whole file into a fresh byte buffer.
 # Returns Map{ptr, len}; ptr==0 on failure. EP's read_file is C-string based
@@ -540,18 +552,20 @@ define tts_espeak_ensure returning Int:
     # output=2 (SYNCHRONOUS — no audio device opened), buflength=0, path, options=0
     set sr to ep_dlcall4(f_init and 2 and 0 and path_buf and 0)
     free_bytes(path_buf)
-    # British English voice (for Fable). The language code "en-gb" is NOT accepted by
-    # SetVoiceByName (returns NOT_FOUND) — the VoiceName form is required, else no voice
-    # loads and TextToPhonemes segfaults.
+    # Explicit Received Pronunciation. Pairing generic British phonemes with the American
+    # am_michael style caused accent drift between American regional and British prosody.
+    # The VoiceName form is required by SetVoiceByName.
     set f_voice to ep_dlsym(lib and "espeak_SetVoiceByName")
-    set voice_buf to tts_str_to_buf("English (Great Britain)")
+    set voice_buf to tts_str_to_buf("English (Received Pronunciation)")
     set vr to ep_dlcall1(f_voice and voice_buf)
     free_bytes(voice_buf)
+    if vr != 0:
+        return 0
     set ESPEAK_LIB to lib
     set ESPEAK_READY to 1
     return lib
 
-# ── Phonemize via libespeak-ng: text -> IPA phonemes (British voice for Fable) ──
+# ── Phonemize via libespeak-ng: text -> IPA phonemes (British RP for Fable) ──
 # espeak is initialized once (tts_espeak_ensure); this only runs TextToPhonemes.
 define tts_phonemize with text as Str returning Str:
     set lib to tts_espeak_ensure()

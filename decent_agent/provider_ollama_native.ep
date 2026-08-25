@@ -1,0 +1,146 @@
+# Ollama native /api/chat adapter.
+#
+# Thinking-capable Ollama models use the documented native `think: false`
+# control. This avoids assuming that the OpenAI-compatible adapter implements a
+# model-specific reasoning switch. Message objects share the same pure prefix
+# builder as the OpenAI adapter, preserving byte-identical main/Observer input.
+
+import "string"
+import "collections"
+import "json"
+import "./provider_openai_compat"
+
+define provider_ollama_control_fragment with no_thinking_style as Str returning Str:
+    if no_thinking_style equals "ollama_think_false":
+        return ",\"think\":false"
+    if no_thinking_style equals "not_applicable":
+        return ""
+    return ""
+
+define provider_ollama_build_main_body with model as Str and system_content as Str and user_content as Str and no_thinking_style as Str returning Str:
+    if string_length(model) == 0:
+        return ""
+    if (no_thinking_style equals "ollama_think_false") == 0 and also (no_thinking_style equals "not_applicable") == 0:
+        return ""
+    set body to "{\"model\":\""
+    set body to concat(body and provider_json_escape(model))
+    set body to concat(body and "\",\"messages\":")
+    set body to concat(body and provider_openai_build_messages_prefix(system_content and user_content))
+    set body to concat(body and "]")
+    set body to concat(body and provider_ollama_control_fragment(no_thinking_style))
+    set body to concat(body and ",\"stream\":false,\"options\":{\"stop\":[\"\\nObservation:\",\"\\nUser:\"]}}")
+    return body
+
+define provider_ollama_build_observer_body with model as Str and system_content as Str and query_prompt as Str and assistant_candidate as Str and audit_instruction as Str and no_thinking_style as Str returning Str:
+    if string_length(model) == 0 or else string_length(audit_instruction) == 0:
+        return ""
+    if (no_thinking_style equals "ollama_think_false") == 0 and also (no_thinking_style equals "not_applicable") == 0:
+        return ""
+    set body to "{\"model\":\""
+    set body to concat(body and provider_json_escape(model))
+    set body to concat(body and "\",\"messages\":")
+    set body to concat(body and provider_openai_build_messages_prefix(system_content and query_prompt))
+    if string_length(assistant_candidate) > 0:
+        set body to concat(body and ",{\"role\":\"assistant\",\"content\":\"")
+        set body to concat(body and provider_json_escape(assistant_candidate))
+        set body to concat(body and "\"}")
+    set body to concat(body and ",{\"role\":\"user\",\"content\":\"")
+    set body to concat(body and provider_json_escape(audit_instruction))
+    set body to concat(body and "\"}]")
+    set body to concat(body and provider_ollama_control_fragment(no_thinking_style))
+    set body to concat(body and ",\"stream\":false,\"format\":\"json\"}")
+    return body
+
+define provider_ollama_parse_chat_response with response as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "ok" and 0)
+    set ok to map_insert(result and "error" and "")
+    set ok to map_insert(result and "content" and "")
+    set ok to map_insert(result and "reasoning" and "")
+    if string_length(response) == 0:
+        set ok to map_insert(result and "error" and "Ollama returned an empty response body")
+        return result
+    set root to json_parse(response)
+    if root == 0:
+        set ok to map_insert(result and "error" and "Ollama returned malformed JSON")
+        return result
+    set error_node to get_json_object_value(root and "error")
+    if error_node != 0:
+        set error_text to "Ollama returned an error"
+        if get_json_type(error_node) == 2:
+            set error_text to get_json_value(error_node)
+        set ok to map_insert(result and "error" and error_text)
+        return result
+    set message to get_json_object_value(root and "message")
+    if message == 0 or else get_json_type(message) != 4:
+        set ok to map_insert(result and "error" and "Ollama response has no message object")
+        return result
+    set content_node to get_json_object_value(message and "content")
+    if content_node != 0:
+        if get_json_type(content_node) != 2:
+            set ok to map_insert(result and "error" and "Ollama message content is not a string")
+            return result
+        set ok to map_insert(result and "content" and get_json_value(content_node))
+    set thinking_node to get_json_object_value(message and "thinking")
+    if thinking_node != 0:
+        if get_json_type(thinking_node) != 2:
+            set ok to map_insert(result and "error" and "Ollama message thinking is not a string")
+            return result
+        set ok to map_insert(result and "reasoning" and get_json_value(thinking_node))
+    set ok to map_insert(result and "ok" and 1)
+    return result
+
+define provider_ollama_build_embedding_body with model as Str and input as Str returning Str:
+    if string_length(model) == 0 or else string_length(input) == 0:
+        return ""
+    set body to "{\"model\":\""
+    set body to concat(body and provider_json_escape(model))
+    set body to concat(body and "\",\"input\":\"")
+    set body to concat(body and provider_json_escape(input))
+    return concat(body and "\"}")
+
+# Ollama /api/embed returns `embeddings` as an array of vectors. Preserve the
+# first vector's decimal text because ErnosPlain's generic JSON number node is
+# integer-oriented and would destroy embedding precision.
+define provider_ollama_parse_embedding_response with response as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "ok" and 0)
+    set ok to map_insert(result and "error" and "")
+    set ok to map_insert(result and "embedding" and "")
+    if string_length(response) == 0:
+        set ok to map_insert(result and "error" and "Ollama returned an empty embedding response")
+        return result
+    set root to json_parse(response)
+    if root == 0:
+        set ok to map_insert(result and "error" and "Ollama returned malformed embedding JSON")
+        return result
+    set error_node to get_json_object_value(root and "error")
+    if error_node != 0:
+        set error_text to "Ollama returned an embedding error"
+        if get_json_type(error_node) == 2:
+            set error_text to get_json_value(error_node)
+        set ok to map_insert(result and "error" and error_text)
+        return result
+    set key_pos to string_index_of(response and "\"embeddings\"")
+    if key_pos < 0:
+        set ok to map_insert(result and "error" and "Ollama embedding response has no embeddings field")
+        return result
+    set after_key to substring(response and key_pos and string_length(response) - key_pos)
+    set outer_open to string_index_of(after_key and "[")
+    if outer_open < 0:
+        set ok to map_insert(result and "error" and "Ollama embeddings field is not an array")
+        return result
+    set after_outer to substring(after_key and outer_open + 1 and string_length(after_key) - outer_open - 1)
+    set vector_open to string_index_of(after_outer and "[")
+    if vector_open < 0:
+        set ok to map_insert(result and "error" and "Ollama embeddings array has no vector")
+        return result
+    set vector_tail to substring(after_outer and vector_open and string_length(after_outer) - vector_open)
+    set vector_close to string_index_of(vector_tail and "]")
+    if vector_close <= 1:
+        set ok to map_insert(result and "error" and "Ollama returned an empty or unterminated embedding vector")
+        return result
+    set vector to substring(vector_tail and 0 and vector_close + 1)
+    set ok to map_insert(result and "embedding" and vector)
+    set ok to map_insert(result and "ok" and 1)
+    return result

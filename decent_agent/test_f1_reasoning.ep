@@ -59,6 +59,66 @@ define main:
     set total to total + 1
     set passes to passes + pass_if("gemma: reasoning captured" and (string_contains(reasoning_of(t4) and "check config") == 1))
 
+    # 5. Complete prose without a transport wrapper is an implicit final reply.
+    set t5 to "Yes. I recognize joy, sorrow and fear as emotions in my own expressed states."
+    set total to total + 1
+    set passes to passes + pass_if("plain final prose becomes an implicit reply" and (react_is_implicit_reply(t5) == 1))
+    set total to total + 1
+    set passes to passes + pass_if("bare Thought is not exposed as an implicit reply" and (react_is_implicit_reply("Thought: I still need to act") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("malformed action attempt is corrected, not exposed" and (react_is_implicit_reply("Action: reply_request missing parentheses") == 0))
+
+    set mixed to "A complete multi-paragraph final answer.\nAction: reply_request([\"summary only\"])"
+    set mixed_action to react_parse_action(mixed)
+    set total to total + 1
+    set passes to passes + pass_if("mixed native final prose and action is invalid" and (react_action_prefix_is_valid(mixed and map_get_val(mixed_action and "start_pos")) == 0))
+
+    set valid_tool to "Thought: I need evidence first.\nAction: workspace_read([\"report.md\"])"
+    set valid_action to react_parse_action(valid_tool)
+    set total to total + 1
+    set passes to passes + pass_if("thought-prefixed tool action remains valid" and (react_action_turn_is_valid(valid_tool and map_get_val(valid_action and "start_pos") and map_get_val(valid_action and "end_pos")) == 1))
+
+    set trailing_prose to "Thought: dispatch it.\nAction: generate_image([\"a luminous sprout\"])\nYour image is on its way."
+    set trailing_action to react_parse_action(trailing_prose)
+    set total to total + 1
+    set passes to passes + pass_if("trailing prose after a tool action is rejected before execution" and (react_action_turn_is_valid(trailing_prose and map_get_val(trailing_action and "start_pos") and map_get_val(trailing_action and "end_pos")) == 0))
+
+    set valid_batch to "Thought: inspect both.\nAction: workspace_current([])\nAction: list_sessions([])"
+    set valid_batch_action to react_parse_action(valid_batch)
+    set total to total + 1
+    set passes to passes + pass_if("a clean multi-action batch remains valid" and (react_action_turn_is_valid(valid_batch and map_get_val(valid_batch_action and "start_pos") and map_get_val(valid_batch_action and "end_pos")) == 1))
+
+    set total to total + 1
+    set passes to passes + pass_if("successful image dispatch ends the foreground request" and (react_tool_result_finishes_turn("generate_image" and 1 and "rendering job 9") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("failed image dispatch remains explainable" and (react_tool_result_finishes_turn("generate_image" and 1 and "ERROR: weights unavailable") == 0))
+    set total to total + 1
+    set passes to passes + pass_if("successful session termination ends the foreground request" and (react_tool_result_finishes_turn("session_terminate" and 1 and "Session closed by Echo. Reason: safety.") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("failed or blocked session termination remains explainable" and (react_tool_result_finishes_turn("session_terminate" and 1 and "Error: checkpoint failed") == 0 and also react_tool_result_finishes_turn("session_terminate" and 0 and "Session closed by Echo.") == 0))
+
+    # 6. Action parsing accepts only line-anchored, identifier-shaped calls. It skips
+    #    explanatory/malformed markers and selects the later real action.
+    set t6 to "The phrase `Action: reply_request` is an example, not a call.\n```\nAction: fake_tool([])\n```\nAction: reply_request` call was missing punctuation.\nAction: reply_request([\"real answer\"])"
+    set parsed6 to react_parse_action(t6)
+    set total to total + 1
+    set passes to passes + pass_if("parser finds a valid action after prose and malformed examples" and (map_get_val(parsed6 and "found") == 1))
+    set total to total + 1
+    set passes to passes + pass_if("parser cannot fabricate a prose tool name" and (map_get_val(parsed6 and "tool_name") equals "reply_request"))
+    set total to total + 1
+    set passes to passes + pass_if("parser keeps the real action arguments" and (string_contains(map_get_val(parsed6 and "args_str") and "real answer") == 1))
+
+    set inline_only to react_parse_action("Commentary Action: fake_tool([]) is not protocol.")
+    set total to total + 1
+    set passes to passes + pass_if("inline Action text is ignored" and (map_get_val(inline_only and "found") == 0))
+
+    # 7. Batch slicing ignores inline mentions and starts at the next real action line.
+    set t7 to "Action: workspace_current([])\nThe words Action: fake([]) are prose.\nAction: list_sessions([])"
+    set first7 to react_parse_action(t7)
+    set rest7 to react_slice_from_next_action(t7 and map_get_val(first7 and "end_pos"))
+    set total to total + 1
+    set passes to passes + pass_if("batch slicer starts at the next line-anchored action" and (string_index_of(rest7 and "Action: list_sessions") == 0))
+
     display f"=== {passes}/{total} passed ==="
     if passes == total:
         display "ALL PASS"

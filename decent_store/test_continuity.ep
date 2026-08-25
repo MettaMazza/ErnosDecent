@@ -1,0 +1,105 @@
+# Automatic continuity-memory gate.  Uses fixed test embeddings, so it exercises
+# provenance, supersession, semantic ranking and the prompt envelope without HTTP.
+
+import "string"
+import "collections"
+import "sql"
+import "fs"
+import "continuity"
+
+define continuity_pass with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main:
+    set path to "/tmp/ernos_test_continuity.db"
+    set db to sql_open(path)
+    set ok to sql_execute(db and "DROP TABLE IF EXISTS continuity_memories;")
+    set ok to sql_execute(db and "DROP TABLE IF EXISTS continuity_session_state;")
+    set ok to sql_execute(db and "DROP TABLE IF EXISTS procedures;")
+    set ok to continuity_ensure_schema(db)
+    set ok to sql_execute(db and "CREATE TABLE procedures (name TEXT PRIMARY KEY, steps TEXT NOT NULL DEFAULT '', pinned INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0);")
+    set now to ep_time_now_sec()
+    set passes to 0
+    set total to 0
+
+    set ok to continuity_store_memory(db and "echo" and "relationship" and "voice accent" and "Echo should use a Bostonian accent." and "discord" and "session_old" and now - 200 and 90 and "stated" and 90 and "[1.0,0.0]" and 0 and "active")
+    set ok to continuity_store_memory(db and "echo" and "relationship" and "voice accent" and "Echo should sound British, not Bostonian or New York." and "discord" and "session_new" and now - 100 and 100 and "stated" and 100 and "[1.0,0.0]" and 1 and "active")
+    set active_rows to sql_query(db and "SELECT COUNT(*) FROM continuity_memories WHERE kind='relationship' AND status='active';")
+    set old_rows to sql_query(db and "SELECT COUNT(*) FROM continuity_memories WHERE kind='relationship' AND status='superseded';")
+    set chain_rows to sql_query(db and "SELECT supersedes_id FROM continuity_memories WHERE kind='relationship' AND status='active' LIMIT 1;")
+    set total to total + 1
+    set passes to passes + continuity_pass("correction leaves one active relationship fact" and (ptr_to_str(get_list(get_list(active_rows and 0) and 0)) equals "1"))
+    set total to total + 1
+    set passes to passes + continuity_pass("correction preserves superseded history" and (ptr_to_str(get_list(get_list(old_rows and 0) and 0)) equals "1"))
+    set total to total + 1
+    set passes to passes + continuity_pass("correction carries supersedes provenance" and (string_to_int(ptr_to_str(get_list(get_list(chain_rows and 0) and 0))) > 0))
+
+    set ok to continuity_store_memory(db and "resolve_echo" and "active_state" and "pending build" and "Build and validate the continuity implementation." and "web" and "resolve_session" and now - 20 and 90 and "stated" and 90 and "[0.0,1.0]" and 0 and "active")
+    set ok to continuity_store_memory(db and "resolve_echo" and "active_state" and "build complete" and "The continuity build and validation completed." and "web" and "resolve_session" and now - 10 and 90 and "observed" and 80 and "[0.0,1.0]" and 1 and "resolved")
+    set unresolved_rows to sql_query(db and "SELECT COUNT(*) FROM continuity_memories WHERE persona='resolve_echo' AND kind='active_state' AND status='active';")
+    set total to total + 1
+    set passes to passes + continuity_pass("resolved outcome closes the related open loop" and (ptr_to_str(get_list(get_list(unresolved_rows and 0) and 0)) equals "0"))
+
+    set ok to continuity_store_memory(db and "echo" and "active_state" and "continuity implementation" and "Implement and test the automatic continuity system." and "web" and "session_current" and now - 50 and 95 and "stated" and 95 and "[0.0,1.0]" and 0 and "active")
+    set ok to continuity_store_memory(db and "echo" and "long_term" and "voice identity" and "British voice consistency is an enduring identity requirement." and "discord" and "session_new" and now - 80 and 90 and "observed" and 88 and "[1.0,0.0]" and 0 and "active")
+    set ok to continuity_store_memory(db and "echo" and "episode" and "prior voice correction" and "The user corrected Echo's accent after it drifted between Bostonian and British." and "discord" and "session_previous" and now - 120 and 100 and "observed" and 75 and "[1.0,0.0]" and 0 and "active")
+    set ok to continuity_store_session_state(db and "echo" and "session_current" and "The continuity implementation is underway." and "- Keep the 26B response path unchanged.\n" and "The user wants reliable natural continuity." and "- Automatic memory replaced explicit recall.\n" and "- Build and manual validation remain.\n" and now - 30)
+    set ok to continuity_store_session_state(db and "echo" and "session_previous" and "The prior session established British voice consistency." and "" and "The correction was important." and "" and "- Confirm the voice remains stable.\n" and now - 90)
+    set ok to sql_execute(db and concat("INSERT INTO procedures(name,steps,pinned,archived,created_at) VALUES ('continuity test','Build, run the continuity gate, then manually validate retrieval.',1,0," and concat(int_to_string(now) and ");")))
+
+    set lessons to create_map()
+    set ok to map_insert(lessons and "voice_consistency" and "Preserve the selected voice and accent consistently across replies.")
+    set envelope to continuity_build_envelope_with_embedding(db and "echo" and "session_current" and "British voice continuity project" and "[1.0,0.0]" and lessons)
+    set total to total + 1
+    set passes to passes + continuity_pass("envelope contains stable relationship memory" and string_contains(envelope and "Stable relationship memory"))
+    set total to total + 1
+    set passes to passes + continuity_pass("envelope contains corrected British fact" and string_contains(envelope and "not Bostonian"))
+    set total to total + 1
+    set passes to passes + continuity_pass("envelope contains current semantic state" and string_contains(envelope and "continuity implementation is underway"))
+    set total to total + 1
+    set passes to passes + continuity_pass("envelope contains preceding session/day" and string_contains(envelope and "prior session established British"))
+    set total to total + 1
+    set passes to passes + continuity_pass("envelope contains active/prospective state" and string_contains(envelope and "Active state and prospective memory"))
+    set total to total + 1
+    set passes to passes + continuity_pass("envelope contains relevant procedure" and string_contains(envelope and "procedure_store"))
+    set total to total + 1
+    set passes to passes + continuity_pass("envelope contains relevant legacy lesson" and string_contains(envelope and "legacy lesson"))
+    set total to total + 1
+    set passes to passes + continuity_pass("envelope exposes source provenance" and (string_contains(envelope and "source=discord") and also string_contains(envelope and "epistemic=stated")))
+    set total to total + 1
+    set passes to passes + continuity_pass("envelope remains bounded" and (string_length(envelope) <= 8020))
+
+    # This is the exact combined shape emitted by the existing Gemma reply audit:
+    # verdict/reason remain primary and continuity is carried in the same JSON object.
+    set semantic_json to "{\"verdict\":\"ALLOWED\",\"reason\":\"Grounded reply.\",\"recent_summary\":\"A cumulative semantic state.\",\"decisions\":[\"Keep retrieval bounded.\"],\"emotional_context\":\"Trust depends on continuity.\",\"changes\":[\"Memory became automatic.\"],\"open_loops\":[\"Run manual validation.\"],\"memories\":[{\"kind\":\"relationship\",\"topic\":\"response style\",\"content\":\"The user prefers natural continuity.\",\"confidence\":96,\"epistemic\":\"stated\",\"importance\":90,\"correction\":false,\"status\":\"active\"}]}"
+    set semantic_evidence to "A cumulative semantic state. Keep retrieval bounded. Trust depends on continuity. Memory became automatic. Run manual validation. The user prefers natural continuity."
+    set ok to continuity_apply_semantic_json(db and "echo" and "semantic_session" and "web" and now and "[0.5,0.5]" and semantic_evidence and semantic_json)
+    set parsed_rows to sql_query(db and "SELECT summary,open_loops FROM continuity_session_state WHERE session_id='semantic_session';")
+    set total to total + 1
+    set passes to passes + continuity_pass("semantic JSON updates cumulative session state" and (length_list(parsed_rows) == 1 and also string_contains(ptr_to_str(get_list(get_list(parsed_rows and 0) and 0)) and "cumulative")))
+    set total to total + 1
+    set passes to passes + continuity_pass("semantic JSON retains open loops" and string_contains(ptr_to_str(get_list(get_list(parsed_rows and 0) and 1)) and "manual validation"))
+
+    set hallucinated_json to "{\"verdict\":\"ALLOWED\",\"reason\":\"ok\",\"recent_summary\":\"A finance policy changed across several departments.\",\"decisions\":[],\"emotional_context\":\"\",\"changes\":[],\"open_loops\":[],\"memories\":[{\"kind\":\"long_term\",\"topic\":\"finance policy\",\"content\":\"A finance policy affects several departments.\",\"confidence\":99,\"epistemic\":\"inferred\",\"importance\":90,\"correction\":false,\"status\":\"active\"}]}"
+    set ok to continuity_apply_semantic_json(db and "echo" and "hallucination_session" and "web" and now and "[0.5,0.5]" and "Echo should sound British." and hallucinated_json)
+    set hallucinated_state to sql_query(db and "SELECT COUNT(*) FROM continuity_session_state WHERE session_id='hallucination_session';")
+    set hallucinated_memory to sql_query(db and "SELECT COUNT(*) FROM continuity_memories WHERE source_id='hallucination_session';")
+    set total to total + 1
+    set passes to passes + continuity_pass("ungrounded audit summary is discarded" and (ptr_to_str(get_list(get_list(hallucinated_state and 0) and 0)) equals "0"))
+    set total to total + 1
+    set passes to passes + continuity_pass("ungrounded audit memory is discarded" and (ptr_to_str(get_list(get_list(hallucinated_memory and 0) and 0)) equals "0"))
+
+    set total to total + 1
+    set passes to passes + continuity_pass("deterministic correction fallback recognizes corrections" and (continuity_contains_correction("No, that's wrong; I told you it should be British.") == 1))
+    set total to total + 1
+    set passes to passes + continuity_pass("deterministic prospective fallback recognizes commitments" and (continuity_contains_commitment("I'll run the tests and report back.") == 1))
+    set total to total + 1
+    set passes to passes + continuity_pass("deterministic resolution fallback avoids negated closure" and (continuity_contains_resolution("It is not fixed; the tests failed.") == 0))
+
+    set ok to sql_close(db)
+    display concat("continuity-memory: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))
+    return 0

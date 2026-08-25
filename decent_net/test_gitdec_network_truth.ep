@@ -1,0 +1,59 @@
+# GitDec remote-transport truth tests. Remote methods must report capability
+# absence immediately; local repository durability is covered by
+# test_gitdec_persistence.ep.
+
+import "./gitdec"
+import "../decent_id/keys"
+import "string"
+
+define gitdec_network_pass with label as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main returning Int:
+    set passed to 0
+    set total to 0
+    set signing to generate_signing_keypair()
+    set signing_err to map_get_val(signing and "error")
+    set public_key to ptr_to_str(map_get_val(signing and "public_key"))
+    set secret_key to ptr_to_str(map_get_val(signing and "secret_key"))
+
+    set total to total + 1
+    set passed to passed + gitdec_network_pass("signing fixture is valid" and signing_err == ERR_NONE and also string_length(public_key) == crypto_sign_PUBLICKEYBYTES * 2 and also string_length(secret_key) == crypto_sign_SECRETKEYBYTES * 2)
+
+    set started_at to ep_time_now_ms()
+    set publish_rc to gitdec_publish_remote("truth_repo" and 20020 and "{\"action\":\"update_manifest\"}" and secret_key and public_key)
+    set history_rc to gitdec_request_history("truth_repo")
+    set elapsed_ms to ep_time_now_ms() - started_at
+
+    set total to total + 1
+    set passed to passed + gitdec_network_pass("remote publication reports network unavailable" and publish_rc == GITDEC_ERR_NETWORK_UNAVAILABLE)
+    set total to total + 1
+    set passed to passed + gitdec_network_pass("remote history reports network unavailable" and history_rc == GITDEC_ERR_NETWORK_UNAVAILABLE)
+    set total to total + 1
+    set passed to passed + gitdec_network_pass("network-unavailable is not success or a transient socket error" and GITDEC_ERR_NETWORK_UNAVAILABLE != GITDEC_ERR_NONE and also GITDEC_ERR_NETWORK_UNAVAILABLE != GITDEC_ERR_NETWORK)
+    set total to total + 1
+    set passed to passed + gitdec_network_pass("unavailable methods return without reconnect sleeps" and elapsed_ms < 1000)
+
+    set bad_repo_rc to gitdec_publish_remote("../escape" and 20020 and "{}" and secret_key and public_key)
+    set bad_kind_rc to gitdec_publish_remote("truth_repo" and 42 and "{}" and secret_key and public_key)
+    set bad_secret_rc to gitdec_publish_remote("truth_repo" and 20020 and "{}" and "bad" and public_key)
+    set bad_history_rc to gitdec_request_history("../escape")
+
+    set total to total + 1
+    set passed to passed + gitdec_network_pass("publication rejects path-traversing repository ids" and bad_repo_rc == GITDEC_ERR_INVALID_INPUT)
+    set total to total + 1
+    set passed to passed + gitdec_network_pass("publication rejects unsupported event kinds" and bad_kind_rc == GITDEC_ERR_INVALID_INPUT)
+    set total to total + 1
+    set passed to passed + gitdec_network_pass("publication rejects malformed signing keys" and bad_secret_rc == GITDEC_ERR_INVALID_INPUT)
+    set total to total + 1
+    set passed to passed + gitdec_network_pass("history rejects path-traversing repository ids" and bad_history_rc == GITDEC_ERR_INVALID_INPUT)
+
+    free_map(signing)
+    display f"GitDec network truth: {passed}/{total} passed"
+    if passed != total:
+        return 1
+    return 0

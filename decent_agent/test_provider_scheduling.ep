@@ -1,0 +1,111 @@
+# Deterministic provider-priority and scheduler-routing gate.
+# No provider, network, model, context-window, or token-count fixture is used.
+
+import "string"
+import "collections"
+import "./llm"
+import "./scheduler"
+
+define scheduling_pass with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main returning Int:
+    set passed to 0
+    set total to 0
+
+    # Direct compatibility callers carry no shared scheduling state.
+    set unmanaged to create_map()
+    set unmanaged_admission to llm_provider_try_admit(unmanaged)
+    set total to total + 1
+    set passed to passed + scheduling_pass(map_get_val(unmanaged_admission and "ok") == 1 and also map_get_val(unmanaged_admission and "guarded") == 0 and "unmanaged compatibility route is admitted without changing shared state")
+
+    set foregrounds to create_map()
+    set gate to create_map()
+    set ok to map_insert(gate and "background_active" and 0)
+
+    set foreground_ctx to create_map()
+    set ok to map_insert(foreground_ctx and "session_id" and "foreground-session")
+    set ok to map_insert(foreground_ctx and "turn_id" and "foreground-turn")
+    set ok to map_insert(foreground_ctx and "foreground_turns" and foregrounds)
+    set ok to map_insert(foreground_ctx and "provider_gate" and gate)
+    set ok to map_insert(foregrounds and "foreground-turn" and 1)
+    set foreground_route to create_map()
+    set foreground_bound to llm_provider_bind_route_context(foreground_route and foreground_ctx)
+    set total to total + 1
+    set passed to passed + scheduling_pass(foreground_bound == 1 and also map_get_val(foreground_route and "provider_foreground_turns") == foregrounds and also map_get_val(foreground_route and "provider_gate") == gate and "route retains the node-owned foreground and gate maps")
+
+    set foreground_admission to llm_provider_try_admit(foreground_route)
+    set total to total + 1
+    set passed to passed + scheduling_pass(map_get_val(foreground_admission and "ok") == 1 and also map_get_val(foreground_admission and "guarded") == 0 and also map_get_val(gate and "background_active") == 0 and "foreground request is admitted without a background guard")
+    set foreground_release to llm_provider_release(foreground_admission)
+    set total to total + 1
+    set passed to passed + scheduling_pass(foreground_release == 0 and also map_get_val(gate and "background_active") == 0 and "foreground release is a checked no-op")
+
+    set background_ctx to create_map()
+    set ok to map_insert(background_ctx and "session_id" and "background-session")
+    set ok to map_insert(background_ctx and "turn_id" and "background-turn")
+    set ok to map_insert(background_ctx and "parent_session_id" and "foreground-session")
+    set ok to map_insert(background_ctx and "is_background" and 1)
+    set ok to map_insert(background_ctx and "foreground_turns" and foregrounds)
+    set ok to map_insert(background_ctx and "provider_gate" and gate)
+    set background_route to create_map()
+    set background_bound to llm_provider_bind_route_context(background_route and background_ctx)
+    set denied_background to llm_provider_try_admit(background_route)
+    set total to total + 1
+    set passed to passed + scheduling_pass(background_bound == 1 and also map_get_val(denied_background and "ok") == 0 and also map_get_val(denied_background and "busy") == 1 and also (map_get_val(denied_background and "error_code") equals "foreground_provider_active") and also map_get_val(gate and "background_active") == 0 and "background provider work is denied while any foreground phase exists")
+    set denied_release to llm_provider_release(denied_background)
+    set total to total + 1
+    set passed to passed + scheduling_pass(denied_release == 0 and also map_get_val(gate and "background_active") == 0 and "denied admission release cannot decrement the guard")
+
+    set removed to map_delete(foregrounds and "foreground-turn")
+    set background_admission to llm_provider_try_admit(background_route)
+    set total to total + 1
+    set passed to passed + scheduling_pass(map_get_val(background_admission and "ok") == 1 and also map_get_val(background_admission and "guarded") == 1 and also map_get_val(gate and "background_active") == 1 and "admitted background request increments the shared guard")
+
+    # A foreground arriving after a background request was admitted must wait for
+    # that exact guard to be released; it is never allowed to overtake the request.
+    set ok to map_insert(foregrounds and "foreground-turn" and 1)
+    set waiting_foreground to llm_provider_try_admit(foreground_route)
+    set total to total + 1
+    set passed to passed + scheduling_pass(map_get_val(waiting_foreground and "ok") == 0 and also map_get_val(waiting_foreground and "busy") == 1 and also (map_get_val(waiting_foreground and "error_code") equals "background_provider_inflight") and also map_get_val(gate and "background_active") == 1 and "foreground waits while an already-admitted background request is active")
+    set waiting_release to llm_provider_release(waiting_foreground)
+    set total to total + 1
+    set passed to passed + scheduling_pass(waiting_release == 0 and also map_get_val(gate and "background_active") == 1 and "busy foreground release leaves the admitted background guard intact")
+
+    set background_release to llm_provider_release(background_admission)
+    set total to total + 1
+    set passed to passed + scheduling_pass(background_release == 0 and also map_get_val(gate and "background_active") == 0 and "completed background request releases exactly one guard")
+    set resumed_foreground to llm_provider_try_admit(foreground_route)
+    set total to total + 1
+    set passed to passed + scheduling_pass(map_get_val(resumed_foreground and "ok") == 1 and also map_get_val(resumed_foreground and "busy") == 0 and "foreground is admitted immediately after the background guard releases")
+
+    # A route retained by asynchronous work cannot masquerade as foreground after
+    # node.ep removes its owner turn at terminal publication.
+    set removed_again to map_delete(foregrounds and "foreground-turn")
+    set retained_route_admission to llm_provider_try_admit(foreground_route)
+    set total to total + 1
+    set passed to passed + scheduling_pass(map_get_val(retained_route_admission and "ok") == 1 and also map_get_val(retained_route_admission and "guarded") == 1 and also map_get_val(gate and "background_active") == 1 and "retained route becomes guarded background work after its foreground owner ends")
+    set retained_release to llm_provider_release(retained_route_admission)
+    set total to total + 1
+    set passed to passed + scheduling_pass(retained_release == 0 and also map_get_val(gate and "background_active") == 0 and "retained background route releases its guard")
+
+    set partial_ctx to create_map()
+    set ok to map_insert(partial_ctx and "foreground_turns" and foregrounds)
+    set total to total + 1
+    set passed to passed + scheduling_pass(llm_provider_bind_route_context(create_map() and partial_ctx) == 0 and "partial scheduling context fails closed")
+
+    set infer_command to scheduler_build_infer_command("inspect now" and "job/id")
+    set expected_command to "AI INFER [SESSION:scheduler_job_id] [PLATFORM:ipc] [BACKGROUND:1] inspect now"
+    set total to total + 1
+    set passed to passed + scheduling_pass((infer_command equals expected_command) and "scheduler IPC command uses an isolated per-job session and trusted background marker")
+    set total to total + 1
+    set passed to passed + scheduling_pass((scheduler_safe_session_component("") equals "job") and also string_length(scheduler_safe_session_component("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_more")) == 64 and "scheduler session component is non-empty and bounded")
+
+    display concat("provider scheduling: " and concat(int_to_string(passed) and concat("/" and int_to_string(total))))
+    if passed != total:
+        return 1
+    return 0

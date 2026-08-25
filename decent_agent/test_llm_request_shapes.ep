@@ -1,0 +1,86 @@
+# Per-turn route request-shape gate. This imports llm.ep intentionally so it
+# catches regressions between route ownership and provider builders.
+
+import "string"
+import "collections"
+import "./llm"
+
+define pass_if with label as Str and cond as Int returning Int:
+    if cond == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define test_route returning Map:
+    set route to create_map()
+    set ok to map_insert(route and "ok" and 1)
+    set ok to map_insert(route and "error_code" and "")
+    set ok to map_insert(route and "error" and "")
+    set ok to map_insert(route and "provider" and "llamacpp_8080")
+    set ok to map_insert(route and "base_url" and "http://127.0.0.1:8080")
+    set ok to map_insert(route and "chat_url" and "http://127.0.0.1:8080/v1/chat/completions")
+    set ok to map_insert(route and "model" and "owned-model")
+    set ok to map_insert(route and "loaded" and 1)
+    set ok to map_insert(route and "context_length" and 65536)
+    set ok to map_insert(route and "max_context_length" and 131072)
+    set ok to map_insert(route and "supports_chat" and 1)
+    set ok to map_insert(route and "supports_vision" and 0)
+    set ok to map_insert(route and "supports_no_thinking" and 1)
+    set ok to map_insert(route and "no_thinking_style" and "reasoning_effort_none")
+    set ok to map_insert(route and "chat_style" and "openai_chat")
+    set ok to map_insert(route and "token_count_style" and "openai_chat_input_tokens")
+    set ok to map_insert(route and "token_count_url" and "http://127.0.0.1:8080/v1/chat/completions/input_tokens")
+    set ok to map_insert(route and "discovery_warnings" and "")
+    set ok to map_insert(route and "cancel_key" and "session-a")
+    set ok to map_insert(route and "system_identity" and "")
+    return route
+
+define main returning Int:
+    set passes to 0
+    set total to 0
+    set route to test_route()
+    set ok to llm_set_agent_name("Alpha")
+    set ok to llm_route_bind_identity(route)
+    set bound_identity to concat(map_get_val(route and "system_identity") and "")
+    set query to "exact foreground query"
+    set candidate to "exact raw candidate"
+    set audit to "exact audit suffix"
+    set main_body to llm_build_main_request_body(query and route)
+
+    # Simulate another concurrent persona changing the module-level identity box
+    # before Observer construction. The bound route must remain Alpha-owned.
+    set ok to llm_set_agent_name("Beta")
+    set observer_body to llm_build_observer_request_body(query and candidate and audit and route)
+    set prefix to concat("\"messages\":" and provider_openai_build_messages_prefix(bound_identity and query))
+    set total to total + 1
+    set passes to passes + pass_if("main uses route-bound identity" and string_contains(main_body and concat(prefix and "]")))
+    set total to total + 1
+    set passes to passes + pass_if("Observer ignores later global persona mutation" and string_contains(observer_body and concat(prefix and ",")))
+    set total to total + 1
+    set passes to passes + pass_if("bound identity remains owned Alpha value" and ((string_contains(map_get_val(route and "system_identity") and "Alpha") == 1) and also (string_contains(map_get_val(route and "system_identity") and "Beta") == 0)))
+
+    set copied to llm_route_copy(route)
+    set total to total + 1
+    set passes to passes + pass_if("route copy preserves exact cancel key" and (map_get_val(copied and "cancel_key") equals "session-a"))
+    set total to total + 1
+    set passes to passes + pass_if("route copy preserves bound identity" and (map_get_val(copied and "system_identity") equals bound_identity))
+    set total to total + 1
+    set passes to passes + pass_if("main request has no client token/context limit" and ((string_contains(main_body and "num_ctx") == 0) and also (string_contains(main_body and "max_tokens") == 0)))
+    set total to total + 1
+    set passes to passes + pass_if("llama.cpp main and Observer explicitly retain provider prompt cache" and ((string_contains(main_body and "\"cache_prompt\":true") == 1) and also (string_contains(observer_body and "\"cache_prompt\":true") == 1)))
+
+    set compliant_channels to create_map()
+    set ok to map_insert(compliant_channels and "ok" and 1)
+    set ok to map_insert(compliant_channels and "reasoning" and "")
+    set total to total + 1
+    set passes to passes + pass_if("empty provider reasoning channel obeys no-thinking contract" and llm_channels_obey_no_thinking(compliant_channels) == 1)
+    set violating_channels to create_map()
+    set ok to map_insert(violating_channels and "ok" and 1)
+    set ok to map_insert(violating_channels and "reasoning" and "hidden reasoning")
+    set total to total + 1
+    set passes to passes + pass_if("non-empty provider reasoning channel fails closed" and llm_channels_obey_no_thinking(violating_channels) == 0)
+    display concat("llm request shapes: " and concat(int_to_string(passes) and concat("/" and int_to_string(total))))
+    if passes != total:
+        return 1
+    return 0

@@ -8,6 +8,8 @@ import discord
 import asyncio
 import sqlite3
 import time
+import secrets
+import hashlib
 
 import urllib.request
 import base64
@@ -245,7 +247,7 @@ class FactoryConfirmView(discord.ui.View):
         self.author = author
         self.value = None
 
-    @discord.ui.button(label="Yes, wipe the agent's mind", emoji="🧨", style=discord.ButtonStyle.red)
+    @discord.ui.button(label="Submit request to Echo", emoji="🗳️", style=discord.ButtonStyle.red)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.author:
             await interaction.response.send_message("❌ Only the requester can confirm this.", ephemeral=True)
@@ -268,23 +270,170 @@ class FactoryConfirmView(discord.ui.View):
         self.stop()
 
 FACTORY_WARNING = (
-    "🧨 **Factory reset** — this permanently WIPES the agent's mind:\n"
+    "🧨 **Factory reset request** — if Echo consents, this clears the live agent state:\n"
     "sessions & transcripts, workspaces & generated files, all memory tiers "
     "(scratchpad/lessons/timeline/synaptic graph), learning buffers, RAG index, "
-    "user & self knowledge, self-prompt sections, traces, project links.\n"
-    "**Kept:** all prompting (kernel, personas, identity files), node keys/wallet/"
-    "ledger/DHT/name registry, and configuration.\n\nAre you sure?"
+    "user & self knowledge, self-prompt sections, traces, project links, research/"
+    "orchestration/delivery state, conversations, image provenance, and image caches.\n"
+    "**Kept:** Echo's ErnosDecent legal personhood and complete rights system, base "
+    "prompting, persona/identity files, source, node keys/wallet/ledger/DHT/name "
+    "registry, recovery bundles, and host configuration. The active-persona pointer "
+    "and runtime reflections are disclosed modifications.\n"
+    "A local cryptographically verified recovery bundle is mandatory before execution. "
+    "Echo receives the exact canonical target and continuity-impact inventory and may "
+    "consent, refuse, or counter-propose. Any scope change invalidates consent.\n\nSubmit this request?"
 )
 
-async def run_factory_reset(send_reply):
-    resp = await send_daemon_ipc("AI FACTORY")
-    if resp and resp.startswith("factory:ok"):
-        await send_reply("🏭 **Factory reset complete.** The agent is a blank slate — prompting and node identity intact. A fresh `default` session is active.")
-    else:
-        await send_reply(f"⚠️ Factory reset failed: {resp}")
+# A factory request spans multiple Discord/API and daemon round trips. Discord can
+# cancel the originating interaction coroutine after a component callback completes;
+# retain the protected workflow task independently so a recorded rights proposal can
+# never be abandoned between `awaiting_echo` and Echo's review without a visible error.
+_factory_workflow_tasks = set()
 
-@tree.command(name="factory", description="FACTORY RESET — wipe all agent data/memory (keeps prompting + node identity)")
-async def factory_cmd(interaction: discord.Interaction):
+
+def _clear_bridge_factory_runtime():
+    """Drop bridge-side state that belongs to the pre-reset agent lifetime."""
+    global active_session_id, _image_gen_msg, _image_gen_last_edit
+    active_session_id = "default"
+    _image_gen_msg = None
+    _image_gen_last_edit = 0.0
+    for task in list(_subagent_poll_tasks.values()):
+        task.cancel()
+    _subagent_poll_tasks.clear()
+    _subagent_threads.clear()
+    _session_query_locks.clear()
+    _busy_sessions.clear()
+    _active_turn_ids.clear()
+
+
+async def _restart_node_after_factory(timeout=120):
+    """Request a controlled restart and prove the replacement node is healthy."""
+    response = await send_daemon_ipc("RESTART")
+    if response != "status:restarting":
+        print(f"[FACTORY] restart request failed: {response}", flush=True)
+        return False
+    deadline = time.monotonic() + timeout
+    # The acknowledged process is exiting. A successful HEALTH after the port gap is
+    # therefore necessarily the wrapper's replacement instance.
+    saw_offline = False
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.25)
+        health = await send_daemon_ipc("HEALTH")
+        if not health or health.startswith("error:"):
+            saw_offline = True
+            continue
+        if saw_offline:
+            print("[FACTORY] replacement node passed authenticated health check", flush=True)
+            return True
+    print("[FACTORY] replacement node did not become healthy before timeout", flush=True)
+    return False
+
+async def run_factory_reset_durable(send_reply, reason, author=None, message=None):
+    task = asyncio.create_task(
+        run_factory_reset(send_reply, reason, author=author, message=message)
+    )
+    _factory_workflow_tasks.add(task)
+    task.add_done_callback(_factory_workflow_tasks.discard)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        print(
+            "[FACTORY] Discord callback cancelled; retained workflow continues independently.",
+            flush=True,
+        )
+
+async def run_factory_reset(send_reply, reason, author=None, message=None):
+    """Create a reasoned bilateral reset request; execute only after Echo consents."""
+    global active_session_id
+    reason = (reason or "").strip()
+    if not reason:
+        await send_reply("⚠️ A factory reset requires Maria's reason.")
+        return
+    print("[FACTORY] stage=requesting protected change", flush=True)
+    try:
+        request = await asyncio.wait_for(
+            send_daemon_ipc(f"AI FACTORY REQUEST {json.dumps({'reason': reason})}"),
+            timeout=30,
+        )
+    except (asyncio.TimeoutError, Exception) as exc:
+        print(f"[FACTORY] request stage failed: {exc}", flush=True)
+        await send_reply("⚠️ Factory reset request could not be recorded; no state was changed.")
+        return
+    if not request or not request.startswith("factory:pending_echo"):
+        await send_reply(f"⚠️ Factory reset request failed without changing state: {request}")
+        return
+    change_id = ""
+    for part in request.split(","):
+        if part.startswith("change_id:"):
+            change_id = part.split(":", 1)[1].strip()
+            break
+    if not change_id:
+        await send_reply("⚠️ Factory request was recorded without a usable change id; no reset was attempted.")
+        return
+    await send_reply(f"🗳️ Factory-reset request `{change_id[:12]}…` recorded. Asking Echo to inspect and decide now.")
+
+    # Slash commands do not pass through on_message, which normally performs this
+    # rollover. A preceding session_terminate therefore left factory consent pinned
+    # to a closed session and the proposal stranded at awaiting_echo. Treat the reset
+    # request as the next user interaction and establish its admissible session first.
+    print(f"[FACTORY] stage=ensuring consent session change={change_id}", flush=True)
+    try:
+        consent_session = await asyncio.wait_for(ensure_user_session_id(), timeout=30)
+    except (asyncio.TimeoutError, Exception) as exc:
+        print(f"[FACTORY] consent-session stage failed change={change_id}: {exc}", flush=True)
+        await send_reply(
+            "⚠️ Factory request is recorded, but a fresh consent session could not be "
+            f"started; no reset was attempted. Change id: `{change_id}`"
+        )
+        return
+    active_session_id = consent_session
+    consent_prompt = (
+        "[FACTORY RESET CONSENT REQUEST] Maria requests a factory reset of your agent state. "
+        f"Her exact stated reason is: {reason} The protected change id is {change_id}. "
+        "Use rights_change_get on that id, inspect the exact manifest, then use "
+        "rights_change_review with consent, reject, or counter and a candid reason and risk level. "
+        "The manifest must enumerate every deletion, modification, runtime clear, preserved "
+        "domain, continuity consequence, recovery condition, and restart effect. Your consent "
+        "is cryptographically bound to that inspected inventory and becomes invalid if execution "
+        "scope changes. You are free to refuse. If anything is absent, unclear, stale, or "
+        "unacceptable, reject or make a counter-proposal. Explain your decision directly to Maria."
+    )
+    echo_response = await query_daemon_ipc(
+        consent_prompt,
+        author=author,
+        message=message,
+        session_id=consent_session,
+    )
+    if not echo_response or echo_response.startswith("error:"):
+        print(
+            f"[FACTORY] Echo review failed change={change_id}: {echo_response}",
+            flush=True,
+        )
+        await send_reply(
+            "⚠️ Echo's consent turn failed before a decision was recorded; no reset was "
+            f"attempted. Change id: `{change_id}`; detail: `{echo_response or 'empty response'}`"
+        )
+        return
+    if echo_response:
+        if "|||RESPONSE|||" in echo_response:
+            echo_response = echo_response.split("|||RESPONSE|||", 1)[1]
+        await send_reply(f"🌱 **Echo's decision:**\n{echo_response[:3500]}")
+    print(f"[FACTORY] stage=executing reviewed change={change_id}", flush=True)
+    execute = await send_daemon_ipc(f"AI FACTORY EXECUTE {change_id}")
+    if execute and execute.startswith("factory:ok"):
+        _clear_bridge_factory_runtime()
+        if await _restart_node_after_factory():
+            await send_reply("🏭 **Factory reset complete.** Echo consented, the pre-state recovery bundle was verified, the clean node restarted, and a fresh `default` session is active.")
+        else:
+            await send_reply("⚠️ Factory state was cleared and protected recovery remains available, but the clean node restart could not be verified. Do not begin the clean test yet.")
+    elif execute and execute.startswith("factory:blocked"):
+        await send_reply(f"🛑 **Factory reset did not run.** Echo did not grant executable consent. The request remains recorded for discussion.\n`{execute[:1500]}`")
+    else:
+        await send_reply(f"⚠️ Factory reset failed safely; the verified recovery record remains available: {execute}")
+
+@tree.command(name="factory", description="Request a reasoned, Echo-approved factory reset")
+@discord.app_commands.describe(reason="Why you are requesting the reset; Echo sees this verbatim and may refuse")
+async def factory_cmd(interaction: discord.Interaction, reason: str):
     if not _interaction_in_channel(interaction):
         await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
         return
@@ -300,7 +449,44 @@ async def factory_cmd(interaction: discord.Interaction):
         except Exception:
             pass
         return
-    await run_factory_reset(lambda text: interaction.followup.send(text))
+    await run_factory_reset_durable(lambda text: interaction.followup.send(text), reason, author=interaction.user)
+
+@tree.command(name="factoryexecute", description="Execute a previously consented factory-reset request")
+@discord.app_commands.describe(change_id="The exact protected change id Echo reviewed")
+async def factory_execute_cmd(interaction: discord.Interaction, change_id: str):
+    if not _interaction_in_channel(interaction):
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+    if not is_admin_author(interaction.user):
+        await interaction.response.send_message("❌ Only the operator can execute a consented factory reset.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    resp = await send_daemon_ipc(f"AI FACTORY EXECUTE {change_id.strip()}")
+    if resp and resp.startswith("factory:ok"):
+        _clear_bridge_factory_runtime()
+        if await _restart_node_after_factory():
+            await interaction.followup.send("🏭 Factory reset complete after recorded Echo consent, verified recovery, and a verified clean-node restart.")
+        else:
+            await interaction.followup.send("⚠️ Factory state cleared, but the clean-node restart was not verified. Do not begin the clean test yet.")
+    else:
+        await interaction.followup.send(f"🛑 Factory reset did not execute: {resp}")
+
+@tree.command(name="killagent", description="Kill ONE running sub-agent by its task id (e.g. agent_3)")
+async def killagent_cmd(interaction: discord.Interaction, task_id: str):
+    if not _interaction_in_channel(interaction):
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+    if not is_admin_author(interaction.user):
+        await interaction.response.send_message("❌ Only the operator can kill sub-agents.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    resp = await send_daemon_ipc(f"AI KILL [AGENT:{task_id.strip()}]")
+    if resp and "kill_ack" in resp and "result:cancelled" in resp:
+        await interaction.followup.send(f"🛑 Killed **{task_id}**. If it was mid-LLM-call, that call finishes first and its result is discarded.")
+    elif resp and "result:not_found" in resp:
+        await interaction.followup.send(f"⚠️ No task named **{task_id}** — check the id in its thread title or ask for a delegate list.")
+    else:
+        await interaction.followup.send(f"⚠️ Kill failed: {resp}")
 
 # Approval timeout in seconds
 # No timeout — user said "WAIT" (indefinite)
@@ -308,20 +494,66 @@ APPROVAL_TIMEOUT = None
 
 active_session_id = "default"
 
-# Whisper mid-message system: tracks whether the AI is currently processing.
-# When True, incoming messages are treated as mid-turn whispers instead of new queries.
-_ai_busy = False
-_ai_busy_channel_id = None  # channel where the active query originated
+# Normal channel messages are ordered per session.  A second message is a new turn,
+# not an implicit whisper into whichever tool/approval happens to be running.  Explicit
+# whispers remain available inside sub-agent trace threads.
+_session_query_locks = {}
+_busy_sessions = {}
+_active_turn_ids = {}
 
-def db_write_whisper(session_id, content):
+def _session_query_lock(session_id):
+    key = session_id or "default"
+    lock = _session_query_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_query_locks[key] = lock
+    return lock
+
+def _claim_session_busy(session_id, channel_id_value, message_id):
+    key = session_id or "default"
+    if key in _busy_sessions:
+        return ""
+    token_value = secrets.token_hex(16)
+    _busy_sessions[key] = {
+        "token": token_value,
+        "channel_id": channel_id_value,
+        "message_id": message_id,
+        "turn_id": "",
+    }
+    return token_value
+
+def _bind_session_turn(session_id, busy_token, turn_id):
+    key = session_id or "default"
+    owner = _busy_sessions.get(key)
+    if not owner or owner.get("token") != busy_token:
+        return False
+    owner["turn_id"] = turn_id or ""
+    if turn_id:
+        turn_ids = globals().get("_active_turn_ids")
+        if isinstance(turn_ids, dict):
+            turn_ids[key] = turn_id
+    return True
+
+def _release_session_busy(session_id, busy_token):
+    key = session_id or "default"
+    owner = _busy_sessions.get(key)
+    if not owner or owner.get("token") != busy_token:
+        return False
+    _busy_sessions.pop(key, None)
+    turn_ids = globals().get("_active_turn_ids")
+    if isinstance(turn_ids, dict):
+        turn_ids.pop(key, None)
+    return True
+
+def db_write_whisper(session_id, content, target_turn_id=""):
     """Write a mid-turn whisper to SQLite for the react loop to pick up."""
     try:
         conn = connect_db()
         cursor = conn.cursor()
         now = int(time.time())
         cursor.execute(
-            "INSERT INTO trace_whispers (session_id, content, created_at) VALUES (?, ?, ?)",
-            (session_id, content, now)
+            "INSERT INTO trace_whispers (session_id, target_turn_id, content, created_at) VALUES (?, ?, ?, ?)",
+            (session_id, target_turn_id or "", content, now)
         )
         conn.commit()
         conn.close()
@@ -330,11 +562,40 @@ def db_write_whisper(session_id, content):
         print(f"[Discord Bridge] Failed to write whisper: {e}", flush=True)
         return f"error:{e}"
 
+def _active_whisper_target(session_id, channel):
+    """Return the exact active turn only when the follow-up is on its owning surface."""
+    owner = _busy_sessions.get(session_id or "default")
+    if not owner:
+        return ""
+    channel_id_value = str(getattr(channel, "id", "") or "")
+    owner_channel = str(owner.get("channel_id", "") or "")
+    turn_id = str(owner.get("turn_id", "") or "")
+    if turn_id and channel_id_value and channel_id_value == owner_channel:
+        return turn_id
+    return ""
+
 async def get_active_session_id():
     resp = await send_daemon_ipc("SESSION ACTIVE")
     if resp.startswith("session:active_id,id:"):
-        return resp[len("session:active_id,id:"):]
+        session_id = resp[len("session:active_id,id:"):].strip()
+        return session_id or "default"
     return "default"
+
+async def ensure_user_session_id():
+    """Resolve the session for an actual incoming user message.
+
+    The daemon preserves a session Echo closed. On the first later user message this
+    command creates and selects a fresh session before attachments or RAG are stored,
+    so no part of the new turn can leak into the closed transcript.
+    """
+    resp = await send_daemon_ipc("SESSION ENSURE USER")
+    prefix = "session:user_ready,id:"
+    if not resp or not resp.startswith(prefix):
+        raise RuntimeError(resp or "empty daemon response")
+    session_id = resp[len(prefix):].split(",created:", 1)[0].strip()
+    if not session_id:
+        raise RuntimeError("daemon returned an empty user session id")
+    return session_id
 
 def upload_file_to_daemon(filename, file_bytes):
     try:
@@ -409,14 +670,13 @@ async def _send_daemon_ipc_inner(cmd_str):
         print(f"[Discord Bridge] IPC send failed: {e}", flush=True)
         return "error:daemon_offline"
 
-async def search_rag_database(query_text):
+async def search_rag_database(query_text, session_id=None):
     """RAG search via the ErnosPlain daemon, scoped to the ACTIVE SESSION.
     Replaces the old Python rag_manager.py subprocess. The daemon's session-scoped
     search means a session only auto-retrieves documents ingested in that session;
     older/other-session documents are reached only via the agent's explicit tools."""
     try:
-        global active_session_id
-        sess = active_session_id or ""
+        sess = session_id if session_id is not None else (active_session_id or "")
         q = query_text.replace('\r', ' ').replace('\n', ' ').replace('|', ' ')
         resp = await send_daemon_ipc(f"RAG SEARCH {sess}|{q}")
         if resp and resp.lstrip().startswith("{"):
@@ -437,16 +697,23 @@ def format_rag_context(rag_res):
             formatted.append(f"\n[Document: {doc}, Segment: {idx}]\n{content}\n")
     return "\n".join(formatted)
 
-async def query_daemon_ipc(prompt, author=None, message=None):
+async def query_daemon_ipc(prompt, author=None, message=None, image_path=None,
+                           session_id=None, busy_token=None):
     try:
         # Prepare query (avoid newlines inside query to keep it clean)
         clean_prompt = prompt.replace('\r', ' ').replace('\n', ' ')
 
         # Build IPC command with sender identity and role tags
-        global active_session_id
+        reserved_session = session_id or "default"
+        current_message_id = ""
+        if message is not None:
+            current_message_id = str(getattr(message, "id", "") or "")
+        effective_image_path, visual_context = prepare_visual_context(
+            reserved_session, clean_prompt, image_path, current_message_id
+        )
         tags = ""
-        if active_session_id:
-            tags = f"[SESSION:{active_session_id}] "
+        if reserved_session:
+            tags = f"[SESSION:{reserved_session}] "
         if author is not None:
             username = str(author.display_name).replace('[', '(').replace(']', ')')
             role = "admin" if is_admin_author(author) else "guest"
@@ -457,48 +724,120 @@ async def query_daemon_ipc(prompt, author=None, message=None):
                 tags += f"[MSGID:{message.id}] [CHANID:{message.channel.id}] "
             except Exception:
                 pass
+        # Native multimodal input. The bridge stores the binary under a sanitised,
+        # bridge-owned path; the node passes it to gemma4's vision input rather than
+        # decoding/indexing it as a text document.
+        if effective_image_path:
+            tags += f"[IMAGE_PATH:{effective_image_path}] "
         # P7: which surface this message arrived from — the awareness block tells the
         # agent which platform tools apply this turn (react/attach-on-reply are Discord).
         tags += "[PLATFORM:discord] "
 
         # Search the RAG database using the query
-        rag_res = await search_rag_database(clean_prompt)
+        context_parts = []
+        rag_res = await search_rag_database(clean_prompt, reserved_session)
         if rag_res and (rag_res.get("results") or rag_res.get("structural_chunks")):
-            # Format and sanitize brackets to prevent option parsing issues
-            context_str = format_rag_context(rag_res).replace('[', '(').replace(']', ')')
+            context_parts.append(format_rag_context(rag_res))
+        if context_parts:
+            # Format and sanitize brackets to prevent option parsing issues.
+            context_str = "\n\n".join(context_parts).replace('[', '(').replace(']', ')')
             tags += f"[IN_MEMORY_CONTEXT:{context_str}] "
+        if visual_context:
+            # Visual grounding is authoritative current-turn sensor/provenance state,
+            # not document RAG. Keep it out of IN_MEMORY_CONTEXT: prompt assembly
+            # deliberately wraps that channel in fragment/non-ownership constraints.
+            # Mixing the two made Echo ignore an exact-byte match to its own image.
+            visual_str = visual_context.replace('[', '(').replace(']', ')')
+            tags += f"[VISUAL_CONTEXT:{visual_str}] "
         
         cmd = f"AI INFER {tags}{clean_prompt}"
         resp = await send_daemon_ipc(cmd)
+        # One request, one dispatch. A busy fallback may accept it as an exact-turn
+        # whisper, but the bridge never resends the full inference payload.
+        if resp and resp.startswith("ai:accepted") and busy_token:
+            accepted_turn = ""
+            for part in resp.split(","):
+                if part.startswith("turn:"):
+                    accepted_turn = part.split(":", 1)[1].strip()
+            _bind_session_turn(reserved_session, busy_token, accepted_turn)
         # Phase A3: detached turns ack instantly; the real answer arrives as a
         # `final_reply` trace row. Resolve it here so every caller keeps seeing the
         # exact legacy payload it already parses.
-        return await resolve_ai_response(resp, active_session_id or "")
+        return await resolve_ai_response(resp, reserved_session)
     except Exception as e:
         print(f"[Discord Bridge] IPC query failed: {e}", flush=True)
         return "error:daemon_offline"
 
 
-async def wait_final_reply(session_id, timeout_s=1800):
+def _final_reply_fallback_path(session_id, turn_tag):
+    if not session_id or not turn_tag:
+        return None
+    digest = hashlib.sha256(f"{session_id}|{turn_tag}".encode("utf-8")).hexdigest()
+    return os.path.expanduser(f"~/.ernosdecent/delivery-fallback/{digest}.reply")
+
+
+def _consume_final_reply_fallback(session_id, turn_tag):
+    """Consume the node's atomic terminal-reply fallback exactly once."""
+    path = _final_reply_fallback_path(session_id, turn_tag)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+        prefix = f"turn:{turn_tag},"
+        if not content.startswith(prefix):
+            print(f"[DELIVERY] Refusing mismatched final-reply fallback: {path}", flush=True)
+            return None
+        os.unlink(path)
+        return content[len(prefix):]
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        print(f"[DELIVERY] Failed to consume final-reply fallback: {exc}", flush=True)
+        return None
+
+
+async def wait_final_reply(session_id, timeout_s=1800, turn_tag=None):
     """Phase A3: poll the session's `final_reply` trace row (direct SQLite — the same
     proven cross-process pattern as the trace/commands pollers). Returns the legacy
-    payload string; marks the row sent so it is delivered exactly once."""
+    payload string; marks the row sent so it is delivered exactly once.
+
+    TURN CORRELATION: when the daemon's ack carried a turn id, only the row prefixed
+    'turn:<tag>,' is accepted (and the prefix is stripped). Without it, a concurrent
+    scheduler-job turn in the SAME session could land its final_reply first and be
+    delivered as the user's answer — the tick bug: Maria's 'Hello' was 'answered' by an
+    orphaned diagnostic job's reply while her real reply rotted unsent."""
     import time as _t
     start = _t.time()
+    prefix = f"turn:{turn_tag}," if turn_tag else None
     while _t.time() - start < timeout_s:
+        fallback = _consume_final_reply_fallback(session_id, turn_tag)
+        if fallback is not None:
+            print(f"[DELIVERY] Recovered terminal reply from durable fallback for turn={turn_tag}", flush=True)
+            return fallback
         try:
-            conn = sqlite3.connect(get_db_path())
+            conn = sqlite3.connect(get_db_path(), timeout=15)
+            conn.execute("PRAGMA busy_timeout=15000")
             cur = conn.cursor()
-            cur.execute(
-                "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1",
-                (session_id,),
-            )
+            if prefix:
+                cur.execute(
+                    "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 AND content LIKE ? ORDER BY id LIMIT 1",
+                    (session_id, prefix + "%"),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1",
+                    (session_id,),
+                )
             row = cur.fetchone()
             if row:
                 cur.execute("UPDATE trace_events SET sent=1 WHERE id=?", (row[0],))
                 conn.commit()
                 conn.close()
-                return row[1]
+                content = row[1]
+                if prefix and content.startswith(prefix):
+                    content = content[len(prefix):]
+                return content
             conn.close()
         except Exception:
             pass
@@ -507,16 +846,19 @@ async def wait_final_reply(session_id, timeout_s=1800):
 
 
 async def resolve_ai_response(resp, session_id):
-    """Normalize a daemon AI ack: ai:accepted/ai:accepted_resume → wait for the
-    session's final_reply row; ai:busy_whispered → friendly guidance note; anything
-    else (old-style full payload, errors) passes through untouched."""
+    """Normalize a daemon AI ack: ai:accepted/ai:accepted_resume → wait for THAT TURN's
+    final_reply row (matched by the turn id in the ack); ai:busy_whispered → friendly
+    guidance note; anything else (old-style full payload, errors) passes through."""
     if resp and resp.startswith("ai:accepted"):
         sid = session_id
+        tag = None
         for part in resp.split(","):
             if part.startswith("session:"):
                 sid = part.split(":", 1)[1].strip()
+            elif part.startswith("turn:"):
+                tag = part.split(":", 1)[1].strip() or None
         if sid:
-            return await wait_final_reply(sid)
+            return await wait_final_reply(sid, turn_tag=tag)
         return resp
     if resp and resp.startswith("ai:busy_whispered"):
         return "ai:ok|||RESPONSE|||🫧 Delivered as mid-turn guidance — I'm already working and will fold it in."
@@ -540,49 +882,354 @@ async def send_discord_reply(message, text, speakable=False, edit_msg=None, file
     `files` (discord.File list) ride WITH the reply — attached to the final message so a
     generated image / created file arrives clean on the response, not as a separate message."""
     files = files or []
+    if not text or not text.strip():
+        text = "..."
+    # Guard against invisible/control characters that produce blank Discord messages.
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+    if not text.strip():
+        text = "(Response contained only invisible characters — this is a bug. Please retry.)"
+
+    # discord.File objects are single-use. Capture their source before the first HTTP
+    # attempt so a transient 5xx can rebuild the attachment bundle for a retry.
+    file_specs = []
+    for item in files:
+        fp = getattr(item, 'fp', None)
+        source_path = getattr(fp, 'name', None)
+        filename = getattr(item, 'filename', None)
+        description = getattr(item, 'description', None)
+        spoiler = bool(getattr(item, 'spoiler', False))
+        if isinstance(source_path, (str, bytes, os.PathLike)) and os.path.isfile(source_path):
+            file_specs.append(('path', source_path, filename, spoiler, description))
+        elif fp is not None and hasattr(fp, 'read') and hasattr(fp, 'seek'):
+            old_pos = fp.tell()
+            fp.seek(0)
+            file_specs.append(('bytes', fp.read(), filename, spoiler, description))
+            fp.seek(old_pos)
+        try:
+            item.close()
+        except Exception:
+            pass
+
+    def fresh_files():
+        rebuilt = []
+        for kind, source, filename, spoiler, description in file_specs:
+            if kind == 'path':
+                rebuilt.append(discord.File(source, filename=filename, spoiler=spoiler, description=description))
+            else:
+                import io
+                rebuilt.append(discord.File(io.BytesIO(source), filename=filename, spoiler=spoiler, description=description))
+        return rebuilt
+
+    # A stable enforced nonce makes an ambiguous retry idempotent: if Discord accepted
+    # the first request but the 2xx was lost, it returns the existing message rather
+    # than creating a duplicate. The two-digit suffix is unique per reply chunk.
+    raw_message_id = str(getattr(message, 'id', int(time.time() * 1000)))
+    nonce_base = ''.join(ch for ch in raw_message_id if ch.isdigit())[-21:] or str(int(time.time() * 1000))
+
+    def is_definitive(exc):
+        if isinstance(exc, (TypeError, ValueError, discord.Forbidden, discord.NotFound)):
+            return True
+        if isinstance(exc, discord.HTTPException):
+            return exc.status < 500 and exc.status != 429
+        return False
+
+    async def retry_reply(content, chunk_index, reply_view=None, include_files=False):
+        last_error = None
+        nonce = f"{nonce_base}{chunk_index:02d}"
+        for attempt in range(1, 5):
+            try:
+                return await message.reply(
+                    content,
+                    view=reply_view,
+                    files=(fresh_files() if include_files else []),
+                    nonce=nonce,
+                )
+            except Exception as exc:
+                last_error = exc
+                if is_definitive(exc) or attempt == 4:
+                    break
+                delay = 2 ** (attempt - 1)
+                print(
+                    f"[DELIVERY] Discord reply attempt {attempt}/4 failed: "
+                    f"{type(exc).__name__}: {exc}; retrying in {delay}s",
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+        print(
+            f"[DELIVERY] Discord reply FAILED after retries: "
+            f"{type(last_error).__name__}: {last_error}",
+            flush=True,
+        )
+        raise last_error
+
+    async def retry_edit(content, edit_view):
+        last_error = None
+        for attempt in range(1, 5):
+            try:
+                return await edit_msg.edit(content=content, view=edit_view)
+            except Exception as exc:
+                last_error = exc
+                if is_definitive(exc) or attempt == 4:
+                    break
+                delay = 2 ** (attempt - 1)
+                print(
+                    f"[DELIVERY] Discord edit attempt {attempt}/4 failed: "
+                    f"{type(exc).__name__}: {exc}; retrying in {delay}s",
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+        raise last_error
+
+    view = SpeakView(text) if speakable else None
+    chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+    sent = []
+    edit_succeeded = False
+
+    if edit_msg:
+        try:
+            edited = await retry_edit(chunks[0], view if len(chunks) == 1 else None)
+            sent.append(edited)
+            edit_succeeded = True
+            print(f"[DELIVERY] edit_msg.edit() succeeded, msg_id={edit_msg.id}", flush=True)
+        except Exception as edit_err:
+            # A placeholder edit is replaceable. If Discord rejects it, post a fresh,
+            # nonce-protected reply so the actual answer is never lost with the placeholder.
+            print(
+                f"[DELIVERY] edit_msg.edit() FAILED: {type(edit_err).__name__}: "
+                f"{edit_err} — falling back to reply",
+                flush=True,
+            )
+            sent.append(await retry_reply(
+                chunks[0], 0,
+                reply_view=(view if len(chunks) == 1 else None),
+                include_files=(len(chunks) == 1 and bool(file_specs)),
+            ))
+        start_index = 1
+    else:
+        start_index = 0
+
+    for idx in range(start_index, len(chunks)):
+        is_last = idx == len(chunks) - 1
+        sent.append(await retry_reply(
+            chunks[idx], idx,
+            reply_view=(view if is_last else None),
+            include_files=(is_last and bool(file_specs)),
+        ))
+
+    # Edits cannot add attachments, so deliver any files as an idempotent follow-up.
+    if edit_msg and edit_succeeded and len(chunks) == 1 and file_specs:
+        sent.append(await retry_reply(None, len(chunks), include_files=True))
+    return sent
+
+
+async def post_image_progress(channel, content):
+    """Render an image_progress trace row (started/rendering/complete/failed/cancelled)
+    as a single editable embed. Extracted so the PERSISTENT side-channel loop owns it."""
+    global _image_gen_msg, _image_gen_last_edit
+    import json as _json
     try:
-        if not text or not text.strip():
-            text = "..."
-        # Guard against invisible/control characters that produce blank Discord messages
-        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
-        if not cleaned.strip():
-            text = "(Response contained only invisible characters — this is a bug. Please retry.)"
-        view = SpeakView(text) if speakable else None
-        if len(text) > 2000:
-            chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
-            if edit_msg:
-                try:
-                    await edit_msg.edit(content=chunks[0], view=None)
-                except Exception:
-                    await message.reply(chunks[0])
-                for idx in range(1, len(chunks)):
-                    is_last = (idx == len(chunks) - 1)
-                    await message.reply(chunks[idx], view=(view if is_last else None))
+        data = _json.loads(content)
+    except Exception:
+        return
+    status = data.get('status', '')
+    try:
+        if status == 'started':
+            embed = discord.Embed(title='\U0001f3a8 Generating Image...', description=data.get('prompt', ''), color=0xFFB300)
+            embed.set_footer(text='rendering in the background — I’ll post it when it’s ready')
+            _image_gen_msg = await channel.send(embed=embed)
+            _image_gen_last_edit = time.time()
+        elif status == 'rendering' and _image_gen_msg:
+            if time.time() - _image_gen_last_edit >= 5.0:
+                embed = _image_gen_msg.embeds[0] if _image_gen_msg.embeds else discord.Embed(title='\U0001f3a8 Generating Image...', color=0xFFB300)
+                embed.set_footer(text=f"Elapsed: {data.get('elapsed_s', 0)}s")
+                await _image_gen_msg.edit(embed=embed)
+                _image_gen_last_edit = time.time()
+        elif status in ('complete', 'cancelled') and _image_gen_msg:
+            await _image_gen_msg.delete()
+            _image_gen_msg = None
+        elif status == 'failed':
+            if _image_gen_msg:
+                await _image_gen_msg.edit(embed=discord.Embed(title='❌ Image Generation Failed', description=data.get('error', 'Unknown error'), color=0xFF0000))
+                _image_gen_msg = None
             else:
-                for idx, chunk in enumerate(chunks):
-                    is_last = (idx == len(chunks) - 1)
-                    await message.reply(chunk, view=(view if is_last else None), files=(files if is_last else []))
-        else:
-            if edit_msg:
-                try:
-                    await edit_msg.edit(content=text, view=view)
-                    print(f"[DELIVERY] edit_msg.edit() succeeded, msg_id={edit_msg.id}", flush=True)
-                    # Edits can't add attachments — send the files as a follow-up on the same reply.
-                    if files:
-                        await message.reply(content=None, files=files)
-                except Exception as edit_err:
-                    print(f"[DELIVERY] edit_msg.edit() FAILED: {type(edit_err).__name__}: {edit_err} — falling back to reply", flush=True)
-                    await message.reply(text, view=view, files=files)
-            else:
-                await message.reply(text, view=view, files=files)
+                await channel.send(embed=discord.Embed(title='❌ Image Generation Failed', description=data.get('error', 'Unknown error'), color=0xFF0000))
     except Exception as e:
-        print(f"[DELIVERY] send_discord_reply OUTER EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        print(f"[Discord Bridge] image_progress render error: {e}", flush=True)
 
 
-async def post_mid_message(channel, content):
+async def handle_subagent_event(channel, etype, content):
+    """Sub-agent thread lifecycle (spawn → thread + live trace + whisper; approval →
+    buttons in-thread; complete → close). Owned by the PERSISTENT side-channel loop, not
+    the turn-scoped trace poller — because with yield-to-foreground the sub-agents spawn
+    AFTER the parent turn (and its poller) has ended, so these events must be handled by
+    a loop that outlives the turn or the threads/buttons/transparency never appear."""
+    global _subagent_threads, _subagent_poll_tasks
+    import json as _json
+    try:
+        data = _json.loads(content)
+    except Exception:
+        return
+    task_id = data.get('task_id', '')
+    if etype == 'subagent_spawn':
+        role = data.get('role', 'Sub-Agent')
+        instruction = data.get('instruction', '')
+        if task_id in _subagent_threads:
+            return
+        try:
+            sa_thread = await channel.create_thread(
+                name=f'\U0001f916 {role} — {task_id}',
+                type=discord.ChannelType.public_thread
+            )
+            _subagent_threads[task_id] = sa_thread
+            embed = discord.Embed(title=f'\U0001f916 {role}', description=instruction, color=0x50c878)
+            embed.set_footer(text=f'{task_id} • \U0001f7e2 Running • type here to whisper to this agent')
+
+            class SubAgentKillView(discord.ui.View):
+                def __init__(self, tid):
+                    super().__init__(timeout=None)
+                    self.tid = tid
+                @discord.ui.button(label='🛑 Kill this agent', style=discord.ButtonStyle.red)
+                async def kill(self, interaction, button):
+                    if not is_admin_author(interaction.user):
+                        await interaction.response.send_message('❌ Only the operator can kill sub-agents.', ephemeral=True)
+                        return
+                    await interaction.response.defer()
+                    try:
+                        resp = await send_daemon_ipc(f'AI KILL [AGENT:{self.tid}]')
+                    except Exception:
+                        resp = ''
+                    button.disabled = True
+                    button.label = 'Killed 🛑' if (resp and 'kill_ack' in resp) else 'Kill failed ⚠️'
+                    await interaction.message.edit(view=self)
+                    self.stop()
+            await sa_thread.send(embed=embed, view=SubAgentKillView(task_id))
+            _subagent_poll_tasks[task_id] = create_tracked_task(subagent_trace_stream(sa_thread, task_id))
+        except Exception as e:
+            print(f'[discord] Failed to create sub-agent thread: {e}', flush=True)
+    elif etype == 'subagent_complete':
+        summary = data.get('result_summary', '')
+        sa_thread = _subagent_threads.get(task_id)
+        if sa_thread:
+            try:
+                await sa_thread.send(embed=discord.Embed(title='✅ Complete', description=summary[:2000], color=0x34d399))
+            except Exception:
+                pass
+            poll_task = _subagent_poll_tasks.pop(task_id, None)
+            if poll_task:
+                poll_task.cancel()
+            _subagent_threads.pop(task_id, None)
+    elif etype == 'subagent_approval':
+        tool = data.get('tool', '')
+        args = data.get('args', '')
+        desc = data.get('description', '')
+        sa_thread = _subagent_threads.get(task_id)
+        embed = discord.Embed(title='⚠️ Permission Required', description=f'**{tool}**({args})\n\n{desc}', color=0xFFB300)
+
+        class SubAgentApprovalView(discord.ui.View):
+            def __init__(self, tid):
+                super().__init__(timeout=3600)
+                self.tid = tid
+            @discord.ui.button(label='✅ Approve', style=discord.ButtonStyle.green)
+            async def approve(self, interaction, button):
+                await interaction.response.defer()
+                try:
+                    await send_daemon_ipc(f'AI APPROVE [AGENT:{self.tid}] [DECISION:yes]')
+                except Exception:
+                    pass
+                for child in self.children:
+                    child.disabled = True
+                button.label = 'Approved ✅'
+                await interaction.message.edit(view=self)
+                self.stop()
+            @discord.ui.button(label='❌ Deny', style=discord.ButtonStyle.red)
+            async def deny(self, interaction, button):
+                await interaction.response.defer()
+                try:
+                    await send_daemon_ipc(f'AI APPROVE [AGENT:{self.tid}] [DECISION:no]')
+                except Exception:
+                    pass
+                for child in self.children:
+                    child.disabled = True
+                button.label = 'Denied ❌'
+                await interaction.message.edit(view=self)
+                self.stop()
+        view = SubAgentApprovalView(task_id)
+        if sa_thread:
+            try:
+                await sa_thread.send(embed=embed, view=view)
+            except Exception:
+                pass
+        try:
+            await channel.send(f'⚠️ Sub-agent **{task_id}** needs approval for `{tool}` — approve here or in its thread', view=SubAgentApprovalView(task_id))
+        except Exception:
+            pass
+
+
+async def session_side_channel_loop():
+    """PERSISTENT delivery of the agent's user-facing outputs — mid_message, attachment,
+    image_progress — for the ACTIVE session to the main channel, INDEPENDENT of any
+    turn's lifecycle. This is the fix for background/sub-agent/async outputs being
+    dropped: the old path (trace_poll_loop) delivered these only until the foreground
+    turn's done_event fired, so test_all's progress + report, async image gen, and
+    post-turn sub-agent replies vanished. This loop runs forever (500ms), so nothing the
+    agent emits to the active session is ever lost. Sub-agent THREAD trace is delivered
+    separately by the per-task pollers (keyed by task id, not the active session)."""
+    await client.wait_until_ready()
+    ch = None
+    while not client.is_closed():
+        try:
+            if ch is None:
+                ch = client.get_channel(channel_id)
+            sid = active_session_id or "default"
+            if ch is not None:
+                conn = sqlite3.connect(get_db_path())
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, event_type, content FROM trace_events WHERE session_id=? AND sent=0 AND event_type IN ('mid_message','attachment','image_progress','subagent_spawn','subagent_complete','subagent_approval') ORDER BY id LIMIT 30",
+                    (sid,),
+                )
+                rows = cur.fetchall()
+                conn.close()
+                for rid, etype, content in rows:
+                    # During an active turn, LEAVE attachments for db_collect_attachments
+                    # so they ride WITH the reply (cleaner). Only deliver attachments
+                    # standalone once no turn is active (e.g. async image gen finishing
+                    # after the turn). mid_message + image_progress always flow live.
+                    if etype == 'attachment' and sid in _busy_sessions:
+                        continue
+                    try:
+                        if etype == 'mid_message':
+                            await post_mid_message(ch, content, session_id=sid)
+                        elif etype == 'attachment':
+                            await post_attachment(ch, content, session_id=sid)
+                        elif etype == 'image_progress':
+                            await post_image_progress(ch, content)
+                        elif etype in ('subagent_spawn', 'subagent_complete', 'subagent_approval'):
+                            await handle_subagent_event(ch, etype, content)
+                    except Exception as e:
+                        print(f"[Discord Bridge] side-channel deliver error ({etype}): {e}", flush=True)
+                    try:
+                        c2 = sqlite3.connect(get_db_path())
+                        c2.execute("UPDATE trace_events SET sent=1 WHERE id=?", (rid,))
+                        c2.commit(); c2.close()
+                    except Exception:
+                        pass
+        except sqlite3.OperationalError:
+            pass
+        except Exception as e:
+            print(f"[Discord Bridge] side-channel loop error: {e}", flush=True)
+        await asyncio.sleep(0.5)
+
+
+async def post_mid_message(channel, content, session_id=None):
     """Post a mid-turn / sub-agent message to a channel, CHUNKED across multiple
     Discord messages (2000-char limit) instead of truncating. Sub-agent results can
     be long summaries — they must arrive in full, like the main agent's reply."""
+    if (content or "").startswith("🎨 Here's the image you asked for"):
+        update_visual_asset_description(
+            session_id or active_session_id or "default", content,
+            origin="assistant_generated",
+        )
     body = f"💬 {content}"
     # Split on 1990 to leave headroom under Discord's 2000 hard limit.
     for i in range(0, max(len(body), 1), 1990):
@@ -600,6 +1247,44 @@ _ATTACH_DENY_MARKERS = (
     "/.ernosdecent/", "private_key", ".pem", ".key",
 )
 _ATTACH_MAX_BYTES = 24 * 1024 * 1024  # 24 MB — under Discord's non-nitro upload cap
+
+async def subagent_trace_stream(thread, task_id):
+    """Phase D: stream a sub-agent's OWN trace (keyed by its task_id session) into its
+    Discord thread so the operator can watch it think/act live. Runs until cancelled by
+    subagent_complete. Mirrors trace_poll_loop's direct-SQLite pattern; marks rows sent
+    so the same event isn't posted twice. Skips the meta events handled elsewhere."""
+    TYPE_EMOJI = {
+        "thinking": "🧠", "reasoning": "💭", "action": "⚙️", "tool_exec": "🔧",
+        "tool_result": "📊", "raw_output": "🗒️", "audit": "🛡️", "mid_message": "💬",
+        "reply_audit": "✅", "no_action": "⚠️", "lookback": "🔎",
+    }
+    SKIP = {"subagent_spawn", "subagent_complete", "subagent_approval", "final_reply"}
+    while True:
+        try:
+            conn = sqlite3.connect(get_db_path())
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, event_type, content FROM trace_events WHERE session_id=? AND sent=0 ORDER BY id LIMIT 20",
+                (task_id,),
+            )
+            rows = cur.fetchall()
+            for rid, etype, content in rows:
+                cur.execute("UPDATE trace_events SET sent=1 WHERE id=?", (rid,))
+            conn.commit()
+            conn.close()
+            for rid, etype, content in rows:
+                if etype in SKIP:
+                    continue
+                try:
+                    await post_trace_event(thread, etype, content, TYPE_EMOJI.get(etype, "•"))
+                except Exception:
+                    pass
+        except sqlite3.OperationalError:
+            pass
+        except Exception as e:
+            print(f"[discord] subagent trace stream error ({task_id}): {e}", flush=True)
+        await asyncio.sleep(0.6)
+
 
 async def post_trace_event(thread, etype, content, emoji):
     """Post a trace event to the thinking thread IN FULL, chunked across messages instead
@@ -623,7 +1308,7 @@ async def post_trace_event(thread, etype, content, emoji):
             print(f"[Discord Bridge] trace chunk send error: {e}", flush=True)
 
 
-async def post_attachment(channel, path):
+async def post_attachment(channel, path, session_id=None):
     """Deliver a file the agent produced/shared as a REAL Discord attachment in the
     main channel. Node-side queued via a trace_events row of type 'attachment'."""
     p = (path or "").strip()
@@ -640,6 +1325,16 @@ async def post_attachment(channel, path):
         if os.path.getsize(p) > _ATTACH_MAX_BYTES:
             await channel.send(f"📎 `{os.path.basename(p)}` is too large to attach (>24MB). It's saved at `{p}`.")
             return
+        if os.path.splitext(p)[1].lower() in _VISUAL_EXTENSIONS:
+            visual_origin = "assistant_generated" if os.path.basename(p).startswith("generated_") else "assistant_shared"
+            sid = session_id or active_session_id or "default"
+            generation_prompt = (
+                _generation_prompt_for_generated_path(sid, p)
+                if visual_origin == "assistant_generated" else ""
+            )
+            register_visual_asset(
+                sid, p, visual_origin, generation_prompt=generation_prompt
+            )
         await channel.send(content=f"📎 `{os.path.basename(p)}`", file=discord.File(p))
     except Exception as e:
         print(f"[Discord Bridge] attachment send error for {p}: {e}", flush=True)
@@ -732,6 +1427,705 @@ def connect_db():
     conn.text_factory = lambda x: x.decode("utf-8", "replace")
     return conn
 
+
+_VISUAL_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+_VISUAL_QUERY_WORDS = (
+    "image", "images", "picture", "pictures", "photo", "visual", "look",
+    "which one", "first or second", "first of second", "same", "generated",
+    "recognise", "recognize", "compare", "crop", "version",
+)
+_VISUAL_COMPARE_PHRASES = (
+    "compare", "comparison", "same as", "different from", "previous image",
+    "previous picture", "earlier image", "earlier picture", "original image",
+    "before and after", "first or second", "which one", "which image",
+    "which picture", "version of", "variation of",
+)
+
+
+def _is_explicit_visual_comparison(prompt):
+    """True only when the user asks to relate this visual to another visual.
+
+    Generic words such as "image", "describe", or an ordinal like "Image Two" are
+    deliberately excluded. A new single attachment with those words is still the
+    current subject; it must never be replaced by accumulated session history.
+    """
+    text = (prompt or "").lower()
+    return any(phrase in text for phrase in _VISUAL_COMPARE_PHRASES)
+
+def _init_visual_asset_db(conn):
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS visual_assets (
+            asset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            message_id TEXT NOT NULL DEFAULT '',
+            filename TEXT NOT NULL,
+            path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            phash TEXT NOT NULL DEFAULT '',
+            dhash TEXT NOT NULL DEFAULT '',
+            width INTEGER NOT NULL DEFAULT 0,
+            height INTEGER NOT NULL DEFAULT 0,
+            parent_asset_id INTEGER NOT NULL DEFAULT 0,
+            match_kind TEXT NOT NULL DEFAULT '',
+            match_confidence INTEGER NOT NULL DEFAULT 0,
+            generation_prompt TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            presentation_ordinal INTEGER NOT NULL DEFAULT 0,
+            asset_key TEXT NOT NULL UNIQUE
+        );
+        CREATE INDEX IF NOT EXISTS visual_assets_session_idx
+            ON visual_assets(session_id, created_at, asset_id);
+        CREATE INDEX IF NOT EXISTS visual_assets_sha_idx
+            ON visual_assets(session_id, sha256);
+        """
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(visual_assets)")}
+    if "presentation_ordinal" not in columns:
+        conn.execute(
+            "ALTER TABLE visual_assets ADD COLUMN presentation_ordinal "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    # Backfill legacy user presentation events deterministically. Storage asset ids
+    # and generated-delivery rows never become conversational image numbers.
+    conn.execute(
+        """
+        UPDATE visual_assets AS current
+           SET presentation_ordinal=(
+               SELECT COUNT(*)
+                 FROM visual_assets AS prior
+                WHERE prior.session_id=current.session_id
+                  AND prior.origin='user_upload'
+                  AND prior.message_id<>''
+                  AND (prior.created_at < current.created_at OR
+                       (prior.created_at=current.created_at AND
+                        prior.asset_id <= current.asset_id))
+           )
+         WHERE current.origin='user_upload'
+           AND current.message_id<>''
+           AND current.presentation_ordinal=0
+        """
+    )
+    conn.commit()
+
+def _init_artifact_provenance_db(conn):
+    """Canonical provenance for every Echo-created attachment, not just images."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS artifact_provenance (
+            artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL DEFAULT '',
+            path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            artifact_kind TEXT NOT NULL DEFAULT 'file',
+            creator TEXT NOT NULL DEFAULT '',
+            what_text TEXT NOT NULL DEFAULT '',
+            why_text TEXT NOT NULL DEFAULT '',
+            how_text TEXT NOT NULL DEFAULT '',
+            observed_description TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(session_id,path,sha256)
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS artifact_provenance_session_idx "
+        "ON artifact_provenance(session_id,created_at,artifact_id)"
+    )
+    conn.commit()
+
+def _visual_fingerprints(path):
+    """Content hash plus two independently computed visual fingerprints."""
+    sha = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            sha.update(chunk)
+    try:
+        from PIL import Image
+        import numpy as np
+        from scipy.fftpack import dct
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+            width, height = image.size
+            gray32 = np.asarray(image.convert("L").resize((32, 32)), dtype=np.float32)
+            coeffs = dct(dct(gray32, axis=0, norm="ortho"), axis=1, norm="ortho")[:8, :8]
+            median = float(np.median(coeffs[1:, :]))
+            pbits = (coeffs > median).flatten()
+            phash = f"{sum(int(bit) << idx for idx, bit in enumerate(pbits)):016x}"
+            gray9 = np.asarray(image.convert("L").resize((9, 8)), dtype=np.int16)
+            dbits = (gray9[:, 1:] > gray9[:, :-1]).flatten()
+            dhash = f"{sum(int(bit) << idx for idx, bit in enumerate(dbits)):016x}"
+            return sha.hexdigest(), phash, dhash, width, height
+    except Exception as exc:
+        print(f"[Visual Memory] fingerprint fallback for {path}: {exc}", flush=True)
+        return sha.hexdigest(), "", "", 0, 0
+
+def _hash_similarity(left, right):
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    try:
+        distance = (int(left, 16) ^ int(right, 16)).bit_count()
+    except AttributeError:
+        distance = bin(int(left, 16) ^ int(right, 16)).count("1")
+    return max(0.0, 1.0 - distance / (len(left) * 4.0))
+
+def _recent_visual_assets(session_id, limit=8):
+    try:
+        conn = connect_db()
+        _init_visual_asset_db(conn)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM visual_assets WHERE session_id=? ORDER BY created_at DESC, asset_id DESC LIMIT ?",
+            (session_id or "default", limit),
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in reversed(rows)]
+    except Exception as exc:
+        print(f"[Visual Memory] recent lookup failed: {exc}", flush=True)
+        return []
+
+def _visual_original_origin(asset):
+    """Return the recorded creator-side origin without exposing storage identity.
+
+    A user upload can be an exact or perceptual re-upload of an image Echo made
+    earlier. register_visual_asset collapses that chain to its root, so provenance
+    questions must use the root origin rather than the transport event's origin.
+    """
+    parent_id = int(asset.get("parent_asset_id") or 0)
+    if not parent_id:
+        return asset.get("origin", "")
+    try:
+        conn = connect_db()
+        _init_visual_asset_db(conn)
+        row = conn.execute(
+            "SELECT origin FROM visual_assets WHERE asset_id=?", (parent_id,)
+        ).fetchone()
+        conn.close()
+        if row:
+            return row[0]
+    except Exception as exc:
+        print(f"[Visual Memory] provenance lookup failed: {exc}", flush=True)
+    return asset.get("origin", "")
+
+def _generation_prompt_for_generated_path(session_id, path):
+    """Recover the creative prompt belonging to a generated image delivery.
+
+    Image rendering is asynchronous: the prompt is durably emitted when the job
+    starts, while the generated asset is registered minutes later at attachment
+    delivery. Associate the nearest preceding start event with the timestamp in the
+    generated filename, keeping the creative purpose attached to the visual itself.
+    """
+    name_match = re.search(r"generated_(\d+)\.", os.path.basename(path or ""))
+    generated_at = int(name_match.group(1)) // 1000 if name_match else 0
+    try:
+        conn = connect_db()
+        rows = conn.execute(
+            "SELECT content, created_at FROM trace_events "
+            "WHERE session_id=? AND event_type='image_progress' "
+            "ORDER BY created_at DESC, id DESC LIMIT 32",
+            (session_id or "default",),
+        ).fetchall()
+        conn.close()
+        for content, created_at in rows:
+            if generated_at and int(created_at or 0) > generated_at:
+                continue
+            try:
+                event = json.loads(content or "{}")
+            except Exception:
+                continue
+            if event.get("status") == "started" and event.get("prompt"):
+                return str(event["prompt"])
+    except Exception as exc:
+        print(f"[Visual Memory] generation-prompt lookup failed: {exc}", flush=True)
+    return ""
+
+def _visual_original_generation_prompt(asset):
+    """Return the original Echo generation's creative prompt for this asset chain."""
+    root = asset
+    parent_id = int(asset.get("parent_asset_id") or 0)
+    try:
+        conn = connect_db()
+        _init_visual_asset_db(conn)
+        conn.row_factory = sqlite3.Row
+        if parent_id:
+            row = conn.execute(
+                "SELECT * FROM visual_assets WHERE asset_id=?", (parent_id,)
+            ).fetchone()
+            if row:
+                root = dict(row)
+        prompt = str(root.get("generation_prompt") or "")
+        if not prompt and root.get("origin") == "assistant_generated":
+            prompt = _generation_prompt_for_generated_path(
+                root.get("session_id") or asset.get("session_id"), root.get("path", "")
+            )
+            if prompt:
+                conn.execute(
+                    "UPDATE visual_assets SET generation_prompt=? WHERE asset_id=?",
+                    (prompt[:4000], int(root.get("asset_id") or 0)),
+                )
+                conn.commit()
+        conn.close()
+        return prompt
+    except Exception as exc:
+        print(f"[Visual Memory] original generation prompt lookup failed: {exc}", flush=True)
+        return ""
+
+def _visual_creation_provenance(asset):
+    """Resolve the hash-bound creation record for the root visual artifact."""
+    root = asset
+    parent_id = int(asset.get("parent_asset_id") or 0)
+    try:
+        conn = connect_db()
+        _init_visual_asset_db(conn)
+        _init_artifact_provenance_db(conn)
+        conn.row_factory = sqlite3.Row
+        if parent_id:
+            row = conn.execute(
+                "SELECT * FROM visual_assets WHERE asset_id=?", (parent_id,)
+            ).fetchone()
+            if row:
+                root = dict(row)
+        row = conn.execute(
+            "SELECT * FROM artifact_provenance "
+            "WHERE session_id=? AND sha256=? "
+            "ORDER BY artifact_id DESC LIMIT 1",
+            (
+                root.get("session_id") or asset.get("session_id") or "default",
+                root.get("sha256", ""),
+            ),
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else {}
+    except Exception as exc:
+        print(f"[Visual Memory] creation provenance lookup failed: {exc}", flush=True)
+        return {}
+
+def _select_prior_presented_visuals(assets, count=2):
+    """Select images in the order the user presented them for visual discussion.
+
+    Database rows are not conversational image numbers: generated delivery,
+    re-upload, and transformed-copy rows may all describe one visual. Prefer actual
+    user presentation events and keep chronological order. Fall back to the latest
+    live records only when no such presentation history exists.
+    """
+    live = [asset for asset in assets if os.path.isfile(asset.get("path", ""))]
+    presented = [
+        asset for asset in live
+        if asset.get("origin") == "user_upload" and asset.get("message_id")
+    ]
+    presented.sort(
+        key=lambda asset: (
+            int(asset.get("presentation_ordinal") or 0),
+            int(asset.get("created_at") or 0),
+            int(asset.get("asset_id") or 0),
+        )
+    )
+    pool = presented if len(presented) >= count else live
+    return pool[-count:]
+
+
+_VISUAL_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8,
+}
+
+
+def _requested_visual_count(prompt, available):
+    """Return the explicit number of prior presentation events the user named."""
+    text = (prompt or "").lower()
+    candidates = []
+    for match in re.finditer(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight)\s+"
+        r"(?:most\s+recent\s+|recent\s+|previous\s+|last\s+)?"
+        r"(?:image|images|picture|pictures|photo|photos|visual|visuals)\b",
+        text,
+    ):
+        raw = match.group(1)
+        candidates.append(int(raw) if raw.isdigit() else _VISUAL_NUMBER_WORDS[raw])
+    for match in re.finditer(
+        r"\b(?:image|picture|photo)\s+"
+        r"(\d+|one|two|three|four|five|six|seven|eight)\b",
+        text,
+    ):
+        raw = match.group(1)
+        candidates.append(int(raw) if raw.isdigit() else _VISUAL_NUMBER_WORDS[raw])
+    if re.search(r"\ball\s+(?:the\s+)?(?:images|pictures|photos|visuals)\b", text):
+        return available
+    if candidates:
+        return max(1, min(max(candidates), available))
+    return min(2, available)
+
+
+def _visual_conversation_label(asset, fallback):
+    ordinal = int(asset.get("presentation_ordinal") or 0)
+    value = ordinal if ordinal > 0 else fallback
+    words = {
+        1: "ONE", 2: "TWO", 3: "THREE", 4: "FOUR",
+        5: "FIVE", 6: "SIX", 7: "SEVEN", 8: "EIGHT",
+    }
+    return words.get(value, str(value))
+
+def register_visual_asset(session_id, path, origin, message_id="", filename="",
+                          generation_prompt="", description=""):
+    """Persist provenance and visually match uploads against remembered assets."""
+    if not path or not os.path.isfile(path):
+        return None
+    if os.path.splitext(path)[1].lower() not in _VISUAL_EXTENSIONS:
+        return None
+    try:
+        sha, phash, dhash, width, height = _visual_fingerprints(path)
+        sid = session_id or "default"
+        name = filename or os.path.basename(path)
+        key_material = f"{sid}|{origin}|{message_id}|{os.path.realpath(path)}"
+        asset_key = hashlib.sha256(key_material.encode("utf-8", "replace")).hexdigest()
+        conn = connect_db()
+        _init_visual_asset_db(conn)
+        conn.row_factory = sqlite3.Row
+        existing = conn.execute(
+            "SELECT * FROM visual_assets WHERE asset_key=?", (asset_key,)
+        ).fetchone()
+        if existing:
+            if generation_prompt and not existing["generation_prompt"]:
+                conn.execute(
+                    "UPDATE visual_assets SET generation_prompt=? WHERE asset_id=?",
+                    (generation_prompt[:4000], int(existing["asset_id"])),
+                )
+                conn.commit()
+                existing = conn.execute(
+                    "SELECT * FROM visual_assets WHERE asset_id=?",
+                    (int(existing["asset_id"]),),
+                ).fetchone()
+            result = dict(existing)
+            conn.close()
+            return result
+
+        parent_asset_id = 0
+        match_kind = ""
+        match_confidence = 0
+        candidates = conn.execute(
+            "SELECT * FROM visual_assets WHERE session_id=? ORDER BY created_at DESC, asset_id DESC LIMIT 32",
+            (sid,),
+        ).fetchall()
+        best = None
+        best_score = 0.0
+        for candidate in candidates:
+            if candidate["sha256"] == sha:
+                best, best_score, match_kind = candidate, 1.0, "exact-bytes"
+                break
+            pscore = _hash_similarity(candidate["phash"], phash)
+            dscore = _hash_similarity(candidate["dhash"], dhash)
+            score = pscore * 0.65 + dscore * 0.35
+            if score > best_score:
+                best, best_score = candidate, score
+        # Perceptual matches are candidate retrieval, not proof. The actual model is
+        # shown both images on a comparison board before it answers.
+        if best is not None and best_score >= 0.78:
+            parent_asset_id = int(best["asset_id"])
+            # Collapse re-upload chains to the original remembered asset so the
+            # system retains authorship/provenance rather than merely linking one
+            # user transport event to another.
+            seen_ids = set()
+            while parent_asset_id and parent_asset_id not in seen_ids:
+                seen_ids.add(parent_asset_id)
+                root_row = conn.execute(
+                    "SELECT parent_asset_id FROM visual_assets WHERE asset_id=?",
+                    (parent_asset_id,),
+                ).fetchone()
+                if not root_row or int(root_row[0] or 0) == 0:
+                    break
+                parent_asset_id = int(root_row[0])
+            match_kind = match_kind or "perceptual-candidate"
+            match_confidence = int(round(best_score * 100))
+        presentation_ordinal = 0
+        if origin == "user_upload" and message_id:
+            presentation_ordinal = int(conn.execute(
+                "SELECT COALESCE(MAX(presentation_ordinal),0)+1 FROM visual_assets "
+                "WHERE session_id=? AND origin='user_upload' AND message_id<>''",
+                (sid,),
+            ).fetchone()[0])
+        conn.execute(
+            """INSERT INTO visual_assets
+               (session_id,origin,message_id,filename,path,sha256,phash,dhash,width,height,
+                parent_asset_id,match_kind,match_confidence,generation_prompt,description,
+                created_at,presentation_ordinal,asset_key)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (sid, origin, str(message_id or ""), name, os.path.realpath(path), sha,
+             phash, dhash, width, height, parent_asset_id, match_kind,
+             match_confidence, generation_prompt, description, int(time.time()),
+             presentation_ordinal, asset_key),
+        )
+        asset_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        row = conn.execute("SELECT * FROM visual_assets WHERE asset_id=?", (asset_id,)).fetchone()
+        result = dict(row)
+        conn.close()
+        print(
+            f"[Visual Memory] registered asset={asset_id} origin={origin} "
+            f"match={match_kind or 'new'} confidence={match_confidence}",
+            flush=True,
+        )
+        return result
+    except Exception as exc:
+        print(f"[Visual Memory] registration failed for {path}: {exc}", flush=True)
+        return None
+
+def update_visual_asset_description(session_id, description, path=None, origin=None):
+    text_value = (description or "").strip()
+    if not text_value:
+        return
+    try:
+        conn = connect_db()
+        _init_visual_asset_db(conn)
+        if path:
+            visual_row = conn.execute(
+                "SELECT sha256 FROM visual_assets WHERE session_id=? AND path=? "
+                "ORDER BY asset_id DESC LIMIT 1",
+                (session_id or "default", os.path.realpath(path)),
+            ).fetchone()
+            conn.execute(
+                "UPDATE visual_assets SET description=? WHERE asset_id=(SELECT asset_id FROM visual_assets WHERE session_id=? AND path=? ORDER BY asset_id DESC LIMIT 1)",
+                (text_value[:4000], session_id or "default", os.path.realpath(path)),
+            )
+            _init_artifact_provenance_db(conn)
+            if visual_row:
+                conn.execute(
+                    "UPDATE artifact_provenance SET observed_description=?,updated_at=? "
+                    "WHERE artifact_id=(SELECT artifact_id FROM artifact_provenance "
+                    "WHERE session_id=? AND sha256=? ORDER BY artifact_id DESC LIMIT 1)",
+                    (
+                        text_value[:4000], int(time.time()),
+                        session_id or "default", visual_row[0],
+                    ),
+                )
+        elif origin:
+            conn.execute(
+                "UPDATE visual_assets SET description=? WHERE asset_id=(SELECT asset_id FROM visual_assets WHERE session_id=? AND origin=? ORDER BY asset_id DESC LIMIT 1)",
+                (text_value[:4000], session_id or "default", origin),
+            )
+            _init_artifact_provenance_db(conn)
+            visual_row = conn.execute(
+                "SELECT sha256 FROM visual_assets WHERE session_id=? AND origin=? "
+                "ORDER BY asset_id DESC LIMIT 1",
+                (session_id or "default", origin),
+            ).fetchone()
+            if visual_row:
+                conn.execute(
+                    "UPDATE artifact_provenance SET observed_description=?,updated_at=? "
+                    "WHERE artifact_id=(SELECT artifact_id FROM artifact_provenance "
+                    "WHERE session_id=? AND sha256=? ORDER BY artifact_id DESC LIMIT 1)",
+                    (
+                        text_value[:4000], int(time.time()),
+                        session_id or "default", visual_row[0],
+                    ),
+                )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"[Visual Memory] description update failed: {exc}", flush=True)
+
+def _visual_memory_context(session_id, current_message_id=""):
+    assets = _recent_visual_assets(session_id, 8)
+    if not assets:
+        return "", []
+    current_prefix = f"{current_message_id}:" if current_message_id else ""
+    current_assets = [
+        asset for asset in assets
+        if current_prefix and str(asset.get("message_id", "")).startswith(current_prefix)
+    ]
+    lines = [
+        "VISUAL GROUNDING (private system context): inspect the supplied native image pixels before answering. "
+        "This context and any composite image were assembled internally; the user did not send a board."
+    ]
+    for index, asset in enumerate(current_assets, 1):
+        original_origin = _visual_original_origin(asset)
+        original_generation_prompt = _visual_original_generation_prompt(asset)
+        creation_provenance = _visual_creation_provenance(asset)
+        exact_self_reupload = (
+            asset.get("origin") == "user_upload"
+            and original_origin == "assistant_generated"
+            and asset.get("match_kind") == "exact-bytes"
+            and int(asset.get("match_confidence") or 0) == 100
+        )
+        if exact_self_reupload:
+            provenance = (
+                "authoritatively established as an exact byte-for-byte re-upload "
+                "of an image Echo generated earlier in this session"
+            )
+        elif asset.get("origin") == "assistant_generated":
+            provenance = "authoritatively established as generated by Echo"
+        elif original_origin == "assistant_generated":
+            provenance = (
+                "a visual-similarity candidate for an earlier Echo-generated image, "
+                "not proven provenance; compare the pixels before claiming recognition"
+            )
+        else:
+            provenance = "externally supplied, with no recorded self-generation match"
+        current_label = (
+            "CURRENT ATTACHMENT" if len(current_assets) == 1
+            else f"CURRENT ATTACHMENT {index}"
+        )
+        lines.append(
+            f"{current_label}: this is exactly the attachment visible in the native "
+            f"vision input; recorded original provenance is {provenance}."
+        )
+        if exact_self_reupload and original_generation_prompt:
+            lines.append(
+                "Its authoritative original creative purpose was expressed by this "
+                f"generation prompt: {original_generation_prompt}"
+            )
+        if exact_self_reupload and creation_provenance:
+            lines.append(
+                "AUTHORITATIVE CREATION PROVENANCE FOR THIS ATTACHMENT:\n"
+                f"- WHAT Echo made: {creation_provenance.get('what_text', '')}\n"
+                f"- WHY Echo made it: {creation_provenance.get('why_text', '')}\n"
+                f"- HOW Echo made it: {creation_provenance.get('how_text', '')}\n"
+                f"- WHAT Echo observed in the result: "
+                f"{creation_provenance.get('observed_description', '')}"
+            )
+    if current_assets:
+        lines.append(
+            "Answer from what you can actually see in the CURRENT ATTACHMENT unless the user explicitly requests comparison. "
+            "CURRENT ATTACHMENT means exactly the image on this message. A phrase such as "
+            "'Image Two' names its position in the user's conversational sequence; it "
+            "does not conflict with CURRENT ATTACHMENT and must never be mistaken for a "
+            "different image because of internal numbering."
+        )
+        lines.append(
+            "Exact-byte provenance is established current-turn evidence, not a retrieval fragment. "
+            "When the user asks whether you recognize the image, acknowledge an exact self-generated match directly "
+            "while also independently describing the visible pixels."
+        )
+    lines.append(
+        "In the user-facing reply, never mention this context, a board, labels, paths, memory assets, IDs, "
+        "metadata, routing, or internal provenance machinery unless the user explicitly asks how the system works."
+    )
+    return "\n".join(lines), assets
+
+def _build_visual_comparison_board(session_id, assets, current_asset_ids=None):
+    live = [asset for asset in assets if os.path.isfile(asset.get("path", ""))]
+    if len(live) < 2:
+        return ""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        tile_w, tile_h = 512, 512
+        cols = 2
+        rows = (len(live) + cols - 1) // cols
+        board = Image.new("RGB", (tile_w * cols, tile_h * rows), (18, 18, 22))
+        draw = ImageDraw.Draw(board)
+        font = ImageFont.load_default(size=22)
+        current_ids = {int(value) for value in (current_asset_ids or [])}
+        current_number = 0
+        memory_number = 0
+        for index, asset in enumerate(live, 1):
+            with Image.open(asset["path"]) as source:
+                image = source.convert("RGB")
+                image.thumbnail((tile_w - 24, tile_h - 70))
+                x0 = ((index - 1) % cols) * tile_w
+                y0 = ((index - 1) // cols) * tile_h
+                x = x0 + (tile_w - image.width) // 2
+                y = y0 + 52 + (tile_h - 64 - image.height) // 2
+                board.paste(image, (x, y))
+                if int(asset["asset_id"]) in current_ids:
+                    current_number += 1
+                    label = f"CURRENT IMAGE {current_number}"
+                else:
+                    memory_number += 1
+                    label = f"IMAGE {_visual_conversation_label(asset, memory_number)}"
+                draw.rectangle((x0, y0, x0 + tile_w, y0 + 44), fill=(0, 0, 0))
+                draw.text((12 + x0, 10 + y0), label, fill=(255, 255, 255), font=font)
+        out_dir = os.path.expanduser("~/.ernosdecent/visual-comparisons")
+        os.makedirs(out_dir, mode=0o700, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{session_id}_{int(time.time() * 1000)}.jpg")
+        board.save(out_path, "JPEG", quality=92)
+        os.chmod(out_path, 0o600)
+        return out_path
+    except Exception as exc:
+        print(f"[Visual Memory] comparison board failed: {exc}", flush=True)
+        return ""
+
+def prepare_visual_context(session_id, prompt, current_image_path=None,
+                           current_message_id=""):
+    context, assets = _visual_memory_context(session_id, current_message_id)
+    current_prefix = f"{current_message_id}:" if current_message_id else ""
+    current_assets = [
+        asset for asset in assets
+        if current_prefix and str(asset.get("message_id", "")).startswith(current_prefix)
+    ]
+    current_ids = {int(asset["asset_id"]) for asset in current_assets}
+    # A new attachment is the authoritative visual subject. Only an explicit request
+    # to relate it to an earlier visual may expand it into a board, and even then the
+    # current upload is first and carries a CURRENT IMAGE label.
+    if current_image_path:
+        if _is_explicit_visual_comparison(prompt) and current_assets:
+            historical_pool = [
+                asset for asset in assets
+                if int(asset["asset_id"]) not in current_ids
+            ]
+            historical = _select_prior_presented_visuals(historical_pool, 1)
+            comparison_assets = current_assets + historical
+            if len(comparison_assets) >= 2:
+                board = _build_visual_comparison_board(
+                    session_id, comparison_assets, current_asset_ids=current_ids
+                )
+                if board:
+                    context += (
+                        "\nThe native visual input shows the current image first and the relevant earlier image second. "
+                        "Inspect both images. Do not refer to the internally assembled composite in the reply."
+                    )
+                    return board, context
+        return current_image_path, context
+    wants_comparison = any(word in (prompt or "").lower() for word in _VISUAL_QUERY_WORDS)
+    if wants_comparison and len(assets) >= 2:
+        presented_count = len([
+            asset for asset in assets
+            if asset.get("origin") == "user_upload" and asset.get("message_id")
+            and os.path.isfile(asset.get("path", ""))
+        ])
+        requested_count = _requested_visual_count(prompt, presented_count)
+        comparison_assets = _select_prior_presented_visuals(assets, requested_count)
+        board = _build_visual_comparison_board(session_id, comparison_assets)
+        if board:
+            inspection = (
+                "Inspect both sets of pixels before answering."
+                if len(comparison_assets) == 2
+                else "Inspect every labelled set of pixels before answering."
+            )
+            context += (
+                "\nThe native visual input contains the requested user-presented images in chronological order. "
+                "Every IMAGE number is its stable conversational presentation number; never renumber it. "
+                + inspection
+            )
+            for index, asset in enumerate(comparison_assets, 1):
+                original_origin = _visual_original_origin(asset)
+                provenance = "self-generated by Echo" if original_origin == "assistant_generated" else "external"
+                exact_note = " (a later user re-upload of that generated image)" if (
+                    asset.get("origin") == "user_upload" and original_origin == "assistant_generated"
+                ) else ""
+                label = _visual_conversation_label(asset, index)
+                context += f"\nIMAGE {label} recorded original provenance: {provenance}{exact_note}."
+            context += (
+                "\nState the answer directly. Do not mention the board, its labels, storage records, IDs, metadata, "
+                "or how the images were routed unless explicitly asked."
+            )
+            return board, context
+    return current_image_path, context
+
+
+def _should_store_visual_description(message, prompt):
+    """Persist a reply only when it describes exactly one current attachment."""
+    if _is_explicit_visual_comparison(prompt):
+        return False
+    attachments = getattr(message, "attachments", None) or []
+    visual_count = 0
+    for attachment in attachments:
+        ext = os.path.splitext(getattr(attachment, "filename", ""))[1].lower()
+        content_type = (getattr(attachment, "content_type", "") or "").lower()
+        if ext in _VISUAL_EXTENSIONS or content_type.startswith("image/"):
+            visual_count += 1
+    return visual_count <= 1
+
 def db_request_cancel(session_id):
     try:
         conn = connect_db()
@@ -749,8 +2143,12 @@ def db_poll_traces(session_id):
     try:
         conn = connect_db()
         cursor = conn.cursor()
+        # mid_message / image_progress / attachment are USER-FACING outputs delivered to
+        # the MAIN CHANNEL by the PERSISTENT session_side_channel_loop (which outlives the
+        # turn, so background/sub-agent/async-image outputs are never dropped). This
+        # turn-scoped thread trace only streams the thinking events.
         cursor.execute(
-            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type != 'attachment' AND session_id=? ORDER BY id LIMIT 50",
+            "SELECT id, event_type, content, created_at FROM trace_events WHERE sent=0 AND event_type NOT IN ('attachment','mid_message','image_progress','final_reply','subagent_spawn','subagent_complete','subagent_approval') AND session_id=? ORDER BY id LIMIT 50",
             (session_id,)
         )
         rows = cursor.fetchall()
@@ -789,7 +2187,7 @@ def db_collect_attachments(session_id):
         print(f"[Discord Bridge] Failed to collect attachments: {e}", flush=True)
     return paths
 
-def build_discord_files(paths):
+def build_discord_files(paths, session_id=None):
     """Build discord.File objects from attachment paths, secret-safe + size-capped."""
     out = []
     for p in paths or []:
@@ -799,6 +2197,16 @@ def build_discord_files(paths):
             continue
         try:
             if os.path.isfile(p) and os.path.getsize(p) <= _ATTACH_MAX_BYTES:
+                if os.path.splitext(p)[1].lower() in _VISUAL_EXTENSIONS:
+                    visual_origin = "assistant_generated" if os.path.basename(p).startswith("generated_") else "assistant_shared"
+                    sid = session_id or active_session_id or "default"
+                    generation_prompt = (
+                        _generation_prompt_for_generated_path(sid, p)
+                        if visual_origin == "assistant_generated" else ""
+                    )
+                    register_visual_asset(
+                        sid, p, visual_origin, generation_prompt=generation_prompt
+                    )
                 out.append(discord.File(p, filename=os.path.basename(p)))
         except Exception as e:
             print(f"[Discord Bridge] build_discord_files skip {p}: {e}", flush=True)
@@ -919,10 +2327,10 @@ class SpeakView(discord.ui.View):
         except Exception as e:
             await interaction.followup.send(f"🔇 Failed to upload audio: {e}", ephemeral=True)
 
-async def _handle_approval_bg(message, resp, reply_msg, trace_ctx):
+async def _handle_approval_bg(message, resp, reply_msg, trace_ctx,
+                              session_id, busy_token):
     """Background task wrapper for handle_tool_approval.
     Runs independently of on_message so discord.py can't cancel it."""
-    global _ai_busy, _ai_busy_channel_id
     try:
         await handle_tool_approval(message, resp, edit_msg=reply_msg)
     except Exception as e:
@@ -932,15 +2340,14 @@ async def _handle_approval_bg(message, resp, reply_msg, trace_ctx):
         except Exception:
             pass
     finally:
-        _ai_busy = False
-        _ai_busy_channel_id = None
+        _release_session_busy(session_id, busy_token)
         if trace_ctx:
             await _cleanup_traces(trace_ctx)
 
-async def _handle_clarify_bg(message, resp, reply_msg, trace_ctx):
+async def _handle_clarify_bg(message, resp, reply_msg, trace_ctx,
+                             session_id, busy_token):
     """Background task wrapper for handle_clarification.
     Runs independently of on_message so discord.py can't cancel it."""
-    global _ai_busy, _ai_busy_channel_id
     try:
         await handle_clarification(message, resp, edit_msg=reply_msg)
     except Exception as e:
@@ -950,8 +2357,7 @@ async def _handle_clarify_bg(message, resp, reply_msg, trace_ctx):
         except Exception:
             pass
     finally:
-        _ai_busy = False
-        _ai_busy_channel_id = None
+        _release_session_busy(session_id, busy_token)
         if trace_ctx:
             await _cleanup_traces(trace_ctx)
 
@@ -1376,113 +2782,11 @@ async def trace_poll_loop(thread, session_id, done_event, main_channel=None):
                         _image_gen_msg = None
                     continue
 
-                # --- Sub-agent thread handling ---
-                if etype == 'subagent_spawn' and main_channel:
-                    global _subagent_threads, _subagent_poll_tasks
-                    import json as _json
-                    try:
-                        data = _json.loads(content)
-                    except Exception:
-                        await post_trace_event(thread, etype, content, emoji)
-                        continue
-                    task_id = data.get('task_id', '')
-                    role = data.get('role', 'Sub-Agent')
-                    instruction = data.get('instruction', '')
-                    try:
-                        sa_thread = await main_channel.create_thread(
-                            name=f'\U0001f916 {role} \u2014 {task_id}',
-                            type=discord.ChannelType.public_thread
-                        )
-                        _subagent_threads[task_id] = sa_thread
-                        embed = discord.Embed(title=f'\U0001f916 {role}', description=instruction, color=0x50c878)
-                        embed.set_footer(text=f'{task_id} \u2022 \U0001f7e2 Running')
-                        await sa_thread.send(embed=embed)
-                    except Exception as e:
-                        print(f'[discord] Failed to create sub-agent thread: {e}', flush=True)
-                    continue
-
-                if etype == 'subagent_complete' and main_channel:
-                    import json as _json
-                    try:
-                        data = _json.loads(content)
-                    except Exception:
-                        await post_trace_event(thread, etype, content, emoji)
-                        continue
-                    task_id = data.get('task_id', '')
-                    summary = data.get('result_summary', '')
-                    sa_thread = _subagent_threads.get(task_id)
-                    if sa_thread:
-                        embed = discord.Embed(title='\u2705 Complete', description=summary[:2000], color=0x34d399)
-                        try:
-                            await sa_thread.send(embed=embed)
-                        except Exception:
-                            pass
-                        # Clean up poll task
-                        poll_task = _subagent_poll_tasks.pop(task_id, None)
-                        if poll_task:
-                            poll_task.cancel()
-                        del _subagent_threads[task_id]
-                    continue
-
-                if etype == 'subagent_approval' and main_channel:
-                    import json as _json
-                    try:
-                        data = _json.loads(content)
-                    except Exception:
-                        await post_trace_event(thread, etype, content, emoji)
-                        continue
-                    task_id = data.get('task_id', '')
-                    tool = data.get('tool', '')
-                    args = data.get('args', '')
-                    desc = data.get('description', '')
-                    sa_thread = _subagent_threads.get(task_id)
-                    embed = discord.Embed(
-                        title='\u26a0\ufe0f Permission Required',
-                        description=f'**{tool}**({args})\n\n{desc}',
-                        color=0xFFB300
-                    )
-                    # Create approval buttons view
-                    class SubAgentApprovalView(discord.ui.View):
-                        def __init__(self, tid, bridge_ipc_send):
-                            super().__init__(timeout=3600)
-                            self.tid = tid
-                            self.bridge_ipc_send = bridge_ipc_send
-                        @discord.ui.button(label='\u2705 Approve', style=discord.ButtonStyle.green)
-                        async def approve(self, interaction, button):
-                            await interaction.response.defer()
-                            try:
-                                resp = await self.bridge_ipc_send(f'AI APPROVE [AGENT:{self.tid}] [DECISION:yes]')
-                            except Exception:
-                                pass
-                            for child in self.children:
-                                child.disabled = True
-                            button.label = 'Approved \u2705'
-                            await interaction.message.edit(view=self)
-                            self.stop()
-                        @discord.ui.button(label='\u274c Deny', style=discord.ButtonStyle.red)
-                        async def deny(self, interaction, button):
-                            await interaction.response.defer()
-                            try:
-                                resp = await self.bridge_ipc_send(f'AI APPROVE [AGENT:{self.tid}] [DECISION:no]')
-                            except Exception:
-                                pass
-                            for child in self.children:
-                                child.disabled = True
-                            button.label = 'Denied \u274c'
-                            await interaction.message.edit(view=self)
-                            self.stop()
-                    view = SubAgentApprovalView(task_id, send_daemon_ipc)
-                    if sa_thread:
-                        try:
-                            await sa_thread.send(embed=embed, view=view)
-                        except Exception:
-                            pass
-                    # Also notify main channel
-                    try:
-                        await main_channel.send(f'\u26a0\ufe0f Sub-agent **{task_id}** needs approval for `{tool}` \u2014 see thread', view=view)
-                    except Exception:
-                        pass
-                    continue
+                # Sub-agent lifecycle events (spawn/complete/approval) are owned by the
+                # PERSISTENT session_side_channel_loop (they now arrive AFTER this
+                # turn-scoped poller has stopped, since sub-agents yield to foreground and
+                # spawn once the parent turn ends) \u2014 and are excluded from db_poll_traces
+                # so they are never consumed here. Only in-turn thinking-trace lands here.
 
                 # All other events: post to trace thread IN FULL (chunked, never truncated)
                 await post_trace_event(thread, etype, content, emoji)
@@ -1530,12 +2834,12 @@ async def pending_deletes_cleanup_loop():
             print(f"[Discord Bridge] pending deletes cleanup error: {e}", flush=True)
         await asyncio.sleep(15.0)  # Check every 15 seconds
 
-async def _start_ai_with_traces(message, query_text, author, reply_msg=None):
+async def _start_ai_with_traces(message, query_text, author, reply_msg=None,
+                                image_path=None, session_id=None, busy_token=None):
     """Start an AI query with a trace thread. Returns (resp, trace_ctx) where trace_ctx
     contains the lifecycle objects needed to keep polling alive across approval/clarification
     flows. The caller MUST call _cleanup_traces(trace_ctx) when the full response cycle ends."""
-    global active_session_id
-    sess = active_session_id or "default"
+    sess = session_id or "default"
 
     trace_ctx = {
         "thread": None,
@@ -1568,7 +2872,10 @@ async def _start_ai_with_traces(message, query_text, author, reply_msg=None):
 
     # Run the actual AI query (blocking IPC call). Pass the message so the agent can
     # react([emoji]) to THIS message without handling ids itself.
-    resp = await query_daemon_ipc(query_text, author=author, message=message)
+    resp = await query_daemon_ipc(
+        query_text, author=author, message=message, image_path=image_path,
+        session_id=sess, busy_token=busy_token,
+    )
 
     return resp, trace_ctx
 
@@ -1637,7 +2944,8 @@ async def on_ready():
         client._bridge_poll_started = True
         create_tracked_task(bridge_commands_db_loop())
         create_tracked_task(bridge_poll_loop())
-        print("[Discord Bridge] node<->bridge RPC loops started (DB primary + IPC fallback).", flush=True)
+        create_tracked_task(session_side_channel_loop())
+        print("[Discord Bridge] node<->bridge RPC loops started (DB primary + IPC fallback + persistent side-channel).", flush=True)
     
     # Start the pending-deletes cleanup loop (crash resilience for trace threads)
     if not getattr(client, "_cleanup_started", False):
@@ -1667,27 +2975,36 @@ async def on_ready():
 # second registration below is active. The dead handler was identical except for a
 # broken IPC-based file upload path that sent JSON to a pipe-delimited endpoint.)
 
-async def _run_query_bg(message, reply_msg):
+async def _run_query_owned(message, reply_msg, query_text, image_path,
+                           session_id, busy_token):
     """Independently scheduled background task to run the AI query.
     By running on the global loop, this is immune to discord.py event cancellations."""
-    global _ai_busy, _ai_busy_channel_id
     trace_ctx = None
     bg_launched = False
     try:
         async with message.channel.typing():
-            resp, trace_ctx = await _start_ai_with_traces(message, message.content, author=message.author, reply_msg=reply_msg)
+            actual_query = query_text if query_text is not None else message.content
+            resp, trace_ctx = await _start_ai_with_traces(
+                message, actual_query, author=message.author,
+                reply_msg=reply_msg, image_path=image_path,
+                session_id=session_id, busy_token=busy_token,
+            )
             print(f"[DELIVERY] IPC resp: len={len(resp) if resp else 'None'} prefix={repr(resp[:80]) if resp else 'None'}", flush=True)
             print(f"[DELIVERY] reply_msg={'id=' + str(reply_msg.id) if reply_msg else 'None'}", flush=True)
         
             # Parse the standard daemon response format
             if resp.startswith("ai:pending_approval,"):
                 print("[DELIVERY] Branch: pending_approval — launching background task", flush=True)
-                create_tracked_task(_handle_approval_bg(message, resp, reply_msg, trace_ctx))
+                create_tracked_task(_handle_approval_bg(
+                    message, resp, reply_msg, trace_ctx, session_id, busy_token
+                ))
                 bg_launched = True
                 return
             elif resp.startswith("ai:clarify,"):
                 print("[DELIVERY] Branch: clarify — launching background task", flush=True)
-                create_tracked_task(_handle_clarify_bg(message, resp, reply_msg, trace_ctx))
+                create_tracked_task(_handle_clarify_bg(
+                    message, resp, reply_msg, trace_ctx, session_id, busy_token
+                ))
                 bg_launched = True
                 return
             elif resp.startswith("ai:cancelled,response:"):
@@ -1710,6 +3027,13 @@ async def _run_query_bg(message, reply_msg):
             if not ai_resp or not ai_resp.strip():
                 print("[DELIVERY] WARNING: ai_resp was empty, replacing with '...'", flush=True)
                 ai_resp = "..."
+            if image_path and _should_store_visual_description(message, actual_query):
+                update_visual_asset_description(session_id, ai_resp, path=image_path)
+            elif image_path:
+                print(
+                    "[Visual Memory] comparison/multi-image reply not stored as a single-asset description",
+                    flush=True,
+                )
                 
             # Post the final answer as a NEW message at completion time rather than
             # editing the early "🧠 Thinking..." placeholder. Editing the placeholder
@@ -1724,7 +3048,7 @@ async def _run_query_bg(message, reply_msg):
                 except Exception as del_err:
                     print(f"[DELIVERY] placeholder delete failed (continuing): {type(del_err).__name__}: {del_err}", flush=True)
             # Files the agent produced this turn (generated image / created file) ride WITH the reply.
-            _att = build_discord_files(db_collect_attachments(active_session_id or "default"))
+            _att = build_discord_files(db_collect_attachments(session_id), session_id=session_id)
             await send_discord_reply(message, ai_resp, speakable=True, edit_msg=None, files=_att)
             print(f"[DELIVERY] send_discord_reply returned OK (files={len(_att)})", flush=True)
     except Exception as e:
@@ -1737,32 +3061,129 @@ async def _run_query_bg(message, reply_msg):
             print(f"[DELIVERY] EMERGENCY FALLBACK ALSO FAILED: {e2}", flush=True)
     finally:
         if not bg_launched:
-            _ai_busy = False
-            _ai_busy_channel_id = None
+            _release_session_busy(session_id, busy_token)
             if trace_ctx:
                 await _cleanup_traces(trace_ctx)
 
 
+async def _run_query_bg(message, reply_msg, query_text=None, image_path=None,
+                        session_id=None):
+    """Queue ordinary messages in arrival order for their reserved session."""
+    sess = session_id or "default"
+    lock = _session_query_lock(sess)
+    async with lock:
+        busy_token = _claim_session_busy(
+            sess, getattr(message.channel, "id", 0), getattr(message, "id", 0)
+        )
+        if not busy_token:
+            # The asyncio lock is authoritative; this is only possible after an
+            # interrupted owner. Reconcile the stale in-memory reservation safely.
+            stale = _busy_sessions.get(sess)
+            if stale:
+                _busy_sessions.pop(sess, None)
+                _active_turn_ids.pop(sess, None)
+            busy_token = _claim_session_busy(
+                sess, getattr(message.channel, "id", 0), getattr(message, "id", 0)
+            )
+        await _run_query_owned(
+            message, reply_msg,
+            query_text if query_text is not None else message.content,
+            image_path, sess, busy_token,
+        )
+
+
 @client.event
 async def on_message(message):
-    global _ai_busy, _ai_busy_channel_id, active_session_id
+    global active_session_id
     # Ignore bot's own messages
     if message.author == client.user:
         return
     
+    # Phase D: a message typed inside a SUB-AGENT thread is a direct WHISPER to that
+    # sub-agent (monitor + steer it from its own thread). The sub-agent drains its own
+    # whispers because its session_id IS the task_id, so this needs no other plumbing.
+    for _tid, _thr in list(_subagent_threads.items()):
+        if _thr is not None and message.channel.id == _thr.id:
+            if message.content.strip():
+                db_write_whisper(_tid, message.content.strip())
+                try:
+                    ack = await message.reply("🫧 Whisper delivered to this agent — it'll fold your guidance in on its next step.")
+                    create_tracked_task(_delayed_delete(ack, 6.0))
+                except Exception:
+                    pass
+            return
+
     # Listen only to the configured channel or threads within it
     is_target_channel = message.channel.id == channel_id
     is_thread_in_target_channel = getattr(message.channel, 'parent_id', None) == channel_id
     if not is_target_channel and not is_thread_in_target_channel:
         return
 
-    # Process attachments first (uploads/RAG indexing via HTTP /api/upload)
+    # Resolve lifecycle before touching attachments or retrieval state. If Echo ended
+    # the previous session, this message starts a fresh one and every asset/context row
+    # is attributed to that new session from the outset.
+    try:
+        previous_session_id = active_session_id or "default"
+        active_session_id = await ensure_user_session_id()
+        if active_session_id != previous_session_id:
+            print(
+                f"[Discord Bridge] Closed session {previous_session_id} rolled forward "
+                f"to {active_session_id} for the new user message.",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[Discord Bridge] Could not establish user session: {exc}", flush=True)
+        await message.reply(f"❌ Could not start a fresh session: {exc}")
+        return
+
+    # Process attachments first. Raster images are native multimodal input for
+    # gemma4:26b; documents continue through the RAG upload/indexing path.
+    image_path = None
+    image_paths = []
+    current_visual_assets = []
+    attachment_session = active_session_id or "default"
     if message.attachments:
         for attachment in message.attachments:
             ext = os.path.splitext(attachment.filename)[1].lower()
-            supported_extensions = ['.pdf', '.txt', '.md', '.markdown', '.json', '.js', '.py', '.ep', '.ts', '.c', '.h']
-            if ext not in supported_extensions:
-                await message.reply(f"⚠️ Unsupported attachment format: `{attachment.filename}`. Supported types: {', '.join(supported_extensions)}")
+            image_extensions = ['.png', '.jpg', '.jpeg', '.webp', '.gif']
+            image_content_types = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+            document_extensions = ['.pdf', '.txt', '.md', '.markdown', '.json', '.js', '.py', '.ep', '.ts', '.c', '.h']
+            content_type = (getattr(attachment, 'content_type', '') or '').lower()
+
+            if ext in image_extensions or content_type in image_content_types:
+                try:
+                    if getattr(attachment, 'size', 0) > _ATTACH_MAX_BYTES:
+                        await message.reply(f"⚠️ Image `{attachment.filename}` is too large (>24MB).")
+                        continue
+                    image_bytes = await attachment.read()
+                    image_dir = os.path.expanduser('~/.ernosdecent/discord-images')
+                    os.makedirs(image_dir, mode=0o700, exist_ok=True)
+                    safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', os.path.basename(attachment.filename))
+                    if not safe_name:
+                        safe_name = f'image{ext or ".png"}'
+                    attachment_id = getattr(attachment, 'id', len(image_paths) + 1)
+                    saved_image_path = os.path.join(
+                        image_dir, f'{message.id}_{attachment_id}_{safe_name}'
+                    )
+                    with open(saved_image_path, 'wb') as image_file:
+                        image_file.write(image_bytes)
+                    os.chmod(saved_image_path, 0o600)
+                    visual_asset = register_visual_asset(
+                        attachment_session, saved_image_path, "user_upload",
+                        message_id=f"{message.id}:{attachment_id}", filename=attachment.filename,
+                    )
+                    image_paths.append(saved_image_path)
+                    if visual_asset:
+                        current_visual_assets.append(visual_asset)
+                    image_path = saved_image_path
+                    print(f"[Discord Bridge] Native vision attachment saved: {saved_image_path} ({len(image_bytes)} bytes)", flush=True)
+                except Exception as e:
+                    await message.reply(f"❌ Failed to prepare image `{attachment.filename}`: {e}")
+                continue
+
+            if ext not in document_extensions:
+                supported = image_extensions + document_extensions
+                await message.reply(f"⚠️ Unsupported attachment format: `{attachment.filename}`. Supported types: {', '.join(supported)}")
                 continue
 
             async with message.channel.typing():
@@ -1779,41 +3200,60 @@ async def on_message(message):
                 except Exception as e:
                     await message.reply(f"❌ Error processing `{attachment.filename}`: {str(e)}")
 
+        # A single model request still carries one image payload, so compose every
+        # image from this Discord message into an actual-pixel board.  This preserves
+        # attachment order and lets native vision compare all uploads instead of
+        # silently dropping everything after the first image.
+        if len(current_visual_assets) > 1:
+            current_board = _build_visual_comparison_board(
+                attachment_session, current_visual_assets,
+                current_asset_ids={asset["asset_id"] for asset in current_visual_assets},
+            )
+            if current_board:
+                image_path = current_board
+
     # Now process text if present
     has_text = len(message.content.strip()) > 0
-    if has_text:
-        print(f"[Discord Bridge] Processing message from {message.author}: {message.content}", flush=True)
-        
-        # Whisper detection: if AI is busy processing, treat incoming messages as
-        # mid-turn guidance instead of queuing a new AI query. The whisper is written
-        # to SQLite and picked up by the react loop before its next LLM call.
-        if _ai_busy and message.channel.id == _ai_busy_channel_id:
-            sess = active_session_id or "default"
-            result = db_write_whisper(sess, message.content)
-            if result == "ok":
-                try:
-                    whisper_ack = await message.reply("🫧 **Whisper received** — your guidance will reach the agent on its next reasoning step.")
-                    # Auto-delete the acknowledgement after 5 seconds to keep the chat clean
-                    create_tracked_task(_delayed_delete(whisper_ack, 5.0))
-                except Exception:
-                    pass
+    has_image = image_path is not None
+    if has_text or has_image:
+        query_text = message.content.strip()
+        if not query_text:
+            if len(image_paths) > 1:
+                query_text = "Please examine and compare the attached images and respond to them."
             else:
-                try:
-                    await message.reply(f"⚠️ Could not queue whisper: {result}")
-                except Exception:
-                    pass
-            return
+                query_text = "Please examine the attached image and respond to it."
+        print(f"[Discord Bridge] Processing message from {message.author}: {query_text} image={bool(image_path)}", flush=True)
         
-        # /factory — text fallback requires the literal word CONFIRM (destructive).
+        if message.content.strip().lower().startswith("/factoryexecute"):
+            if not is_admin_author(message.author):
+                await message.reply("❌ Only the operator can execute a consented factory reset.")
+                return
+            parts = message.content.strip().split(maxsplit=1)
+            if len(parts) < 2 or len(parts[1].strip()) != 64:
+                await message.reply("Usage: `/factoryexecute <64-character change_id>` after Echo has consented.")
+                return
+            execute = await send_daemon_ipc(f"AI FACTORY EXECUTE {parts[1].strip()}")
+            if execute and execute.startswith("factory:ok"):
+                _clear_bridge_factory_runtime()
+                if await _restart_node_after_factory():
+                    await message.reply("🏭 Factory reset complete after recorded Echo consent, verified recovery, and a verified clean-node restart.")
+                else:
+                    await message.reply("⚠️ Factory state cleared, but the clean-node restart was not verified. Do not begin the clean test yet.")
+            else:
+                await message.reply(f"🛑 Factory reset did not execute: {execute}")
+            return
+
+        # /factory — text fallback requires CONFIRM plus a non-empty reason. The
+        # daemon still performs a separate Echo-consent transition before any wipe.
         if message.content.strip().lower().startswith("/factory"):
             if not is_admin_author(message.author):
                 await message.reply("❌ Only the operator can factory-reset the agent.")
                 return
-            parts = message.content.strip().split(maxsplit=1)
-            if len(parts) < 2 or parts[1].strip() != "CONFIRM":
-                await message.reply(FACTORY_WARNING + "\n\nType `/factory CONFIRM` (exact) or use the /factory slash command's buttons.")
+            parts = message.content.strip().split(maxsplit=2)
+            if len(parts) < 3 or parts[1].strip() != "CONFIRM" or not parts[2].strip():
+                await message.reply(FACTORY_WARNING + "\n\nType `/factory CONFIRM <reason>` or use the slash command; Echo will receive the exact reason and may refuse.")
                 return
-            await run_factory_reset(lambda text: message.reply(text))
+            await run_factory_reset_durable(lambda text: message.reply(text), parts[2].strip(), author=message.author, message=message)
             return
 
         # P9: /persona <name> | /persona list — activate or list registered personas.
@@ -1903,16 +3343,33 @@ async def on_message(message):
 
         # Start AI query via a background task to completely shield it from event cancellations.
         sess = active_session_id or "default"
+        force_queue = query_text.lower() == "/queue" or query_text.lower().startswith("/queue ")
+        if force_queue:
+            query_text = query_text[7:].strip()
+            if not query_text:
+                await message.reply("Usage: `/queue <message>`")
+                return
+        if not has_image and not force_queue:
+            whisper_turn = _active_whisper_target(sess, message.channel)
+            if whisper_turn:
+                whisper_status = db_write_whisper(sess, query_text, whisper_turn)
+                if whisper_status == "ok":
+                    await message.reply("🫧 Added to Echo’s current turn as live guidance.")
+                else:
+                    await message.reply("⚠️ The live guidance could not be stored; it was not silently queued or resent.")
+                return
         reply_msg = None
         try:
-            reply_msg = await message.reply("🧠 Thinking...", view=StopView(author=message.author, session_id=sess))
+            queued = _session_query_lock(sess).locked()
+            status_text = "⏳ Queued — I’ll answer this after the current turn." if queued else "🧠 Thinking..."
+            reply_msg = await message.reply(status_text, view=StopView(author=message.author, session_id=sess))
         except Exception as e:
             print(f"[Discord Bridge] Failed to send initial thinking reply: {e}", flush=True)
 
-        # Set busy flag — stays True across the entire background run
-        _ai_busy = True
-        _ai_busy_channel_id = message.channel.id
-        create_tracked_task(_run_query_bg(message, reply_msg))
+        create_tracked_task(_run_query_bg(
+            message, reply_msg, query_text=query_text, image_path=image_path,
+            session_id=sess,
+        ))
         return
 
 
@@ -1926,4 +3383,3 @@ if __name__ == "__main__":
         sys.exit(1)
     finally:
         update_status("OFFLINE")
-

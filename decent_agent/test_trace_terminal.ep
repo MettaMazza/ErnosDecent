@@ -1,0 +1,53 @@
+import "sql"
+import "fs"
+import "os"
+import "string"
+import "./trace"
+
+set PASSED to 0
+set FAILED to 0
+
+define expect with label as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        set PASSED to PASSED + 1
+        return 1
+    display concat("FAIL: " and label)
+    set FAILED to FAILED + 1
+    return 0
+
+define scalar with db as Int and query as Str returning Str:
+    set rows to sql_query(db and query)
+    if length_list(rows) == 0:
+        return ""
+    set row to get_list(rows and 0)
+    return get_list(row and 0)
+
+define main returning Int:
+    set path to concat("/tmp/ernos_trace_terminal_" and concat(int_to_string(ep_time_now_ms()) and ".db"))
+    set db to sql_open(path)
+    expect("test database opens" and db != 0)
+    set rc to sql_execute(db and "PRAGMA busy_timeout=15000;")
+    expect("busy timeout config succeeds" and rc == 0)
+    set rc to sql_execute(db and "CREATE TABLE trace_events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, event_type TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0);")
+    expect("trace schema created" and rc == 0)
+    set rc to trace_emit(db and "s" and "thinking" and "ordinary")
+    expect("ordinary trace returns real success" and rc == 0)
+    set rc to sql_execute(db and "CREATE TRIGGER reject_final BEFORE INSERT ON trace_events WHEN NEW.event_type='final_reply' BEGIN SELECT RAISE(ABORT, 'forced terminal failure'); END;")
+    expect("failure trigger created" and rc == 0)
+    set rc to trace_emit(db and "s" and "final_reply" and "turn:t_test,answer")
+    expect("trace emitter propagates SQLite failure" and rc != 0)
+    set rc to trace_emit_terminal(db and "s" and "turn:t_test,answer")
+    expect("terminal emitter fails closed after bounded retries" and rc != 0)
+    set rc to sql_execute(db and "DROP TRIGGER reject_final;")
+    set rc to trace_emit_terminal(db and "s" and "turn:t_test,answer")
+    expect("terminal emitter publishes after contention clears" and rc == 0)
+    expect("terminal publication is present exactly once" and scalar(db and "SELECT COUNT(*) FROM trace_events WHERE event_type='final_reply' AND content='turn:t_test,answer';") equals "1")
+    set duplicate_rc to trace_emit_terminal(db and "s" and "turn:t_test,answer")
+    expect("terminal publication retry is idempotent" and duplicate_rc == 0 and also scalar(db and "SELECT COUNT(*) FROM trace_events WHERE event_type='final_reply';") equals "1")
+    set close_rc to sql_close(db)
+    set removed to remove_file(path)
+    display concat("Terminal trace tests: " and concat(int_to_string(PASSED) and concat(" passed, " and concat(int_to_string(FAILED) and " failed"))))
+    if FAILED > 0:
+        return 1
+    return 0

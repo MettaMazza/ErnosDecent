@@ -1,0 +1,90 @@
+# Regression coverage for map_insert's value-returning contract.
+# A zero integer or empty string is a successful stored value, so mutation
+# success is established by key presence plus the exact value read back.
+
+import "collections"
+import "../decent_net/gitdec"
+import "../decent_search/crawl"
+import "../decent_consensus/raft_transport"
+import "../decent_host/email"
+import "../decent_name/registry"
+import "../decent_msg/message"
+
+define map_insert_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main returning Int:
+    set passed to 0
+    set total to 0
+
+    set raw to create_map()
+    set zero_return to map_insert(raw and "zero" and 0)
+    set total to total + 1
+    set passed to passed + map_insert_expect(zero_return == 0 and also map_contains(raw and "zero") == 1 and also map_get_val(raw and "zero") == 0 and "zero return is the stored value, not a failed insertion")
+
+    set empty_return to map_insert(raw and "empty" and "")
+    set total to total + 1
+    set passed to passed + map_insert_expect(empty_return != 0 and also map_contains(raw and "empty") == 1 and also (map_get_val(raw and "empty") equals "") and "empty-string insertion is verified by its postcondition")
+
+    set error_result to gitdec_error_result(GITDEC_ERR_NONE)
+    set total to total + 1
+    set passed to passed + map_insert_expect(error_result != 0 and also map_contains(error_result and "error") == 1 and also map_get_val(error_result and "error") == GITDEC_ERR_NONE and "GitDec preserves its zero success code")
+
+    set crawl_index to crawl_create_index()
+    set total to total + 1
+    set passed to passed + map_insert_expect(crawl_index != 0 and also map_contains(crawl_index and "page_count") == 1 and also map_get_val(crawl_index and "page_count") == 0 and also map_get_val(crawl_index and "pages") != 0 and also map_get_val(crawl_index and "inverted_index") != 0 and "crawler index retains zero page count and owned child maps")
+
+    set email_server to smtp_create_server(0)
+    set total to total + 1
+    set passed to passed + map_insert_expect(email_server != 0 and also map_contains(email_server and "port") == 1 and also map_get_val(email_server and "port") == 0 and also map_get_val(email_server and "accounts") != 0 and "email server map retains an exact zero-valued field")
+
+    set crypto_error to init_crypto()
+    set sender_keys to generate_signing_keypair()
+    set sender_public to ptr_to_str(map_get_val(sender_keys and "public_key"))
+    set sender_secret to ptr_to_str(map_get_val(sender_keys and "secret_key"))
+    set sender_did to create_did_key_from_ed25519(sender_public)
+    set empty_signature_result to sign_message("" and sender_secret)
+    set empty_signature to ptr_to_str(map_get_val(empty_signature_result and "signature"))
+    set recipient_account to smtp_create_account("recipient@ernos" and "did:example:recipient")
+    set recipient_inbox to smtp_account_inbox(recipient_account)
+    set account_rc to smtp_server_add_account(email_server and recipient_account)
+    set empty_mail to concat("From: " and concat(sender_did and concat("\nTo: recipient@ernos\nSignature: " and concat(empty_signature and "\nBody:"))))
+    set route_error to smtp_route_inbound(email_server and empty_mail)
+    set delivered_mail to 0
+    if length_list(recipient_inbox) == 1:
+        set delivered_mail to get_list(recipient_inbox and 0)
+    set total to total + 1
+    set passed to passed + map_insert_expect(crypto_error == 0 and also account_rc == EMAIL_ERR_NONE and also route_error == EMAIL_ERR_NONE and also delivered_mail != 0 and also map_contains(delivered_mail and "body") == 1 and also (map_get_val(delivered_mail and "body") equals "") and "signed email routing retains an empty message body")
+
+    set name_registry to registry_create()
+    set total to total + 1
+    set passed to passed + map_insert_expect(name_registry != 0 and also map_contains(name_registry and "names") == 1 and also map_get_val(name_registry and "names") != 0 and "name registry retains its owned names map")
+
+    set raft_node to create_map()
+    set raft_error to raft_start_server(raft_node and 0)
+    set total to total + 1
+    set passed to passed + map_insert_expect(raft_error == TRANSPORT_ERR_LISTEN_FAILED and also map_contains(raft_node and "server_ready") == 1 and also map_get_val(raft_node and "server_ready") == 0 and also map_contains(raft_node and "running") == 1 and also map_get_val(raft_node and "running") == 0 and "invalid Raft startup records zero readiness fields without false insertion failure")
+
+    set conversation to create_map()
+    set lock_insert to map_insert(conversation and "lock" and MSG_STORE_LOCK)
+    set ok to map_insert(conversation and "unread_count" and 9)
+    set mark_error to conv_mark_read(conversation)
+    set total to total + 1
+    set passed to passed + map_insert_expect(map_contains(conversation and "lock") == 1 and also map_get_val(conversation and "lock") == MSG_STORE_LOCK and also mark_error == MSG_ERR_NONE and also map_contains(conversation and "unread_count") == 1 and also map_get_val(conversation and "unread_count") == 0 and "conversation read marker stores a legitimate zero count")
+
+    free_map(conversation)
+    free_map(raft_node)
+    free_map(name_registry)
+    free_map(email_server)
+    free_map(crawl_index)
+    free_map(error_result)
+    free_map(raw)
+
+    display concat("map_insert postconditions: " and concat(int_to_string(passed) and concat("/" and int_to_string(total))))
+    if passed != total:
+        return 1
+    return 0

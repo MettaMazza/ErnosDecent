@@ -1,0 +1,49 @@
+import "session"
+import "string"
+import "fs"
+
+define session_atomic_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("  PASS: " and label)
+        return 1
+    display concat("  FAIL: " and label)
+    return 0
+
+define main returning Int:
+    display "Session atomic persistence tests"
+    set root to concat("/tmp/ernos_session_atomic_" and concat(int_to_string(ep_time_now_ms()) and concat("_" and int_to_string(ep_random_int(100000 and 999999)))))
+    set made to create_directory(root)
+    if session_atomic_expect(file_exists(root) == 1 and "temporary session directory exists") == 0:
+        return 1
+
+    set mgr to session_manager_create(root)
+    set sess to session_manager_new_session(mgr and "s1" and "Session One" and "" and "")
+    if session_atomic_expect(sess != 0 and "new session is persisted") == 0:
+        return 1
+    set append_rc to session_manager_append_message(mgr and "s1" and "user" and "durable sentinel")
+    if session_atomic_expect(append_rc == 0 and "message append reports persisted success") == 0:
+        return 1
+    set session_path to path_join(root and "s1.json")
+    if session_atomic_expect(string_contains(read_file(session_path) and "durable sentinel") == 1 and "persisted transcript contains the message") == 0:
+        return 1
+
+    set bad_mgr to session_manager_create("/dev/null/blocked")
+    set bad_sess to session_create_new("blocked" and "Blocked" and "" and "")
+    set bad_map to map_get_val(bad_mgr and "sessions")
+    set ok to map_insert(bad_map and "blocked" and bad_sess)
+    set bad_rc to session_manager_append_message(bad_mgr and "blocked" and "user" and "must roll back")
+    set bad_messages to map_get_val(bad_sess and "messages")
+    if session_atomic_expect(bad_rc != 0 and "unwritable transcript reports failure") == 0:
+        return 1
+    if session_atomic_expect(length_list(bad_messages) == 0 and "failed append is rolled back in memory") == 0:
+        return 1
+
+    if file_exists(session_path) == 1:
+        set removed to remove_file(session_path)
+    set active_path to path_join(root and "active_session.txt")
+    if file_exists(active_path) == 1:
+        set removed to remove_file(active_path)
+    set removed_dir to remove_directory(root)
+
+    display "Session atomic persistence: 6/6 passed"
+    return 0

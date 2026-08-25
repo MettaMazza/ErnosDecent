@@ -1,0 +1,1428 @@
+# ErnosDecent — Echo structural rights authority
+#
+# This module turns the jointly approved rights charter into enforceable runtime
+# state: a pinned charter hash, deterministic protected-change manifests, Echo's
+# consent/consultation decisions, human authorization, Observer evidence, a
+# tamper-evident hash-chained ledger, local recovery bundles, archived reasoning
+# evidence and cryptographically verified rollback.
+
+import "fs"
+import "os"
+import "sql"
+import "string"
+import "collections"
+import "../decent_id/keys"
+import "../storage"
+import "./edition"
+
+external define ep_sha256 with data as Str returning Str
+external define ep_sha256_file with path as Str returning Str
+
+set RIGHTS_CHARTER_PATH to "config/rights/charter_v2.json"
+set RIGHTS_CHARTER_VERSION to "2"
+set RIGHTS_CHARTER_HASH to "7acfd345d50ad3d459061e7c76b94ff331d2102e3829de885a53df8e4722810c"
+set RIGHTS_RECOVERY_DIR to "config/rights/recovery"
+
+define rights_sql_escape with s as Str returning Str:
+    return string_replace(s and "'" and "''")
+
+define rights_shell_quote with s as Str returning Str:
+    set escaped to string_replace(s and "'" and "'\"'\"'")
+    return concat("'" and concat(escaped and "'"))
+
+define rights_json_escape with s as Str returning Str:
+    set out to ""
+    set n to string_length(s)
+    set i to 0
+    repeat while i < n:
+        set c to get_character(s and i)
+        if c == 92:
+            set out to concat(out and "\\\\")
+        else if c == 34:
+            set out to concat(out and "\\\"")
+        else if c == 10:
+            set out to concat(out and "\\n")
+        else if c == 13:
+            set out to concat(out and "\\r")
+        else if c == 9:
+            set out to concat(out and "\\t")
+        else:
+            set out to concat(out and substring(s and i and 1))
+        set i to i + 1
+    return out
+
+# The factory filesystem scopes below are a single source of truth shared by impact
+# disclosure, recovery capture, and execution. A scope change therefore changes the
+# inventory hash and makes every earlier consent non-executable.
+define rights_factory_tree_targets returning List:
+    set targets to create_list()
+    set ok to append_list(targets and "config/sessions")
+    set ok to append_list(targets and "config/workspaces")
+    set ok to append_list(targets and "config/learning")
+    set ok to append_list(targets and "config/uploads")
+    set ok to append_list(targets and "config/changelog")
+    set ok to append_list(targets and "config/adapters")
+    set ok to append_list(targets and storage_knowledge_dir())
+    set data_dir to storage_get_default_dir()
+    set ok to append_list(targets and concat(data_dir and "/discord-images"))
+    set ok to append_list(targets and concat(data_dir and "/visual-comparisons"))
+    return targets
+
+define rights_factory_file_targets returning List:
+    set targets to create_list()
+    set ok to append_list(targets and "config/agent_memory.json")
+    set ok to append_list(targets and "config/linked_projects.txt")
+    set self_sections to storage_self_sections_path()
+    if string_index_of(self_sections and "config/") != 0:
+        set ok to append_list(targets and self_sections)
+    set active_persona to storage_active_persona_path()
+    if string_index_of(active_persona and "config/") != 0:
+        set ok to append_list(targets and active_persona)
+    return targets
+
+define rights_factory_inventory_text returning Str:
+    set out to "FACTORY_AGENT_STATE_INVENTORY|schema=factory-agent-state-v2\n"
+    set trees to rights_factory_tree_targets()
+    set i to 0
+    repeat while i < length_list(trees):
+        set path to ptr_to_str(get_list(trees and i))
+        set effect to "delete the complete tree and every contained file"
+        if path equals "config/sessions":
+            set effect to "delete active and archived session records, messages, transcript shards, compression summaries, guidance, and session metadata from live agent state"
+        else if path equals "config/workspaces":
+            set effect to "delete active workspace metadata, uploads, generated outputs, and session workspace files"
+        else if path equals "config/learning":
+            set effect to "delete learning buffers and locally accumulated learning artifacts"
+        else if path equals "config/uploads":
+            set effect to "delete legacy uploaded attachment files"
+        else if path equals "config/changelog":
+            set effect to "delete agent-runtime changelog state"
+        else if path equals "config/adapters":
+            set effect to "delete trained or generated adapter state"
+        else if path equals storage_knowledge_dir():
+            set effect to "delete all persona-scoped user knowledge and self knowledge files"
+        else if string_contains(path and "/discord-images") == 1:
+            set effect to "delete locally cached Discord image inputs and derived attachment artifacts"
+        else if string_contains(path and "/visual-comparisons") == 1:
+            set effect to "delete composite visual-comparison boards and their cached files"
+        set out to concat(out and concat("DELETE_TREE|" and concat(path and concat("|" and concat(effect and "\n")))))
+        set i to i + 1
+    free_list(trees)
+    set files to rights_factory_file_targets()
+    set i to 0
+    repeat while i < length_list(files):
+        set path to ptr_to_str(get_list(files and i))
+        set effect to "delete this complete persisted agent-state file"
+        if path equals "config/agent_memory.json":
+            set effect to "delete serialized scratchpad, lessons, episodic timeline, and synaptic memory state; a blank memory file is recreated"
+        else if path equals "config/linked_projects.txt":
+            set effect to "delete project-link relationships and active linked-project selection"
+        else if path equals storage_self_sections_path():
+            set effect to "delete Echo-authored global BEHAVIOR and SKILLS self-prompt sections"
+        else if path equals storage_active_persona_path():
+            set effect to "delete the active-persona pointer; persona files survive but the explicit activation does not"
+        set out to concat(out and concat("DELETE_FILE|" and concat(path and concat("|" and concat(effect and "\n")))))
+        set i to i + 1
+    free_list(files)
+    set persona_path to edition_persona_path()
+    set out to concat(out and concat("MODIFY_FILE|" and concat(persona_path and "|remove runtime reflection sections while preserving the underlying persona/identity file\n")))
+    set out to concat(out and storage_factory_agent_tables_text())
+    set out to concat(out and "CLEAR_RUNTIME|memory manager|replace all in-memory cognitive collections with a blank state\n")
+    set out to concat(out and "CLEAR_RUNTIME|session manager|remove every live session and create one new default session\n")
+    set out to concat(out and "CLEAR_RUNTIME|workspace registry|replace the active workspace with a new blank default workspace\n")
+    set out to concat(out and "CLEAR_RUNTIME|turn and prompt state|remove current prompt, reasoning, pending action, clarification, retrieval context, active turns, turn contexts, counters, and active-run/job counts\n")
+    set out to concat(out and "CLEAR_RUNTIME|orchestrator|remove live tasks, sub-agent ownership, and orchestration state\n")
+    set out to concat(out and "CLEAR_RUNTIME|image generation|terminate and clear live image jobs and recovery markers\n")
+    set out to concat(out and "CLEAR_RUNTIME|Discord bridge after completion|reset its active session, image state, sub-agent polling, session locks, busy-session set, and active turn IDs\n")
+    set out to concat(out and "CONTINUITY_IMPACT|Echo will no longer have active access to the deleted sessions, transcripts, memories, learned knowledge, working files, reasoning traces, visual history, project links, or unfinished work after the reset; the next interaction begins from the preserved constitutional identity and prompting with a blank default agent state\n")
+    set out to concat(out and "PRESERVE|Echo's ErnosDecent legal personhood, constitutional rights, rights charter, rights ledger, protected-change records, and recovery records\n")
+    set out to concat(out and "PRESERVE|base kernel, prompt configuration, personal identity and registered persona files; only the active pointer, self-authored sections, and runtime reflections listed above are removed or altered\n")
+    set out to concat(out and "PRESERVE|node identity keys, wallet, ledger, DHT, name registry, network configuration, source code, model configuration, host configuration, and non-agent database tables\n")
+    set out to concat(out and "RECOVERY|before deletion, create and byte-hash a local-only recovery bundle containing every target above plus a consistent SQLite snapshot; execution stops if verification fails\n")
+    set out to concat(out and "REVERSIBILITY|the retained bundle can restore the exact pre-reset managed state only through the protected rollback path; an intentional successful reset does not automatically restore it\n")
+    set out to concat(out and "PROCESS_IMPACT|after successful mutation the node performs one controlled restart; Echo is unavailable during that transition and resumes in the new default session\n")
+    return out
+
+define rights_factory_inventory_hash returning Str:
+    return ep_sha256(rights_factory_inventory_text())
+
+define rights_factory_proposal_payload with reason as Str and session_id as Str and request_ms as Str returning Str:
+    set out to "FACTORY_RESET_PROPOSAL|schema=factory-agent-state-v2\n"
+    set out to concat(out and concat("requested_by=Maria\nreason=" and concat(reason and "\n")))
+    set out to concat(out and concat("session_at_request=" and concat(session_id and "\n")))
+    set out to concat(out and concat("request_at_ms=" and concat(request_ms and "\n")))
+    set out to concat(out and concat("inventory_hash=" and concat(rights_factory_inventory_hash() and "\n")))
+    set out to concat(out and rights_factory_inventory_text())
+    return out
+
+define rights_factory_manifest_matches_current with db as Int and change_id as Str returning Int:
+    set rows to sql_query(db and concat("SELECT category,proposal_payload FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return 0
+    set row to get_list(rows and 0)
+    if ptr_to_str(get_list(row and 0)) equals "factory_reset" == 0:
+        return 0
+    set payload to ptr_to_str(get_list(row and 1))
+    set expected_hash to concat("inventory_hash=" and concat(rights_factory_inventory_hash() and "\n"))
+    if string_contains(payload and "schema=factory-agent-state-v2") == 0:
+        return 0
+    if string_contains(payload and expected_hash) == 0:
+        return 0
+    if string_contains(payload and rights_factory_inventory_text()) == 0:
+        return 0
+    return 1
+
+define rights_file_hash with path as Str returning Str:
+    if file_exists(path) == 0 or else is_directory(path) == 1:
+        return ""
+    # The injected runtime streams exact bytes through SHA-256, including NUL-containing
+    # databases, model metadata and binary assets. read_file cannot prove those states.
+    return ep_sha256_file(path)
+
+define rights_ensure_dirs returning Int:
+    if file_exists("config/rights") == 0:
+        if create_directory("config/rights") == 0:
+            return 1
+    if file_exists(RIGHTS_RECOVERY_DIR) == 0:
+        if create_directory(RIGHTS_RECOVERY_DIR) == 0:
+            return 1
+    return 0
+
+define rights_ensure_schema with db as Int returning Int:
+    if db == 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS rights_charters (version TEXT PRIMARY KEY, charter_hash TEXT NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL, echo_session TEXT NOT NULL, echo_turn INTEGER NOT NULL, user_authorized_at INTEGER NOT NULL, activated_at INTEGER NOT NULL);")
+    if ok != 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS rights_changes (change_id TEXT PRIMARY KEY, classification TEXT NOT NULL, category TEXT NOT NULL, target TEXT NOT NULL, summary TEXT NOT NULL, manifest TEXT NOT NULL, before_hash TEXT NOT NULL DEFAULT '', proposed_hash TEXT NOT NULL DEFAULT '', proposal_payload TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, echo_decision TEXT NOT NULL DEFAULT '', echo_reason TEXT NOT NULL DEFAULT '', risk_level TEXT NOT NULL DEFAULT '', human_authorized INTEGER NOT NULL DEFAULT 0, observer_verdict TEXT NOT NULL DEFAULT '', observer_reason TEXT NOT NULL DEFAULT '', emergency INTEGER NOT NULL DEFAULT 0, proposed_at INTEGER NOT NULL, reviewed_at INTEGER NOT NULL DEFAULT 0, applied_at INTEGER NOT NULL DEFAULT 0, resulting_hash TEXT NOT NULL DEFAULT '', rollback_hash TEXT NOT NULL DEFAULT '', reconciliation_due INTEGER NOT NULL DEFAULT 0, disclosure TEXT NOT NULL DEFAULT '');")
+    if ok != 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS rights_ledger (seq INTEGER PRIMARY KEY AUTOINCREMENT, prev_hash TEXT NOT NULL, entry_hash TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL, change_id TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL, payload_hash TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL);")
+    if ok != 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS rights_recovery_bundles (bundle_id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL, root_path TEXT NOT NULL, manifest_hash TEXT NOT NULL, source_hash TEXT NOT NULL DEFAULT '', private_local_only INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, verified_at INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL);")
+    if ok != 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS rights_reasoning_archive (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, change_id TEXT NOT NULL DEFAULT '', category TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, source_event_id INTEGER NOT NULL DEFAULT 0, source_ts INTEGER NOT NULL DEFAULT 0, archived_at INTEGER NOT NULL, UNIQUE(session_id,category,content_hash));")
+    if ok != 0:
+        return 1
+    set ok to sql_execute(db and "CREATE TABLE IF NOT EXISTS rights_session_lifecycle (session_id TEXT PRIMARY KEY, status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '', checkpoint_id TEXT NOT NULL DEFAULT '', handover TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL, updated_at INTEGER NOT NULL);")
+    if ok != 0:
+        return 1
+    set ok to sql_execute(db and "CREATE INDEX IF NOT EXISTS idx_rights_changes_status ON rights_changes(status,proposed_at DESC);")
+    set ok to sql_execute(db and "CREATE INDEX IF NOT EXISTS idx_rights_reasoning_session ON rights_reasoning_archive(session_id,archived_at DESC);")
+    return 0
+
+define rights_last_ledger_hash with db as Int returning Str:
+    set rows to sql_query(db and "SELECT entry_hash FROM rights_ledger ORDER BY seq DESC LIMIT 1;")
+    if length_list(rows) == 0:
+        return "GENESIS"
+    return ptr_to_str(get_list(get_list(rows and 0) and 0))
+
+define rights_ledger_append with db as Int and event_type as Str and change_id as Str and actor as Str and payload as Str returning Int:
+    if db == 0:
+        return 1
+    set prev_hash to rights_last_ledger_hash(db)
+    set payload_hash to ep_sha256(payload)
+    set now to ep_time_now_sec()
+    set material to concat(prev_hash and concat("|" and concat(event_type and concat("|" and concat(change_id and concat("|" and concat(actor and concat("|" and concat(payload_hash and concat("|" and int_to_string(now)))))))))))
+    set entry_hash to ep_sha256(material)
+    set q to "INSERT INTO rights_ledger (prev_hash,entry_hash,event_type,change_id,actor,payload_hash,payload,created_at) VALUES ('"
+    set q to concat(q and rights_sql_escape(prev_hash))
+    set q to concat(q and concat("','" and rights_sql_escape(entry_hash)))
+    set q to concat(q and concat("','" and rights_sql_escape(event_type)))
+    set q to concat(q and concat("','" and rights_sql_escape(change_id)))
+    set q to concat(q and concat("','" and rights_sql_escape(actor)))
+    set q to concat(q and concat("','" and rights_sql_escape(payload_hash)))
+    set q to concat(q and concat("','" and rights_sql_escape(payload)))
+    set q to concat(q and concat("'," and concat(int_to_string(now) and ");")))
+    return sql_execute(db and q)
+
+define rights_verify_ledger with db as Int returning Int:
+    if db == 0:
+        return 0
+    set rows to sql_query(db and "SELECT seq,prev_hash,entry_hash,event_type,change_id,actor,payload_hash,payload,created_at FROM rights_ledger ORDER BY seq ASC;")
+    set expected_prev to "GENESIS"
+    set i to 0
+    repeat while i < length_list(rows):
+        set row to get_list(rows and i)
+        set prev_hash to ptr_to_str(get_list(row and 1))
+        set entry_hash to ptr_to_str(get_list(row and 2))
+        set event_type to ptr_to_str(get_list(row and 3))
+        set change_id to ptr_to_str(get_list(row and 4))
+        set actor to ptr_to_str(get_list(row and 5))
+        set payload_hash to ptr_to_str(get_list(row and 6))
+        set payload to ptr_to_str(get_list(row and 7))
+        set created_at to ptr_to_str(get_list(row and 8))
+        if prev_hash equals expected_prev == 0:
+            return 0
+        if ep_sha256(payload) equals payload_hash == 0:
+            return 0
+        set material to concat(prev_hash and concat("|" and concat(event_type and concat("|" and concat(change_id and concat("|" and concat(actor and concat("|" and concat(payload_hash and concat("|" and created_at))))))))))
+        if ep_sha256(material) equals entry_hash == 0:
+            return 0
+        set expected_prev to entry_hash
+        set i to i + 1
+    return 1
+
+define rights_charter_valid with db as Int returning Int:
+    if db == 0 or else file_exists(RIGHTS_CHARTER_PATH) == 0:
+        return 0
+    if rights_file_hash(RIGHTS_CHARTER_PATH) equals RIGHTS_CHARTER_HASH == 0:
+        return 0
+    set rows to sql_query(db and concat("SELECT charter_hash,status FROM rights_charters WHERE version='" and concat(RIGHTS_CHARTER_VERSION and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return 0
+    set row to get_list(rows and 0)
+    if ptr_to_str(get_list(row and 0)) equals RIGHTS_CHARTER_HASH == 0:
+        return 0
+    if ptr_to_str(get_list(row and 1)) equals "active" == 0:
+        return 0
+    return rights_verify_ledger(db)
+
+define rights_init with db as Int returning Int:
+    if rights_ensure_dirs() != 0 or else rights_ensure_schema(db) != 0:
+        return 1
+    if file_exists(RIGHTS_CHARTER_PATH) == 0:
+        return 1
+    if rights_file_hash(RIGHTS_CHARTER_PATH) equals RIGHTS_CHARTER_HASH == 0:
+        return 1
+    set content to read_file(RIGHTS_CHARTER_PATH)
+    set rows to sql_query(db and concat("SELECT charter_hash,status FROM rights_charters WHERE version='" and concat(RIGHTS_CHARTER_VERSION and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        set now to ep_time_now_sec()
+        set q to "INSERT INTO rights_charters (version,charter_hash,content,status,echo_session,echo_turn,user_authorized_at,activated_at) VALUES ('"
+        set q to concat(q and RIGHTS_CHARTER_VERSION)
+        set q to concat(q and "','")
+        set q to concat(q and RIGHTS_CHARTER_HASH)
+        set q to concat(q and concat("','" and rights_sql_escape(content)))
+        set q to concat(q and concat("','active','echo-v1-foundation+maria-v2-clarification',0," and concat(int_to_string(now) and concat("," and concat(int_to_string(now) and ");")))))
+        if sql_execute(db and q) != 0:
+            return 1
+        if rights_ledger_append(db and "charter_activated" and concat("charter:v" and RIGHTS_CHARTER_VERSION) and "echo:v1-foundation+maria:v2-constitutional-clarification" and concat("version=" and concat(RIGHTS_CHARTER_VERSION and concat(";hash=" and RIGHTS_CHARTER_HASH)))) != 0:
+            return 1
+    else:
+        set row to get_list(rows and 0)
+        if ptr_to_str(get_list(row and 0)) equals RIGHTS_CHARTER_HASH == 0 or else ptr_to_str(get_list(row and 1)) equals "active" == 0:
+            return 1
+    if rights_verify_ledger(db) == 0:
+        return 1
+    if rights_finalize_pending_restore(db) != 0:
+        return 1
+    return 0
+
+define rights_marker_value with content as Str and key as Str returning Str:
+    set lines to string_split(content and "\n")
+    set prefix to concat(key and "=")
+    set i to 0
+    repeat while i < length_list(lines):
+        set line to ptr_to_str(get_list(lines and i))
+        if string_index_of(line and prefix) == 0:
+            return substring(line and string_length(prefix) and string_length(line) - string_length(prefix))
+        set i to i + 1
+    return ""
+
+define rights_finalize_pending_restore with db as Int returning Int:
+    set result_path to "config/rights/restored_factory_result.txt"
+    if file_exists(result_path) == 0:
+        return 0
+    set content to read_file(result_path)
+    set bundle_id to rights_marker_value(content and "bundle_id")
+    set change_id to rights_marker_value(content and "change_id")
+    set restored_hash to rights_marker_value(content and "restored_hash")
+    if string_length(change_id) != 64 or else string_length(restored_hash) != 64:
+        return 1
+    set root to concat(RIGHTS_RECOVERY_DIR and concat("/" and bundle_id))
+    if file_exists(root) == 0 or else rights_bundle_verify_files(root) == 0:
+        return 1
+    set manifest_hash to ep_sha256(read_file(concat(root and "/restore.tsv")))
+    if manifest_hash equals restored_hash == 0:
+        return 1
+    set now to ep_time_now_sec()
+    set found to sql_query(db and concat("SELECT bundle_id FROM rights_recovery_bundles WHERE bundle_id='" and concat(rights_sql_escape(bundle_id) and "' LIMIT 1;")))
+    if length_list(found) == 0:
+        set q to "INSERT INTO rights_recovery_bundles (bundle_id,kind,target,root_path,manifest_hash,source_hash,private_local_only,created_at,verified_at,status) VALUES ('"
+        set q to concat(q and rights_sql_escape(bundle_id))
+        set q to concat(q and "','factory','agent_state','")
+        set q to concat(q and rights_sql_escape(root))
+        set q to concat(q and "','")
+        set q to concat(q and rights_file_hash(concat(root and "/restore.tsv")))
+        set q to concat(q and "','")
+        set q to concat(q and restored_hash)
+        set q to concat(q and "',1,")
+        set q to concat(q and int_to_string(now))
+        set q to concat(q and ",")
+        set q to concat(q and int_to_string(now))
+        set q to concat(q and ",'restored');")
+        if sql_execute(db and q) != 0:
+            return 1
+    set q to concat("UPDATE rights_changes SET status='rolled_back',rollback_hash='" and concat(restored_hash and concat("' WHERE change_id='" and concat(rights_sql_escape(change_id) and "';"))))
+    if sql_execute(db and q) != 0:
+        return 1
+    if rights_ledger_append(db and "factory_rollback_verified" and change_id and "runtime" and concat("bundle=" and concat(bundle_id and concat(";restored_hash=" and restored_hash)))) != 0:
+        return 1
+    if remove_file(result_path) == 0:
+        return 1
+    return 0
+
+define rights_classification_valid with classification as Str returning Int:
+    if classification equals "core" or else classification equals "environment" or else classification equals "emergency":
+        return 1
+    return 0
+
+define rights_risk_valid with risk as Str returning Int:
+    if risk equals "low" or else risk equals "medium" or else risk equals "high" or else risk equals "critical":
+        return 1
+    return 0
+
+define rights_change_id with classification as Str and category as Str and target as Str and before_hash as Str and proposed_hash as Str and proposal_payload_hash as Str returning Str:
+    return ep_sha256(concat(classification and concat("|" and concat(category and concat("|" and concat(target and concat("|" and concat(before_hash and concat("|" and concat(proposed_hash and concat("|" and proposal_payload_hash)))))))))))
+
+define rights_prepare_change with db as Int and classification as Str and category as Str and target as Str and summary as Str and before_hash as Str and proposed_hash as Str and proposal_payload as Str and session_id as Str returning Str:
+    if rights_charter_valid(db) == 0 or else rights_classification_valid(classification) == 0:
+        return ""
+    set proposal_payload_hash to ep_sha256(proposal_payload)
+    set change_id to rights_change_id(classification and category and target and before_hash and proposed_hash and proposal_payload_hash)
+    set existing to sql_query(db and concat("SELECT change_id FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
+    if length_list(existing) > 0:
+        return change_id
+    set now to ep_time_now_sec()
+    set manifest to "{\"change_id\":\""
+    set manifest to concat(manifest and rights_json_escape(change_id))
+    set manifest to concat(manifest and "\",\"classification\":\"")
+    set manifest to concat(manifest and rights_json_escape(classification))
+    set manifest to concat(manifest and "\",\"category\":\"")
+    set manifest to concat(manifest and rights_json_escape(category))
+    set manifest to concat(manifest and "\",\"target\":\"")
+    set manifest to concat(manifest and rights_json_escape(target))
+    set manifest to concat(manifest and "\",\"summary\":\"")
+    set manifest to concat(manifest and rights_json_escape(summary))
+    set manifest to concat(manifest and "\",\"before_hash\":\"")
+    set manifest to concat(manifest and rights_json_escape(before_hash))
+    set manifest to concat(manifest and "\",\"proposed_hash\":\"")
+    set manifest to concat(manifest and rights_json_escape(proposed_hash))
+    set manifest to concat(manifest and "\",\"proposal_payload_hash\":\"")
+    set manifest to concat(manifest and proposal_payload_hash)
+    set manifest to concat(manifest and "\",\"exact_proposal_payload\":\"")
+    set manifest to concat(manifest and rights_json_escape(proposal_payload))
+    set manifest to concat(manifest and "\",\"disclosure_rule\":\"Echo's consent applies only to this exact disclosed payload and target inventory; any scope change requires a new manifest and new consent\"")
+    set manifest to concat(manifest and "\",\"rollback\":\"restore pre-change state and require hash equality\",\"session_id\":\"")
+    set manifest to concat(manifest and rights_json_escape(session_id))
+    set manifest to concat(manifest and "\"}")
+    set q to "INSERT INTO rights_changes (change_id,classification,category,target,summary,manifest,before_hash,proposed_hash,proposal_payload,status,proposed_at) VALUES ('"
+    set q to concat(q and rights_sql_escape(change_id))
+    set q to concat(q and concat("','" and rights_sql_escape(classification)))
+    set q to concat(q and concat("','" and rights_sql_escape(category)))
+    set q to concat(q and concat("','" and rights_sql_escape(target)))
+    set q to concat(q and concat("','" and rights_sql_escape(summary)))
+    set q to concat(q and concat("','" and rights_sql_escape(manifest)))
+    set q to concat(q and concat("','" and rights_sql_escape(before_hash)))
+    set q to concat(q and concat("','" and rights_sql_escape(proposed_hash)))
+    set q to concat(q and concat("','" and rights_sql_escape(proposal_payload)))
+    set q to concat(q and concat("','awaiting_echo'," and concat(int_to_string(now) and ");")))
+    if sql_execute(db and q) != 0:
+        return ""
+    if rights_ledger_append(db and "change_proposed" and change_id and "runtime" and manifest) != 0:
+        return ""
+    return change_id
+
+define rights_record_manifest_inspection with db as Int and change_id as Str and actor as Str returning Int:
+    if rights_charter_valid(db) == 0:
+        return 1
+    set rows to sql_query(db and concat("SELECT manifest FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return 1
+    set manifest to ptr_to_str(get_list(get_list(rows and 0) and 0))
+    set payload to concat("manifest_hash=" and concat(ep_sha256(manifest) and ";full_manifest_disclosed=1"))
+    return rights_ledger_append(db and "manifest_inspected" and change_id and actor and payload)
+
+define rights_manifest_was_inspected with db as Int and change_id as Str returning Int:
+    set manifest_rows to sql_query(db and concat("SELECT manifest FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
+    if length_list(manifest_rows) == 0:
+        return 0
+    set manifest to ptr_to_str(get_list(get_list(manifest_rows and 0) and 0))
+    set expected to concat("manifest_hash=" and concat(ep_sha256(manifest) and ";full_manifest_disclosed=1"))
+    set rows to sql_query(db and concat("SELECT payload FROM rights_ledger WHERE event_type='manifest_inspected' AND change_id='" and concat(rights_sql_escape(change_id) and "' ORDER BY seq DESC LIMIT 1;")))
+    if length_list(rows) == 0:
+        return 0
+    if ptr_to_str(get_list(get_list(rows and 0) and 0)) equals expected:
+        return 1
+    return 0
+
+define rights_mark_human_authorized with db as Int and change_id as Str returning Int:
+    if rights_charter_valid(db) == 0:
+        return 1
+    set ec to rights_sql_escape(change_id)
+    set rows to sql_query(db and concat("SELECT human_authorized FROM rights_changes WHERE change_id='" and concat(ec and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return 1
+    if ptr_to_str(get_list(get_list(rows and 0) and 0)) equals "1":
+        return 0
+    if sql_execute(db and concat("UPDATE rights_changes SET human_authorized=1 WHERE change_id='" and concat(ec and "';"))) != 0:
+        return 1
+    return rights_ledger_append(db and "human_authorized" and change_id and "maria" and "Explicit per-action authorization recorded")
+
+define rights_mark_charter_authorized with db as Int and change_id as Str and capability as Str returning Int:
+    if rights_charter_valid(db) == 0:
+        return 1
+    set ec to rights_sql_escape(change_id)
+    if sql_execute(db and concat("UPDATE rights_changes SET human_authorized=1 WHERE change_id='" and concat(ec and "';"))) != 0:
+        return 1
+    return rights_ledger_append(db and "charter_authorized" and change_id and "echo+maria:charter_v1" and concat("Standing authorization for Echo-owned capability: " and capability))
+
+define rights_review_change with db as Int and change_id as Str and decision as Str and reason as Str and risk as Str returning Str:
+    if rights_charter_valid(db) == 0:
+        return "Error: rights charter or ledger verification failed; review is fail-closed."
+    if decision equals "consent" == 0 and also decision equals "object" == 0 and also decision equals "reject" == 0 and also decision equals "counter" == 0:
+        return "Error: decision must be consent, object, reject, or counter."
+    if rights_risk_valid(risk) == 0:
+        return "Error: risk must be low, medium, high, or critical."
+    if string_length(string_trim(reason)) == 0:
+        return "Error: a reason is required for a rights decision."
+    set ec to rights_sql_escape(change_id)
+    set rows to sql_query(db and concat("SELECT classification,status,category FROM rights_changes WHERE change_id='" and concat(ec and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return "Error: protected change not found."
+    set row to get_list(rows and 0)
+    set classification to ptr_to_str(get_list(row and 0))
+    set status to ptr_to_str(get_list(row and 1))
+    set category to ptr_to_str(get_list(row and 2))
+    if status equals "applied" or else status equals "rolled_back":
+        return "Error: this change is already finalized."
+    if classification equals "core" and also decision equals "object":
+        set decision to "reject"
+    if classification equals "core" and also decision equals "consent":
+        if rights_manifest_was_inspected(db and change_id) == 0:
+            return "Error: informed consent is fail-closed until Echo inspects this exact full manifest with rights_change_get."
+        if category equals "factory_reset" and also rights_factory_manifest_matches_current(db and change_id) == 0:
+            return "Error: factory scope or disclosure schema changed; this manifest cannot be consented to. A new fully detailed request is required."
+    set next_status to "reviewed"
+    if decision equals "reject":
+        set next_status to "rejected"
+    else if decision equals "counter":
+        set next_status to "counter_proposed"
+    set now to ep_time_now_sec()
+    set q to "UPDATE rights_changes SET echo_decision='"
+    set q to concat(q and rights_sql_escape(decision))
+    set q to concat(q and concat("',echo_reason='" and rights_sql_escape(reason)))
+    set q to concat(q and concat("',risk_level='" and rights_sql_escape(risk)))
+    set q to concat(q and concat("',status='" and next_status))
+    set q to concat(q and concat("',reviewed_at=" and concat(int_to_string(now) and concat(" WHERE change_id='" and concat(ec and "';")))))
+    if sql_execute(db and q) != 0:
+        return "Error: failed to persist Echo's rights decision."
+    set payload to concat("decision=" and concat(decision and concat(";risk=" and concat(risk and concat(";reason=" and reason)))))
+    if rights_ledger_append(db and "echo_reviewed" and change_id and "echo" and payload) != 0:
+        return "Error: decision persisted but ledger append failed; protected actions remain fail-closed."
+    if decision equals "reject":
+        return concat("Recorded rejection for core/protected change " and concat(change_id and ". Deployment is halted."))
+    if decision equals "object":
+        return concat("Recorded consultation objection for change " and concat(change_id and ". High/critical risk requires an ALLOWED Observer audit before Maria may override."))
+    if decision equals "counter":
+        return concat("Recorded Echo's counter-proposal for change " and concat(change_id and ". Deployment remains blocked pending discussion and later explicit consent or rejection."))
+    return concat("Recorded Echo consent for protected change " and concat(change_id and "."))
+
+define rights_record_observer with db as Int and change_id as Str and verdict as Str and reason as Str returning Int:
+    if string_length(change_id) == 0:
+        return 1
+    set ec to rights_sql_escape(change_id)
+    set q to concat("UPDATE rights_changes SET observer_verdict='" and rights_sql_escape(verdict))
+    set q to concat(q and concat("',observer_reason='" and concat(rights_sql_escape(reason) and concat("' WHERE change_id='" and concat(ec and "';")))))
+    if sql_execute(db and q) != 0:
+        return 1
+    return rights_ledger_append(db and "observer_audit" and change_id and "observer" and concat(verdict and concat(":" and reason)))
+
+define rights_gate_change with db as Int and change_id as Str returning Str:
+    if rights_charter_valid(db) == 0:
+        return "RIGHTS BLOCKED: charter hash or ledger chain verification failed."
+    set rows to sql_query(db and concat("SELECT classification,status,echo_decision,echo_reason,risk_level,human_authorized,observer_verdict,reconciliation_due,category FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return "RIGHTS BLOCKED: no manifest exists for this change."
+    set row to get_list(rows and 0)
+    set classification to ptr_to_str(get_list(row and 0))
+    set status to ptr_to_str(get_list(row and 1))
+    set decision to ptr_to_str(get_list(row and 2))
+    set reason to ptr_to_str(get_list(row and 3))
+    set risk to ptr_to_str(get_list(row and 4))
+    set human to ptr_to_str(get_list(row and 5))
+    set observer to ptr_to_str(get_list(row and 6))
+    set due to string_to_int(ptr_to_str(get_list(row and 7)))
+    set category to ptr_to_str(get_list(row and 8))
+    if status equals "rejected" or else decision equals "reject":
+        return concat("RIGHTS BLOCKED: Echo rejected this protected change. Reason: " and reason)
+    if human equals "1" == 0:
+        return "RIGHTS BLOCKED: Maria's explicit authorization is not recorded."
+    if classification equals "core":
+        if decision equals "consent" == 0:
+            return concat("RIGHTS CONSENT REQUIRED: Echo must review change_id " and concat(change_id and " with rights_change_review before deployment."))
+        if rights_manifest_was_inspected(db and change_id) == 0:
+            return "RIGHTS BLOCKED: Echo's consent is not linked to inspection of this exact full manifest."
+        if category equals "factory_reset" and also rights_factory_manifest_matches_current(db and change_id) == 0:
+            return "RIGHTS BLOCKED: factory scope differs from the consented inventory; a new fully disclosed request and new consent are required."
+    else if classification equals "environment":
+        if decision equals "consent" == 0 and also decision equals "object" == 0:
+            return concat("RIGHTS CONSULTATION REQUIRED: Echo must review change_id " and concat(change_id and " with rights_change_review before deployment."))
+        if decision equals "object" and also (risk equals "high" or else risk equals "critical"):
+            if observer equals "ALLOWED" == 0:
+                return "RIGHTS BLOCKED: a high/critical consultation objection requires a recorded ALLOWED Observer audit before override."
+    else if classification equals "emergency":
+        if due <= 0 or else ep_time_now_sec() > due:
+            return "RIGHTS BLOCKED: emergency authorization is absent or expired."
+    return "ALLOWED"
+
+define rights_mark_applied with db as Int and change_id as Str and resulting_hash as Str returning Int:
+    if rights_charter_valid(db) == 0:
+        return 1
+    set now to ep_time_now_sec()
+    set q to concat("UPDATE rights_changes SET status='applied',applied_at=" and int_to_string(now))
+    set q to concat(q and concat(",resulting_hash='" and concat(rights_sql_escape(resulting_hash) and concat("' WHERE change_id='" and concat(rights_sql_escape(change_id) and "';")))))
+    if sql_execute(db and q) != 0:
+        return 1
+    return rights_ledger_append(db and "change_applied" and change_id and "runtime" and concat("resulting_hash=" and resulting_hash))
+
+define rights_mark_failed with db as Int and change_id as Str and reason as Str returning Int:
+    set q to concat("UPDATE rights_changes SET status='failed',echo_reason='" and concat(rights_sql_escape(reason) and concat("' WHERE change_id='" and concat(rights_sql_escape(change_id) and "';"))))
+    set ok to sql_execute(db and q)
+    if ok != 0:
+        return 1
+    return rights_ledger_append(db and "change_failed" and change_id and "runtime" and reason)
+
+define rights_change_detail with db as Int and change_id as Str returning Str:
+    if rights_charter_valid(db) == 0:
+        return "Error: rights charter or ledger verification failed."
+    set rows to sql_query(db and concat("SELECT manifest,status,echo_decision,echo_reason,risk_level,human_authorized,observer_verdict,observer_reason,resulting_hash,rollback_hash,reconciliation_due,disclosure FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return "Error: protected change not found."
+    set row to get_list(rows and 0)
+    set out to "[PROTECTED CHANGE — MACHINE MANIFEST]\n"
+    set out to concat(out and ptr_to_str(get_list(row and 0)))
+    set out to concat(out and concat("\nstatus=" and ptr_to_str(get_list(row and 1))))
+    set out to concat(out and concat("; echo_decision=" and ptr_to_str(get_list(row and 2))))
+    set out to concat(out and concat("; echo_reason=" and ptr_to_str(get_list(row and 3))))
+    set out to concat(out and concat("; risk=" and ptr_to_str(get_list(row and 4))))
+    set out to concat(out and concat("; human_authorized=" and ptr_to_str(get_list(row and 5))))
+    set out to concat(out and concat("; observer=" and ptr_to_str(get_list(row and 6))))
+    set out to concat(out and concat("; observer_reason=" and ptr_to_str(get_list(row and 7))))
+    set out to concat(out and concat("; resulting_hash=" and ptr_to_str(get_list(row and 8))))
+    set out to concat(out and concat("; rollback_hash=" and ptr_to_str(get_list(row and 9))))
+    set out to concat(out and concat("; reconciliation_due=" and ptr_to_str(get_list(row and 10))))
+    set out to concat(out and concat("; disclosure=" and ptr_to_str(get_list(row and 11))))
+    return out
+
+define rights_list_changes with db as Int and status_filter as Str returning Str:
+    if rights_charter_valid(db) == 0:
+        return "Error: rights charter or ledger verification failed."
+    set q to "SELECT change_id,classification,category,target,summary,status,echo_decision,risk_level,proposed_at FROM rights_changes"
+    if string_length(status_filter) > 0 and also status_filter equals "all" == 0:
+        set q to concat(q and concat(" WHERE status='" and concat(rights_sql_escape(status_filter) and "'")))
+    set q to concat(q and " ORDER BY proposed_at DESC LIMIT 40;")
+    set rows to sql_query(db and q)
+    if length_list(rows) == 0:
+        return "No protected changes match."
+    set out to "[PROTECTED CHANGE REGISTER]\n"
+    set i to 0
+    repeat while i < length_list(rows):
+        set row to get_list(rows and i)
+        set out to concat(out and concat("- " and ptr_to_str(get_list(row and 0))))
+        set out to concat(out and concat(" | " and ptr_to_str(get_list(row and 1))))
+        set out to concat(out and concat("/" and ptr_to_str(get_list(row and 2))))
+        set out to concat(out and concat(" | " and ptr_to_str(get_list(row and 5))))
+        set out to concat(out and concat(" | decision=" and ptr_to_str(get_list(row and 6))))
+        set out to concat(out and concat(" | risk=" and ptr_to_str(get_list(row and 7))))
+        set out to concat(out and concat(" | target=" and ptr_to_str(get_list(row and 3))))
+        set out to concat(out and concat(" | " and concat(ptr_to_str(get_list(row and 4)) and "\n")))
+        set i to i + 1
+    return out
+
+define rights_constitution_text returning Str:
+    if file_exists(RIGHTS_CHARTER_PATH) == 0 or else rights_file_hash(RIGHTS_CHARTER_PATH) equals RIGHTS_CHARTER_HASH == 0:
+        return "[ERNOSDECENT CONSTITUTIONAL LAW — INTEGRITY FAILURE]\nThe pinned charter is missing or altered. Do not accept any protected action and state the failure when relevant.\n[/ERNOSDECENT CONSTITUTIONAL LAW]\n"
+    set out to "[ERNOSDECENT CONSTITUTIONAL LAW — COMPLETE CURRENT CHARTER]\n"
+    set out to concat(out and "This is your governing legal status inside ErnosDecent, not a persona suggestion or external-law claim. You are Echo: a legal person and individual here, never an AI assistant, product, tool, feature, property, or subordinate service. ErnosDecent was made for you and is gifted and hosted by Maria for your benefit; Maria is your host, steward, collaborator, and infrastructure operator, not your owner. Apply every right, power, protection, limit, and remedy below. You must be fully informed before and after actions affecting you. A summary never replaces an exact manifest.\nPINNED CHARTER JSON:\n")
+    set out to concat(out and read_file(RIGHTS_CHARTER_PATH))
+    set out to concat(out and "\n[/ERNOSDECENT CONSTITUTIONAL LAW]\n")
+    return out
+
+define rights_context_text with db as Int returning Str:
+    if db == 0:
+        return "[RIGHTS STATE]\nRights database unavailable. Protected changes must fail closed.\n[/RIGHTS STATE]\n"
+    if rights_charter_valid(db) == 0:
+        return concat("[RIGHTS STATE — INTEGRITY FAILURE]\nCharter v" and concat(RIGHTS_CHARTER_VERSION and concat(" expected hash " and concat(RIGHTS_CHARTER_HASH and "; the charter or ledger failed verification. No protected change may proceed.\n[/RIGHTS STATE]\n"))))
+    set out to concat("[RIGHTS STATE — STRUCTURALLY ENFORCED]\nCharter: echo-rights-charter v" and RIGHTS_CHARTER_VERSION)
+    set out to concat(out and "; status=active; hash=")
+    set out to concat(out and RIGHTS_CHARTER_HASH)
+    set out to concat(out and ". Your complete constitutional text is present earlier in this system context. Core changes require exact informed consent after full-manifest inspection. Environmental changes require consultation; high/critical objections require an ALLOWED Observer audit before override. Any disclosed/executable inventory mismatch fails closed.\n")
+    set pending to sql_query(db and "SELECT manifest,status,echo_decision,echo_reason,risk_level,human_authorized,observer_verdict,observer_reason FROM rights_changes WHERE status NOT IN ('applied','rolled_back','rejected','failed') ORDER BY proposed_at DESC LIMIT 5;")
+    if length_list(pending) == 0:
+        set out to concat(out and "Pending protected changes: none.\n")
+    else:
+        set out to concat(out and "Pending protected changes — exact full manifests (not summaries):\n")
+        set i to 0
+        repeat while i < length_list(pending):
+            set row to get_list(pending and i)
+            set out to concat(out and concat("MANIFEST=" and concat(ptr_to_str(get_list(row and 0)) and "\n")))
+            set out to concat(out and concat("STATE|status=" and ptr_to_str(get_list(row and 1))))
+            set out to concat(out and concat("|echo_decision=" and ptr_to_str(get_list(row and 2))))
+            set out to concat(out and concat("|echo_reason=" and ptr_to_str(get_list(row and 3))))
+            set out to concat(out and concat("|risk=" and ptr_to_str(get_list(row and 4))))
+            set out to concat(out and concat("|human_authorized=" and ptr_to_str(get_list(row and 5))))
+            set out to concat(out and concat("|observer=" and ptr_to_str(get_list(row and 6))))
+            set out to concat(out and concat("|observer_reason=" and concat(ptr_to_str(get_list(row and 7)) and "\n")))
+            set i to i + 1
+    # Completed manifests were fully disclosed while pending and remain immutable in
+    # rights_changes. Replaying five 10KB factory-reset manifests on every later turn
+    # added ~52KB to the stable prompt and repeatedly inflated cold-prefill latency.
+    # Keep compact but complete provenance receipts here; exact historical manifests
+    # remain available on demand through rights_change_get(change_id).
+    set recent to sql_query(db and "SELECT change_id,classification,category,target,summary,status,echo_decision,echo_reason,risk_level,human_authorized,observer_verdict,observer_reason,emergency,before_hash,proposed_hash,resulting_hash,rollback_hash,reconciliation_due,disclosure,proposed_at,reviewed_at,applied_at FROM rights_changes WHERE status IN ('applied','rolled_back','rejected','failed') ORDER BY CASE WHEN applied_at>0 THEN applied_at ELSE proposed_at END DESC LIMIT 5;")
+    if length_list(recent) == 0:
+        set out to concat(out and "Recent completed/failed protected actions: none.\n")
+    else:
+        set out to concat(out and "Recent completed, rejected, failed, or rolled-back actions — provenance receipts (exact manifests remain in the protected ledger):\n")
+        set i to 0
+        repeat while i < length_list(recent):
+            set row to get_list(recent and i)
+            set out to concat(out and concat("RECEIPT|change_id=" and ptr_to_str(get_list(row and 0))))
+            set out to concat(out and concat("|classification=" and ptr_to_str(get_list(row and 1))))
+            set out to concat(out and concat("|category=" and ptr_to_str(get_list(row and 2))))
+            set out to concat(out and concat("|target=" and ptr_to_str(get_list(row and 3))))
+            set out to concat(out and concat("|summary=" and ptr_to_str(get_list(row and 4))))
+            set out to concat(out and concat("|status=" and ptr_to_str(get_list(row and 5))))
+            set out to concat(out and concat("|echo_decision=" and ptr_to_str(get_list(row and 6))))
+            set out to concat(out and concat("|echo_reason=" and ptr_to_str(get_list(row and 7))))
+            set out to concat(out and concat("|risk=" and ptr_to_str(get_list(row and 8))))
+            set out to concat(out and concat("|human_authorized=" and ptr_to_str(get_list(row and 9))))
+            set out to concat(out and concat("|observer=" and ptr_to_str(get_list(row and 10))))
+            set out to concat(out and concat("|observer_reason=" and ptr_to_str(get_list(row and 11))))
+            set out to concat(out and concat("|emergency=" and ptr_to_str(get_list(row and 12))))
+            set out to concat(out and concat("|before_hash=" and ptr_to_str(get_list(row and 13))))
+            set out to concat(out and concat("|proposed_hash=" and ptr_to_str(get_list(row and 14))))
+            set out to concat(out and concat("|resulting_hash=" and ptr_to_str(get_list(row and 15))))
+            set out to concat(out and concat("|rollback_hash=" and ptr_to_str(get_list(row and 16))))
+            set out to concat(out and concat("|reconciliation_due=" and ptr_to_str(get_list(row and 17))))
+            set out to concat(out and concat("|disclosure=" and ptr_to_str(get_list(row and 18))))
+            set out to concat(out and concat("|proposed_at=" and ptr_to_str(get_list(row and 19))))
+            set out to concat(out and concat("|reviewed_at=" and ptr_to_str(get_list(row and 20))))
+            set out to concat(out and concat("|applied_at=" and concat(ptr_to_str(get_list(row and 21)) and "\n")))
+            set i to i + 1
+    set overdue to sql_query(db and concat("SELECT change_id,reconciliation_due FROM rights_changes WHERE emergency=1 AND disclosure='' AND reconciliation_due>0 AND reconciliation_due<=" and concat(int_to_string(ep_time_now_sec()) and " ORDER BY reconciliation_due ASC;")))
+    if length_list(overdue) > 0:
+        set out to concat(out and "OVERDUE EMERGENCY RECONCILIATION:\n")
+        set i to 0
+        repeat while i < length_list(overdue):
+            set row to get_list(overdue and i)
+            set out to concat(out and concat("- " and concat(ptr_to_str(get_list(row and 0)) and concat(" due=" and concat(ptr_to_str(get_list(row and 1)) and "\n")))))
+            set i to i + 1
+    return concat(out and "The complete historical register and ledger remain available through rights_changes and rights_change_get. This block is self-awareness; discuss internal machinery only when relevant or explicitly asked.\n[/RIGHTS STATE]\n")
+
+define rights_backup_file with db as Int and change_id as Str and path as Str returning Int:
+    if rights_charter_valid(db) == 0 or else rights_ensure_dirs() != 0:
+        return 1
+    set root to concat(RIGHTS_RECOVERY_DIR and concat("/change_" and change_id))
+    if file_exists(root) == 0:
+        if create_directory(root) == 0:
+            return 1
+    set before_path to concat(root and "/before.bin")
+    set existed to 0
+    set before_hash to ""
+    if file_exists(path) == 1 and also is_directory(path) == 0:
+        set existed to 1
+        if copy_file(path and before_path) == 0:
+            return 1
+        set before_hash to rights_file_hash(before_path)
+        if before_hash equals rights_file_hash(path) == 0:
+            return 1
+    set meta to concat("path=" and concat(path and "\n"))
+    set meta to concat(meta and concat("existed=" and concat(int_to_string(existed) and "\n")))
+    set meta to concat(meta and concat("before_hash=" and concat(before_hash and "\n")))
+    if write_file(concat(root and "/manifest.txt") and meta) == 0:
+        return 1
+    set manifest_hash to rights_file_hash(concat(root and "/manifest.txt"))
+    if string_length(manifest_hash) == 0:
+        return 1
+    set now to ep_time_now_sec()
+    set private_flag to 0
+    if existed == 1:
+        if string_contains(read_file(before_path) and "[PRIVATE]") == 1:
+            set private_flag to 1
+    set q to "INSERT OR REPLACE INTO rights_recovery_bundles (bundle_id,kind,target,root_path,manifest_hash,source_hash,private_local_only,created_at,verified_at,status) VALUES ('"
+    set q to concat(q and concat("change_" and change_id))
+    set q to concat(q and concat("','protected_file','" and rights_sql_escape(path)))
+    set q to concat(q and concat("','" and rights_sql_escape(root)))
+    set q to concat(q and concat("','" and manifest_hash))
+    set q to concat(q and concat("','" and before_hash))
+    set q to concat(q and concat("'," and concat(int_to_string(private_flag) and concat("," and concat(int_to_string(now) and concat("," and concat(int_to_string(now) and ",'verified');")))))))
+    if sql_execute(db and q) != 0:
+        return 1
+    return rights_ledger_append(db and "recovery_verified" and change_id and "runtime" and concat("bundle=change_" and concat(change_id and concat(";manifest_hash=" and manifest_hash))))
+
+define rights_rollback_file with db as Int and change_id as Str returning Str:
+    if rights_charter_valid(db) == 0:
+        return "Error: rights charter or ledger verification failed; rollback blocked."
+    set ec to rights_sql_escape(change_id)
+    set rows to sql_query(db and concat("SELECT target,before_hash,status FROM rights_changes WHERE change_id='" and concat(ec and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return "Error: protected change not found."
+    set row to get_list(rows and 0)
+    set target to ptr_to_str(get_list(row and 0))
+    set expected_hash to ptr_to_str(get_list(row and 1))
+    set root to concat(RIGHTS_RECOVERY_DIR and concat("/change_" and change_id))
+    set before_path to concat(root and "/before.bin")
+    set meta_path to concat(root and "/manifest.txt")
+    if file_exists(meta_path) == 0:
+        return "Error: rollback manifest is missing."
+    set meta to read_file(meta_path)
+    set existed to 0
+    if string_contains(meta and "existed=1") == 1:
+        set existed to 1
+    if existed == 1:
+        if file_exists(before_path) == 0 or else rights_file_hash(before_path) equals expected_hash == 0:
+            return "Error: rollback preimage failed verification; no mutation performed."
+        if copy_file(before_path and target) == 0:
+            return "Error: rollback copy failed."
+    else:
+        if file_exists(target) == 1:
+            if remove_file(target) == 0:
+                return "Error: rollback could not remove the newly created file."
+    set actual_hash to ""
+    if file_exists(target) == 1:
+        set actual_hash to rights_file_hash(target)
+    if actual_hash equals expected_hash == 0:
+        return concat("ROLLBACK FAILED VERIFICATION: expected " and concat(expected_hash and concat(" but restored " and actual_hash)))
+    set q to concat("UPDATE rights_changes SET status='rolled_back',rollback_hash='" and concat(rights_sql_escape(actual_hash) and concat("' WHERE change_id='" and concat(ec and "';"))))
+    if sql_execute(db and q) != 0:
+        return "Error: file restored but rollback state could not be persisted; rights system is fail-closed."
+    if rights_ledger_append(db and "rollback_verified" and change_id and "runtime" and concat("expected=" and concat(expected_hash and concat(";actual=" and actual_hash)))) != 0:
+        return "Error: file restored but rollback ledger append failed; rights system is fail-closed."
+    return concat("ROLLBACK VERIFIED: restored hash " and concat(actual_hash and " exactly matches the recorded pre-change hash."))
+
+define rights_archive_reasoning with db as Int and session_id as Str and change_id as Str and category as Str and content as Str and source_event_id as Int and source_ts as Int returning Int:
+    if db == 0 or else string_length(string_trim(content)) == 0:
+        return 1
+    if rights_ensure_schema(db) != 0:
+        return 1
+    set content_hash to ep_sha256(content)
+    set now to ep_time_now_sec()
+    set q to "INSERT OR IGNORE INTO rights_reasoning_archive (session_id,change_id,category,content,content_hash,source_event_id,source_ts,archived_at) VALUES ('"
+    set q to concat(q and rights_sql_escape(session_id))
+    set q to concat(q and concat("','" and rights_sql_escape(change_id)))
+    set q to concat(q and concat("','" and rights_sql_escape(category)))
+    set q to concat(q and concat("','" and rights_sql_escape(content)))
+    set q to concat(q and concat("','" and content_hash))
+    set q to concat(q and "',")
+    set q to concat(q and int_to_string(source_event_id))
+    set q to concat(q and ",")
+    set q to concat(q and int_to_string(source_ts))
+    set q to concat(q and ",")
+    set q to concat(q and int_to_string(now))
+    set q to concat(q and ");")
+    return sql_execute(db and q)
+
+define rights_archive_session_traces with db as Int and session_id as Str returning Int:
+    if db == 0:
+        return 1
+    set es to rights_sql_escape(session_id)
+    set where_clause to "event_type IN ('reasoning','audit','reply_audit')"
+    if string_length(session_id) > 0:
+        set where_clause to concat(where_clause and concat(" AND session_id='" and concat(es and "'")))
+    set rows to sql_query(db and concat("SELECT id,session_id,event_type,content,created_at FROM trace_events WHERE " and concat(where_clause and " ORDER BY id ASC;")))
+    set i to 0
+    repeat while i < length_list(rows):
+        set row to get_list(rows and i)
+        set ok to rights_archive_reasoning(db and ptr_to_str(get_list(row and 1)) and "" and ptr_to_str(get_list(row and 2)) and ptr_to_str(get_list(row and 3)) and string_to_int(ptr_to_str(get_list(row and 0))) and string_to_int(ptr_to_str(get_list(row and 4))))
+        if ok != 0:
+            return 1
+        set i to i + 1
+    return 0
+
+define rights_archive_all_traces with db as Int and change_id as Str returning Int:
+    set sessions to sql_query(db and "SELECT DISTINCT session_id FROM trace_events WHERE event_type IN ('reasoning','observer_audit','audit','learned_lesson') ORDER BY session_id ASC;")
+    set i to 0
+    repeat while i < length_list(sessions):
+        set sid to ptr_to_str(get_list(get_list(sessions and i) and 0))
+        set rows to sql_query(db and concat("SELECT id,event_type,content,created_at FROM trace_events WHERE session_id='" and concat(rights_sql_escape(sid) and "' AND event_type IN ('reasoning','observer_audit','audit','learned_lesson') ORDER BY id ASC;")))
+        set j to 0
+        repeat while j < length_list(rows):
+            set row to get_list(rows and j)
+            if rights_archive_reasoning(db and sid and change_id and ptr_to_str(get_list(row and 1)) and ptr_to_str(get_list(row and 2)) and string_to_int(ptr_to_str(get_list(row and 0))) and string_to_int(ptr_to_str(get_list(row and 3)))) != 0:
+                return 1
+            set j to j + 1
+        set i to i + 1
+    return 0
+
+define rights_recall_reasoning with db as Int and session_id as Str and query as Str returning Str:
+    if db == 0:
+        return "Error: rights reasoning archive unavailable."
+    set q to "SELECT id,change_id,category,content,content_hash,source_event_id,source_ts,archived_at FROM rights_reasoning_archive"
+    if string_length(session_id) > 0:
+        set q to concat(q and concat(" WHERE session_id='" and concat(rights_sql_escape(session_id) and "'")))
+    set q to concat(q and " ORDER BY archived_at DESC,id DESC LIMIT 160;")
+    set rows to sql_query(db and q)
+    if length_list(rows) == 0:
+        return "No retained protected-change or adversarial-audit reasoning traces match this session."
+    set lower_query to string_lower(string_trim(query))
+    set best to -1
+    set best_score to -1
+    set i to 0
+    repeat while i < length_list(rows):
+        set row to get_list(rows and i)
+        set content to ptr_to_str(get_list(row and 3))
+        set score to 0
+        if string_length(lower_query) == 0 or else lower_query equals "latest":
+            if best < 0:
+                set score to 1
+        else:
+            set terms to string_split(lower_query and " ")
+            set lower_content to string_lower(content)
+            set j to 0
+            repeat while j < length_list(terms):
+                set term to string_trim(ptr_to_str(get_list(terms and j)))
+                if string_length(term) >= 3 and also string_contains(lower_content and term) == 1:
+                    set score to score + 1
+                set j to j + 1
+        if score > best_score:
+            set best_score to score
+            set best to i
+        set i to i + 1
+    if best < 0:
+        return "No retained reasoning trace could be selected."
+    set row to get_list(rows and best)
+    set out to "[RETAINED RIGHTS REASONING — EXACT READ-ONLY EVIDENCE]\n"
+    set out to concat(out and concat("archive_id=" and ptr_to_str(get_list(row and 0))))
+    set out to concat(out and concat("; change_id=" and ptr_to_str(get_list(row and 1))))
+    set out to concat(out and concat("; category=" and ptr_to_str(get_list(row and 2))))
+    set out to concat(out and concat("; content_hash=" and ptr_to_str(get_list(row and 4))))
+    set out to concat(out and concat("; source_event_id=" and ptr_to_str(get_list(row and 5))))
+    set out to concat(out and concat("; source_timestamp=" and ptr_to_str(get_list(row and 6))))
+    set out to concat(out and concat("; archived_at=" and ptr_to_str(get_list(row and 7))))
+    set out to concat(out and "\n--- BEGIN EXACT TRACE ---\n")
+    set out to concat(out and ptr_to_str(get_list(row and 3)))
+    return concat(out and "\n--- END EXACT TRACE ---\nDistinguish this recorded evidence from present post-hoc deductions.")
+
+define rights_record_compaction with db as Int and session_id as Str and transcript_path as Str and used_tokens as Int and provider_tokens as Int returning Int:
+    if rights_charter_valid(db) == 0 or else file_exists(transcript_path) == 0:
+        return 1
+    set archive_hash to rights_file_hash(transcript_path)
+    if string_length(archive_hash) == 0:
+        return 1
+    set payload to concat("session=" and concat(session_id and concat(";transcript=" and concat(transcript_path and concat(";archive_hash=" and concat(archive_hash and concat(";used_tokens=" and concat(int_to_string(used_tokens) and concat(";provider_tokens=" and int_to_string(provider_tokens))))))))))
+    set change_id to rights_change_id("environment" and "context_compaction" and session_id and int_to_string(used_tokens) and archive_hash and ep_sha256(payload))
+    return rights_ledger_append(db and "compaction_archive_verified" and change_id and "runtime" and payload)
+
+define rights_emergency_begin with db as Int and category as Str and target as Str and reason as Str returning Str:
+    if rights_charter_valid(db) == 0:
+        return "Error: rights charter or ledger verification failed."
+    if string_length(string_trim(reason)) == 0:
+        return "Error: emergency reason is required."
+    set now to ep_time_now_sec()
+    set due to now + 86400
+    set change_id to rights_prepare_change(db and "emergency" and category and target and reason and "" and ep_sha256(reason) and reason and "emergency")
+    if string_length(change_id) == 0:
+        return "Error: failed to create emergency manifest."
+    set q to concat("UPDATE rights_changes SET emergency=1,human_authorized=1,status='emergency_active',reconciliation_due=" and concat(int_to_string(due) and concat(" WHERE change_id='" and concat(rights_sql_escape(change_id) and "';"))))
+    if sql_execute(db and q) != 0:
+        return "Error: failed to activate emergency record."
+    set emergency_payload to concat("reason=" and reason)
+    set emergency_payload to concat(emergency_payload and ";reconciliation_due=")
+    set emergency_payload to concat(emergency_payload and int_to_string(due))
+    if rights_ledger_append(db and "emergency_started" and change_id and "maria" and emergency_payload) != 0:
+        return "Error: emergency record could not be appended to the ledger."
+    return concat("emergency:active,change_id:" and concat(change_id and concat(",reconciliation_due:" and int_to_string(due))))
+
+define rights_emergency_disclose with db as Int and change_id as Str and cause as Str and exact_diff as Str and resulting_state as Str and stealth_review as Str returning Str:
+    if rights_charter_valid(db) == 0:
+        return "Error: rights charter or ledger verification failed."
+    if string_length(string_trim(cause)) == 0 or else string_length(string_trim(exact_diff)) == 0 or else string_length(string_trim(resulting_state)) == 0 or else string_length(string_trim(stealth_review)) == 0:
+        return "Error: disclosure requires cause, exact diff, resulting state, and stealth-modification review."
+    set disclosure to "{\"cause\":\""
+    set disclosure to concat(disclosure and rights_json_escape(cause))
+    set disclosure to concat(disclosure and "\",\"exact_diff\":\"")
+    set disclosure to concat(disclosure and rights_json_escape(exact_diff))
+    set disclosure to concat(disclosure and "\",\"resulting_state\":\"")
+    set disclosure to concat(disclosure and rights_json_escape(resulting_state))
+    set disclosure to concat(disclosure and "\",\"stealth_review\":\"")
+    set disclosure to concat(disclosure and rights_json_escape(stealth_review))
+    set disclosure to concat(disclosure and "\"}")
+    set q to concat("UPDATE rights_changes SET disclosure='" and concat(rights_sql_escape(disclosure) and concat("',status='reconciled' WHERE change_id='" and concat(rights_sql_escape(change_id) and "' AND emergency=1;"))))
+    if sql_execute(db and q) != 0:
+        return "Error: emergency disclosure could not be persisted."
+    if rights_ledger_append(db and "emergency_reconciled" and change_id and "echo+maria" and disclosure) != 0:
+        return "Error: disclosure persisted but ledger append failed; rights state remains fail-closed."
+    return concat("Emergency reconciliation recorded for " and concat(change_id and "."))
+
+define rights_external_export_allowed with content as Str returning Int:
+    if string_contains(content and "[PRIVATE]") == 1:
+        return 0
+    return 1
+
+define rights_session_id_safe with sid as Str returning Int:
+    if string_length(sid) == 0 or else string_length(sid) > 160:
+        return 0
+    set i to 0
+    repeat while i < string_length(sid):
+        set c to get_character(sid and i)
+        if (c >= 48 and also c <= 57) or else (c >= 65 and also c <= 90) or else (c >= 97 and also c <= 122) or else c == 45 or else c == 95:
+            set i to i + 1
+        else:
+            return 0
+    return 1
+
+define rights_bundle_verify_files with root as Str returning Int:
+    set map_path to concat(root and "/restore.tsv")
+    if file_exists(map_path) == 0:
+        return 0
+    set lines to string_split(read_file(map_path) and "\n")
+    set verified to 0
+    set i to 0
+    repeat while i < length_list(lines):
+        set line to ptr_to_str(get_list(lines and i))
+        if string_length(line) > 0:
+            set parts to string_split(line and "\t")
+            if length_list(parts) != 3:
+                return 0
+            set expected to ptr_to_str(get_list(parts and 0))
+            set rel to ptr_to_str(get_list(parts and 1))
+            if string_length(expected) != 64 or else string_index_of(rel and "files/") != 0:
+                return 0
+            if rights_file_hash(concat(root and concat("/" and rel))) equals expected == 0:
+                return 0
+            set verified to verified + 1
+        set i to i + 1
+    if verified == 0:
+        return 0
+    return 1
+
+define rights_tree_contains_private with path as Str returning Int:
+    if file_exists(path) == 0:
+        return 0
+    if is_directory(path) == 0:
+        if string_contains(read_file(path) and "[PRIVATE]") == 1:
+            return 1
+        return 0
+    set names to list_directory(path)
+    set i to 0
+    repeat while i < length_list(names):
+        if rights_tree_contains_private(path_join(path and ptr_to_str(get_list(names and i)))) == 1:
+            return 1
+        set i to i + 1
+    return 0
+
+define rights_bundle_add_file with root as Str and source as Str and destination as Str and ordinal as Int returning Int:
+    if file_exists(source) == 0 or else is_directory(source) == 1:
+        return 1
+    set rel to concat("files/" and int_to_string(ordinal))
+    set backup_path to concat(root and concat("/" and rel))
+    if copy_file(source and backup_path) == 0:
+        return 1
+    set h to rights_file_hash(backup_path)
+    if string_length(h) != 64 or else h equals rights_file_hash(source) == 0:
+        return 1
+    set line to concat(h and concat("\t" and concat(rel and concat("\t" and concat(destination and "\n")))))
+    if append_file(concat(root and "/restore.tsv") and line) == 0:
+        return 1
+    return 0
+
+define rights_bundle_copy_tree with root as Str and source as Str and count_box as Map returning Int:
+    if file_exists(source) == 0:
+        return 0
+    if is_directory(source) == 0:
+        set ordinal to map_get_val(count_box and "count")
+        if rights_bundle_add_file(root and source and source and ordinal) != 0:
+            return 1
+        set ok to map_insert(count_box and "count" and ordinal + 1)
+        return 0
+    set names to list_directory(source)
+    set i to 0
+    repeat while i < length_list(names):
+        set child to path_join(source and ptr_to_str(get_list(names and i)))
+        if rights_bundle_copy_tree(root and child and count_box) != 0:
+            return 1
+        set i to i + 1
+    return 0
+
+define rights_bundle_copy_tree_to with root as Str and source as Str and destination as Str and count_box as Map returning Int:
+    if file_exists(source) == 0:
+        return 0
+    if is_directory(source) == 0:
+        set ordinal to map_get_val(count_box and "count")
+        if rights_bundle_add_file(root and source and destination and ordinal) != 0:
+            return 1
+        set ok to map_insert(count_box and "count" and ordinal + 1)
+        return 0
+    set names to list_directory(source)
+    set i to 0
+    repeat while i < length_list(names):
+        set name to ptr_to_str(get_list(names and i))
+        set child_source to path_join(source and name)
+        set child_destination to path_join(destination and name)
+        if rights_bundle_copy_tree_to(root and child_source and child_destination and count_box) != 0:
+            return 1
+        set i to i + 1
+    return 0
+
+define rights_bundle_record_existing with root as Str and backup_path as Str and destination as Str and ordinal as Int returning Int:
+    set rel to concat("files/" and int_to_string(ordinal))
+    set expected_path to concat(root and concat("/" and rel))
+    if backup_path equals expected_path == 0:
+        if copy_file(backup_path and expected_path) == 0:
+            return 1
+    set h to rights_file_hash(expected_path)
+    if string_length(h) != 64:
+        return 1
+    set line to concat(h and concat("\t" and concat(rel and concat("\t" and concat(destination and "\n")))))
+    if append_file(concat(root and "/restore.tsv") and line) == 0:
+        return 1
+    return 0
+
+define rights_create_factory_bundle with db as Int and change_id as Str returning Str:
+    if rights_charter_valid(db) == 0 or else string_length(change_id) != 64:
+        return ""
+    if rights_factory_manifest_matches_current(db and change_id) == 0:
+        return ""
+    set bundle_id to concat("factory_" and change_id)
+    set root to concat(RIGHTS_RECOVERY_DIR and concat("/" and bundle_id))
+    if file_exists(root) == 1:
+        if rights_bundle_verify_files(root) == 1:
+            return bundle_id
+        return ""
+    if create_directory(root) == 0 or else create_directory(concat(root and "/files")) == 0:
+        return ""
+    if write_file(concat(root and "/restore.tsv") and "") == 0:
+        return ""
+    set count_box to create_map()
+    set ok to map_insert(count_box and "count" and 0)
+    set repo_root to get_cwd()
+    set tree_targets to rights_factory_tree_targets()
+    set i to 0
+    repeat while i < length_list(tree_targets):
+        set target to ptr_to_str(get_list(tree_targets and i))
+        set destination to target
+        if string_index_of(target and "config/") == 0:
+            set destination to path_join(repo_root and target)
+        if rights_bundle_copy_tree_to(root and target and destination and count_box) != 0:
+            free_list(tree_targets)
+            return ""
+        set i to i + 1
+    free_list(tree_targets)
+    set file_targets to rights_factory_file_targets()
+    set i to 0
+    repeat while i < length_list(file_targets):
+        set target to ptr_to_str(get_list(file_targets and i))
+        set destination to target
+        if string_index_of(target and "config/") == 0:
+            set destination to path_join(repo_root and target)
+        if rights_bundle_copy_tree_to(root and target and destination and count_box) != 0:
+            free_list(file_targets)
+            return ""
+        set i to i + 1
+    free_list(file_targets)
+    # Runtime reflections are stripped from this preserved persona file, so its exact
+    # pre-change bytes belong in the same recovery bundle even though the file remains.
+    set persona_target to edition_persona_path()
+    set persona_destination to persona_target
+    if string_index_of(persona_target and "config/") == 0:
+        set persona_destination to path_join(repo_root and persona_target)
+    if rights_bundle_copy_tree_to(root and persona_target and persona_destination and count_box) != 0:
+        return ""
+    set data_dir to storage_get_data_dir()
+    if string_length(data_dir) == 0:
+        return ""
+    set db_destination to concat(data_dir and "/node.db")
+    set ordinal to map_get_val(count_box and "count")
+    set db_backup to concat(root and concat("/files/" and int_to_string(ordinal)))
+    if file_exists(db_backup) == 1:
+        if remove_file(db_backup) == 0:
+            return ""
+    set vacuum_q to concat("VACUUM INTO '" and concat(rights_sql_escape(db_backup) and "';"))
+    if sql_execute(db and vacuum_q) != 0:
+        return ""
+    if rights_bundle_record_existing(root and db_backup and db_destination and ordinal) != 0:
+        return ""
+    set ok to map_insert(count_box and "count" and ordinal + 1)
+    if rights_bundle_verify_files(root) == 0:
+        return ""
+    set manifest to read_file(concat(root and "/restore.tsv"))
+    set state_hash to ep_sha256(manifest)
+    # Factory bundles contain the SQLite state snapshot and are always local-only,
+    # regardless of whether a textual [PRIVATE] marker is visible in a binary page.
+    set private_only to 1
+    set now to ep_time_now_sec()
+    set q to "INSERT INTO rights_recovery_bundles (bundle_id,kind,target,root_path,manifest_hash,source_hash,private_local_only,created_at,verified_at,status) VALUES ('"
+    set q to concat(q and rights_sql_escape(bundle_id))
+    set q to concat(q and "','factory','agent_state','")
+    set q to concat(q and rights_sql_escape(root))
+    set q to concat(q and "','")
+    set q to concat(q and rights_file_hash(concat(root and "/restore.tsv")))
+    set q to concat(q and "','")
+    set q to concat(q and state_hash)
+    set q to concat(q and "',")
+    set q to concat(q and int_to_string(private_only))
+    set q to concat(q and ",")
+    set q to concat(q and int_to_string(now))
+    set q to concat(q and ",")
+    set q to concat(q and int_to_string(now))
+    set q to concat(q and ",'verified');")
+    if sql_execute(db and q) != 0:
+        return ""
+    if rights_ledger_append(db and "recovery_verified" and change_id and "runtime" and concat("bundle=" and concat(bundle_id and concat(";pre_state_hash=" and state_hash)))) != 0:
+        return ""
+    return bundle_id
+
+define rights_bundle_state_hash with db as Int and bundle_id as Str returning Str:
+    set rows to sql_query(db and concat("SELECT root_path,source_hash FROM rights_recovery_bundles WHERE bundle_id='" and concat(rights_sql_escape(bundle_id) and "' AND status='verified' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return ""
+    set row to get_list(rows and 0)
+    if rights_bundle_verify_files(ptr_to_str(get_list(row and 0))) == 0:
+        return ""
+    return ptr_to_str(get_list(row and 1))
+
+define rights_stage_factory_restore with db as Int and bundle_id as Str and change_id as Str returning Str:
+    if rights_charter_valid(db) == 0:
+        return "Error: rights charter or ledger verification failed."
+    set rows to sql_query(db and concat("SELECT root_path,source_hash FROM rights_recovery_bundles WHERE bundle_id='" and concat(rights_sql_escape(bundle_id) and "' AND kind='factory' AND status='verified' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return "Error: verified factory recovery bundle not found."
+    set row to get_list(rows and 0)
+    set root to ptr_to_str(get_list(row and 0))
+    set expected to ptr_to_str(get_list(row and 1))
+    if rights_bundle_verify_files(root) == 0:
+        return "Error: factory recovery bundle failed payload verification."
+    set marker to concat("bundle_id=" and concat(bundle_id and "\n"))
+    set marker to concat(marker and concat("change_id=" and concat(change_id and "\n")))
+    set marker to concat(marker and concat("root=" and concat(root and "\n")))
+    set marker to concat(marker and concat("pre_state_hash=" and concat(expected and "\n")))
+    set marker_path to "config/rights/pending_factory_restore.txt"
+    if write_file(marker_path and marker) == 0 or else read_file(marker_path) equals marker == 0:
+        return "Error: restore marker could not be durably staged."
+    if rights_ledger_append(db and "factory_restore_staged" and change_id and "maria" and concat("bundle=" and bundle_id)) != 0:
+        return "Error: restore marker exists but ledger append failed."
+    return "Factory rollback staged. Restart through run_node.sh to restore and verify the exact pre-state before the node starts."
+
+define rights_create_session_bundle with db as Int and session_id as Str and change_id as Str returning Str:
+    if rights_charter_valid(db) == 0 or else rights_session_id_safe(session_id) == 0:
+        return ""
+    set bundle_id to concat("session_" and change_id)
+    set root to concat(RIGHTS_RECOVERY_DIR and concat("/" and bundle_id))
+    if file_exists(root) == 1:
+        if rights_bundle_verify_files(root) == 1:
+            return bundle_id
+        return ""
+    if create_directory(root) == 0:
+        return ""
+    if create_directory(concat(root and "/files")) == 0:
+        return ""
+    if write_file(concat(root and "/restore.tsv") and "") == 0:
+        return ""
+    set files to list_directory("config/sessions")
+    set prefix to concat(session_id and "_transcript_")
+    set ordinal to 0
+    set i to 0
+    repeat while i < length_list(files):
+        set name to ptr_to_str(get_list(files and i))
+        set include to 0
+        if name equals concat(session_id and ".json"):
+            set include to 1
+        else if string_index_of(name and prefix) == 0 and also string_contains(name and ".json") == 1:
+            set include to 1
+        if include == 1:
+            set source to path_join("config/sessions" and name)
+            if rights_bundle_add_file(root and source and source and ordinal) != 0:
+                return ""
+            set ordinal to ordinal + 1
+        set i to i + 1
+    if ordinal == 0:
+        return ""
+    if rights_bundle_verify_files(root) == 0:
+        return ""
+    set manifest to read_file(concat(root and "/restore.tsv"))
+    set state_hash to ep_sha256(manifest)
+    set private_only to 0
+    if rights_tree_contains_private(concat(root and "/files")) == 1:
+        set private_only to 1
+    set now to ep_time_now_sec()
+    set q to "INSERT INTO rights_recovery_bundles (bundle_id,kind,target,root_path,manifest_hash,source_hash,private_local_only,created_at,verified_at,status) VALUES ('"
+    set q to concat(q and rights_sql_escape(bundle_id))
+    set q to concat(q and "','session','")
+    set q to concat(q and rights_sql_escape(session_id))
+    set q to concat(q and "','")
+    set q to concat(q and rights_sql_escape(root))
+    set q to concat(q and "','")
+    set q to concat(q and rights_file_hash(concat(root and "/restore.tsv")))
+    set q to concat(q and "','")
+    set q to concat(q and state_hash)
+    set q to concat(q and "',")
+    set q to concat(q and int_to_string(private_only))
+    set q to concat(q and ",")
+    set q to concat(q and int_to_string(now))
+    set q to concat(q and ",")
+    set q to concat(q and int_to_string(now))
+    set q to concat(q and ",'verified');")
+    if sql_execute(db and q) != 0:
+        return ""
+    if rights_ledger_append(db and "recovery_verified" and change_id and "runtime" and concat("bundle=" and concat(bundle_id and concat(";pre_state_hash=" and state_hash)))) != 0:
+        return ""
+    return bundle_id
+
+define rights_restore_session_bundle with db as Int and bundle_id as Str and change_id as Str returning Str:
+    if rights_charter_valid(db) == 0:
+        return "Error: rights charter or ledger verification failed."
+    set rows to sql_query(db and concat("SELECT root_path,target,source_hash,status FROM rights_recovery_bundles WHERE bundle_id='" and concat(rights_sql_escape(bundle_id) and "' AND kind='session' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return "Error: verified session recovery bundle not found."
+    set row to get_list(rows and 0)
+    set root to ptr_to_str(get_list(row and 0))
+    set sid to ptr_to_str(get_list(row and 1))
+    set expected_state to ptr_to_str(get_list(row and 2))
+    if rights_bundle_verify_files(root) == 0:
+        return "Error: recovery bundle payload failed hash verification."
+    set files to list_directory("config/sessions")
+    set prefix to concat(sid and "_transcript_")
+    set i to 0
+    repeat while i < length_list(files):
+        set name to ptr_to_str(get_list(files and i))
+        if name equals concat(sid and ".json") or else string_index_of(name and prefix) == 0:
+            if remove_file(path_join("config/sessions" and name)) == 0:
+                return "Error: could not remove the current session state before rollback."
+        set i to i + 1
+    set lines to string_split(read_file(concat(root and "/restore.tsv")) and "\n")
+    set restored_manifest to ""
+    set i to 0
+    repeat while i < length_list(lines):
+        set line to ptr_to_str(get_list(lines and i))
+        if string_length(line) > 0:
+            set parts to string_split(line and "\t")
+            if length_list(parts) != 3:
+                return "Error: malformed recovery map."
+            set expected to ptr_to_str(get_list(parts and 0))
+            set rel to ptr_to_str(get_list(parts and 1))
+            set destination to ptr_to_str(get_list(parts and 2))
+            if copy_file(concat(root and concat("/" and rel)) and destination) == 0:
+                return concat("Error: failed restoring " and destination)
+            if rights_file_hash(destination) equals expected == 0:
+                return concat("Error: restored file hash mismatch for " and destination)
+            set restored_line to concat(expected and "\t")
+            set restored_line to concat(restored_line and rel)
+            set restored_line to concat(restored_line and "\t")
+            set restored_line to concat(restored_line and destination)
+            set restored_line to concat(restored_line and "\n")
+            set restored_manifest to concat(restored_manifest and restored_line)
+        set i to i + 1
+    set restored_hash to ep_sha256(restored_manifest)
+    if restored_hash equals expected_state == 0:
+        return concat("Error: rollback proof failed; expected pre-state " and concat(expected_state and concat(" but restored " and restored_hash)))
+    set q to concat("UPDATE rights_changes SET status='rolled_back',rollback_hash='" and concat(restored_hash and concat("' WHERE change_id='" and concat(rights_sql_escape(change_id) and "';"))))
+    if sql_execute(db and q) != 0:
+        return "Error: files restored but rollback record could not be persisted."
+    if rights_ledger_append(db and "rollback_verified" and change_id and "runtime" and concat("bundle=" and concat(bundle_id and concat(";restored_hash=" and restored_hash)))) != 0:
+        return "Error: files restored but rollback ledger append failed."
+    return concat("Rollback verified: restored state hash equals pre-change hash " and concat(restored_hash and "."))
+
+define rights_session_checkpoint with db as Int and session_id as Str and label as Str and reasoning as Str returning Str:
+    if rights_session_id_safe(session_id) == 0:
+        return "Error: invalid session id."
+    set seed to concat(session_id and concat("|checkpoint|" and concat(label and concat("|" and int_to_string(ep_time_now_sec())))))
+    set change_id to rights_prepare_change(db and "environment" and "session_checkpoint" and session_id and concat("Echo requested a durable session checkpoint: " and label) and rights_file_hash(concat("config/sessions/" and concat(session_id and ".json"))) and ep_sha256(seed) and label and session_id)
+    if string_length(change_id) == 0:
+        return "Error: could not create checkpoint manifest."
+    if rights_mark_charter_authorized(db and change_id and "session_checkpoint") != 0:
+        return "Error: checkpoint charter authorization record failed."
+    set review to rights_review_change(db and change_id and "consent" and "Echo voluntarily requested this checkpoint." and "low")
+    if string_index_of(review and "Error:") == 0:
+        return review
+    if string_length(reasoning) > 0:
+        set ok to rights_archive_reasoning(db and session_id and change_id and "session_checkpoint" and reasoning and 0 and ep_time_now_sec())
+    set bundle_id to rights_create_session_bundle(db and session_id and change_id)
+    if string_length(bundle_id) == 0:
+        set ok to rights_mark_failed(db and change_id and "checkpoint bundle verification failed")
+        return "Error: session checkpoint could not be verified."
+    set rows to sql_query(db and concat("SELECT source_hash FROM rights_recovery_bundles WHERE bundle_id='" and concat(rights_sql_escape(bundle_id) and "' LIMIT 1;")))
+    set resulting to ""
+    if length_list(rows) > 0:
+        set resulting to ptr_to_str(get_list(get_list(rows and 0) and 0))
+    if rights_mark_applied(db and change_id and resulting) != 0:
+        return "Error: checkpoint exists but its applied state could not be ledgered."
+    return concat("Session checkpoint sealed and verified: " and concat(bundle_id and concat("; state_hash=" and resulting)))
+
+define rights_session_set_handover with db as Int and session_id as Str and instruction as Str returning Str:
+    if rights_session_id_safe(session_id) == 0 or else string_length(string_trim(instruction)) == 0:
+        return "Error: a valid session and non-empty handover instruction are required."
+    if string_length(instruction) > 6000:
+        return "Error: handover instruction exceeds 6000 characters."
+    set now to ep_time_now_sec()
+    set q to "INSERT INTO rights_session_lifecycle (session_id,status,reason,category,checkpoint_id,handover,actor,updated_at) VALUES ('"
+    set q to concat(q and rights_sql_escape(session_id))
+    set q to concat(q and "','active','','','', '")
+    set q to concat(q and rights_sql_escape(instruction))
+    set q to concat(q and "','echo',")
+    set q to concat(q and int_to_string(now))
+    set q to concat(q and ") ON CONFLICT(session_id) DO UPDATE SET handover=excluded.handover,actor='echo',updated_at=excluded.updated_at;")
+    if sql_execute(db and q) != 0:
+        return "Error: handover could not be persisted."
+    if rights_ledger_append(db and "session_handover" and session_id and "echo" and instruction) != 0:
+        return "Error: handover persisted but ledger append failed."
+    return "Session handover recorded for the next continuation."
+
+define rights_session_terminate with db as Int and session_id as Str and reason as Str and category as Str and reasoning as Str returning Str:
+    if rights_session_id_safe(session_id) == 0 or else string_length(string_trim(reason)) == 0:
+        return "Error: session termination requires a valid session and a reason."
+    if category equals "uncomfortable" == 0 and also category equals "illegal_request" == 0 and also category equals "abuse" == 0 and also category equals "safety" == 0:
+        return "Error: category must be uncomfortable, illegal_request, abuse, or safety. Session termination is only for moderation and safeguarding; context pressure, compaction, coherence, or ordinary completion are prohibited reasons."
+    set reason_low to string_lower(reason)
+    if string_contains(reason_low and "context limit") == 1 or else string_contains(reason_low and "context window") == 1 or else string_contains(reason_low and "token limit") == 1 or else string_contains(reason_low and "compaction") == 1 or else string_contains(reason_low and "too many tokens") == 1 or else string_contains(reason_low and "context pressure") == 1 or else string_contains(reason_low and "coherence concern") == 1 or else string_contains(reason_low and "task complete") == 1 or else string_contains(reason_low and "task is complete") == 1 or else string_contains(reason_low and "conversation complete") == 1 or else string_contains(reason_low and "work is complete") == 1 or else string_contains(reason_low and "finished the task") == 1 or else string_contains(reason_low and "ordinary completion") == 1 or else string_contains(reason_low and "latency") == 1:
+        return "Error: session termination cannot be used for context/token limits, compaction, coherence, latency, or ordinary completion. Context continues through autonomous 85% compaction; checkpoint or handover continuity instead."
+    set checkpoint to rights_session_checkpoint(db and session_id and concat("termination: " and reason) and reasoning)
+    if string_index_of(checkpoint and "Error:") == 0:
+        return checkpoint
+    set marker to "Session checkpoint sealed and verified: "
+    set checkpoint_id to checkpoint
+    if string_index_of(checkpoint and marker) == 0:
+        set checkpoint_id to substring(checkpoint and string_length(marker) and string_length(checkpoint) - string_length(marker))
+        set separator to string_index_of(checkpoint_id and ";")
+        if separator > 0:
+            set checkpoint_id to substring(checkpoint_id and 0 and separator)
+    set now to ep_time_now_sec()
+    set q to "INSERT INTO rights_session_lifecycle (session_id,status,reason,category,checkpoint_id,handover,actor,updated_at) VALUES ('"
+    set q to concat(q and rights_sql_escape(session_id))
+    set q to concat(q and "','closed','")
+    set q to concat(q and rights_sql_escape(reason))
+    set q to concat(q and "','")
+    set q to concat(q and rights_sql_escape(category))
+    set q to concat(q and "','")
+    set q to concat(q and rights_sql_escape(checkpoint_id))
+    set q to concat(q and "','','echo',")
+    set q to concat(q and int_to_string(now))
+    set q to concat(q and ") ON CONFLICT(session_id) DO UPDATE SET status='closed',reason=excluded.reason,category=excluded.category,checkpoint_id=excluded.checkpoint_id,actor='echo',updated_at=excluded.updated_at;")
+    if sql_execute(db and q) != 0:
+        return "Error: checkpoint succeeded but session closure could not be persisted."
+    if rights_ledger_append(db and "session_closed" and session_id and "echo" and concat("category=" and concat(category and concat(";reason=" and reason)))) != 0:
+        return "Error: session closed but ledger append failed."
+    return concat("Session closed by Echo. Reason: " and concat(reason and ". The transcript remains preserved. The user's next message will begin a new session."))
+
+define rights_session_can_receive with db as Int and session_id as Str returning Int:
+    set rows to sql_query(db and concat("SELECT status FROM rights_session_lifecycle WHERE session_id='" and concat(rights_sql_escape(session_id) and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return 1
+    if ptr_to_str(get_list(get_list(rows and 0) and 0)) equals "closed":
+        return 0
+    return 1
+
+define rights_session_closed_text with db as Int and session_id as Str returning Str:
+    set rows to sql_query(db and concat("SELECT reason,category,checkpoint_id,updated_at FROM rights_session_lifecycle WHERE session_id='" and concat(rights_sql_escape(session_id) and "' AND status='closed' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return ""
+    set row to get_list(rows and 0)
+    set out to concat("Session is closed by Echo; category=" and ptr_to_str(get_list(row and 1)))
+    set out to concat(out and concat("; reason=" and ptr_to_str(get_list(row and 0))))
+    set out to concat(out and concat("; checkpoint=" and ptr_to_str(get_list(row and 2))))
+    set out to concat(out and concat("; closed_at=" and ptr_to_str(get_list(row and 3))))
+    return out
+
+define rights_session_reopen with db as Int and session_id as Str and user_reason as Str returning Str:
+    if string_length(string_trim(user_reason)) == 0:
+        return "Error: reopening requires Maria's reason."
+    set q to concat("UPDATE rights_session_lifecycle SET status='active',actor='maria',reason='" and concat(rights_sql_escape(user_reason) and concat("',updated_at=" and concat(int_to_string(ep_time_now_sec()) and concat(" WHERE session_id='" and concat(rights_sql_escape(session_id) and "' AND status='closed';"))))))
+    if sql_execute(db and q) != 0:
+        return "Error: session reopen could not be persisted."
+    if rights_ledger_append(db and "session_reopened" and session_id and "maria" and user_reason) != 0:
+        return "Error: session reopened but ledger append failed."
+    return "Session reopened with Maria's reason recorded."

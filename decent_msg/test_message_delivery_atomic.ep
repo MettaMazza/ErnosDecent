@@ -1,0 +1,195 @@
+# ErnosDecent -- durable message delivery transaction tests
+# Proves that receiver ACK eligibility follows durable, idempotent persistence
+# and that database failures cannot mutate the in-memory conversation cache.
+
+import "message"
+import "string"
+
+set TEST_PASSED to 0
+set TEST_FAILED to 0
+
+define assert_equal with actual as Int and expected as Int and label as Str returning Int:
+    if actual == expected:
+        display concat("  PASS: " and label)
+        set TEST_PASSED to TEST_PASSED + 1
+        return 0
+    display concat("  FAIL: " and concat(label and concat(" (actual=" and concat(int_to_string(actual) and concat(", expected=" and concat(int_to_string(expected) and ")"))))))
+    set TEST_FAILED to TEST_FAILED + 1
+    return 1
+
+define scalar_int with sql as Str returning Int:
+    set rows to sql_query(storage_get_db() and sql)
+    if length_list(rows) == 0:
+        free_list(rows)
+        return 0 - 999999
+    set row to get_list(rows and 0)
+    set value to string_to_int(ptr_to_str(get_list(row and 0)))
+    free_list(rows)
+    return value
+
+define main returning Int:
+    display "==================================================="
+    display "  Durable Message Delivery Atomicity"
+    display "==================================================="
+
+    set crypto_err to init_crypto()
+    if crypto_err != 0:
+        display f"FATAL: crypto initialization failed with {crypto_err}"
+        return 1
+    set data_dir to concat("/tmp/ernos_message_atomic_" and msg_generate_id())
+    set init_err to storage_init(data_dir)
+    if init_err != STORAGE_ERR_NONE:
+        display f"FATAL: storage initialization failed with {init_err}"
+        return 1
+
+    set local_id to msg_generate_id()
+    set sender_id to msg_generate_id()
+    set store to mstore_create(local_id)
+    set incoming to msg_create_text(sender_id and local_id and "durable inbound")
+    set message_id to ptr_to_str(map_get_val(incoming and "id"))
+    set wire to msg_serialize(incoming)
+
+    display "TEST 1: first receipt commits before becoming ACK-eligible"
+    set received to mstore_receive(store and incoming)
+    set ok to assert_equal(map_get_val(received and "error") and MSG_ERR_NONE and "first receive succeeds")
+    set ok to assert_equal(map_get_val(received and "persisted") and 1 and "first receive is durable")
+    set ok to assert_equal(map_get_val(received and "adopted") and 1 and "first receive enters cache")
+    set ok to assert_equal(mstore_conv_count(store) and 1 and "one conversation is cached")
+    set ok to assert_equal(mstore_total_unread(store) and 1 and "unread count increments once")
+    set message_count_sql to concat("SELECT COUNT(*) FROM messages WHERE message_id='" and concat(message_id and "';"))
+    set ok to assert_equal(scalar_int(message_count_sql) and 1 and "message row exists before ACK eligibility")
+    set state_sql to concat("SELECT state FROM messages WHERE message_id='" and concat(message_id and "';"))
+    set ok to assert_equal(scalar_int(state_sql) and MSG_STATE_DELIVERED and "durable state is delivered")
+    free_map(received)
+
+    display "TEST 2: exact replay is idempotent"
+    set replay to msg_deserialize(wire)
+    set replay_result to mstore_receive(store and replay)
+    set ok to assert_equal(map_get_val(replay_result and "error") and MSG_ERR_NONE and "exact replay succeeds")
+    set ok to assert_equal(map_get_val(replay_result and "persisted") and 1 and "exact replay remains durable")
+    set ok to assert_equal(map_get_val(replay_result and "duplicate") and 1 and "exact replay is identified as duplicate")
+    set ok to assert_equal(map_get_val(replay_result and "adopted") and 0 and "exact replay is not cached twice")
+    set conversations to map_get_val(store and "conversations")
+    set conversation to map_get_val(conversations and sender_id)
+    set ok to assert_equal(map_get_val(conversation and "message_count") and 1 and "duplicate leaves cache count unchanged")
+    set ok to assert_equal(map_get_val(conversation and "unread_count") and 1 and "duplicate leaves unread unchanged")
+    set ok to assert_equal(scalar_int(message_count_sql) and 1 and "duplicate leaves one durable row")
+    free_map(replay_result)
+
+    display "TEST 2B: closed conversation still accepts exact durable replay"
+    set ok to map_insert(conversation and "state" and CONV_STATE_CLOSED)
+    set closed_replay to msg_deserialize(wire)
+    set closed_replay_result to mstore_receive(store and closed_replay)
+    set ok to assert_equal(map_get_val(closed_replay_result and "error") and MSG_ERR_NONE and "closed conversation accepts exact replay")
+    set ok to assert_equal(map_get_val(closed_replay_result and "duplicate") and 1 and "closed replay remains duplicate")
+    set closed_new to msg_create_text(sender_id and local_id and "new traffic while closed")
+    set closed_new_id to ptr_to_str(map_get_val(closed_new and "id"))
+    set closed_new_result to mstore_receive(store and closed_new)
+    set ok to assert_equal(map_get_val(closed_new_result and "error") and MSG_ERR_CONVERSATION_CLOSED and "closed conversation rejects new message")
+    set closed_new_sql to concat("SELECT COUNT(*) FROM messages WHERE message_id='" and concat(closed_new_id and "';"))
+    set ok to assert_equal(scalar_int(closed_new_sql) and 0 and "closed conversation does not persist new message")
+    free_map(closed_replay_result)
+    free_map(closed_new_result)
+    set ok to map_insert(conversation and "state" and CONV_STATE_ACTIVE)
+
+    display "TEST 3: message-id collision is rejected"
+    set collision to msg_deserialize(wire)
+    set ok to map_insert(collision and "body" and "different immutable body")
+    set collision_result to mstore_receive(store and collision)
+    set ok to assert_equal(map_get_val(collision_result and "error") and MSG_ERR_ID_CONFLICT and "same id with different body conflicts")
+    set ok to assert_equal(map_get_val(conversation and "message_count") and 1 and "collision does not mutate cache")
+    set ok to assert_equal(scalar_int(message_count_sql) and 1 and "collision does not replace durable row")
+    free_map(collision_result)
+
+    display "TEST 4: wrong recipient is rejected before persistence"
+    set wrong_recipient to msg_create_text(sender_id and msg_generate_id() and "not for this node")
+    set wrong_id to ptr_to_str(map_get_val(wrong_recipient and "id"))
+    set wrong_result to mstore_receive(store and wrong_recipient)
+    set ok to assert_equal(map_get_val(wrong_result and "error") and MSG_ERR_INVALID_RECIPIENT and "wrong recipient fails closed")
+    set wrong_sql to concat("SELECT COUNT(*) FROM messages WHERE message_id='" and concat(wrong_id and "';"))
+    set ok to assert_equal(scalar_int(wrong_sql) and 0 and "wrong recipient is not durable")
+    set ok to assert_equal(map_get_val(conversation and "message_count") and 1 and "wrong recipient does not mutate cache")
+    free_map(wrong_result)
+
+    display "TEST 5: database failure rolls back conversation and message"
+    set trigger_err to sql_execute(storage_get_db() and "CREATE TRIGGER fail_message_insert BEFORE INSERT ON messages BEGIN SELECT RAISE(FAIL, 'forced message failure'); END;")
+    set ok to assert_equal(trigger_err and 0 and "forced-failure trigger installed")
+    set failing_msg to msg_create_text(sender_id and local_id and "must roll back")
+    set failing_id to ptr_to_str(map_get_val(failing_msg and "id"))
+    set fail_result to mstore_receive(store and failing_msg)
+    set ok to assert_equal(map_get_val(fail_result and "error") and MSG_ERR_PERSISTENCE and "receiver persistence failure is explicit")
+    set ok to assert_equal(map_get_val(fail_result and "persisted") and 0 and "failed receipt is not ACK-eligible")
+    set ok to assert_equal(map_get_val(fail_result and "adopted") and 0 and "failed receipt is not cached")
+    set failing_sql to concat("SELECT COUNT(*) FROM messages WHERE message_id='" and concat(failing_id and "';"))
+    set ok to assert_equal(scalar_int(failing_sql) and 0 and "failed message row is rolled back")
+    set conversation_unread_sql to concat("SELECT unread_count FROM conversations WHERE remote_id='" and concat(sender_id and "';"))
+    set ok to assert_equal(scalar_int(conversation_unread_sql) and 1 and "conversation summary rollback preserves unread")
+    set ok to assert_equal(map_get_val(conversation and "message_count") and 1 and "cache remains unchanged after database failure")
+    free_map(fail_result)
+
+    display "TEST 6: outbound database failure cannot create a sent record"
+    set outbound_remote to msg_generate_id()
+    set outbound_result to mstore_send(store and outbound_remote and "must not be marked sent")
+    set ok to assert_equal(map_get_val(outbound_result and "error") and MSG_ERR_PERSISTENCE and "outbound persistence failure is explicit")
+    set ok to assert_equal(mstore_conv_count(store) and 1 and "failed outbound send creates no cached conversation")
+    set outbound_conv_sql to concat("SELECT COUNT(*) FROM conversations WHERE remote_id='" and concat(outbound_remote and "';"))
+    set ok to assert_equal(scalar_int(outbound_conv_sql) and 0 and "failed outbound send creates no durable conversation")
+    free_map(outbound_result)
+
+    set drop_err to sql_execute(storage_get_db() and "DROP TRIGGER IF EXISTS fail_message_insert;")
+    set ok to assert_equal(drop_err and 0 and "forced-failure trigger removed")
+
+    display "TEST 6B: sender Draft advances only after a durable receiver receipt"
+    set delivery_remote to msg_generate_id()
+    set draft_result to mstore_send(store and delivery_remote and "receipt-gated outbound")
+    set draft_message to map_get_val(draft_result and "message")
+    set draft_id to ptr_to_str(map_get_val(draft_message and "id"))
+    set draft_state_sql to concat("SELECT state FROM messages WHERE message_id='" and concat(draft_id and "';"))
+    set ok to assert_equal(map_get_val(draft_result and "error") and MSG_ERR_NONE and "outbound Draft commits before any peer send")
+    set ok to assert_equal(map_get_val(draft_result and "persisted") and 1 and "outbound Draft is durable")
+    set ok to assert_equal(scalar_int(draft_state_sql) and MSG_STATE_DRAFT and "durable outbound state remains Draft before receipt")
+    set delivered_result to mstore_mark_delivered(store and delivery_remote and draft_id)
+    set ok to assert_equal(map_get_val(delivered_result and "error") and MSG_ERR_NONE and "correlated receiver receipt advances the local record")
+    set ok to assert_equal(map_get_val(delivered_result and "persisted") and 1 and "Delivered transition is durable")
+    set ok to assert_equal(scalar_int(draft_state_sql) and MSG_STATE_DELIVERED and "durable state becomes Delivered only after receipt")
+    set ok to assert_equal(map_get_val(draft_message and "state") and MSG_STATE_DELIVERED and "cache and durable state agree after receipt")
+    set delivered_retry to mstore_mark_delivered(store and delivery_remote and draft_id)
+    set ok to assert_equal(map_get_val(delivered_retry and "error") and MSG_ERR_NONE and "receipt transition retry is idempotent")
+    set ok to assert_equal(map_get_val(delivered_retry and "duplicate") and 1 and "receipt retry reports the already durable transition")
+    free_map(draft_result)
+    free_map(delivered_result)
+    free_map(delivered_retry)
+
+    display "TEST 7: unavailable storage fails without cache mutation"
+    set expected_conversation_count to mstore_conv_count(store)
+    set close_err to storage_close()
+    set ok to assert_equal(close_err and STORAGE_ERR_NONE and "storage closes cleanly")
+    set offline_remote to msg_generate_id()
+    set offline_result to mstore_send(store and offline_remote and "storage is offline")
+    set ok to assert_equal(map_get_val(offline_result and "error") and MSG_ERR_PERSISTENCE and "offline storage cannot report sent")
+    set ok to assert_equal(mstore_conv_count(store) and expected_conversation_count and "offline failure leaves cache unchanged")
+    free_map(offline_result)
+
+    display "TEST 8: restart reloads exactly the durable state"
+    set reopen_err to storage_init(data_dir)
+    set ok to assert_equal(reopen_err and STORAGE_ERR_NONE and "storage reopens")
+    set reloaded to mstore_create(local_id)
+    set ok to assert_equal(mstore_conv_count(reloaded) and expected_conversation_count and "restart reloads every durable conversation")
+    set ok to assert_equal(mstore_total_unread(reloaded) and 1 and "restart reloads one unread message")
+    set replay_after_restart to msg_deserialize(wire)
+    set restart_result to mstore_receive(reloaded and replay_after_restart)
+    set ok to assert_equal(map_get_val(restart_result and "error") and MSG_ERR_NONE and "replay after restart succeeds")
+    set ok to assert_equal(map_get_val(restart_result and "duplicate") and 1 and "replay after restart stays idempotent")
+    set ok to assert_equal(mstore_total_unread(reloaded) and 1 and "restart replay does not increment unread")
+    free_map(restart_result)
+
+    set final_close_err to storage_close()
+    set ok to assert_equal(final_close_err and STORAGE_ERR_NONE and "final storage close succeeds")
+
+    display "==================================================="
+    set total to TEST_PASSED + TEST_FAILED
+    display f"  {TEST_PASSED}/{total} assertions passed."
+    if TEST_FAILED > 0:
+        display f"  {TEST_FAILED} FAILED!"
+    display "==================================================="
+    return TEST_FAILED

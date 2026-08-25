@@ -68,7 +68,47 @@ define workspace_count_lines with content as Str returning Int:
 # workspace_init — Initialize per-session workspace directory
 # Archives any existing active session before creating new one
 # ================================================================
+define workspace_session_id_is_safe with session_id as Str returning Int:
+    set sid_len to string_length(session_id)
+    if sid_len == 0 or else sid_len > 160:
+        return 0
+    set i to 0
+    repeat while i < sid_len:
+        set ch to get_character(session_id and i)
+        set allowed to 0
+        if ch >= 48 and also ch <= 57:
+            set allowed to 1
+        else if ch >= 65 and also ch <= 90:
+            set allowed to 1
+        else if ch >= 97 and also ch <= 122:
+            set allowed to 1
+        else if ch == 45 or else ch == 95:
+            set allowed to 1
+        if allowed == 0:
+            return 0
+        set i to i + 1
+    return 1
+
+define workspace_unique_archive_path with base_path as Str returning Str:
+    if file_exists(base_path) == 0 and also is_directory(base_path) == 0:
+        return base_path
+    set suffix to 1
+    set candidate to concat(base_path and concat("_" and int_to_string(suffix)))
+    repeat while file_exists(candidate) == 1 or else is_directory(candidate) == 1:
+        set suffix to suffix + 1
+        set candidate to concat(base_path and concat("_" and int_to_string(suffix)))
+    return candidate
+
 define workspace_init with session_id as Str returning Int:
+    if workspace_session_id_is_safe(session_id) == 0:
+        return 1
+    if create_directory("config/workspaces") == 0:
+        if is_directory("config/workspaces") == 0:
+            return 1
+    if create_directory("config/workspaces/archive") == 0:
+        if is_directory("config/workspaces/archive") == 0:
+            return 1
+
     # Check if active workspace exists with a prior session
     set meta_path to path_join("config/workspaces/active" and ".session_meta.json")
     if file_exists(meta_path) == 1:
@@ -85,22 +125,37 @@ define workspace_init with session_id as Str returning Int:
             if old_created_node != 0:
                 set old_epoch to get_json_value(old_created_node)
 
-            if string_length(old_session_id) > 0:
+            if workspace_session_id_is_safe(old_session_id) == 0 or else old_epoch <= 0:
+                return 1
+
+            # Restarting or re-selecting the same session is idempotent.  Archiving it
+            # here used to issue a second `mv` into an already existing destination,
+            # then report success despite stderr saying "Directory not empty".
+            if old_session_id equals session_id:
+                return 0
+            else:
                 # Get date string from epoch for archive directory name
                 set date_cmd to f"date -r {old_epoch} +%Y-%m-%d"
                 set date_raw to run_command(date_cmd)
                 set date_str to workspace_trim_newline(date_raw)
+                if string_length(date_str) != 10:
+                    return 1
 
                 # Rename active/ to <old_session_id>_<date>/
                 set archive_name to concat(old_session_id and concat("_" and date_str))
-                set dest_path to path_join("config/workspaces" and archive_name)
+                set archive_base to path_join("config/workspaces" and archive_name)
+                set dest_path to workspace_unique_archive_path(archive_base)
                 set mv_cmd to f"mv config/workspaces/active {dest_path}"
                 set mv_res to run_command(mv_cmd)
+                if is_directory("config/workspaces/active") == 1 or else is_directory(dest_path) == 0:
+                    return 1
+        else:
+            return 1
 
     # Create required directory structure
-    set ok to create_directory("config/workspaces")
-    set ok to create_directory("config/workspaces/active")
-    set ok to create_directory("config/workspaces/archive")
+    if create_directory("config/workspaces/active") == 0:
+        if is_directory("config/workspaces/active") == 0:
+            return 1
 
     # Get current epoch time
     set now_epoch to ep_time_now_sec()
@@ -114,7 +169,10 @@ define workspace_init with session_id as Str returning Int:
 
     # Write session metadata
     set new_meta_path to path_join("config/workspaces/active" and ".session_meta.json")
-    set ok to write_file(new_meta_path and meta_json)
+    if write_file(new_meta_path and meta_json) == 0:
+        return 1
+    if read_file(new_meta_path) equals meta_json == 0:
+        return 1
     return 0
 
 # ================================================================

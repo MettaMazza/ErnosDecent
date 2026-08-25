@@ -1,0 +1,134 @@
+# Focused DEX overflow, escrow rollback, atomic persistence, and restart tests.
+
+import "fs"
+import "os"
+import "sql"
+import "string"
+import "collections"
+import "../storage"
+import "token"
+import "exchange"
+
+set EXCHANGE_SECURITY_TOTAL to 0
+
+define exchange_security_expect with condition as Int and label as Str returning Int:
+    set EXCHANGE_SECURITY_TOTAL to EXCHANGE_SECURITY_TOTAL + 1
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define exchange_security_remove_tree with path as Str and depth as Int returning Int:
+    if depth > 8:
+        return 0
+    if file_exists(path) == 0:
+        return 1
+    if is_directory(path) == 0:
+        if remove_file(path) == 0 or else file_exists(path) == 1:
+            return 0
+        return 1
+    set entries to list_directory(path)
+    set i to 0
+    repeat while i < length_list(entries):
+        if exchange_security_remove_tree(path_join(path and get_list(entries and i)) and depth + 1) == 0:
+            free_list(entries)
+            return 0
+        set i to i + 1
+    free_list(entries)
+    if remove_directory(path) == 0 or else file_exists(path) == 1:
+        return 0
+    return 1
+
+define main returning Int:
+    set passed to 0
+    set test_dir to concat("/tmp/ernos_exchange_security_" and concat(int_to_string(ep_time_now_ms()) and concat("_" and int_to_string(ep_random_int(100000 and 999999)))))
+    if storage_init(test_dir) != STORAGE_ERR_NONE:
+        return 1
+    set btc to token_create("Bitcoin" and "BTC" and 8 and 1000000 and "owner")
+    set usdt to token_create("Tether" and "USDT" and 6 and 1000000 and "owner")
+    set dex to dex_create()
+    set passed to passed + exchange_security_expect(map_get_val(dex and "error") == DEX_ERR_NONE and also map_get_val(dex and "persistent") == 1 and "DEX initializes in durable mode")
+
+    set liquidity to dex_add_liquidity(dex and btc and usdt and 1000 and 2000 and "owner")
+    set pool_key to get_pool_key("BTC" and "USDT")
+    set pool to map_get_val(map_get_val(dex and "pools") and pool_key)
+    set lp_key to dex_lp_key(pool_key and "owner")
+    set passed to passed + exchange_security_expect(map_get_val(liquidity and "error") == DEX_ERR_NONE and also map_get_val(liquidity and "lp_minted") == 3000 and also map_get_val(map_get_val(dex and "lp_balances") and lp_key) == 3000 and "liquidity and LP ownership publish together")
+
+    set close_err to storage_close()
+    set reopen_err to storage_init(test_dir)
+    set restored to dex_create()
+    set restored_pool to map_get_val(map_get_val(restored and "pools") and pool_key)
+    set passed to passed + exchange_security_expect(close_err == STORAGE_ERR_NONE and also reopen_err == STORAGE_ERR_NONE and also map_get_val(restored and "error") == DEX_ERR_NONE and also map_get_val(restored_pool and "total_lp") == 3000 and also map_get_val(map_get_val(restored and "lp_balances") and lp_key) == 3000 and "restart restores exact pool and LP balances")
+    set passed to passed + exchange_security_expect(dex_bind_pair(restored and btc and usdt) == DEX_ERR_NONE and "restored accounting binds only to matching real token balances")
+
+    set old_low to map_get_val(restored_pool and "reserve_a")
+    set old_high to map_get_val(restored_pool and "reserve_b")
+    set swap_err to dex_swap_amm(restored and btc and usdt and 100 and "owner")
+    set passed to passed + exchange_security_expect(swap_err == DEX_ERR_NONE and also map_get_val(restored_pool and "reserve_a") == old_low + 100 and also map_get_val(restored_pool and "reserve_b") < old_high and "AMM swap commits token movement and reserves")
+
+    set ok to token_transfer(usdt and "owner" and "buyer" and 1000)
+    set ok to token_transfer(btc and "owner" and "seller" and 100)
+    set buy_result to dex_limit_order(restored and ORDER_BUY and 5 and 10 and btc and usdt and "buyer")
+    set sell_result to dex_limit_order(restored and ORDER_SELL and 3 and 4 and btc and usdt and "seller")
+    set buy_order to map_get_val(buy_result and "order")
+    set sell_order to map_get_val(sell_result and "order")
+    set passed to passed + exchange_security_expect(map_get_val(buy_result and "error") == DEX_ERR_NONE and also map_get_val(sell_result and "error") == DEX_ERR_NONE and also token_balance_of(usdt and "dex_escrow") == 50 and also token_balance_of(btc and "dex_escrow") == 4 and "limit orders escrow exact liabilities")
+
+    # Force durable match failure after settlement; every token transfer and both
+    # order amounts must return to their pre-match values.
+    set buyer_btc_before to token_balance_of(btc and "buyer")
+    set buyer_usdt_before to token_balance_of(usdt and "buyer")
+    set seller_usdt_before to token_balance_of(usdt and "seller")
+    set close_err to storage_close()
+    set failed_match to dex_match_orders(restored)
+    set passed to passed + exchange_security_expect(failed_match == DEX_ERR_STORAGE and also map_get_val(buy_order and "amount") == 10 and also map_get_val(sell_order and "amount") == 4 and also token_balance_of(btc and "buyer") == buyer_btc_before and also token_balance_of(usdt and "buyer") == buyer_usdt_before and also token_balance_of(usdt and "seller") == seller_usdt_before and "match persistence failure rolls back all settlement")
+
+    set reopen_err to storage_init(test_dir)
+    set match_err to dex_match_orders(restored)
+    set passed to passed + exchange_security_expect(reopen_err == STORAGE_ERR_NONE and also match_err == DEX_ERR_NONE and also map_get_val(buy_order and "amount") == 6 and also token_balance_of(btc and "dex_escrow") == 0 and also token_balance_of(usdt and "dex_escrow") == 30 and "atomic match updates both rows and escrow liabilities")
+
+    set close_err to storage_close()
+    set reopen_err to storage_init(test_dir)
+    set restored_again to dex_create()
+    set passed to passed + exchange_security_expect(map_get_val(restored_again and "error") == DEX_ERR_NONE and also dex_match_orders(restored_again) == DEX_ERR_INVALID_PAIR and "restart never matches fake token placeholder maps")
+    set rebound_err to dex_bind_pair(restored_again and btc and usdt)
+    if rebound_err != DEX_ERR_NONE:
+        set btc_pool_balance to token_balance_of(btc and "dex_pool")
+        set btc_pool_need to dex_required_balance(restored_again and "BTC" and "dex_pool")
+        set usdt_pool_balance to token_balance_of(usdt and "dex_pool")
+        set usdt_pool_need to dex_required_balance(restored_again and "USDT" and "dex_pool")
+        set btc_escrow_balance to token_balance_of(btc and "dex_escrow")
+        set btc_escrow_need to dex_required_balance(restored_again and "BTC" and "dex_escrow")
+        set usdt_escrow_balance to token_balance_of(usdt and "dex_escrow")
+        set usdt_escrow_need to dex_required_balance(restored_again and "USDT" and "dex_escrow")
+        display f"DEBUG rebound={rebound_err} btc_pool={btc_pool_balance}/{btc_pool_need} usdt_pool={usdt_pool_balance}/{usdt_pool_need} btc_escrow={btc_escrow_balance}/{btc_escrow_need} usdt_escrow={usdt_escrow_balance}/{usdt_escrow_need}"
+    set passed to passed + exchange_security_expect(rebound_err == DEX_ERR_NONE and "explicit binding validates restored escrow and pool totals")
+    set cancel_err to dex_cancel_order(restored_again and map_get_val(buy_order and "order_id") and "buyer")
+    set passed to passed + exchange_security_expect(cancel_err == DEX_ERR_NONE and also token_balance_of(usdt and "dex_escrow") == 0 and "cancellation deletes durable row only with successful refund")
+
+    set legacy_err to sql_execute(STORAGE_DB and "INSERT INTO dex_pools (token_a, token_b, reserve_a, reserve_b, total_lp) VALUES ('AAA', 'ZZZ', 1, 1, 0);")
+    set legacy_dex to dex_create()
+    set passed to passed + exchange_security_expect(legacy_err == 0 and also map_get_val(legacy_dex and "error") == DEX_ERR_STORAGE and "legacy pool without LP ownership fails closed")
+
+    # A closed database makes the next durable liquidity CAS fail.  Transfers
+    # must be undone and the published pool must remain unchanged.
+    set owner_btc_before to token_balance_of(btc and "owner")
+    set owner_usdt_before to token_balance_of(usdt and "owner")
+    set reserve_a_before to map_get_val(map_get_val(map_get_val(restored_again and "pools") and pool_key) and "reserve_a")
+    set reserve_b_before to map_get_val(map_get_val(map_get_val(restored_again and "pools") and pool_key) and "reserve_b")
+    set close_err to storage_close()
+    set failed_liquidity to dex_add_liquidity(restored_again and btc and usdt and 10 and 20 and "owner")
+    set current_pool to map_get_val(map_get_val(restored_again and "pools") and pool_key)
+    if map_get_val(failed_liquidity and "error") != DEX_ERR_STORAGE:
+        set failed_liquidity_error to map_get_val(failed_liquidity and "error")
+        display f"DEBUG failed_liquidity_error={failed_liquidity_error}"
+    set passed to passed + exchange_security_expect(map_get_val(failed_liquidity and "error") == DEX_ERR_STORAGE and also token_balance_of(btc and "owner") == owner_btc_before and also token_balance_of(usdt and "owner") == owner_usdt_before and also map_get_val(current_pool and "reserve_a") == reserve_a_before and also map_get_val(current_pool and "reserve_b") == reserve_b_before and "liquidity persistence failure rolls back tokens and memory")
+
+    set cleanup_ok to exchange_security_remove_tree(test_dir and 0)
+    set passed to passed + exchange_security_expect(cleanup_ok == 1 and "test persistence tree cleaned")
+    display f"RESULT: {passed}/{EXCHANGE_SECURITY_TOTAL} passed"
+    if passed != EXCHANGE_SECURITY_TOTAL:
+        return 1
+    return 0

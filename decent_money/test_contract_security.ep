@@ -1,0 +1,72 @@
+import "contracts"
+import "string"
+
+set CONTRACT_TESTS to 0
+set CONTRACT_PASSES to 0
+
+define contract_expect with label as Str and condition as Int returning Int:
+    set CONTRACT_TESTS to CONTRACT_TESTS + 1
+    if condition == 1:
+        set CONTRACT_PASSES to CONTRACT_PASSES + 1
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main returning Int:
+    set empty_args to create_list()
+
+    set invalid_contract to contract_create("" and "owner" and 100)
+    set ok to contract_expect("empty contract code rejected" and (map_get_val(invalid_contract and "error") == CONTRACT_ERR_INVALID_ARGUMENT))
+
+    set sequence_code to "LABEL run\nLET a 1\nADD a a 1\nADD a a 1\nSET answer a\nRETURN a"
+    set sequence_contract to contract_create(sequence_code and "owner" and 1000)
+    set sequence_result to contract_call(sequence_contract and "run" and empty_args and "caller" and 1000)
+    set sequence_storage to map_get_val(sequence_contract and "storage")
+    set ok to contract_expect("VM executes every source line in order" and ((map_get_val(sequence_result and "status") == CONTRACT_ERR_NONE) and also (string_equals(map_get_val(sequence_result and "retval") and "3") == 1) and also (string_equals(map_get_val(sequence_storage and "answer") and "3") == 1)))
+
+    set missing_result to contract_call(sequence_contract and "missing" and empty_args and "caller" and 1000)
+    set ok to contract_expect("missing entrypoint rejected instead of executing line zero" and (map_get_val(missing_result and "status") == CONTRACT_ERR_INVALID_ARGUMENT))
+
+    set overflow_code to "LABEL run\nADD out 9223372036854775807 1\nSET poisoned yes\nRETURN out"
+    set overflow_contract to contract_create(overflow_code and "owner" and 1000)
+    set overflow_result to contract_call(overflow_contract and "run" and empty_args and "caller" and 1000)
+    set overflow_storage to map_get_val(overflow_contract and "storage")
+    set ok to contract_expect("integer overflow reverts before later mutation" and ((map_get_val(overflow_result and "status") == CONTRACT_ERR_ARITHMETIC_OVERFLOW) and also (map_contains(overflow_storage and "poisoned") == 0)))
+
+    set bad_numeric_code to "LABEL run\nADD out not_an_integer 1\nRETURN out"
+    set bad_numeric_contract to contract_create(bad_numeric_code and "owner" and 1000)
+    set bad_numeric_result to contract_call(bad_numeric_contract and "run" and empty_args and "caller" and 1000)
+    set ok to contract_expect("invalid numeric operand rejected instead of becoming zero" and (map_get_val(bad_numeric_result and "status") == CONTRACT_ERR_INVALID_ARGUMENT))
+
+    set receiver to contract_create("LABEL read\nGET_BAL b\nRETURN b" and "receiver" and 1000)
+    set receiver_id to map_get_val(receiver and "id")
+    set ok to map_insert(receiver and "balance" and "5")
+    set sender_code to concat("LABEL send\nSEND_BAL \"" and concat(receiver_id and "\" 10\nREVERT forced"))
+    set sender to contract_create(sender_code and "sender" and 1000)
+    set ok to map_insert(sender and "balance" and "100")
+    set send_result to contract_call(sender and "send" and empty_args and "caller" and 1000)
+    set cross_rollback_ok to 0
+    if map_get_val(send_result and "status") == CONTRACT_ERR_REVERTED:
+        if string_equals(map_get_val(sender and "balance") and "100") == 1 and also string_equals(map_get_val(receiver and "balance") and "5") == 1:
+            set cross_rollback_ok to 1
+    set ok to contract_expect("outer revert restores both sides of SEND_BAL" and cross_rollback_ok)
+
+    set self_id to map_get_val(sender and "id")
+    set self_code to concat("LABEL self\nSEND_BAL \"" and concat(self_id and "\" 10\nGET_BAL b\nRETURN b"))
+    set ok to map_insert(sender and "code" and self_code)
+    set self_result to contract_call(sender and "self" and empty_args and "caller" and 1000)
+    set ok to contract_expect("SEND_BAL to self cannot inflate balance" and ((map_get_val(self_result and "status") == CONTRACT_ERR_NONE) and also (string_equals(map_get_val(sender and "balance") and "100") == 1)))
+
+    set target to contract_create("LABEL mutate\nSET changed yes\nRETURN changed" and "target" and 1000)
+    set target_id to map_get_val(target and "id")
+    set caller_code to concat("LABEL outer\nCALL \"" and concat(target_id and "\" mutate result\nREVERT outer_failed"))
+    set caller_contract to contract_create(caller_code and "caller_owner" and 1000)
+    set nested_result to contract_call(caller_contract and "outer" and empty_args and "caller" and 1000)
+    set target_storage to map_get_val(target and "storage")
+    set ok to contract_expect("outer revert restores successful nested CALL state" and ((map_get_val(nested_result and "status") == CONTRACT_ERR_REVERTED) and also (map_contains(target_storage and "changed") == 0)))
+
+    display concat("RESULT: " and concat(int_to_string(CONTRACT_PASSES) and concat("/" and concat(int_to_string(CONTRACT_TESTS) and " passed"))))
+    if CONTRACT_PASSES != CONTRACT_TESTS:
+        return 1
+    return 0

@@ -1,0 +1,130 @@
+# Focused fail-closed identity and IPC-token persistence tests.
+
+import "fs"
+import "os"
+import "collections"
+import "string"
+import "auth"
+import "did"
+import "keys"
+import "../storage"
+
+define identity_test_pass with label as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define identity_test_remove_dir with path as Str returning Int:
+    if is_directory(path) == 0:
+        return 1
+    set entries to list_directory(path)
+    set count to length_list(entries)
+    set i to 0
+    repeat while i < count:
+        set child to path_join(path and get_list(entries and i))
+        if is_directory(child) == 1:
+            set child_ok to identity_test_remove_dir(child)
+        else:
+            set child_ok to remove_file(child)
+        set i to i + 1
+    free_list(entries)
+    return remove_directory(path)
+
+define main returning Int:
+    set passed to 0
+    set total to 0
+    set scratch_root to concat("/tmp/ernos_identity_persistence_" and concat(int_to_string(ep_time_now_ms()) and concat("_" and int_to_string(ep_random_int(100000 and 999999)))))
+    set made_root to create_directory(scratch_root)
+    if made_root == 0 or else is_directory(scratch_root) == 0:
+        display "FAIL: isolated identity persistence fixture could not be created"
+        return 1
+
+    set valid_token to "0123456789abcdef0123456789abcdef0123456789abcdef"
+    set total to total + 1
+    set passed to passed + identity_test_pass("48-character hexadecimal IPC token is valid" and ipc_token_valid(valid_token) == 1)
+    set total to total + 1
+    set passed to passed + identity_test_pass("short IPC token is rejected" and ipc_token_valid("0123") == 0)
+    set total to total + 1
+    set passed to passed + identity_test_pass("non-hexadecimal IPC token is rejected" and ipc_token_valid("g123456789abcdef0123456789abcdef0123456789abcdef") == 0)
+
+    set token_path to path_join(scratch_root and "ipc-token")
+    set total to total + 1
+    set passed to passed + identity_test_pass("token persistence commits exact bytes" and ipc_write_new_token(token_path and valid_token) == 1 and also (ipc_read_token_at(token_path) equals valid_token))
+
+    set invalid_path to path_join(scratch_root and "invalid-token")
+    set total to total + 1
+    set passed to passed + identity_test_pass("invalid token is never written" and ipc_write_new_token(invalid_path and "not-a-token") == 0 and also file_exists(invalid_path) == 0)
+
+    set malformed_path to path_join(scratch_root and "malformed-token")
+    set malformed_written to write_file(malformed_path and "malformed")
+    set total to total + 1
+    set passed to passed + identity_test_pass("malformed persisted token fails closed" and malformed_written == 1 and also string_length(ipc_read_token_at(malformed_path)) == 0)
+
+    set padded_path to path_join(scratch_root and "padded-token")
+    set padded_written to write_file(padded_path and concat(valid_token and "\n"))
+    set total to total + 1
+    set passed to passed + identity_test_pass("token reader rejects non-canonical trailing bytes" and padded_written == 1 and also string_length(ipc_read_token_at(padded_path)) == 0)
+
+    set directory_target to path_join(scratch_root and "directory-target")
+    set made_target to create_directory(directory_target)
+    set sentinel_path to path_join(directory_target and "sentinel")
+    set sentinel_written to write_file(sentinel_path and "preserve")
+    set total to total + 1
+    set passed to passed + identity_test_pass("failed token rename preserves existing directory" and ipc_write_new_token(directory_target and valid_token) == 0 and also is_directory(directory_target) == 1 and also (read_file(sentinel_path) equals "preserve"))
+
+    set existing_path to path_join(scratch_root and "existing-token-target")
+    set existing_written to write_file(existing_path and "preserve")
+    set total to total + 1
+    set passed to passed + identity_test_pass("new-token write never replaces an existing path" and existing_written == 1 and also ipc_write_new_token(existing_path and valid_token) == 0 and also (read_file(existing_path) equals "preserve"))
+
+    set identity_a to generate_identity_keypair()
+    set identity_b to generate_identity_keypair()
+    set signing_a to map_get_val(identity_a and "signing")
+    set encryption_a to map_get_val(identity_a and "encryption")
+    set signing_b to map_get_val(identity_b and "signing")
+    set encryption_b to map_get_val(identity_b and "encryption")
+    set sign_pub_a to map_get_val(signing_a and "public_key")
+    set sign_sec_a to map_get_val(signing_a and "secret_key")
+    set enc_pub_a to map_get_val(encryption_a and "public_key")
+    set enc_sec_a to map_get_val(encryption_a and "secret_key")
+    set did_a to create_did_key_from_ed25519(sign_pub_a)
+    set total to total + 1
+    set passed to passed + identity_test_pass("complete persisted identity keypairs validate" and did_saved_identity_valid(did_a and sign_pub_a and sign_sec_a and enc_pub_a and enc_sec_a) == 1)
+    set total to total + 1
+    set passed to passed + identity_test_pass("mixed signing snapshot is rejected" and did_saved_identity_valid(did_a and sign_pub_a and map_get_val(signing_b and "secret_key") and enc_pub_a and enc_sec_a) == 0)
+    set total to total + 1
+    set passed to passed + identity_test_pass("mixed encryption snapshot is rejected" and did_saved_identity_valid(did_a and sign_pub_a and sign_sec_a and enc_pub_a and map_get_val(encryption_b and "secret_key")) == 0)
+
+    set storage_root to path_join(scratch_root and "closed-storage")
+    set storage_opened to storage_init(storage_root)
+    set persisted_identity to create_identity()
+    set reloaded_identity to create_identity()
+    set persisted_error to map_get_val(persisted_identity and "error")
+    set reloaded_error to map_get_val(reloaded_identity and "error")
+    set persisted_did to map_get_val(persisted_identity and "did")
+    set reloaded_did to map_get_val(reloaded_identity and "did")
+    # Hash copied values before comparing them. Directly comparing two strings
+    # retained by separate returned maps can exercise an Ernos temporary-lifetime
+    # bug even when their bytes are identical.
+    set persisted_did_hash to ep_sha256(persisted_did)
+    set reloaded_did_hash to ep_sha256(reloaded_did)
+    set same_persisted_did to string_length(persisted_did) > 0 and also string_length(persisted_did) == string_length(reloaded_did) and also (persisted_did_hash equals reloaded_did_hash)
+    if storage_opened != STORAGE_ERR_NONE or else persisted_error != DID_ERR_NONE or else reloaded_error != DID_ERR_NONE or else same_persisted_did == 0:
+        display f"identity reload diagnostic: storage={storage_opened}, first_error={persisted_error}, reload_error={reloaded_error}, first_did={persisted_did}, reload_did={reloaded_did}"
+    set total to total + 1
+    set passed to passed + identity_test_pass("identity snapshot persists and reloads as the same validated keypairs" and storage_opened == STORAGE_ERR_NONE and also persisted_error == DID_ERR_NONE and also reloaded_error == DID_ERR_NONE and also same_persisted_did == 1)
+    set storage_closed to storage_close()
+    set failed_identity to create_identity()
+    set total to total + 1
+    set passed to passed + identity_test_pass("identity creation propagates closed-storage save failure" and storage_opened == STORAGE_ERR_NONE and also storage_closed == STORAGE_ERR_NONE and also map_get_val(failed_identity and "error") == DID_ERR_PERSISTENCE_FAILED)
+
+    set cleanup_after to identity_test_remove_dir(scratch_root)
+    set total to total + 1
+    set passed to passed + identity_test_pass("test artifacts are removed" and cleanup_after == 1 and also file_exists(scratch_root) == 0)
+
+    display concat("identity persistence security: " and concat(int_to_string(passed) and concat("/" and int_to_string(total))))
+    if passed != total:
+        return 1
+    return 0

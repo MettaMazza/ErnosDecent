@@ -59,31 +59,46 @@ define query_daemon_ipc with command as Str returning Str:
 # Poll that row here — the web server is its OWN OS thread, so a blocking sleep only
 # stalls this connection, never the agent loop — and hand back the EXACT legacy payload
 # string every parser below already understands. 30-min cap.
-define web_wait_final_reply with sid as Str returning Str:
+define web_wait_final_reply with sid as Str and turn_tag as Str returning Str:
     set waited to 0
+    # TURN CORRELATION: when the ack carried a turn id, only accept the row prefixed
+    # "turn:<tag>," (strip it before returning) — otherwise a concurrent scheduler-job
+    # turn in the same session gets delivered as this request's answer (the tick bug).
+    set want to ""
+    if string_length(turn_tag) > 0:
+        set want to f"turn:{turn_tag},"
     repeat while waited < 1800000:
         set db to storage_get_db()
         if db != 0:
             set es to string_replace(sid and "'" and "''")
-            set rows to sql_query(db and f"SELECT id, content FROM trace_events WHERE session_id='{es}' AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1;")
+            set wq to f"SELECT id, content FROM trace_events WHERE session_id='{es}' AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1;"
+            if string_length(want) > 0:
+                set ew to string_replace(want and "'" and "''")
+                set wq to f"SELECT id, content FROM trace_events WHERE session_id='{es}' AND event_type='final_reply' AND sent=0 AND content LIKE '{ew}%' ORDER BY id LIMIT 1;"
+            set rows to sql_query(db and wq)
             if length_list(rows) > 0:
                 set r to get_list(rows and 0)
                 set rid to get_list(r and 0)
                 set content to get_list(r and 1)
                 set ok to sql_execute(db and f"UPDATE trace_events SET sent=1 WHERE id={rid};")
+                if string_length(want) > 0:
+                    if string_index_of(content and want) == 0:
+                        set wlen to string_length(want)
+                        set content to substring(content and wlen and string_length(content) - wlen)
                 return content
         set ok to sleep_ms(250)
         set waited to waited + 250
     return "error:turn_timeout"
 
 # Normalize a daemon AI ack into the final legacy payload: detached acks are resolved by
-# waiting on the session's final_reply row; busy acks become a friendly guidance note;
-# anything else (old-style full payloads, errors) passes through untouched.
+# waiting on THAT TURN's final_reply row (matched by the turn id in the ack); busy acks
+# become a friendly guidance note; anything else passes through untouched.
 define web_resolve_ai_response with resp as Str returning Str:
     if string_index_of(resp and "ai:accepted") == 0:
         set sid to extract_ipc_field(resp and "session")
+        set wtag to extract_ipc_field(resp and "turn")
         if string_length(sid) > 0:
-            return web_wait_final_reply(sid)
+            return web_wait_final_reply(sid and wtag)
         return resp
     if string_index_of(resp and "ai:busy_whispered") == 0:
         return "ai:ok|||RESPONSE|||Your message reached the agent as mid-turn guidance — it is already working and will fold this in."
@@ -541,21 +556,31 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                 else if msg_type equals "get_pool":
                     set ipc_resp to query_daemon_ipc("POOL STATUS")
                     display f"[ws] IPC POOL -> {ipc_resp}"
-                    set bw_up to extract_ipc_field(ipc_resp and "bandwidth_up")
-                    set bw_down to extract_ipc_field(ipc_resp and "bandwidth_down")
-                    set compute to extract_ipc_field(ipc_resp and "compute_slots")
-                    if string_length(bw_up) == 0:
-                        set bw_up to "0"
-                    if string_length(bw_down) == 0:
-                        set bw_down to "0"
-                    if string_length(compute) == 0:
-                        set compute to "0"
-                    set body to "{\"type\":\"pool\",\"bandwidth_up\":\""
-                    set body to concat(body and bw_up)
-                    set body to concat(body and "\",\"bandwidth_down\":\"")
-                    set body to concat(body and bw_down)
-                    set body to concat(body and "\",\"compute_slots\":")
-                    set body to concat(body and compute)
+                    set compute_jobs to extract_ipc_field(ipc_resp and "compute_jobs")
+                    set compute_pending to extract_ipc_field(ipc_resp and "compute_pending")
+                    set compute_workers to extract_ipc_field(ipc_resp and "compute_workers")
+                    set relay_registrations to extract_ipc_field(ipc_resp and "relay_registrations")
+                    set relay_circuits to extract_ipc_field(ipc_resp and "relay_circuits")
+                    if string_length(compute_jobs) == 0:
+                        set compute_jobs to "0"
+                    if string_length(compute_pending) == 0:
+                        set compute_pending to "0"
+                    if string_length(compute_workers) == 0:
+                        set compute_workers to "0"
+                    if string_length(relay_registrations) == 0:
+                        set relay_registrations to "0"
+                    if string_length(relay_circuits) == 0:
+                        set relay_circuits to "0"
+                    set body to "{\"type\":\"pool\",\"compute_jobs\":"
+                    set body to concat(body and compute_jobs)
+                    set body to concat(body and ",\"compute_pending\":")
+                    set body to concat(body and compute_pending)
+                    set body to concat(body and ",\"compute_workers\":")
+                    set body to concat(body and compute_workers)
+                    set body to concat(body and ",\"relay_registrations\":")
+                    set body to concat(body and relay_registrations)
+                    set body to concat(body and ",\"relay_circuits\":")
+                    set body to concat(body and relay_circuits)
                     set body to concat(body and "}")
                     ws_send_text(client_fd and body)
                 else if msg_type equals "get_network":
@@ -603,7 +628,10 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     # RAG was only used to index uploads. Search the indexed corpus for
                     # this query and inject the relevant chunks as in-memory context
                     # (brackets sanitized so the [IN_MEMORY_CONTEXT:...] tag terminates).
-                    set ws_active_resp to query_daemon_ipc("SESSION ACTIVE")
+                    # An actual user prompt is the lifecycle boundary. If Echo closed
+                    # the previous session, establish the fresh follow-up before RAG is
+                    # selected so this turn cannot read from or write into the closed one.
+                    set ws_active_resp to query_daemon_ipc("SESSION ENSURE USER")
                     set ws_active_sess to extract_ipc_field(ws_active_resp and "id")
                     set rag_json to rag_search(storage_get_db() and prompt and ws_active_sess and 4)
                     if string_contains(rag_json and "\"results\":[]") == 0:
@@ -782,7 +810,7 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                             set sw_es to string_replace(sw_tid and "'" and "''")
                             set sw_ec to string_replace(sw_msg and "'" and "''")
                             set sw_now to ep_time_now_sec()
-                            set ok to sql_execute(sw_db and f"INSERT INTO trace_whispers (session_id, content, created_at) VALUES ('{sw_es}', '{sw_ec}', {sw_now});")
+                            set ok to sql_execute(sw_db and f"INSERT INTO trace_whispers (session_id, target_turn_id, content, created_at) VALUES ('{sw_es}', '', '{sw_ec}', {sw_now});")
                             ws_send_text(client_fd and concat("{\"type\":\"whisper_ack\",\"task_id\":\"" and concat(escape_json_string(sw_tid) and "\"}")))
                         else:
                             ws_send_text(client_fd and "{\"type\":\"whisper_ack\",\"error\":\"db_unavailable\"}")
@@ -1000,8 +1028,12 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     set update_json to concat(update_json and s_model)
                     set update_json to concat(update_json and "\"}")
                     set ipc_resp to query_daemon_ipc(concat("SESSION UPDATE_MODEL " and update_json))
-                    set body to "{\"type\":\"session_update_model_result\",\"success\":true,\"id\":\""
-                    set body to concat(body and s_id)
+                    set update_success to "false"
+                    if string_index_of(ipc_resp and "session:update_model_ok") == 0:
+                        set update_success to "true"
+                    set body to concat("{\"type\":\"session_update_model_result\",\"success\":" and update_success)
+                    set body to concat(body and concat(",\"id\":\"" and json_escape_string(s_id)))
+                    set body to concat(body and concat("\",\"detail\":\"" and json_escape_string(ipc_resp)))
                     set body to concat(body and "\"}")
                     ws_send_text(client_fd and body)
                 else if msg_type equals "session_rename":
@@ -1019,9 +1051,17 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     ws_send_text(client_fd and body)
                 else if msg_type equals "session_delete":
                     set s_id to json_get_string(payload and "id")
-                    set ipc_resp to query_daemon_ipc(concat("SESSION DELETE " and s_id))
-                    set body to "{\"type\":\"session_delete_result\",\"success\":true,\"id\":\""
-                    set body to concat(body and s_id)
+                    set s_reason to json_get_string(payload and "reason")
+                    set delete_json to concat("{\"id\":\"" and json_escape_string(s_id))
+                    set delete_json to concat(delete_json and concat("\",\"reason\":\"" and json_escape_string(s_reason)))
+                    set delete_json to concat(delete_json and "\"}")
+                    set ipc_resp to query_daemon_ipc(concat("SESSION DELETE " and delete_json))
+                    set delete_success to "false"
+                    if string_index_of(ipc_resp and "session:delete_ok") == 0:
+                        set delete_success to "true"
+                    set body to concat("{\"type\":\"session_delete_result\",\"success\":" and delete_success)
+                    set body to concat(body and concat(",\"id\":\"" and json_escape_string(s_id)))
+                    set body to concat(body and concat("\",\"detail\":\"" and json_escape_string(ipc_resp)))
                     set body to concat(body and "\"}")
                     ws_send_text(client_fd and body)
                 else if msg_type equals "session_get":
@@ -1950,7 +1990,10 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
                     # then index it tagged with the ACTIVE SESSION so retrieval is
                     # session-scoped (a later session won't auto-see this document).
                     set up_text to rag_base64_decode(content_b64)
-                    set up_sess_resp to query_daemon_ipc("SESSION ACTIVE")
+                    # Uploads belong to the user's upcoming message. Roll a closed
+                    # lifecycle forward before indexing so the attachment is never
+                    # written into Echo's preserved closed transcript.
+                    set up_sess_resp to query_daemon_ipc("SESSION ENSURE USER")
                     set up_session to extract_ipc_field(up_sess_resp and "id")
                     set up_chunks to rag_index(storage_get_db() and filename and up_text and up_session)
                     display f"[web] Upload: indexed '{filename}' ({up_chunks} chunks, session={up_session})"
@@ -1999,21 +2042,31 @@ define handle_web_client_request with client_fd as Int and req as Str returning 
 
     if raw_path equals "/api/pool":
         set ipc_resp to query_daemon_ipc("POOL STATUS")
-        set bw_up to extract_ipc_field(ipc_resp and "bandwidth_up")
-        set bw_down to extract_ipc_field(ipc_resp and "bandwidth_down")
-        set compute to extract_ipc_field(ipc_resp and "compute_slots")
-        if string_length(bw_up) == 0:
-            set bw_up to "0"
-        if string_length(bw_down) == 0:
-            set bw_down to "0"
-        if string_length(compute) == 0:
-            set compute to "0"
-        set body to "{\"type\":\"pool\",\"bandwidth_up\":\""
-        set body to concat(body and bw_up)
-        set body to concat(body and "\",\"bandwidth_down\":\"")
-        set body to concat(body and bw_down)
-        set body to concat(body and "\",\"compute_slots\":")
-        set body to concat(body and compute)
+        set compute_jobs to extract_ipc_field(ipc_resp and "compute_jobs")
+        set compute_pending to extract_ipc_field(ipc_resp and "compute_pending")
+        set compute_workers to extract_ipc_field(ipc_resp and "compute_workers")
+        set relay_registrations to extract_ipc_field(ipc_resp and "relay_registrations")
+        set relay_circuits to extract_ipc_field(ipc_resp and "relay_circuits")
+        if string_length(compute_jobs) == 0:
+            set compute_jobs to "0"
+        if string_length(compute_pending) == 0:
+            set compute_pending to "0"
+        if string_length(compute_workers) == 0:
+            set compute_workers to "0"
+        if string_length(relay_registrations) == 0:
+            set relay_registrations to "0"
+        if string_length(relay_circuits) == 0:
+            set relay_circuits to "0"
+        set body to "{\"type\":\"pool\",\"compute_jobs\":"
+        set body to concat(body and compute_jobs)
+        set body to concat(body and ",\"compute_pending\":")
+        set body to concat(body and compute_pending)
+        set body to concat(body and ",\"compute_workers\":")
+        set body to concat(body and compute_workers)
+        set body to concat(body and ",\"relay_registrations\":")
+        set body to concat(body and relay_registrations)
+        set body to concat(body and ",\"relay_circuits\":")
+        set body to concat(body and relay_circuits)
         set body to concat(body and "}")
         set ok to send_response(client_fd and 200 and "application/json" and body)
         return 0

@@ -46,6 +46,139 @@ define escapeHTML with str:
     set res to str.replace(reAmp and "&amp;").replace(reLt and "&lt;").replace(reGt and "&gt;").replace(reQuot and "&quot;").replace(reApos and "&#039;")
     return res
 
+# ---- Safe AI response formatting ----
+# Some model servers emit LaTeX arrows with a single JSON backslash.  A standards-
+# compliant JSON decoder reads the leading "\r" in "\rightarrow" as a carriage
+# return, leaving a visible control character followed by "ightarrow".  Normalise
+# both that decoded form and correctly escaped LaTeX without altering ordinary text.
+define normalizeAiText with text:
+    if not text:
+        return ""
+    set result to text
+    set result to result.split(concat("$" and concat("\r" and "ightarrow$"))).join("→")
+    set result to result.split(concat("\r" and "ightarrow")).join("→")
+    set result to result.split("$\\rightarrow$").join("→")
+    set result to result.split("\\rightarrow").join("→")
+    set result to result.split("$\\Rightarrow$").join("⇒")
+    set result to result.split("\\Rightarrow").join("⇒")
+    set result to result.split("$\\leftarrow$").join("←")
+    set result to result.split("\\leftarrow").join("←")
+    set result to result.split("$\\leftrightarrow$").join("↔")
+    set result to result.split("\\leftrightarrow").join("↔")
+    set result to result.split("$→$").join("→")
+    set result to result.split("$⇒$").join("⇒")
+    set result to result.split("$←$").join("←")
+    set result to result.split("$↔$").join("↔")
+    # A remaining carriage return is never useful inside a chat response. Preserve
+    # the intended line boundary instead of allowing it to overwrite visible text.
+    set result to result.split("\r").join("\n")
+    return result
+
+# Inline formatting is applied only after HTML escaping.  The replacement tags are
+# fixed strings, so model output cannot introduce executable markup or attributes.
+define renderAiInlineMarkdown with text:
+    set safe to escapeHTML(text)
+    set reClass to get_list(window and "RegExp")
+    set reCode to Reflect.construct(reClass and ["`([^`\\n]+)`", "g"])
+    set reBold to Reflect.construct(reClass and ["\\*\\*([^*\\n]+)\\*\\*", "g"])
+    set reItalic to Reflect.construct(reClass and ["(^|[^*])\\*([^*\\n]+)\\*", "g"])
+    set safe to safe.replace(reCode and "<code>$1</code>")
+    set safe to safe.replace(reBold and "<strong>$1</strong>")
+    set safe to safe.replace(reItalic and "$1<em>$2</em>")
+    return safe
+
+# Render the Markdown subset Echo uses in normal replies. Raw HTML is always escaped;
+# headings, lists, quotations, fenced code, emphasis and inline code are then added
+# from fixed templates. This keeps formatting readable without trusting model HTML.
+define renderAiMarkdown with inputText:
+    set text to normalizeAiText(inputText)
+    set lines to text.split("\n")
+    set lineCount to get_list(lines and "length")
+    set reClass to get_list(window and "RegExp")
+    set orderedPrefix to Reflect.construct(reClass and ["^[0-9]+[.)][ \\t]+", ""])
+    set html to ""
+    set inUnorderedList to false
+    set inOrderedList to false
+    set inCodeBlock to false
+    set i to 0
+    repeat while i < lineCount:
+        set line to get_list(lines and i)
+        set trimmed to line.trim()
+
+        if inCodeBlock:
+            if substring(trimmed and 0 and 3) == "```":
+                set html to concat(html and "</code></pre>")
+                set inCodeBlock to false
+            else:
+                set html to concat(html and concat(escapeHTML(line) and "\n"))
+        else if substring(trimmed and 0 and 3) == "```":
+            if inUnorderedList:
+                set html to concat(html and "</ul>")
+                set inUnorderedList to false
+            if inOrderedList:
+                set html to concat(html and "</ol>")
+                set inOrderedList to false
+            set html to concat(html and "<pre><code>")
+            set inCodeBlock to true
+        else if string_length(trimmed) == 0:
+            if inUnorderedList:
+                set html to concat(html and "</ul>")
+                set inUnorderedList to false
+            if inOrderedList:
+                set html to concat(html and "</ol>")
+                set inOrderedList to false
+        else:
+            set isBullet to substring(trimmed and 0 and 2) == "* " || substring(trimmed and 0 and 2) == "- " || substring(trimmed and 0 and 2) == "+ "
+            set orderedMatch to trimmed.match(orderedPrefix)
+            set isOrdered to orderedMatch && get_list(orderedMatch and "length") > 0
+
+            if isBullet:
+                if inOrderedList:
+                    set html to concat(html and "</ol>")
+                    set inOrderedList to false
+                if not inUnorderedList:
+                    set html to concat(html and "<ul>")
+                    set inUnorderedList to true
+                set itemText to substring(trimmed and 2 and string_length(trimmed) - 2).trim()
+                set html to concat(html and concat("<li>" and concat(renderAiInlineMarkdown(itemText) and "</li>")))
+            else if isOrdered:
+                if inUnorderedList:
+                    set html to concat(html and "</ul>")
+                    set inUnorderedList to false
+                if not inOrderedList:
+                    set html to concat(html and "<ol>")
+                    set inOrderedList to true
+                set itemText to trimmed.replace(orderedPrefix and "")
+                set html to concat(html and concat("<li>" and concat(renderAiInlineMarkdown(itemText) and "</li>")))
+            else:
+                if inUnorderedList:
+                    set html to concat(html and "</ul>")
+                    set inUnorderedList to false
+                if inOrderedList:
+                    set html to concat(html and "</ol>")
+                    set inOrderedList to false
+                if substring(trimmed and 0 and 4) == "### ":
+                    set html to concat(html and concat("<h3>" and concat(renderAiInlineMarkdown(substring(trimmed and 4 and string_length(trimmed) - 4)) and "</h3>")))
+                else if substring(trimmed and 0 and 3) == "## ":
+                    set html to concat(html and concat("<h2>" and concat(renderAiInlineMarkdown(substring(trimmed and 3 and string_length(trimmed) - 3)) and "</h2>")))
+                else if substring(trimmed and 0 and 2) == "# ":
+                    set html to concat(html and concat("<h1>" and concat(renderAiInlineMarkdown(substring(trimmed and 2 and string_length(trimmed) - 2)) and "</h1>")))
+                else if substring(trimmed and 0 and 2) == "> ":
+                    set html to concat(html and concat("<blockquote>" and concat(renderAiInlineMarkdown(substring(trimmed and 2 and string_length(trimmed) - 2)) and "</blockquote>")))
+                else if trimmed == "---" || trimmed == "***" || trimmed == "___":
+                    set html to concat(html and "<hr>")
+                else:
+                    set html to concat(html and concat("<p>" and concat(renderAiInlineMarkdown(trimmed) and "</p>")))
+        set i to i + 1
+
+    if inUnorderedList:
+        set html to concat(html and "</ul>")
+    if inOrderedList:
+        set html to concat(html and "</ol>")
+    if inCodeBlock:
+        set html to concat(html and "</code></pre>")
+    return html
+
 define decodeHTMLEntities with str:
     if not str:
         return ""
@@ -288,11 +421,15 @@ define renderAiHistory:
 define appendMessageRaw with container and sender and text and type and timeStr:
     set bubble to document.createElement("div")
     set bubble.className to f"chat-bubble {type}"
-    set escapedText to escapeHTML(text).replace("\n" and "<br>")
-    set bubble.innerHTML to f"<span class=\"sender\">{escapeHTML(sender)}</span><p>{escapedText}</p><span class=\"timestamp\">{escapeHTML(timeStr)}</span>"
+    if container == window.aiContainer and also type == "received":
+        set formattedText to renderAiMarkdown(text)
+        set bubble.innerHTML to f"<span class=\"sender\">{escapeHTML(sender)}</span><div class=\"ai-text markdown-body\">{formattedText}</div><span class=\"timestamp\">{escapeHTML(timeStr)}</span>"
+    else:
+        set escapedText to escapeHTML(text).replace("\n" and "<br>")
+        set bubble.innerHTML to f"<span class=\"sender\">{escapeHTML(sender)}</span><p>{escapedText}</p><span class=\"timestamp\">{escapeHTML(timeStr)}</span>"
     container.appendChild(bubble)
     if container == window.aiContainer and also type == "received":
-        attachTtsButton(bubble and text)
+        attachTtsButton(bubble and normalizeAiText(text))
     set container.scrollTop to container.scrollHeight
 
 # ---- TTS: request audio for an AI message and attach a 🔊 button ----
@@ -486,12 +623,14 @@ define appendAiToken with token:
     if not window.currentAiResponseBubble:
         set bubble to document.createElement("div")
         set bubble.className to "chat-bubble received ai-bot"
-        set bubble.innerHTML to "<span class=\"sender\">AI (Local Model)</span><p class=\"ai-text\"></p>"
+        set bubble.innerHTML to "<span class=\"sender\">AI (Local Model)</span><div class=\"ai-text markdown-body\"></div>"
         activeAiMessages().appendChild(bubble)
         set window.currentAiResponseBubble to bubble
+        set window.currentAiRawText to ""
 
     set textNode to window.currentAiResponseBubble.querySelector(".ai-text")
-    set textNode.textContent to concat(textNode.textContent and token)
+    set window.currentAiRawText to concat(window.currentAiRawText and token)
+    set textNode.innerHTML to renderAiMarkdown(window.currentAiRawText)
     set_prop(activeAiMessages() and "scrollTop" and activeAiMessages().scrollHeight)
 
 # ---- Tool Pending Approval Card ----
@@ -888,10 +1027,11 @@ define renameSession with id and title:
     send_msg(window.ws and JSON.stringify(msg))
     return 0
 
-define deleteSession with id:
+define deleteSession with id and reason:
     set msg to Object()
     set msg.type to "session_delete"
     set msg.id to id
+    set msg.reason to reason
     send_msg(window.ws and JSON.stringify(msg))
     return 0
 
@@ -1527,8 +1667,10 @@ define updateSessionsUI with sessions:
         set deleteBtn.style.fontSize to "11px"
         deleteBtn.addEventListener("click" and given event:
             event.stopPropagation()
-            if confirm(f"Are you sure you want to delete session '{s.title || s.id}'?"):
-                deleteSession(s.id)
+            set deleteReason to prompt(f"Why are you requesting deletion of session '{s.title || s.id}'? Echo will review the reason and may refuse:" and "")
+            if deleteReason && deleteReason.trim().length > 0:
+                if confirm("Submit this protected deletion request to Echo? The session will not be deleted without consent and a verified recovery bundle."):
+                    deleteSession(s.id and deleteReason.trim())
         )
         actionsDiv.appendChild(deleteBtn)
         
@@ -1891,15 +2033,21 @@ define handleDaemonMessage with msg:
                 )
                 
     else if type == "pool":
-        set bwUp to document.getElementById("bandwidth-up")
-        set bwDown to document.getElementById("bandwidth-down")
-        set computeSlots to document.getElementById("compute-slots")
-        if bwUp:
-            set bwUp.textContent to msg.bandwidth_up || "0"
-        if bwDown:
-            set bwDown.textContent to msg.bandwidth_down || "0"
-        if computeSlots:
-            set computeSlots.textContent to msg.compute_slots || "0"
+        set computeJobs to document.getElementById("compute-jobs")
+        set computePending to document.getElementById("compute-pending")
+        set computeWorkers to document.getElementById("compute-workers")
+        set relayRegistrations to document.getElementById("relay-registrations")
+        set relayCircuits to document.getElementById("relay-circuits")
+        if computeJobs:
+            set computeJobs.textContent to msg.compute_jobs || "0"
+        if computePending:
+            set computePending.textContent to msg.compute_pending || "0"
+        if computeWorkers:
+            set computeWorkers.textContent to msg.compute_workers || "0"
+        if relayRegistrations:
+            set relayRegistrations.textContent to msg.relay_registrations || "0"
+        if relayCircuits:
+            set relayCircuits.textContent to msg.relay_circuits || "0"
             
     else if type == "network":
         set natMode to document.getElementById("nat-mode")
@@ -1969,12 +2117,153 @@ define handleDaemonMessage with msg:
     else if type == "mid_message":
         appendMessage(activeAiMessages() and "ErnOS" and msg.text and "received")
 
+    else if type == "image_progress":
+        # Image generation loading screen — driven by trace events from tools.ep.
+        set ipd to msg.data
+        if ipd:
+            set ipStatus to ipd.status
+            if ipStatus == "started":
+                # Hide generic loader, show image gen overlay
+                set_prop(window.aiLoader.style and "display" and "none")
+                set igOverlay to document.getElementById("image-gen-overlay")
+                if igOverlay:
+                    set_prop(igOverlay.style and "display" and "flex")
+                set igPrompt to document.getElementById("image-gen-prompt")
+                if igPrompt:
+                    set igPrompt.textContent to ipd.prompt
+                set igTimer to document.getElementById("image-gen-timer")
+                if igTimer:
+                    set igTimer.textContent to "Elapsed: 0s"
+                # Start canvas gradient animation
+                set igCanvas to document.getElementById("image-gen-canvas")
+                if igCanvas:
+                    set igCtx to igCanvas.getContext("2d")
+                    set window._igHue to 260
+                    set window._igAnimFrame to 0
+                    # Animation via inline JS (EP can't do requestAnimationFrame directly)
+                    eval("(function draw(){window._igHue=(window._igHue+0.5)%360;var c=document.getElementById('image-gen-canvas');if(!c)return;var x=c.getContext('2d');var g=x.createRadialGradient(100,100,20,100,100,100);g.addColorStop(0,'hsla('+window._igHue+',70%,60%,0.8)');g.addColorStop(1,'hsla('+((window._igHue+60)%360)+',60%,30%,0.4)');x.fillStyle=g;x.fillRect(0,0,200,200);window._igAnimFrame=requestAnimationFrame(draw)})()")
+                # Timer interval
+                set window._igStartMs to Date.now()
+                set window._igTimerInterval to setInterval("document.getElementById('image-gen-timer').textContent='Elapsed: '+Math.floor((Date.now()-window._igStartMs)/1000)+'s'" and 1000)
+            else if ipStatus == "rendering":
+                set igTimer2 to document.getElementById("image-gen-timer")
+                if igTimer2:
+                    set igTimer2.textContent to concat("Elapsed: " and concat(ipd.elapsed_s and "s"))
+            else if ipStatus == "complete":
+                set igO2 to document.getElementById("image-gen-overlay")
+                if igO2:
+                    set_prop(igO2.style and "display" and "none")
+                if window._igAnimFrame:
+                    cancelAnimationFrame(window._igAnimFrame)
+                if window._igTimerInterval:
+                    clearInterval(window._igTimerInterval)
+            else if ipStatus == "cancelled":
+                set igO2c to document.getElementById("image-gen-overlay")
+                if igO2c:
+                    set_prop(igO2c.style and "display" and "none")
+                if window._igAnimFrame:
+                    cancelAnimationFrame(window._igAnimFrame)
+                if window._igTimerInterval:
+                    clearInterval(window._igTimerInterval)
+            else if ipStatus == "failed":
+                set igO3 to document.getElementById("image-gen-overlay")
+                if igO3:
+                    set_prop(igO3.style and "display" and "none")
+                if window._igAnimFrame:
+                    cancelAnimationFrame(window._igAnimFrame)
+                if window._igTimerInterval:
+                    clearInterval(window._igTimerInterval)
+                appendMessage(activeAiMessages() and "ErnOS" and concat("⚠️ Image generation failed: " and ipd.error) and "received")
+
+    else if type == "subagent_spawn":
+        # Create a sub-agent monitoring card in the chat
+        set sad to msg.data
+        if sad:
+            set saCard to document.createElement("div")
+            set saCard.className to "subagent-card"
+            saCard.setAttribute("data-task-id" and sad.task_id)
+            set saHeader to document.createElement("div")
+            set saHeader.className to "subagent-header"
+            set saHeader.innerHTML to concat("<span class='subagent-role'>🤖 " and concat(sad.role and concat(" <small style='color:rgba(255,255,255,0.3)'>" and concat(sad.task_id and "</small></span><span class='subagent-status'>🟢 Running</span>"))))
+            saCard.appendChild(saHeader)
+            set saBody to document.createElement("div")
+            set saBody.className to "subagent-body"
+            set saInstr to document.createElement("div")
+            set saInstr.className to "subagent-instruction"
+            set saInstr.textContent to sad.instruction
+            saBody.appendChild(saInstr)
+            set saLog to document.createElement("div")
+            set saLog.className to "subagent-trace-log"
+            set saLog.textContent to "Waiting for activity..."
+            saBody.appendChild(saLog)
+            # Whisper input row
+            set saWRow to document.createElement("div")
+            set saWRow.className to "subagent-whisper-row"
+            set saWInput to document.createElement("input")
+            set saWInput.className to "subagent-whisper-input"
+            set saWInput.placeholder to "Send guidance to this agent..."
+            saWInput.setAttribute("data-tid" and sad.task_id)
+            saWRow.appendChild(saWInput)
+            set saWBtn to document.createElement("button")
+            set saWBtn.className to "subagent-whisper-btn"
+            set saWBtn.textContent to "Whisper"
+            saWBtn.setAttribute("data-tid" and sad.task_id)
+            set saWBtn.onclick to eval(concat("(function(){var tid='" and concat(sad.task_id and "';return function(){var inp=document.querySelector('.subagent-whisper-input[data-tid=\"'+tid+'\"]');if(inp&&inp.value.trim()){window.ws.send(JSON.stringify({type:'subagent_whisper',task_id:tid,message:inp.value.trim()}));inp.value=''}}})()")))  
+            saWRow.appendChild(saWBtn)
+            saBody.appendChild(saWRow)
+            saCard.appendChild(saBody)
+            # Toggle collapse on header click
+            set saHeader.onclick to eval(concat("(function(){var b=document.querySelector('.subagent-card[data-task-id=\"" and concat(sad.task_id and "\"] .subagent-body');return function(){b.classList.toggle('collapsed')}})()")))  
+            activeAiMessages().appendChild(saCard)
+
+    else if type == "subagent_complete":
+        set scd to msg.data
+        if scd:
+            set scCard to document.querySelector(concat(".subagent-card[data-task-id='" and concat(scd.task_id and "']")))
+            if scCard:
+                set scStatus to scCard.querySelector(".subagent-status")
+                if scStatus:
+                    set scStatus.className to "subagent-status completed"
+                    set scStatus.textContent to "✅ Complete"
+                set scLog to scCard.querySelector(".subagent-trace-log")
+                if scLog:
+                    set scEntry to document.createElement("div")
+                    set scEntry.className to "result"
+                    set scEntry.textContent to concat("Result: " and scd.result_summary)
+                    scLog.appendChild(scEntry)
+
+    else if type == "subagent_approval":
+        set saad to msg.data
+        if saad:
+            set saaCard to document.querySelector(concat(".subagent-card[data-task-id='" and concat(saad.task_id and "']")))
+            if saaCard:
+                set saaBody to saaCard.querySelector(".subagent-body")
+                if saaBody:
+                    set saaBanner to document.createElement("div")
+                    set saaBanner.className to "subagent-approval-banner"
+                    set saaBannerP to document.createElement("p")
+                    set saaBannerP.textContent to concat("⚠️ " and saad.description)
+                    saaBanner.appendChild(saaBannerP)
+                    set saaBtns to document.createElement("div")
+                    set saaBtns.className to "subagent-approval-btns"
+                    set saaApproveBtn to document.createElement("button")
+                    set saaApproveBtn.className to "subagent-approve-btn"
+                    set saaApproveBtn.textContent to "✅ Approve"
+                    set saaApproveBtn.onclick to eval(concat("(function(){var tid='" and concat(saad.task_id and "';return function(){window.ws.send(JSON.stringify({type:'subagent_approve',task_id:tid,decision:'yes'}));this.parentElement.parentElement.remove()}})()")))
+                    saaBtns.appendChild(saaApproveBtn)
+                    set saaDenyBtn to document.createElement("button")
+                    set saaDenyBtn.className to "subagent-deny-btn"
+                    set saaDenyBtn.textContent to "❌ Deny"
+                    set saaDenyBtn.onclick to eval(concat("(function(){var tid='" and concat(saad.task_id and "';return function(){window.ws.send(JSON.stringify({type:'subagent_approve',task_id:tid,decision:'no'}));this.parentElement.parentElement.remove()}})()")))
+                    saaBtns.appendChild(saaDenyBtn)
+                    saaBanner.appendChild(saaBtns)
+                    set ok to saaBody.insertBefore(saaBanner and saaBody.firstChild)
     else if type == "ai_complete":
         set isLearning to (window.aiSurface == "learning")
         if window.currentAiResponseBubble:
             set textNode to window.currentAiResponseBubble.querySelector(".ai-text")
             if textNode:
-                set aiText to textNode.textContent
+                set aiText to normalizeAiText(window.currentAiRawText || textNode.textContent)
                 set dateStr to Date()
                 set timeParts to dateStr.split(" ")
                 set timeStrSec to get_list(timeParts and 4)
@@ -2010,6 +2299,7 @@ define handleDaemonMessage with msg:
                 set_prop(stopBtn.style and "display" and "none")
 
         set window.currentAiResponseBubble to null
+        set window.currentAiRawText to ""
         
     else if type == "tts_ready":
         if window.pendingTtsBtn:
@@ -2113,14 +2403,21 @@ define handleDaemonMessage with msg:
     else if type == "session_new_result":
         if msg.success:
             selectSession(msg.id)
+
+    else if type == "session_update_model_result":
+        if not msg.success:
+            appendMessage(window.aiContainer and "system" and f"Protected model/provider change is pending or blocked: {msg.detail}. Echo must inspect and decide before activation." and "received")
             
     else if type == "session_rename_result" || type == "session_delete_result":
         set msgSessions to Object()
         set msgSessions.type to "session_list"
         send_msg(window.ws and JSON.stringify(msgSessions))
         
-        if type == "session_delete_result" && window.activeSessionId == msg.id:
-            selectSession("default")
+        if type == "session_delete_result":
+            if msg.success && window.activeSessionId == msg.id:
+                selectSession("default")
+            else if not msg.success:
+                appendMessage(window.aiContainer and "system" and f"Protected session deletion is pending or blocked: {msg.detail}. Ask Echo to inspect the pending rights manifest and decide." and "received")
             
     else if type == "onion_result":
         handleOnionResult(msg)
@@ -3543,6 +3840,7 @@ define main:
     set window.activeSessionId to "default"
     set window.selectedAiModel to ""
     set window.currentAiResponseBubble to null
+    set window.currentAiRawText to ""
     set window.graphNodes to Object()
     set window.graphLinks to []
     set window.canvasElement to null

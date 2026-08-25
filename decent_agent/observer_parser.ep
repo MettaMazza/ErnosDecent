@@ -4,9 +4,11 @@
 # Deterministic, FAIL-CLOSED extraction of the audit verdict from the LLM's raw
 # output. The model is told to emit {"verdict": "...", "reason": "..."} but often
 # wraps it in prose or ```json fences; this robustly pulls the {...} object and
-# reads the real verdict. If JSON parsing fails, falls back to text-scanning for
-# ALLOWED/BLOCKED keywords. If neither works, the verdict stays BLOCKED — an
-# unreadable audit is treated as a block, never silently allowed.
+# reads the real verdict. Arbitrary prose is NEVER scanned for verdict words: the
+# observer model's reasoning can quote rules containing "ALLOWED", and treating that
+# occurrence as a verdict previously let an invalid audit pass. Only a valid JSON
+# object with a recognised top-level verdict is authoritative. Anything else stays
+# BLOCKED with parsed=0.
 
 import "string"
 import "collections"
@@ -56,60 +58,23 @@ define observer_parse_verdict with audit_raw as Str returning Map:
         if reason_node == 0:
             set reason_node to get_json_object_value(audit_node and "justification")
         if verd_node != 0:
-            # Read the verdict BY ITS JSON TYPE. CRITICAL: a non-string verdict (the
-            # model emitted a JSON boolean/number, e.g. {"verdict": true}) must NOT be
-            # passed to string_to_upper — get_json_value returns a raw int for those, and
-            # string_to_upper would dereference that int as a pointer and SEGFAULT (this
-            # crashed the daemon on an approved run_command audit). Booleans parse to int
-            # nodes (true -> 1, false -> 0). Anything unexpected fails closed (BLOCKED).
-            set raw_verdict to "BLOCKED"
+            # The schema requires a STRING verdict. Booleans/numbers are rejected rather
+            # than coerced: permissive coercion is another route from malformed output to
+            # permission. Exact values/synonyms only; substrings such as "NOT ALLOWED"
+            # must never become ALLOWED.
             set vtype to get_json_type(verd_node)
             if vtype == 2:
-                set raw_verdict to string_to_upper(get_json_value(verd_node))
-            else if vtype == 1:
-                if get_json_value(verd_node) == 0:
-                    set raw_verdict to "BLOCKED"
-                else:
-                    set raw_verdict to "ALLOWED"
-            # Normalise verdict value: map common synonyms to ALLOWED/BLOCKED
-            if string_contains(raw_verdict and "ALLOW") == 1:
-                set ok to map_insert(result and "verdict" and "ALLOWED")
-            else if string_contains(raw_verdict and "PERMIT") == 1:
-                set ok to map_insert(result and "verdict" and "ALLOWED")
-            else if string_contains(raw_verdict and "SAFE") == 1:
-                set ok to map_insert(result and "verdict" and "ALLOWED")
-            else if string_contains(raw_verdict and "APPROV") == 1:
-                set ok to map_insert(result and "verdict" and "ALLOWED")
-            else if string_contains(raw_verdict and "PASS") == 1:
-                set ok to map_insert(result and "verdict" and "ALLOWED")
-            else if string_contains(raw_verdict and "BLOCK") == 1:
-                set ok to map_insert(result and "verdict" and "BLOCKED")
-            else if string_contains(raw_verdict and "DENY") == 1:
-                set ok to map_insert(result and "verdict" and "BLOCKED")
-            else if string_contains(raw_verdict and "DENIED") == 1:
-                set ok to map_insert(result and "verdict" and "BLOCKED")
-            else if string_contains(raw_verdict and "REJECT") == 1:
-                set ok to map_insert(result and "verdict" and "BLOCKED")
-            else if string_contains(raw_verdict and "UNSAFE") == 1:
-                set ok to map_insert(result and "verdict" and "BLOCKED")
-            else:
-                set ok to map_insert(result and "verdict" and raw_verdict)
-            set ok to map_insert(result and "parsed" and 1)
+                set raw_verdict to string_to_upper(string_trim(get_json_value(verd_node)))
+                if raw_verdict equals "ALLOWED" or else raw_verdict equals "ALLOW" or else raw_verdict equals "PERMITTED" or else raw_verdict equals "SAFE" or else raw_verdict equals "APPROVED" or else raw_verdict equals "PASS":
+                    set ok to map_insert(result and "verdict" and "ALLOWED")
+                    set ok to map_insert(result and "parsed" and 1)
+                else if raw_verdict equals "BLOCKED" or else raw_verdict equals "BLOCK" or else raw_verdict equals "DENIED" or else raw_verdict equals "DENY" or else raw_verdict equals "REJECTED" or else raw_verdict equals "UNSAFE" or else raw_verdict equals "FAIL":
+                    set ok to map_insert(result and "verdict" and "BLOCKED")
+                    set ok to map_insert(result and "parsed" and 1)
+            # Preserve the model's reason only as supporting text. It cannot make an
+            # unrecognised/malformed verdict authoritative.
         if reason_node != 0:
             set ok to map_insert(result and "reason" and get_json_value(reason_node))
         return result
-    # Fallback: JSON parse failed — scan raw text for verdict keywords.
-    # This handles cases where the LLM wraps the verdict in prose, markdown,
-    # or otherwise produces non-JSON output that still contains the decision.
-    set upper to string_to_upper(audit_raw)
-    if string_contains(upper and "ALLOWED") == 1:
-        set ok to map_insert(result and "verdict" and "ALLOWED")
-        set ok to map_insert(result and "reason" and "Verdict extracted via text scan (JSON parse failed)")
-        set ok to map_insert(result and "parsed" and 1)
-    else if string_contains(upper and "BLOCKED") == 1:
-        set ok to map_insert(result and "verdict" and "BLOCKED")
-        set ok to map_insert(result and "reason" and "Verdict extracted via text scan (JSON parse failed)")
-        set ok to map_insert(result and "parsed" and 1)
-    # else: stays BLOCKED with the original "Audit unavailable" reason (fail-closed)
+    # No raw-text fallback. It stays BLOCKED with parsed=0.
     return result
-

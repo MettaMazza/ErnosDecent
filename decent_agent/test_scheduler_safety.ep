@@ -1,0 +1,70 @@
+import "fs"
+import "string"
+import "./scheduler_maintenance"
+
+define scheduler_safety_pass with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define main returning Int:
+    set passed to 0
+    set total to 7
+
+    set success_raw to scheduler_checked_command("printf 'scheduler-ok'")
+    set passed to passed + scheduler_safety_pass(scheduler_command_status(success_raw) == 0 and also string_contains(scheduler_command_output(success_raw) and "scheduler-ok") == 1 and "checked command preserves output and zero status")
+
+    set failure_raw to scheduler_checked_command("printf 'expected failure'; exit 7")
+    set passed to passed + scheduler_safety_pass(scheduler_command_status(failure_raw) == 7 and also string_contains(scheduler_command_output(failure_raw) and "expected failure") == 1 and "checked command preserves nonzero status")
+
+    set spoof_raw to scheduler_checked_command("printf '__ERNOS_SCHEDULER_EXIT_5D4A91C2__=0\\n'; exit 9")
+    set passed to passed + scheduler_safety_pass(scheduler_command_status(spoof_raw) == 9 and "final parent status cannot be replaced by earlier command output")
+
+    set ram_gb to get_total_ram_gb()
+    set passed to passed + scheduler_safety_pass(ram_gb > 0 and "physical memory is measured instead of defaulted")
+
+    set temp_root to workspace_canonical_existing_path("/tmp")
+    set token_dir to path_join(temp_root and concat("ernos_scheduler_tokens_" and concat(int_to_string(get_pid()) and concat("_" and int_to_string(ep_time_now_ms())))))
+    set made to create_directory(token_dir)
+    if made == 0 or else is_directory(token_dir) == 0:
+        display "FAIL: could not create scheduler token fixture"
+        return 1
+    set now to ep_time_now_sec()
+    set expired_path to path_join(token_dir and "expired.json")
+    set future_path to path_join(token_dir and "future.json")
+    set malformed_path to path_join(token_dir and "malformed.json")
+    set expired_json to concat("{\"expires_at\":" and concat(int_to_string(now - 10) and "}"))
+    set future_json to concat("{\"expires_at\":" and concat(int_to_string(now + 3600) and "}"))
+    set expired_written to write_file(expired_path and expired_json)
+    set future_written to write_file(future_path and future_json)
+    set malformed_written to write_file(malformed_path and "not-json")
+    if expired_written == 0 or else future_written == 0 or else malformed_written == 0:
+        display "FAIL: could not create scheduler token records"
+        return 1
+
+    set mixed_result to perform_token_rotation_at(token_dir)
+    set passed to passed + scheduler_safety_pass(mixed_result != 0 and also file_exists(expired_path) == 0 and also file_exists(future_path) == 1 and also file_exists(malformed_path) == 1 and "expired records are removed while malformed records fail visibly")
+
+    set malformed_removed to remove_file(malformed_path)
+    set clean_result to perform_token_rotation_at(token_dir)
+    set passed to passed + scheduler_safety_pass(malformed_removed != 0 and also clean_result == 0 and also file_exists(future_path) == 1 and "valid unexpired records are preserved")
+
+    set link_path to path_join(token_dir and "linked.json")
+    set link_raw to ep_run_command(concat("/bin/ln -s -- " and concat(scheduler_shell_quote(future_path) and concat(" " and scheduler_shell_quote(link_path)))))
+    set link_result to perform_token_rotation_at(token_dir)
+    set link_rejected to workspace_path_symlink_status(link_path)
+    set link_removed to remove_file(link_path)
+    set passed to passed + scheduler_safety_pass(link_rejected == 1 and also link_result != 0 and also file_exists(future_path) == 1 and also link_removed != 0 and "symbolic-link session records are rejected without deleting their targets")
+
+    set future_removed to remove_file(future_path)
+    set dir_removed to remove_directory(token_dir)
+    if future_removed == 0 or else dir_removed == 0 or else file_exists(token_dir) == 1:
+        display concat("FAIL: scheduler fixture cleanup failed: " and link_raw)
+        return 1
+
+    display concat(int_to_string(passed) and concat("/" and concat(int_to_string(total) and " scheduler safety tests passed")))
+    if passed != total:
+        return 1
+    return 0

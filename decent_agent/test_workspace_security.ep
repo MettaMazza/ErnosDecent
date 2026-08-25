@@ -1,0 +1,206 @@
+# Adversarial workspace path-confinement and truthful-I/O tests.
+# Run the binary from a fresh directory whose name starts with
+# ernos_workspace_security_; the guard prevents touching a real config tree.
+
+import "fs"
+import "os"
+import "string"
+import "./workspace"
+
+define workspace_security_pass with label as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define workspace_security_error with value as Str returning Int:
+    return string_index_of(value and "Error: ") == 0
+
+define workspace_security_make_session with dirname as Str and session_id as Str and payload as Str returning Int:
+    set session_path to path_join("config/workspaces" and dirname)
+    if create_directory(session_path) == 0:
+        return 0
+    set metadata to concat("{\"session_id\":\"" and concat(session_id and "\",\"created_at\":100}"))
+    if write_file(path_join(session_path and ".session_meta.json") and metadata) == 0:
+        return 0
+    return write_file(path_join(session_path and "payload.txt") and payload)
+
+define main returning Int:
+    set cwd to get_cwd()
+    if string_contains(cwd and "/ernos_workspace_security_") == 0:
+        display "FAIL: security test refused to run outside an isolated workspace"
+        return 1
+
+    set passed to 0
+    set total to 0
+
+    set made_config to create_directory("config")
+    set made_workspaces to create_directory("config/workspaces")
+    set made_active to create_directory("config/workspaces/active")
+    set made_archive to create_directory("config/workspaces/archive")
+    set outside_written to write_file("outside.txt" and "outside remains unchanged")
+
+    set total to total + 1
+    set passed to passed + workspace_security_pass("isolated fixture directories were created" and made_config == 1 and also made_workspaces == 1 and also made_active == 1 and also made_archive == 1 and also outside_written == 1)
+
+    set init_result to workspace_init("test_session")
+    set persisted_metadata to read_file("config/workspaces/active/.session_meta.json")
+    set made_docs to create_directory("config/workspaces/active/docs")
+    set made_uploads to create_directory("config/workspaces/active/uploads")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("valid workspace initialization persists verified session metadata" and init_result == 0 and also string_contains(persisted_metadata and "\"session_id\": \"test_session\"") == 1 and also string_contains(persisted_metadata and "\"created_at\":") == 1 and also made_docs == 1 and also made_uploads == 1)
+
+    set normal_path to workspace_write_file("docs/note.txt" and "alpha\nbeta")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("confined atomic write preserves the public relative path" and (normal_path equals "config/workspaces/active/docs/note.txt") and also (read_file(normal_path) equals "alpha\nbeta"))
+
+    set normal_read to workspace_read_file("docs/note.txt")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("regular workspace read returns verified content and metadata" and string_contains(normal_read and "[File: docs/note.txt | Lines: 2 | Size: 10 bytes]") == 1 and also string_contains(normal_read and "alpha\nbeta") == 1)
+
+    set normal_info to workspace_file_info("docs/note.txt")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("file info reports exact regular-file size and line count" and (normal_info equals "{\"filename\":\"docs/note.txt\",\"size\":10,\"lines\":2}"))
+
+    set normal_range to workspace_read_range("docs/note.txt" and 2 and 2)
+    set total to total + 1
+    set passed to passed + workspace_security_pass("range reads use the verified confined file" and string_contains(normal_range and "[Lines 2-2 of 2 total | File: docs/note.txt]") == 1 and also string_contains(normal_range and "beta") == 1)
+
+    set normal_listing to workspace_list_active()
+    set total to total + 1
+    set passed to passed + workspace_security_pass("workspace listing enumerates direct regular files and directories" and workspace_security_error(normal_listing) == 0 and also string_contains(normal_listing and "docs/") == 1 and also string_contains(normal_listing and "docs/note.txt") == 1)
+
+    set empty_path to workspace_write_file("empty.txt" and "")
+    set empty_read to workspace_read_file("empty.txt")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("a verified zero-byte file is valid rather than an I/O failure" and string_length(empty_path) > 0 and also string_contains(empty_read and "Size: 0 bytes") == 1)
+
+    set outside_abs to path_join(cwd and "outside.txt")
+    set abs_write to workspace_write_file(outside_abs and "overwritten")
+    set abs_read to workspace_read_file(outside_abs)
+    set abs_info to workspace_file_info(outside_abs)
+    set abs_range to workspace_read_range(outside_abs and 1 and 1)
+    set total to total + 1
+    set passed to passed + workspace_security_pass("absolute paths are rejected by every active-workspace file API" and string_length(abs_write) == 0 and also string_length(abs_read) == 0 and also workspace_security_error(abs_info) == 1 and also workspace_security_error(abs_range) == 1 and also (read_file("outside.txt") equals "outside remains unchanged"))
+
+    set traversal_write to workspace_write_file("../../../outside.txt" and "overwritten")
+    set traversal_read to workspace_read_file("../../../outside.txt")
+    set traversal_info to workspace_file_info("../../../outside.txt")
+    set traversal_range to workspace_read_range("../../../outside.txt" and 1 and 1)
+    set total to total + 1
+    set passed to passed + workspace_security_pass("traversal is rejected by every active-workspace file API" and string_length(traversal_write) == 0 and also string_length(traversal_read) == 0 and also workspace_security_error(traversal_info) == 1 and also workspace_security_error(traversal_range) == 1 and also (read_file("outside.txt") equals "outside remains unchanged"))
+
+    set link_output to run_command("ln -s ../../../outside.txt config/workspaces/active/link.txt")
+    set link_fixture to file_exists("config/workspaces/active/link.txt")
+    set link_read to workspace_read_file("link.txt")
+    set link_info to workspace_file_info("link.txt")
+    set link_range to workspace_read_range("link.txt" and 1 and 1)
+    set link_write to workspace_write_file("link.txt" and "overwritten")
+    set link_listing to workspace_list_active()
+    set total to total + 1
+    set passed to passed + workspace_security_pass("file symlinks are rejected for read, info, range, write, and listing" and link_fixture == 1 and also string_length(link_read) == 0 and also workspace_security_error(link_info) == 1 and also workspace_security_error(link_range) == 1 and also string_length(link_write) == 0 and also workspace_security_error(link_listing) == 1 and also (read_file("outside.txt") equals "outside remains unchanged"))
+    set removed_link to remove_file("config/workspaces/active/link.txt")
+
+    set inside_link_output to run_command("ln -s docs/note.txt config/workspaces/active/inside_link.txt")
+    set inside_link_fixture to file_exists("config/workspaces/active/inside_link.txt")
+    set inside_link_read to workspace_read_file("inside_link.txt")
+    set inside_link_write to workspace_write_file("inside_link.txt" and "overwritten")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("symlinks are rejected even when their target remains inside the workspace" and inside_link_fixture == 1 and also string_length(inside_link_read) == 0 and also string_length(inside_link_write) == 0 and also (read_file("config/workspaces/active/docs/note.txt") equals "alpha\nbeta"))
+    set removed_inside_link to remove_file("config/workspaces/active/inside_link.txt")
+
+    set dangling_link_output to run_command("ln -s ../../../does_not_exist config/workspaces/active/dangling.txt")
+    set dangling_status to workspace_path_symlink_status("config/workspaces/active/dangling.txt")
+    set dangling_read to workspace_read_file("dangling.txt")
+    set dangling_write to workspace_write_file("dangling.txt" and "must not replace the link")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("dangling symlinks are classified and rejected before file_exists" and dangling_status == 1 and also string_length(dangling_read) == 0 and also string_length(dangling_write) == 0 and also workspace_path_symlink_status("config/workspaces/active/dangling.txt") == 1)
+    set removed_dangling_link to remove_file("config/workspaces/active/dangling.txt")
+
+    set outside_dir_made to create_directory("outside_dir")
+    set outside_secret_written to write_file("outside_dir/secret.txt" and "secret outside content")
+    set dir_link_output to run_command("ln -s ../../../outside_dir config/workspaces/active/escape")
+    set dir_link_fixture to is_directory("config/workspaces/active/escape")
+    set dir_link_read to workspace_read_file("escape/secret.txt")
+    set dir_link_write to workspace_write_file("escape/new.txt" and "escaped")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("symlinked parent directories cannot escape the active root" and outside_dir_made == 1 and also outside_secret_written == 1 and also dir_link_fixture == 1 and also string_length(dir_link_read) == 0 and also string_length(dir_link_write) == 0 and also file_exists("outside_dir/new.txt") == 0)
+    set removed_dir_link to remove_file("config/workspaces/active/escape")
+
+    set dir_read to workspace_read_file("docs")
+    set dir_info to workspace_file_info("docs")
+    set dir_range to workspace_read_range("docs" and 1 and 1)
+    set total to total + 1
+    set passed to passed + workspace_security_pass("directories are rejected where a regular file is required" and string_length(dir_read) == 0 and also workspace_security_error(dir_info) == 1 and also workspace_security_error(dir_range) == 1)
+
+    set fifo_output to run_command("mkfifo config/workspaces/active/pipe")
+    set fifo_fixture to file_exists("config/workspaces/active/pipe")
+    set fifo_read to workspace_read_file("pipe")
+    set fifo_info to workspace_file_info("pipe")
+    set fifo_range to workspace_read_range("pipe" and 1 and 1)
+    set total to total + 1
+    set passed to passed + workspace_security_pass("FIFO type confusion is rejected before a blocking read" and fifo_fixture == 1 and also string_length(fifo_read) == 0 and also workspace_security_error(fifo_info) == 1 and also workspace_security_error(fifo_range) == 1)
+    set removed_fifo to remove_file("config/workspaces/active/pipe")
+
+    set unreadable_made to create_directory("config/workspaces/active/unreadable")
+    set unreadable_file to write_file("config/workspaces/active/unreadable/hidden.txt" and "must not be silently omitted")
+    set unreadable_mode_output to run_command("chmod 000 config/workspaces/active/unreadable")
+    set unreadable_probe to workspace_directory_readable("config/workspaces/active/unreadable")
+    set unreadable_listing to workspace_list_active()
+    set total to total + 1
+    set passed to passed + workspace_security_pass("an unreadable directory is an explicit listing failure, not an empty success" and unreadable_made == 1 and also unreadable_file == 1 and also unreadable_probe == 0 and also workspace_security_error(unreadable_listing) == 1)
+    set readable_mode_output to run_command("chmod 700 config/workspaces/active/unreadable")
+    set readable_probe to workspace_directory_readable("config/workspaces/active/unreadable")
+
+    set upload_path to workspace_write_file("uploads/upload.txt" and "verified upload")
+    set upload_read to workspace_read_file("upload.txt")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("uploads fallback remains confined and operational" and string_length(upload_path) > 0 and also string_contains(upload_read and "verified upload") == 1)
+
+    set alice_made to workspace_security_make_session("alice_100" and "alice" and "prior payload")
+    set alice_path to workspace_get_session_path("alice")
+    set prefix_path to workspace_get_session_path("ali")
+    set prior_read to workspace_read_prior("alice" and "payload.txt")
+    set prior_traversal to workspace_read_prior("alice" and "../../outside.txt")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("prior-session lookup matches metadata exactly, not directory prefixes" and alice_made == 1 and also (alice_path equals "config/workspaces/alice_100") and also string_length(prefix_path) == 0 and also (prior_read equals "prior payload") and also string_length(prior_traversal) == 0)
+
+    set bad_session_abs to workspace_get_session_path("../../alice")
+    set bad_session_empty to workspace_get_session_path("")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("unsafe prior-session identifiers are rejected before lookup" and string_length(bad_session_abs) == 0 and also string_length(bad_session_empty) == 0)
+
+    set duplicate_made to workspace_security_make_session("copy_100" and "alice" and "duplicate")
+    set ambiguous_path to workspace_get_session_path("alice")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("duplicate metadata claims fail closed instead of choosing by directory order" and duplicate_made == 1 and also string_length(ambiguous_path) == 0)
+
+    set outside_session_made to create_directory("outside_session")
+    set outside_session_meta to write_file("outside_session/.session_meta.json" and "{\"session_id\":\"evil\",\"created_at\":100}")
+    set prior_link_output to run_command("ln -s ../../outside_session config/workspaces/evil_link")
+    set prior_link_fixture to is_directory("config/workspaces/evil_link")
+    set linked_session_path to workspace_get_session_path("evil")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("symlinked prior-session directories are rejected" and outside_session_made == 1 and also outside_session_meta == 1 and also prior_link_fixture == 1 and also string_length(linked_session_path) == 0)
+    set removed_prior_link to remove_file("config/workspaces/evil_link")
+
+    set root_link_output to run_command("ln -s config/workspaces workspace_root_link")
+    set root_link_fixture to is_directory("workspace_root_link")
+    set root_link_archive to workspace_archive_old_in_root("workspace_root_link" and 14 and 200000)
+    set total to total + 1
+    set passed to passed + workspace_security_pass("archive helper rejects a symlinked workspace root" and root_link_fixture == 1 and also root_link_archive == 0 - 1)
+
+    set unsafe_meta to write_file("config/workspaces/active/.session_meta.json" and "{\"session_id\":\"../../escape\",\"created_at\":100}")
+    set unsafe_old_init to workspace_init("fresh_session")
+    set unsafe_new_init to workspace_init("../../fresh")
+    set total to total + 1
+    set passed to passed + workspace_security_pass("workspace initialization rejects persisted and requested path-forming session IDs" and unsafe_meta == 1 and also unsafe_old_init == 1 and also unsafe_new_init == 1 and also is_directory("config/workspaces/active") == 1 and also file_exists("escape_100") == 0)
+
+    set total to total + 1
+    set passed to passed + workspace_security_pass("all adversarial fixture removals and permission restoration succeeded" and removed_link == 1 and also removed_inside_link == 1 and also removed_dangling_link == 1 and also removed_dir_link == 1 and also removed_fifo == 1 and also removed_prior_link == 1 and also readable_probe == 1)
+
+    display concat("workspace security: " and concat(int_to_string(passed) and concat("/" and int_to_string(total))))
+    if passed != total:
+        return 1
+    return 0

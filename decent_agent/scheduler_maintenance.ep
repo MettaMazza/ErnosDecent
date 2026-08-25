@@ -1,0 +1,223 @@
+# Checked local maintenance operations used by the background scheduler. Kept
+# independent of the LLM/tool graph so failure paths can be compiled and executed
+# directly in focused tests.
+
+import "fs"
+import "os"
+import "json"
+import "collections"
+import "string"
+import "./workspace"
+import "../logging"
+
+external define ep_run_command with cmd as Str returning Str
+
+set SCHEDULER_COMMAND_MARKER to "__ERNOS_SCHEDULER_EXIT_5D4A91C2__="
+
+define scheduler_shell_quote with value as Str returning Str:
+    set quoted to "'"
+    set n to string_length(value)
+    set i to 0
+    repeat while i < n:
+        set c to get_character(value and i)
+        if c == 39:
+            set quoted to concat(quoted and "'\"'\"'")
+        else:
+            set quoted to concat(quoted and char_from_code(c))
+        set i to i + 1
+    return concat(quoted and "'")
+
+define scheduler_parse_exit_status with value as Str returning Int:
+    set trimmed to string_trim(value)
+    set n to string_length(trimmed)
+    if n == 0 or else n > 3:
+        return 0 - 1
+    set i to 0
+    repeat while i < n:
+        set c to get_character(trimmed and i)
+        if c < 48 or else c > 57:
+            return 0 - 1
+        set i to i + 1
+    set parsed to string_to_int(trimmed)
+    if parsed < 0 or else parsed > 255:
+        return 0 - 1
+    return parsed
+
+define scheduler_checked_command with command as Str returning Str:
+    if string_length(command) == 0:
+        return "Error: scheduler command is empty"
+    set wrapped to concat("( " and concat(command and " ) 2>&1; scheduler_status=$?; printf '\n__ERNOS_SCHEDULER_EXIT_5D4A91C2__=%d\n' \"$scheduler_status\""))
+    return ep_run_command(wrapped)
+
+define scheduler_command_status with output as Str returning Int:
+    set marker_pos to string_last_index_of(output and SCHEDULER_COMMAND_MARKER)
+    if marker_pos < 0:
+        return 0 - 1
+    set value_start to marker_pos + string_length(SCHEDULER_COMMAND_MARKER)
+    return scheduler_parse_exit_status(substring(output and value_start and string_length(output) - value_start))
+
+define scheduler_command_output with output as Str returning Str:
+    set marker_pos to string_last_index_of(output and SCHEDULER_COMMAND_MARKER)
+    if marker_pos < 0:
+        return output
+    return substring(output and 0 and marker_pos)
+
+define perform_token_rotation_at with sess_dir as Str returning Int:
+    if file_exists(sess_dir) == 0:
+        return 0
+    if string_length(workspace_direct_directory(sess_dir)) == 0 or else workspace_directory_readable(sess_dir) == 0:
+        log_error("scheduler" and concat("Session token directory is not a readable direct directory: " and sess_dir))
+        return 1
+
+    set files to list_directory(sess_dir)
+    set len to length_list(files)
+    set now to ep_time_now_sec()
+    set i to 0
+    set cleaned_count to 0
+    set rotation_error to 0
+
+    repeat while i < len:
+        set filename to get_list(files and i)
+        if ends_with(filename and ".json") == 1:
+            set filepath to concat(sess_dir and concat("/" and filename))
+            if workspace_directory_entry_safe(filename) == 0 or else string_length(workspace_direct_existing_path(filepath)) == 0 or else is_directory(filepath) == 1:
+                log_error("scheduler" and concat("Rejected unsafe or non-regular session token entry: " and filepath))
+                set rotation_error to 1
+            else:
+                set content to read_file(filepath)
+                set root to 0
+                if string_length(content) > 0:
+                    set root to json_parse(content)
+                if root == 0 or else get_json_type(root) != 4:
+                    log_error("scheduler" and concat("Session token record is empty or malformed: " and filepath))
+                    set rotation_error to 1
+                else:
+                    set exp_node to get_json_object_value(root and "expires_at")
+                    if exp_node == 0 or else get_json_type(exp_node) != 1:
+                        log_error("scheduler" and concat("Session token record has no numeric expires_at: " and filepath))
+                        set rotation_error to 1
+                    else:
+                        set expires_at to get_json_value(exp_node)
+                        if expires_at <= 0:
+                            log_error("scheduler" and concat("Session token record has an invalid expires_at: " and filepath))
+                            set rotation_error to 1
+                        else if now >= expires_at:
+                            set deleted to fs_delete_file(filepath)
+                            if deleted == 0 or else file_exists(filepath) == 1:
+                                log_error("scheduler" and concat("Failed to remove expired session token: " and filepath))
+                                set rotation_error to 1
+                            else:
+                                set cleaned_count to cleaned_count + 1
+        set i to i + 1
+
+    free_list(files)
+    if cleaned_count > 0:
+        log_info("scheduler" and f"Cleaned up {cleaned_count} expired session tokens.")
+    if rotation_error != 0:
+        return 1
+    return 0
+
+define perform_token_rotation returning Int:
+    log_info("scheduler" and "Running background session token rotation / cleanup...")
+    set home to get_home_dir()
+    set sess_dir to concat(home and "/.ernosdecent/auth_sessions")
+    return perform_token_rotation_at(sess_dir)
+
+define perform_cert_rotation returning Int:
+    log_info("scheduler" and "Running step-ca intermediate certificate auto-renewal check...")
+    set cert_path to "/persist/step-ca/certs/intermediate_ca.crt"
+    set key_path to "/persist/step-ca/secrets/intermediate_ca_key"
+    if file_exists(cert_path) == 0:
+        log_info("scheduler" and "No step-ca intermediate certificate found. Skipping cert rotation.")
+        return 0
+    if file_exists(key_path) == 0 or else is_directory(cert_path) == 1 or else is_directory(key_path) == 1:
+        log_error("scheduler" and "Certificate rotation requires regular certificate and key files, but one is missing or a directory.")
+        return 1
+    set cert_canonical to workspace_canonical_existing_path(cert_path)
+    set key_canonical to workspace_canonical_existing_path(key_path)
+    if string_length(cert_canonical) == 0 or else string_length(key_canonical) == 0:
+        log_error("scheduler" and "Certificate rotation could not resolve the certificate or key path.")
+        return 1
+
+    set locate_raw to scheduler_checked_command("command -v step")
+    if scheduler_command_status(locate_raw) != 0:
+        log_error("scheduler" and concat("Certificate rotation could not locate the step CLI: " and scheduler_command_output(locate_raw)))
+        return 1
+    set step_path to string_trim(scheduler_command_output(locate_raw))
+    set step_canonical to workspace_canonical_existing_path(step_path)
+    if string_length(step_canonical) == 0 or else is_directory(step_canonical) == 1:
+        log_error("scheduler" and concat("Certificate rotation resolved an invalid step CLI path: " and step_path))
+        return 1
+
+    log_info("scheduler" and concat("step-ca intermediate certificate found; dispatching the configured renewal command for " and cert_canonical))
+    set cmd to concat(scheduler_shell_quote(step_canonical) and " ca renew --force --daemon ")
+    set cmd to concat(cmd and scheduler_shell_quote(cert_canonical))
+    set cmd to concat(cmd and " ")
+    set cmd to concat(cmd and scheduler_shell_quote(key_canonical))
+    set res to scheduler_checked_command(cmd)
+    set status to scheduler_command_status(res)
+    set output to scheduler_command_output(res)
+    if status != 0:
+        log_error("scheduler" and concat("step ca renew failed or returned no verifiable exit status: " and output))
+        return 1
+    log_info("scheduler" and concat("step ca renew accepted the renewal command: " and output))
+    return 0
+
+define get_total_ram_gb returning Int:
+    set os_kind to ep_os_name()
+    if os_kind equals "macos":
+        set sys_res to scheduler_checked_command("/usr/sbin/sysctl -n hw.memsize")
+        if scheduler_command_status(sys_res) != 0:
+            log_error("scheduler" and concat("Could not read macOS physical memory: " and scheduler_command_output(sys_res)))
+            return 0
+        set bytes_text to string_trim(scheduler_command_output(sys_res))
+        set bytes_len to string_length(bytes_text)
+        if bytes_len == 0 or else bytes_len > 18:
+            log_error("scheduler" and concat("macOS returned an invalid physical-memory value: " and bytes_text))
+            return 0
+        set i to 0
+        repeat while i < bytes_len:
+            set ch to get_character(bytes_text and i)
+            if ch < 48 or else ch > 57:
+                log_error("scheduler" and concat("macOS returned a non-decimal physical-memory value: " and bytes_text))
+                return 0
+            set i to i + 1
+        set bytes to string_to_int(bytes_text)
+        if bytes < 1073741824:
+            log_error("scheduler" and concat("macOS physical-memory value is below one GiB or overflowed: " and bytes_text))
+            return 0
+        return bytes / 1073741824
+
+    if os_kind equals "linux":
+        if file_exists("/proc/meminfo") == 0 or else is_directory("/proc/meminfo") == 1:
+            log_error("scheduler" and "Linux physical-memory source /proc/meminfo is unavailable.")
+            return 0
+        set mem_res to read_file("/proc/meminfo")
+        set marker_pos to string_index_of(mem_res and "MemTotal:")
+        if marker_pos < 0:
+            log_error("scheduler" and "Linux /proc/meminfo has no MemTotal field.")
+            return 0
+        set line_start to marker_pos + 9
+        set line_rest to substring(mem_res and line_start and string_length(mem_res) - line_start)
+        set newline_pos to string_index_of(line_rest and "\n")
+        if newline_pos >= 0:
+            set line_rest to substring(line_rest and 0 and newline_pos)
+        set clean_digits to ""
+        set line_len to string_length(line_rest)
+        set j to 0
+        repeat while j < line_len:
+            set line_ch to get_character(line_rest and j)
+            if line_ch >= 48 and also line_ch <= 57:
+                set clean_digits to concat(clean_digits and substring(line_rest and j and 1))
+            set j to j + 1
+        if string_length(clean_digits) == 0 or else string_length(clean_digits) > 18:
+            log_error("scheduler" and concat("Linux returned an invalid MemTotal field: " and line_rest))
+            return 0
+        set kb to string_to_int(clean_digits)
+        if kb < 1048576:
+            log_error("scheduler" and concat("Linux MemTotal is below one GiB or overflowed: " and clean_digits))
+            return 0
+        return kb / 1048576
+
+    log_error("scheduler" and concat("Physical-memory detection is unavailable on platform: " and os_kind))
+    return 0

@@ -1,0 +1,170 @@
+# Focused ledger integrity, ownership, atomic persistence, and restart tests.
+
+import "fs"
+import "os"
+import "sql"
+import "string"
+import "collections"
+import "../storage"
+import "../decent_id/keys"
+import "ledger"
+
+set LEDGER_SECURITY_TOTAL to 0
+
+define ledger_security_expect with condition as Int and label as Str returning Int:
+    set LEDGER_SECURITY_TOTAL to LEDGER_SECURITY_TOTAL + 1
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define ledger_security_remove_tree with path as Str and depth as Int returning Int:
+    if depth > 8:
+        return 0
+    if file_exists(path) == 0:
+        return 1
+    if is_directory(path) == 0:
+        if remove_file(path) == 0 or else file_exists(path) == 1:
+            return 0
+        return 1
+    set entries to list_directory(path)
+    set i to 0
+    repeat while i < length_list(entries):
+        if ledger_security_remove_tree(path_join(path and get_list(entries and i)) and depth + 1) == 0:
+            free_list(entries)
+            return 0
+        set i to i + 1
+    free_list(entries)
+    if remove_directory(path) == 0 or else file_exists(path) == 1:
+        return 0
+    return 1
+
+define main returning Int:
+    set passed to 0
+    if init_crypto() != 0:
+        return 1
+    set test_dir to concat("/tmp/ernos_ledger_security_" and concat(int_to_string(ep_time_now_ms()) and concat("_" and int_to_string(ep_random_int(100000 and 999999)))))
+    set init_err to storage_init(test_dir)
+    if init_err != STORAGE_ERR_NONE:
+        display "FAIL: storage initialization"
+        return 1
+
+    set owner_kp to generate_signing_keypair()
+    set owner_public to map_get_val(owner_kp and "public_key")
+    set owner_secret to map_get_val(owner_kp and "secret_key")
+    set recipient_kp to generate_signing_keypair()
+    set recipient_public to map_get_val(recipient_kp and "public_key")
+    set ledger to ledger_create(owner_public)
+    set passed to passed + ledger_security_expect(map_get_val(ledger and "error") == LEDGER_ERR_NONE and also map_get_val(ledger and "persistent") == 1 and "genesis is durably initialized")
+    set passed to passed + ledger_security_expect(storage_ledger_get_block_count() == 1 and "genesis block and state snapshot commit together")
+
+    set blocks to map_get_val(ledger and "blocks")
+    set genesis to get_list(blocks and 0)
+    set genesis_tx to get_list(map_get_val(genesis and "transactions") and 0)
+    set inputs to create_list()
+    set input to create_map()
+    set ok to map_insert(input and "tx_id" and map_get_val(genesis_tx and "id"))
+    set ok to map_insert(input and "output_index" and 0)
+    set ok to append_list(inputs and input)
+    set outputs to create_list()
+    set recipient_output to create_map()
+    set ok to map_insert(recipient_output and "recipient" and recipient_public)
+    set ok to map_insert(recipient_output and "amount" and 100)
+    set ok to map_insert(recipient_output and "index" and 0)
+    set ok to append_list(outputs and recipient_output)
+    set change_output to create_map()
+    set ok to map_insert(change_output and "recipient" and owner_public)
+    set ok to map_insert(change_output and "amount" and 999900)
+    set ok to map_insert(change_output and "index" and 1)
+    set ok to append_list(outputs and change_output)
+    set tx to ledger_create_tx(inputs and outputs and 0)
+    set tx_id to map_get_val(tx and "id")
+    set tx_sig to sign_message(tx_id and owner_secret)
+    set ok to map_insert(input and "signature" and map_get_val(tx_sig and "signature"))
+    set txs to create_list()
+    set ok to append_list(txs and tx)
+    set state_root to ledger_compute_state_root()
+    set block_hash to ledger_compute_block_hash(tx_id and map_get_val(genesis and "hash") and state_root)
+    set block_sig to sign_message(block_hash and owner_secret)
+    set wrong_root to "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    set wrong_root_err to ledger_add_block(ledger and txs and owner_public and map_get_val(block_sig and "signature") and wrong_root)
+    set passed to passed + ledger_security_expect(wrong_root_err == LEDGER_ERR_BLOCK_BAD_HASH and also length_list(blocks) == 1 and also storage_ledger_get_block_count() == 1 and "mismatched comprehensive state root is rejected before mutation")
+    set add_err to ledger_add_block(ledger and txs and owner_public and map_get_val(block_sig and "signature") and state_root)
+    set passed to passed + ledger_security_expect(add_err == LEDGER_ERR_NONE and also storage_ledger_get_block_count() == 2 and "block and post-state commit atomically")
+    set passed to passed + ledger_security_expect(ledger_get_balance(ledger and recipient_public) == 100 and "accepted output has expected balance")
+
+    # Every consensus-relevant state class must influence the canonical root.
+    set consensus_root to ledger_compute_state_root_for(ledger)
+    set committed_utxos to map_get_val(ledger and "utxos")
+    set recipient_key to ledger_utxo_key(tx_id and 0)
+    set committed_recipient_output to map_get_val(committed_utxos and recipient_key)
+    set ok to map_insert(committed_recipient_output and "amount" and 101)
+    set utxo_changed_root to ledger_compute_state_root_for(ledger)
+    set ok to map_insert(committed_recipient_output and "amount" and 100)
+    set passed to passed + ledger_security_expect((utxo_changed_root equals consensus_root) == 0 and also ledger_compute_state_root_for(ledger) equals consensus_root and "UTXO mutation changes root and exact restoration recovers it")
+
+    set seen_transactions to map_get_val(ledger and "seen_transactions")
+    set replay_marker to "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    set ok to map_insert(seen_transactions and replay_marker and 1)
+    set replay_changed_root to ledger_compute_state_root_for(ledger)
+    set ok to map_delete(seen_transactions and replay_marker)
+    set passed to passed + ledger_security_expect((replay_changed_root equals consensus_root) == 0 and also ledger_compute_state_root_for(ledger) equals consensus_root and "replay-protection mutation changes root")
+
+    set test_contract to contract_create("ENTRY main\nRETURN \"ok\"\nEND" and owner_public and 1000)
+    set contract_root to ledger_compute_state_root_for(ledger)
+    set test_contract_storage to map_get_val(test_contract and "storage")
+    set ok to map_insert(test_contract_storage and "counter" and "1")
+    set contract_storage_root to ledger_compute_state_root_for(ledger)
+    set destroy_err to contract_destroy(test_contract)
+    set passed to passed + ledger_security_expect((contract_root equals consensus_root) == 0 and also (contract_storage_root equals contract_root) == 0 and also destroy_err == CONTRACT_ERR_NONE and also ledger_compute_state_root_for(ledger) equals consensus_root and "contract definition and storage mutations change root")
+
+    set stakes to map_get_val(ledger and "stakes")
+    set validators to map_get_val(ledger and "validators")
+    set stake_api_err to ledger_stake_coins(ledger and recipient_public and 1)
+    set ok to map_insert(stakes and recipient_public and 1)
+    set stake_changed_root to ledger_compute_state_root_for(ledger)
+    set poisoned_election to ledger_elect_validator(ledger and map_get_val(get_list(blocks and 1) and "hash"))
+    set ok to append_list(validators and recipient_public)
+    set validator_changed_root to ledger_compute_state_root_for(ledger)
+    set removed_validator to remove_list(validators and 0)
+    set ok to map_delete(stakes and recipient_public)
+    set passed to passed + ledger_security_expect(stake_api_err == LEDGER_ERR_STAKING_REQUIRES_BLOCK and also (stake_changed_root equals consensus_root) == 0 and also (validator_changed_root equals stake_changed_root) == 0 and also string_length(poisoned_election) == 0 and also ledger_compute_state_root_for(ledger) equals consensus_root and "off-block stake fails closed and stake/validator state is root-bound")
+
+    # Caller-owned maps must not remain mutable aliases of accepted chain state.
+    set ok to map_insert(recipient_output and "amount" and 500000)
+    set passed to passed + ledger_security_expect(ledger_get_balance(ledger and recipient_public) == 100 and "accepted transactions are deep canonical copies")
+    set passed to passed + ledger_security_expect(ledger_add_block(ledger and txs and owner_public and map_get_val(block_sig and "signature") and state_root) != LEDGER_ERR_NONE and "mutated or spent transaction cannot be replayed")
+
+    set close_err to storage_close()
+    set reopen_err to storage_init(test_dir)
+    set restored to ledger_create(owner_public)
+    set passed to passed + ledger_security_expect(close_err == STORAGE_ERR_NONE and also reopen_err == STORAGE_ERR_NONE and also map_get_val(restored and "error") == LEDGER_ERR_NONE and "signed chain restores after restart")
+    set passed to passed + ledger_security_expect(length_list(map_get_val(restored and "blocks")) == 2 and also ledger_get_balance(restored and recipient_public) == 100 and "restart restores exact blocks and UTXOs")
+
+    set wrong_owner to ledger_create(recipient_public)
+    set passed to passed + ledger_security_expect(map_get_val(wrong_owner and "error") != LEDGER_ERR_NONE and "persisted genesis identity mismatch fails closed")
+
+    # A database attacker can recompute an unkeyed checksum.  Reassign one
+    # canonical UTXO while preserving total supply and prove full block replay,
+    # rather than the checksum alone, rejects the forged snapshot.
+    set canonical_state to storage_ledger_load_state()
+    set canonical_state_data to map_get_val(canonical_state and "data")
+    set canonical_tip to map_get_val(canonical_state and "tip_hash")
+    set forged_state_data to string_replace(canonical_state_data and recipient_public and owner_public)
+    set forge_save_err to storage_ledger_save_state(canonical_tip and forged_state_data and ep_sha256(forged_state_data))
+    set forged_snapshot to ledger_create(owner_public)
+    set restore_snapshot_err to storage_ledger_save_state(canonical_tip and canonical_state_data and map_get_val(canonical_state and "checksum"))
+    set passed to passed + ledger_security_expect((forged_state_data equals canonical_state_data) == 0 and also forge_save_err == STORAGE_ERR_NONE and also map_get_val(forged_snapshot and "error") == LEDGER_ERR_BLOCK_BAD_HASH and also restore_snapshot_err == STORAGE_ERR_NONE and "recomputed-checksum state forgery fails signed block replay")
+
+    set tamper_err to sql_execute(STORAGE_DB and "UPDATE ledger_state SET state_data='tampered' WHERE id=1;")
+    set tampered to ledger_create(owner_public)
+    set passed to passed + ledger_security_expect(tamper_err == 0 and also map_get_val(tampered and "error") == LEDGER_ERR_STORAGE and "state checksum corruption fails closed")
+
+    set close_err to storage_close()
+    set cleanup_ok to ledger_security_remove_tree(test_dir and 0)
+    set passed to passed + ledger_security_expect(close_err == STORAGE_ERR_NONE and also cleanup_ok == 1 and "test persistence tree cleaned")
+    display f"RESULT: {passed}/{LEDGER_SECURITY_TOTAL} passed"
+    if passed != LEDGER_SECURITY_TOTAL:
+        return 1
+    return 0

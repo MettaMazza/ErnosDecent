@@ -1,0 +1,309 @@
+# Provider-authoritative model metadata parsers.
+#
+# This module contains no network policy and no model-name knowledge. It converts
+# the documented discovery payloads emitted by Ollama, llama.cpp, and LM Studio
+# into one record shape consumed by llm.ep. Context values retain their provider
+# meaning: context_length is the currently allocated runtime window;
+# max_context_length is the model's advertised training/configuration ceiling.
+
+import "string"
+import "collections"
+import "json"
+
+define provider_model_record with provider as Str and model as Str and loaded as Int and context_length as Int and max_context_length as Int and supports_chat as Int and supports_vision as Int and supports_no_thinking as Int and no_thinking_style as Str returning Map:
+    set record to create_map()
+    set ok to map_insert(record and "provider" and provider)
+    set ok to map_insert(record and "model" and model)
+    set ok to map_insert(record and "loaded" and loaded)
+    set ok to map_insert(record and "context_length" and context_length)
+    set ok to map_insert(record and "max_context_length" and max_context_length)
+    set ok to map_insert(record and "supports_chat" and supports_chat)
+    set ok to map_insert(record and "supports_vision" and supports_vision)
+    set ok to map_insert(record and "supports_embedding" and 0)
+    set ok to map_insert(record and "supports_no_thinking" and supports_no_thinking)
+    set ok to map_insert(record and "no_thinking_style" and no_thinking_style)
+    return record
+
+define provider_model_copy with source as Map returning Map:
+    set result to provider_model_record(concat(map_get_val(source and "provider") and "") and concat(map_get_val(source and "model") and "") and map_get_val(source and "loaded") and map_get_val(source and "context_length") and map_get_val(source and "max_context_length") and map_get_val(source and "supports_chat") and map_get_val(source and "supports_vision") and map_get_val(source and "supports_no_thinking") and concat(map_get_val(source and "no_thinking_style") and ""))
+    if map_contains(source and "metadata_ok") == 1:
+        set ok to map_insert(result and "metadata_ok" and map_get_val(source and "metadata_ok"))
+    if map_contains(source and "metadata_error") == 1:
+        set ok to map_insert(result and "metadata_error" and concat(map_get_val(source and "metadata_error") and ""))
+    if map_contains(source and "supports_embedding") == 1:
+        set ok to map_insert(result and "supports_embedding" and map_get_val(source and "supports_embedding"))
+    return result
+
+define provider_json_int with object as List and key as Str returning Int:
+    set node to get_json_object_value(object and key)
+    if node == 0:
+        return 0
+    if get_json_type(node) != 1:
+        return 0
+    return get_json_value(node)
+
+define provider_json_string with object as List and key as Str returning Str:
+    set node to get_json_object_value(object and key)
+    if node == 0:
+        return ""
+    return get_json_value(node)
+
+define provider_json_string_list_contains with node as List and wanted as Str returning Int:
+    if node == 0:
+        return 0
+    if get_json_type(node) != 3:
+        return 0
+    set values to get_json_value(node)
+    set n to length_list(values)
+    set i to 0
+    repeat while i < n:
+        set item_node to get_list(values and i)
+        if get_json_type(item_node) == 2:
+            if get_json_value(item_node) equals wanted:
+                return 1
+        set i to i + 1
+    return 0
+
+define provider_inventory_success with models as List returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "ok" and 1)
+    set ok to map_insert(result and "error" and "")
+    set ok to map_insert(result and "models" and models)
+    return result
+
+define provider_inventory_failure with error as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "ok" and 0)
+    set ok to map_insert(result and "error" and error)
+    set ok to map_insert(result and "models" and create_list())
+    return result
+
+# Ollama GET /api/ps. context_length is the authoritative window allocated to
+# the live runner, not the model's theoretical maximum.
+define provider_parse_ollama_running with response as Str returning Map:
+    set out to create_list()
+    set root to json_parse(response)
+    if root == 0:
+        return provider_inventory_failure("Ollama /api/ps returned malformed JSON")
+    set models_node to get_json_object_value(root and "models")
+    if models_node == 0 or else get_json_type(models_node) != 3:
+        return provider_inventory_failure("Ollama /api/ps response has no models array")
+    set models to get_json_value(models_node)
+    set n to length_list(models)
+    set i to 0
+    repeat while i < n:
+        set item to get_list(models and i)
+        set model_name to provider_json_string(item and "model")
+        if string_length(model_name) == 0:
+            set model_name to provider_json_string(item and "name")
+        set context_length to provider_json_int(item and "context_length")
+        if string_length(model_name) == 0 or else context_length <= 0:
+            return provider_inventory_failure("Ollama /api/ps contains a model without model and positive context_length")
+        set ok to append_list(out and provider_model_record("ollama" and model_name and 1 and context_length and 0 and 0 and 0 and 0 and "unknown"))
+        set i to i + 1
+    return provider_inventory_success(out)
+
+# Ollama GET /api/tags supplies available model identities. Runtime allocation
+# comes from /api/ps and the model ceiling from /api/show; undocumented tag
+# extensions are deliberately ignored.
+define provider_parse_ollama_available with response as Str returning Map:
+    set out to create_list()
+    set root to json_parse(response)
+    if root == 0:
+        return provider_inventory_failure("Ollama /api/tags returned malformed JSON")
+    set models_node to get_json_object_value(root and "models")
+    if models_node == 0 or else get_json_type(models_node) != 3:
+        return provider_inventory_failure("Ollama /api/tags response has no models array")
+    set models to get_json_value(models_node)
+    set n to length_list(models)
+    set i to 0
+    repeat while i < n:
+        set item to get_list(models and i)
+        set model_name to provider_json_string(item and "model")
+        if string_length(model_name) == 0:
+            set model_name to provider_json_string(item and "name")
+        if string_length(model_name) == 0:
+            return provider_inventory_failure("Ollama /api/tags contains a model without a model name")
+        set record to provider_model_record("ollama" and model_name and 0 and 0 and 0 and 0 and 0 and 0 and "unknown")
+        set capabilities to get_json_object_value(item and "capabilities")
+        if capabilities != 0:
+            set ok to map_insert(record and "supports_embedding" and provider_json_string_list_contains(capabilities and "embedding"))
+        set ok to append_list(out and record)
+        set i to i + 1
+    return provider_inventory_success(out)
+
+# Ollama POST /api/show. Capabilities are provider-owned. A model without the
+# thinking capability needs no suppression. For a thinking-capable model Ollama
+# does not expose per-model allowed controls, so strict no-thinking remains
+# unknown instead of assuming reasoning_effort=none is effective for every model.
+# model_info keys are architecture-qualified. general.architecture identifies
+# the provider-owned prefix for the corresponding <architecture>.context_length
+# field, so no client-authored architecture/model table or suffix guessing is
+# involved.
+define provider_apply_ollama_show with source as Map and response as Str returning Map:
+    set result to provider_model_copy(source)
+    set ok to map_insert(result and "metadata_ok" and 0)
+    set ok to map_insert(result and "metadata_error" and "")
+    set root to json_parse(response)
+    if root == 0:
+        set ok to map_insert(result and "metadata_error" and "Ollama /api/show returned malformed JSON")
+        return result
+    set capabilities to get_json_object_value(root and "capabilities")
+    if capabilities == 0 or else get_json_type(capabilities) != 3:
+        set ok to map_insert(result and "metadata_error" and "Ollama /api/show response has no capabilities array")
+        return result
+    set vision to provider_json_string_list_contains(capabilities and "vision")
+    set ok to map_insert(result and "supports_vision" and vision)
+    set supports_embedding to provider_json_string_list_contains(capabilities and "embedding")
+    set ok to map_insert(result and "supports_embedding" and supports_embedding)
+    set supports_chat to provider_json_string_list_contains(capabilities and "completion")
+    set ok to map_insert(result and "supports_chat" and supports_chat)
+    if supports_chat == 0 and also supports_embedding == 0:
+        set ok to map_insert(result and "metadata_error" and "Ollama /api/show model advertises neither completion nor embedding capability")
+        return result
+    set has_thinking to provider_json_string_list_contains(capabilities and "thinking")
+    set ok to map_insert(result and "supports_no_thinking" and 0)
+    if supports_chat == 1:
+        set ok to map_insert(result and "supports_no_thinking" and 1)
+    if supports_chat == 1 and also has_thinking == 1:
+        # Ollama's native /api/chat exposes a documented boolean think control.
+        # Use that provider-owned control instead of assuming the OpenAI adapter's
+        # reasoning_effort behavior for every model.
+        set ok to map_insert(result and "no_thinking_style" and "ollama_think_false")
+    else if supports_chat == 1:
+        set ok to map_insert(result and "no_thinking_style" and "not_applicable")
+    set model_info to get_json_object_value(root and "model_info")
+    if model_info == 0 or else get_json_type(model_info) != 4:
+        set ok to map_insert(result and "metadata_error" and "Ollama /api/show response has no model_info object")
+        return result
+    set architecture_node to get_json_object_value(model_info and "general.architecture")
+    if architecture_node == 0 or else get_json_type(architecture_node) != 2:
+        set ok to map_insert(result and "metadata_error" and "Ollama /api/show model_info has no string general.architecture")
+        return result
+    set architecture to get_json_value(architecture_node)
+    if string_length(architecture) == 0:
+        set ok to map_insert(result and "metadata_error" and "Ollama /api/show general.architecture is empty")
+        return result
+    set context_key to concat(architecture and ".context_length")
+    set context_node to get_json_object_value(model_info and context_key)
+    if context_node == 0 or else get_json_type(context_node) != 1:
+        set ok to map_insert(result and "metadata_error" and concat("Ollama /api/show model_info has no integer " and context_key))
+        return result
+    set max_context to get_json_value(context_node)
+    if max_context <= 0:
+        set ok to map_insert(result and "metadata_error" and concat("Ollama /api/show " and concat(context_key and " is not positive")))
+        return result
+    set ok to map_insert(result and "max_context_length" and max_context)
+    set ok to map_insert(result and "metadata_ok" and 1)
+    return result
+
+# llama.cpp GET /v1/models. n_ctx_train is retained only as max_context_length;
+# the allocated slot window comes from GET /props below.
+define provider_parse_llamacpp_models with response as Str and provider_id as Str returning Map:
+    set out to create_list()
+    set root to json_parse(response)
+    if root == 0:
+        return provider_inventory_failure(concat(provider_id and " /v1/models returned malformed JSON"))
+    set data_node to get_json_object_value(root and "data")
+    if data_node == 0 or else get_json_type(data_node) != 3:
+        return provider_inventory_failure(concat(provider_id and " /v1/models response has no data array"))
+    set data to get_json_value(data_node)
+    set n to length_list(data)
+    set i to 0
+    repeat while i < n:
+        set item to get_list(data and i)
+        set model_name to provider_json_string(item and "id")
+        set max_context to 0
+        set meta to get_json_object_value(item and "meta")
+        if meta != 0:
+            set max_context to provider_json_int(meta and "n_ctx_train")
+        if string_length(model_name) == 0:
+            return provider_inventory_failure(concat(provider_id and " /v1/models contains a model without an id"))
+        # llama.cpp documents reasoning_effort=none for its OpenAI-compatible
+        # adapter. This is a provider-protocol capability, not a model-name guess.
+        set ok to append_list(out and provider_model_record(provider_id and model_name and 1 and 0 and max_context and 1 and 0 and 1 and "reasoning_effort_none"))
+        set i to i + 1
+    return provider_inventory_success(out)
+
+# llama.cpp GET /props. default_generation_settings.n_ctx is the live per-slot
+# context reported by the running provider.
+define provider_apply_llamacpp_props with source as Map and response as Str returning Map:
+    set result to provider_model_copy(source)
+    set ok to map_insert(result and "metadata_ok" and 0)
+    set ok to map_insert(result and "metadata_error" and "")
+    set root to json_parse(response)
+    if root == 0:
+        set ok to map_insert(result and "metadata_error" and "llama.cpp /props returned malformed JSON")
+        return result
+    set settings to get_json_object_value(root and "default_generation_settings")
+    if settings == 0:
+        set ok to map_insert(result and "metadata_error" and "llama.cpp /props has no default_generation_settings object")
+        return result
+    set context_length to provider_json_int(settings and "n_ctx")
+    if context_length > 0:
+        set ok to map_insert(result and "context_length" and context_length)
+        set ok to map_insert(result and "metadata_ok" and 1)
+    else:
+        set ok to map_insert(result and "metadata_error" and "llama.cpp /props has no positive n_ctx")
+    return result
+
+# LM Studio GET /api/v1/models. This endpoint exposes both the model ceiling and
+# each live instance's allocated context. Reasoning routes are eligible only when
+# capabilities.reasoning.allowed_options explicitly includes off; absent public
+# reasoning metadata remains unknown/unsupported.
+define provider_parse_lmstudio_models with response as Str returning Map:
+    set out to create_list()
+    set root to json_parse(response)
+    if root == 0:
+        return provider_inventory_failure("LM Studio /api/v1/models returned malformed JSON")
+    set models_node to get_json_object_value(root and "models")
+    if models_node == 0 or else get_json_type(models_node) != 3:
+        return provider_inventory_failure("LM Studio /api/v1/models response has no models array")
+    set models to get_json_value(models_node)
+    set n to length_list(models)
+    set i to 0
+    repeat while i < n:
+        set item to get_list(models and i)
+        set model_type to provider_json_string(item and "type")
+        set model_name to provider_json_string(item and "key")
+        if model_type equals "llm" and also string_length(model_name) > 0:
+            set loaded to 0
+            set context_length to 0
+            set instances_node to get_json_object_value(item and "loaded_instances")
+            if instances_node != 0:
+                set instances to get_json_value(instances_node)
+                if length_list(instances) > 0:
+                    set instance to get_list(instances and 0)
+                    set config to get_json_object_value(instance and "config")
+                    if config != 0:
+                        set context_length to provider_json_int(config and "context_length")
+                    if context_length > 0:
+                        set loaded to 1
+            set max_context to provider_json_int(item and "max_context_length")
+            set vision to 0
+            set supports_no_thinking to 0
+            set no_thinking_style to "unknown"
+            set capabilities to get_json_object_value(item and "capabilities")
+            if capabilities != 0:
+                set vision_node to get_json_object_value(capabilities and "vision")
+                if vision_node != 0:
+                    set vision to get_json_value(vision_node)
+                set reasoning to get_json_object_value(capabilities and "reasoning")
+                if reasoning != 0:
+                    set allowed to get_json_object_value(reasoning and "allowed_options")
+                    set supports_no_thinking to provider_json_string_list_contains(allowed and "off")
+                    if supports_no_thinking == 1:
+                        set no_thinking_style to "reasoning_effort_none"
+            set ok to append_list(out and provider_model_record("lmstudio" and model_name and loaded and context_length and max_context and 1 and vision and supports_no_thinking and no_thinking_style))
+        set i to i + 1
+    return provider_inventory_success(out)
+
+define provider_find_model with records as List and model_name as Str returning Map:
+    set n to length_list(records)
+    set i to 0
+    repeat while i < n:
+        set record to get_list(records and i)
+        if map_get_val(record and "model") equals model_name:
+            return provider_model_copy(record)
+        set i to i + 1
+    return create_map()
