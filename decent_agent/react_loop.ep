@@ -5,11 +5,13 @@ import "collections"
 import "string"
 import "json"
 import "llm"
+import "fs"
 
 import "prompt"
 import "tools"
 import "./access"
 import "./orchestrator"
+import "./workspace_links"
 import "memory"
 import "observer"
 import "reply_format"
@@ -292,6 +294,216 @@ define react_extract_raw_arg with args_str as Str returning Str:
         return args_str
     return substring(args_str and content_start and content_len)
 
+# Local models sometimes express a registered call as Python-style positional
+# parameters after putting only the first parameter inside the required JSON list:
+#
+#   codebase_search(["literal"], "decent_agent", 25)
+#
+# Every Ernos tool contract instead uses one JSON array containing every argument.
+# The runtime must tolerate that stable model dialect until training converges, but
+# it must not let json_parse accept only the first array and silently ignore the
+# trailing expressions. Detect that exact shape here and fold the trailing values
+# into the one canonical array before JSON decoding and schema validation.
+define react_split_default_expression_close with args_str as Str returning Int:
+    set clean to string_trim(args_str)
+    set n to string_length(clean)
+    if n < 4 or else get_character(clean and 0) != 91: # '['
+        return -1
+    set depth to 0
+    set in_string to 0
+    set escaped to 0
+    set i to 0
+    repeat while i < n:
+        set ch to get_character(clean and i)
+        if escaped == 1:
+            set escaped to 0
+        else if ch == 92: # '\\'
+            set escaped to 1
+        else if ch == 34: # '"'
+            if in_string == 0:
+                set in_string to 1
+            else:
+                set in_string to 0
+        else if in_string == 0:
+            if ch == 91:
+                set depth to depth + 1
+            else if ch == 93:
+                set depth to depth - 1
+                if depth == 0:
+                    set next_pos to i + 1
+                    repeat while next_pos < n and also (get_character(clean and next_pos) == 9 or else get_character(clean and next_pos) == 10 or else get_character(clean and next_pos) == 13 or else get_character(clean and next_pos) == 32):
+                        set next_pos to next_pos + 1
+                    if next_pos < n and also get_character(clean and next_pos) == 44: # ','
+                        return i
+                    return -1
+        set i to i + 1
+    return -1
+
+define react_normalize_split_default_expression with args_str as Str returning Str:
+    set clean to string_trim(args_str)
+    set close_pos to react_split_default_expression_close(clean)
+    if close_pos < 0:
+        return clean
+    # Remove the first array's closing bracket, retain the model's comma-separated
+    # trailing expressions, and close the resulting canonical argument array once.
+    set prefix to substring(clean and 0 and close_pos)
+    set suffix_start to close_pos + 1
+    set suffix to substring(clean and suffix_start and string_length(clean) - suffix_start)
+    set candidate to concat(prefix and concat(suffix and "]"))
+    set candidate_node to json_parse(candidate)
+    if candidate_node == 0 or else get_json_type(candidate_node) != 3:
+        return ""
+    return candidate
+
+# Recover the second argument when a model emits Python-style triple quotes around
+# a multiline payload, for example ["regression", """...source..."""]. That is
+# not valid JSON, but it is an unambiguous and common serialization of source code.
+# The JSON parser can otherwise return a two-item list whose second value is NULL;
+# downstream tools then see an empty payload and misleadingly report an encoding
+# failure. Use the first and last triple-quote delimiters so Python docstrings inside
+# the payload remain intact. Valid JSON strings are unaffected because their quotes
+# are backslash-separated rather than three adjacent quote bytes.
+define react_unescape_triple_payload with payload as Str returning Str:
+    set n to string_length(payload)
+    set escaped_quotes to 0
+    set probe to 0
+    repeat while probe + 1 < n:
+        if get_character(payload and probe) == 92 and also get_character(payload and probe + 1) == 34:
+            set escaped_quotes to escaped_quotes + 1
+            set probe to probe + 2
+        else:
+            set probe to probe + 1
+    # Only remove one JSON-escape layer when the payload itself clearly has
+    # escaped source quotes. Plain triple-quoted Python remains byte-exact.
+    if escaped_quotes < 2:
+        return payload
+    set out to ""
+    set i to 0
+    repeat while i < n:
+        set c to get_character(payload and i)
+        if c == 92 and also i + 1 < n:
+            set next_c to get_character(payload and i + 1)
+            if next_c == 34 or else next_c == 92:
+                set out to concat(out and substring(payload and i + 1 and 1))
+                set i to i + 2
+            else:
+                set out to concat(out and substring(payload and i and 1))
+                set i to i + 1
+        else:
+            set out to concat(out and substring(payload and i and 1))
+            set i to i + 1
+    return out
+
+define react_extract_triple_quoted_second_arg with args_str as Str returning Str:
+    set n to string_length(args_str)
+    if n < 9:
+        return ""
+    set first_end to -1
+    set last_start to -1
+    set i to 0
+    repeat while i + 2 < n:
+        set c0 to get_character(args_str and i)
+        set c1 to get_character(args_str and i + 1)
+        set c2 to get_character(args_str and i + 2)
+        if c0 == 34 and also c1 == 34 and also c2 == 34:
+            if first_end < 0:
+                set first_end to i + 3
+            else:
+                set last_start to i
+            set i to i + 3
+        else:
+            set i to i + 1
+    if first_end < 0 or else last_start < first_end:
+        return ""
+    set payload to substring(args_str and first_end and last_start - first_end)
+    return react_unescape_triple_payload(payload)
+
+# Tool-call shape validation happens before approval, Observer audit, execution,
+# persistence, or platform delivery. In particular, run_command's optional working
+# directory and timeout are NOT an argv array: all executable arguments belong in the
+# first command string. Rejecting malformed calls here prevents a bad call from asking
+# the user for approval and then failing only after they approve it.
+define react_is_decimal_integer with text as Str returning Int:
+    set clean to string_trim(text)
+    set n to string_length(clean)
+    if n == 0:
+        return 0
+    set i to 0
+    repeat while i < n:
+        set ch to get_character(clean and i)
+        if ch < 48 or else ch > 57:
+            return 0
+        set i to i + 1
+    return 1
+
+define react_validate_tool_args with tool_name as Str and args_list as List and raw_args as Str returning Str:
+    if tool_name equals "codebase_search":
+        set search_argc to length_list(args_list)
+        if search_argc < 1 or else search_argc > 3:
+            return concat("Invalid codebase_search call rejected before execution: expected one query string plus optional root and max_results, received " and concat(int_to_string(search_argc) and ". Canonical form: Action: codebase_search([\"one literal\", \"source-root\", 25]). For multiple literals emit separate batched Action: codebase_search(...) lines; do not put multiple queries in the first argument list."))
+        set search_query to string_trim(ptr_to_str(get_list(args_list and 0)))
+        if string_length(search_query) == 0:
+            return "Invalid codebase_search call rejected before execution: the query is empty. Canonical form: Action: codebase_search([\"one literal\", \"source-root\", 25])."
+        return ""
+
+    if tool_name equals "codebase_replace":
+        set replace_argc to length_list(args_list)
+        if replace_argc == 2:
+            set whole_candidate to ptr_to_str(get_list(args_list and 1))
+            if string_length(whole_candidate) >= 200 and also string_contains(whole_candidate and "define ") == 1:
+                return ""
+        if replace_argc < 3 or else replace_argc > 4:
+            return concat("IMPROVEMENT_GATE_FAILED code=TOOL_ARGUMENTS_INVALID message=codebase_replace requires either path plus a complete retained-candidate body, or path, exact_old, exact_new, and optional expected_count; received " and concat(int_to_string(replace_argc) and ". Canonical envelopes: {\"tool_name\":\"codebase_replace\",\"arguments\":[\"decent_agent/file.ep\",\"complete candidate source\"]} or {\"tool_name\":\"codebase_replace\",\"arguments\":[\"decent_agent/file.ep\",\"exact defective fragment\",\"exact corrected fragment\",1]}."))
+        if string_length(string_trim(ptr_to_str(get_list(args_list and 0)))) == 0 or else string_length(ptr_to_str(get_list(args_list and 1))) == 0:
+            return "IMPROVEMENT_GATE_FAILED code=TOOL_ARGUMENTS_INVALID message=codebase_replace path and replacement body must be non-empty. Use the original production path with either the complete corrected retained candidate or the smallest exact defective/corrected fragments."
+        if ptr_to_str(get_list(args_list and 1)) equals ptr_to_str(get_list(args_list and 2)):
+            return "IMPROVEMENT_GATE_FAILED code=NO_CHANGE message=codebase_replace exact_old and exact_new are byte-identical. Nothing would change. Use the compiler diagnostic and retained candidate bytes to provide a causal replacement."
+        if replace_argc == 4:
+            set replace_count_text to string_trim(ptr_to_str(get_list(args_list and 3)))
+            if react_is_decimal_integer(replace_count_text) == 0 or else string_to_int(replace_count_text) < 1:
+                return "IMPROVEMENT_GATE_FAILED code=TOOL_ARGUMENTS_INVALID message=codebase_replace expected_count must be a positive integer. Canonical envelope: {\"tool_name\":\"codebase_replace\",\"arguments\":[\"production/path\",\"exact_old\",\"exact_new\",1]}."
+        return ""
+
+    if tool_name equals "improvement_plan_scaffold":
+        set scaffold_argc to length_list(args_list)
+        if scaffold_argc < 2:
+            return "IMPROVEMENT_GATE_FAILED code=TOOL_ARGUMENTS_INVALID message=improvement_plan_scaffold requires the exact public snake_case surface first and one or more exact discovered production paths after it. Canonical envelope: {\"tool_name\":\"improvement_plan_scaffold\",\"arguments\":[\"surface_name\",\"decent_agent/production_file.ep\"]}."
+        set scaffold_surface to string_trim(ptr_to_str(get_list(args_list and 0)))
+        set scaffold_len to string_length(scaffold_surface)
+        if scaffold_len < 3 or else scaffold_len > 64 or else string_contains(scaffold_surface and "/") == 1 or else string_contains(scaffold_surface and ".") == 1 or else string_contains(scaffold_surface and " ") == 1 or else string_contains(scaffold_surface and "\n") == 1:
+            return "IMPROVEMENT_GATE_FAILED code=TOOL_ARGUMENTS_INVALID message=improvement_plan_scaffold arguments are ordered incorrectly. Argument 1 must be the exact public snake_case identifier from required_surface, never a file path or objective sentence. Arguments 2+ must be exact paths already returned by source discovery. Canonical envelope: {\"tool_name\":\"improvement_plan_scaffold\",\"arguments\":[\"surface_name\",\"decent_agent/production_file.ep\"]}."
+        return ""
+
+    if tool_name equals "run_command" == 0:
+        return ""
+
+    set argc to length_list(args_list)
+    if argc < 1 or else argc > 3:
+        return concat("Invalid run_command call: expected 1-3 elements, received " and concat(int_to_string(argc) and ". The first element must contain the ENTIRE shell command and all of its command-line arguments. Canonical form: Action: run_command([\"bash path/to/script argument\", \"optional-working-directory\", 600]). Do not repeat the rejected call unchanged."))
+
+    set command_text to string_trim(ptr_to_str(get_list(args_list and 0)))
+    if string_length(command_text) == 0:
+        return "Invalid run_command call: the first element is empty. Put the ENTIRE shell command and all command-line arguments in that first string. Example: Action: run_command([\"bash build.sh test\"])."
+
+    if argc >= 2:
+        set dir_arg to string_trim(ptr_to_str(get_list(args_list and 1)))
+        set resolved_dir to links_path_for(dir_arg)
+        if string_length(resolved_dir) == 0:
+            if file_exists(dir_arg) == 1 and also is_directory(dir_arg) == 1:
+                set resolved_dir to dir_arg
+        if string_length(resolved_dir) == 0:
+            return concat("Invalid run_command call rejected before approval: argument 2 is a working-directory path or linked-project id, not a command argument, and it did not resolve to a directory. Your rejected arguments were " and concat(raw_args and ". Put the executable and every command-line argument together in element 1. Example: Action: run_command([\"bash decent_agent/run_test.sh decent_agent/test_e2e_quick.ep\"]). Do not repeat the rejected call unchanged."))
+
+    if argc >= 3:
+        set timeout_text to string_trim(ptr_to_str(get_list(args_list and 2)))
+        if react_is_decimal_integer(timeout_text) == 0:
+            return concat("Invalid run_command call rejected before approval: argument 3 must be an integer timeout from 1 to 1800 seconds, not another command argument. Your rejected arguments were " and concat(raw_args and ". Put the executable and every command-line argument together in element 1. Example: Action: run_command([\"bash decent_agent/run_test.sh decent_agent/test_e2e_quick.ep\", \".\", 600]). Do not repeat the rejected call unchanged."))
+        set timeout_value to string_to_int(timeout_text)
+        if timeout_value < 1 or else timeout_value > 1800:
+            return concat("Invalid run_command call rejected before approval: timeout_seconds must be between 1 and 1800, received " and concat(timeout_text and ". Use a bounded value and do not repeat the rejected call unchanged."))
+
+    return ""
+
 # Find a protocol marker only when it begins a real line (allowing indentation) and is
 # outside a fenced code/example block. Inline/backticked/quoted examples cannot execute.
 define react_find_line_marker_from with raw as Str and marker as Str and from_pos as Int returning Int:
@@ -350,10 +562,27 @@ define react_find_protocol_marker_from with raw as Str and from_pos as Int retur
 # Plain final prose is already a valid user response even when a model omits the ReAct
 # wrapper. Recover it deterministically instead of paying for another inference and
 # feeding a format error back into the conversation. Thought/Observation continuations
-# and attempted action lines still go through the explicit correction path.
+# and attempted action lines still go through the explicit correction path. Markdown
+# dividers left behind after private reasoning extraction are transport residue, not a
+# user-facing answer; accepting them would terminate unfinished tool work.
+define react_is_separator_residue with raw as Str returning Int:
+    set clean to string_trim(raw)
+    set n to string_length(clean)
+    if n == 0:
+        return 1
+    set i to 0
+    repeat while i < n:
+        set ch to get_character(clean and i)
+        if ch != 9 and also ch != 10 and also ch != 13 and also ch != 32 and also ch != 35 and also ch != 42 and also ch != 45 and also ch != 61 and also ch != 62 and also ch != 95 and also ch != 124:
+            return 0
+        set i to i + 1
+    return 1
+
 define react_is_implicit_reply with raw as Str returning Int:
     set clean to string_trim(raw)
     if string_length(clean) == 0:
+        return 0
+    if react_is_separator_residue(clean) == 1:
         return 0
     set clean_lower to string_lower(clean)
     if string_index_of(clean_lower and "thought:") == 0:
@@ -433,6 +662,90 @@ define react_tool_result_finishes_turn with tool_name as Str and action_allowed 
     if tool_name equals "session_terminate":
         if string_index_of(tool_result and "Session closed by Echo.") == 0:
             return 1
+    if tool_name equals "system_recompile":
+        if string_index_of(tool_result and "RECOMPILE STAGED:") == 0:
+            return 1
+    # Evaluator failures are always recoverable authoring feedback. They return to
+    # durable transaction state and never become terminal merely because evidence
+    # repeated a fixed number of times.
+    return 0
+
+# Parse the provider-constrained decision envelope. This parser intentionally accepts
+# no prose fallback: fresh model output is either exactly the two-key object or it is
+# not executable. Controller-authored recovery transitions still use the legacy
+# Action parser below because they are trusted local data, not model text.
+define react_parse_action_envelope with raw as Str returning Map:
+    set result to create_map()
+    set ok to map_insert(result and "found" and 0)
+    set clean to string_trim(raw)
+    set root to json_parse(clean)
+    if root == 0 or else get_json_type(root) != 4:
+        return result
+    set keys to get_list(root and 1)
+    if length_list(keys) != 2:
+        return result
+    set tool_node to get_json_object_value(root and "tool_name")
+    set args_node to get_json_object_value(root and "arguments")
+    if tool_node == 0 or else args_node == 0:
+        return result
+    if get_json_type(tool_node) != 2 or else get_json_type(args_node) != 3:
+        return result
+    # Some local providers preserve the required `arguments` array but wrap the
+    # complete positional list in one additional array:
+    #   {"tool_name":"codebase_read_range","arguments":[["path",501,1000]]}
+    # Registered tools do not accept list-valued positional parameters. Flatten
+    # exactly this one unambiguous wrapper at the typed boundary, then apply the
+    # normal object rejection and per-tool schema validation to the canonical list.
+    # Deeper nesting and mixed nested/scalar arguments remain invalid.
+    set outer_values to get_json_value(args_node)
+    if length_list(outer_values) == 1:
+        set only_outer_arg to get_list(outer_values and 0)
+        if get_json_type(only_outer_arg) == 3:
+            set nested_values to get_json_value(only_outer_arg)
+            set nested_invalid to 0
+            set nested_idx to 0
+            repeat while nested_idx < length_list(nested_values):
+                set nested_node to get_list(nested_values and nested_idx)
+                if get_json_type(nested_node) == 3 or else get_json_type(nested_node) == 4:
+                    set nested_invalid to 1
+                set nested_idx to nested_idx + 1
+            if nested_invalid == 1:
+                return result
+            set args_node to only_outer_arg
+    set arg_values to get_json_value(args_node)
+    set arg_idx to 0
+    repeat while arg_idx < length_list(arg_values):
+        set arg_node to get_list(arg_values and arg_idx)
+        # Registered tools use positional values. A named object inside `arguments`
+        # is a different protocol and must not reach dispatch even if a provider
+        # ignored the response grammar.
+        if get_json_type(arg_node) == 4:
+            return result
+        set arg_idx to arg_idx + 1
+    set tool_name to string_trim(ptr_to_str(get_json_value(tool_node)))
+    if string_length(tool_name) == 0:
+        return result
+    set args_str to json_stringify(args_node)
+    set ok to map_insert(result and "found" and 1)
+    set ok to map_insert(result and "tool_name" and tool_name)
+    set ok to map_insert(result and "args_str" and args_str)
+    set ok to map_insert(result and "start_pos" and 0)
+    set ok to map_insert(result and "end_pos" and string_length(clean))
+    set values_list to create_list()
+    set ok to map_insert(result and "values_list" and values_list)
+    set ok to append_list(values_list and tool_name)
+    set ok to append_list(values_list and args_str)
+    return result
+
+# Gemma occasionally represents an explicitly empty positional list as one empty
+# string. Normalize only when the authoritative registered schema declares the exact
+# tool as `name([])`; no non-empty argument or optional-argument tool is affected.
+define react_schema_declares_zero_args with tool_name as Str and schemas as Str returning Int:
+    if string_length(tool_name) == 0:
+        return 0
+    set declaration to concat("- " and concat(tool_name and "([])"))
+    if string_contains(schemas and declaration) == 1:
+        return 1
     return 0
 
 define react_parse_action with raw as Str returning Map:
@@ -544,6 +857,31 @@ define react_parse_action with raw as Str returning Map:
                     set scan_done to 1
         set scan_idx to scan_idx + 1
 
+    # Some local models finish an otherwise complete JSON-array tool call at EOF with
+    # the outer Action parenthesis omitted: `Action: tool([..]`. Recover exactly that
+    # one-byte transport truncation only when the string state is closed, parenthesis
+    # depth is otherwise balanced, and the complete argument bytes parse as a JSON
+    # list. Any unterminated string, nested expression, prose tail, or malformed JSON
+    # still fails closed and is re-prompted without executing a tool.
+    set recovered_terminal_close to 0
+    if end_args < start_args and also depth == 1 and also in_string == 0 and also escaped == 0:
+        set trimmed_end to raw_len
+        set trimming_tail to 1
+        repeat while trimmed_end > start_args + 1 and trimming_tail == 1:
+            set tail_ch to get_character(raw and trimmed_end - 1)
+            if tail_ch == 9 or else tail_ch == 10 or else tail_ch == 13 or else tail_ch == 32:
+                set trimmed_end to trimmed_end - 1
+            else:
+                set trimming_tail to 0
+        if trimmed_end > start_args + 1:
+            if get_character(raw and trimmed_end - 1) == 93: # ']'
+                set candidate_args to substring(raw and start_args + 1 and trimmed_end - start_args - 1)
+                set candidate_json to json_parse(candidate_args)
+                if candidate_json != 0:
+                    if get_json_type(candidate_json) == 3: # List
+                        set end_args to trimmed_end
+                        set recovered_terminal_close to 1
+
     if end_args < start_args:
         return result
         
@@ -556,7 +894,10 @@ define react_parse_action with raw as Str returning Map:
     # the batching queue to slice off any FURTHER actions in the same response without
     # re-matching inside this action's own arguments.
     set ok to map_insert(result and "start_pos" and pos)
-    set ok to map_insert(result and "end_pos" and end_args + 1)
+    set action_end_pos to end_args + 1
+    if recovered_terminal_close == 1:
+        set action_end_pos to end_args
+    set ok to map_insert(result and "end_pos" and action_end_pos)
 
     set values_list to create_list()
     set ok to map_insert(result and "values_list" and values_list)
@@ -704,6 +1045,794 @@ define react_simulate_inference with prompt as Str and loop_idx as Int returning
         
     return "Thought: I will answer the user request directly.\nAction: reply_request([\"ai:agent_rebuild,response:Hello! I am the ErnOS Agent rebuilt in ErnosPlain. How can I help you today?\"])"
 
+# When the repair controller has only one legal next transition, do not spend another
+# model call asking it to choose—or let a stale repeated action loop against the same
+# gate. The generated action still passes normal parsing, audit, execution and trace.
+define react_repair_gate_forced_action with gate_error as Str returning Str:
+    # Controller decisions consume stable machine codes only. Human diagnostics may
+    # change for clarity without silently changing state-machine behavior.
+    if string_contains(gate_error and "code=BASELINE_NO_CHANGE") == 1:
+        return "Thought: The sealed current-source baseline proves that no implementation regression is present.\nAction: reply_request([\"No current implementation regression was found. The complete mandatory current-source suite is green, so I did not modify, recompile, or restart the system.\"])"
+    if string_contains(gate_error and "code=VERIFY_REQUIRED") == 1:
+        return "Thought: The repair controller requires the authoritative current-source gate now.\nAction: system_verify([])"
+    if string_contains(gate_error and "code=DEPLOY_REQUIRED") == 1:
+        return "Thought: The verified repair request requires transactional deployment now.\nAction: system_recompile([])"
+    if string_contains(gate_error and "code=EXACT_PATH_DISCOVERY_REQUIRED") == 1:
+        return "Thought: The investigation controller requires exact existing source paths before any filename can be selected.\nAction: codebase_list([\"decent_agent\", 200])"
+    if string_contains(gate_error and "code=EVALUATOR_AUTHORING_REQUIRED") == 1:
+        if file_exists("config/improvements/staging/validation.json") == 1:
+            set evaluator_validation to read_file("config/improvements/staging/validation.json")
+            if string_contains(evaluator_validation and "\"status\": \"passed\"") == 1:
+                return "Thought: The retained evaluators have a current successful validation receipt, so the controller requires their immutable freeze.\nAction: improvement_test_freeze([])"
+        if file_exists("config/improvements/staging/regression.py") == 1 and also file_exists("config/improvements/staging/e2e.py") == 1:
+            set staged_regression to string_trim(read_file("config/improvements/staging/regression.py"))
+            set staged_e2e to string_trim(read_file("config/improvements/staging/e2e.py"))
+            if string_length(staged_regression) > 0 and also string_length(staged_e2e) > 0:
+                if file_exists("config/improvements/staging/validation.json") == 1:
+                    set failed_validation to read_file("config/improvements/staging/validation.json")
+                    if string_contains(failed_validation and "\"status\": \"failed\"") == 1 or else string_contains(failed_validation and "\"status\":\"failed\"") == 1:
+                        return ""
+                return "Thought: Both retained controller-checked evaluators exist, so I will validate their causal unchanged-source behavior now.\nAction: improvement_test_validate([])"
+        return "Thought: Evaluator authoring is incomplete, so I will use the deterministic plan-bound evaluator scaffold instead of generating transport or test boilerplate in prose.\nAction: improvement_test_scaffold([])"
+    return ""
+
+# A frozen pre-write contract is intentionally closed to new discovery. If a real
+# controller result proves that the selected plan omitted a required production path,
+# continuing to reread or rewrite the same insufficient file cannot make progress.
+# Use the existing approval- and rights-ledgered abandonment transition immediately;
+# its immutable archive preserves the failed plan and the same turn can reinvestigate
+# the missing dependency. This is narrower than reacting to an ordinary compiler
+# error: only an explicit frozen-plan scope rejection triggers it.
+define react_result_has_gate_code with tool_result as Str and error_code as Str returning Int:
+    if string_length(error_code) == 0:
+        return 0
+    # Match the controller-owned structured envelope, not incidental prose such as
+    # "only code=PLAN_SCOPE_MISSING may abandon" in a successful tool result.
+    set marker to concat("IMPROVEMENT_GATE_FAILED code=" and concat(error_code and " "))
+    if string_contains(tool_result and marker) == 1:
+        return 1
+    return 0
+
+define react_frozen_scope_replan_action with ctx as Map and tool_result as Str returning Str:
+    set frozen to 0
+    set write_seen to 0
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if map_contains(ctx and "repair_write_seen") == 1:
+        set write_seen to map_get_val(ctx and "repair_write_seen")
+    if frozen != 1 or else write_seen != 0:
+        return ""
+    # Human-readable compiler/path text is diagnostic only. Abandonment authority is
+    # granted solely by the gate's explicit structured code.
+    if react_result_has_gate_code(tool_result and "PLAN_SCOPE_MISSING") == 0:
+        return ""
+    set ok to map_insert(ctx and "improvement_plan_scope_missing_authorized" and 1)
+    return "Thought: The controller has proven that this frozen plan omitted a required production dependency, and no implementation write was accepted. I will preserve the failed contract and restart investigation with the missing path included.\nAction: improvement_test_abandon([\"The frozen implementation plan omitted a production dependency proven necessary by the controller's rejected pre-write operation. No implementation write was accepted, so I am preserving this evidence and restarting investigation with the missing path explicitly included.\"])"
+
+define react_candidate_repair_action with ctx as Map and tool_result as Str returning Str:
+    if react_result_has_gate_code(tool_result and "CANDIDATE_REPAIR_REQUIRED") == 0:
+        return ""
+    # If the retained candidate can be resolved internally, the next durable prompt
+    # includes its exact current bytes directly. Do not burn another tool turn rereading
+    # the same production alias after every failed localized repair.
+    set retained_path to ""
+    if map_contains(ctx and "last_codebase_path") == 1:
+        set retained_path to tools_improvement_candidate_for_read(ctx and ptr_to_str(map_get_val(ctx and "last_codebase_path")))
+    if string_length(retained_path) > 0 and also file_exists(retained_path) == 1 and also is_directory(retained_path) == 0:
+        return ""
+    return react_frozen_planned_reread_action(ctx)
+
+# Persist the controller's exact structured candidate failure for the next fresh
+# state decision. Without this handoff, post-execution addressing failures existed
+# only in the discarded observation text, so the already-implemented deterministic
+# candidate-reset transition could never see reason=EXACT_MATCH_COUNT and the model
+# repeatedly requested approval for the same impossible replacement.
+define react_record_candidate_gate_correction with ctx as Map and tool_result as Str returning Int:
+    if react_result_has_gate_code(tool_result and "CANDIDATE_REPAIR_REQUIRED") == 0:
+        return 0
+    set ok to map_insert(ctx and "durable_protocol_correction" and tool_result)
+    return 1
+
+# A legacy frozen plan that retained only path names/hashes but not exact callable
+# evidence cannot be implemented safely after compaction. Preserve it through the
+# existing rights-ledgered abandonment path and immediately reinvestigate; do not ask
+# the model to guess APIs from filenames.
+define react_missing_plan_evidence_forced_action with ctx as Map returning Str:
+    set missing to 0
+    set frozen to 0
+    set write_seen to 0
+    if map_contains(ctx and "frozen_plan_evidence_missing") == 1:
+        set missing to map_get_val(ctx and "frozen_plan_evidence_missing")
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if map_contains(ctx and "repair_write_seen") == 1:
+        set write_seen to map_get_val(ctx and "repair_write_seen")
+    if missing == 1 and also frozen == 1 and also write_seen == 0:
+        return "Thought: The controller proved this legacy frozen plan lost its exact callable evidence across compaction. I will preserve it and restart investigation before any implementation write.\nAction: improvement_test_abandon([\"The frozen plan predates mandatory hash-bound callable, import, and working-call-site evidence. Compaction removed facts required for a safe implementation, and no implementation write was accepted, so I am preserving the failed contract and restarting exact investigation.\"])"
+    return ""
+
+define react_candidate_reset_forced_action_from_state with active_bytes as Str and correction as Str returning Str:
+    # Historical attempt diagnostics remain in active.json after a successful reset.
+    # Force another reset only while a *current* retained candidate is rejected;
+    # otherwise the controller loops forever on an already archived attempt.
+    set has_rejected_candidate to 0
+    if string_contains(active_bytes and "\"status\": \"rejected\"") == 1 or else string_contains(active_bytes and "\"status\":\"rejected\"") == 1:
+        set has_rejected_candidate to 1
+    if has_rejected_candidate == 1 and also string_contains(active_bytes and "CANDIDATE_BASELINE_INCOMPLETE") == 1:
+        return "Thought: The additive candidate removed existing production definitions. The controller will archive the rejected attempt and reopen the same frozen contract at an exact live-source reread.\nAction: improvement_candidate_reset([])"
+    # A repeated byte-identical replacement is a controller state transition, not a
+    # reason to call the model again with the same evidence. Archive the never-live
+    # candidate and reopen whole-candidate authoring from the exact production bytes;
+    # the immutable plan/evaluators and compiler diagnostic remain in active.json.
+    if has_rejected_candidate == 1 and also string_contains(correction and "code=NO_CHANGE_REPEAT") == 1:
+        return "Thought: Localized repair has stalled on a repeated byte-no-op. The controller will preserve the rejected attempt and diagnostic, then reopen this same frozen contract from an exact production reread for one genuinely new complete candidate.\nAction: improvement_candidate_reset([])"
+    # An exact-addressing miss means the model is no longer operating on the bytes
+    # actually registered by the candidate controller. Retrying another guessed
+    # fragment only grows the transcript and can never repair those hidden bytes.
+    # Archive the never-live candidate immediately and reopen whole-candidate
+    # authoring from an exact production reread; this preserves the frozen contract.
+    if has_rejected_candidate == 1 and also string_contains(correction and "reason=EXACT_MATCH_COUNT") == 1:
+        return "Thought: The localized replacement did not address the registered candidate bytes. The controller will preserve that never-live attempt and reopen this same frozen contract from an exact production reread for one complete corrected candidate.\nAction: improvement_candidate_reset([])"
+    return ""
+
+
+# Repetition recovery must respect candidate addressing state. Once a retained
+# candidate is rejected, a production reread is not a legal repair transition: the
+# path alias resolves to candidate state, while the frozen guard correctly refuses
+# redundant production discovery. Reset the isolated candidate instead. This is a
+# transaction-preserving repair transition, not abandonment or rollback.
+define react_repetition_checkpoint_action_from_state with active_bytes as Str and reread_action as Str returning Str:
+    if string_contains(active_bytes and "\"status\": \"rejected\"") == 1 or else string_contains(active_bytes and "\"status\":\"rejected\"") == 1:
+        return "Thought: Repeated generation cannot safely address the rejected retained candidate. The controller will preserve that never-live attempt and reopen the same frozen contract from exact production bytes.\nAction: improvement_candidate_reset([])"
+    return reread_action
+
+
+define react_repetition_checkpoint_action with ctx as Map returning Str:
+    set active_bytes to ""
+    if file_exists("config/improvements/active.json") == 1:
+        set active_bytes to read_file("config/improvements/active.json")
+    return react_repetition_checkpoint_action_from_state(active_bytes and react_frozen_planned_reread_action(ctx))
+
+define react_incomplete_candidate_reset_forced_action with ctx as Map returning Str:
+    if map_contains(ctx and "improvement_test_frozen") == 0 or else map_get_val(ctx and "improvement_test_frozen") != 1:
+        return ""
+    if file_exists("config/improvements/active.json") == 0:
+        return ""
+    set correction to ""
+    if map_contains(ctx and "durable_protocol_correction") == 1:
+        set correction to ptr_to_str(map_get_val(ctx and "durable_protocol_correction"))
+    return react_candidate_reset_forced_action_from_state(read_file("config/improvements/active.json") and correction)
+
+# Record a structured candidate failure and select its mechanically required
+# recovery atomically at the same post-tool boundary. Approval resume and durable
+# prompt rebuilding must never separate reason=EXACT_MATCH_COUNT from the mandatory
+# provenance-preserving candidate reset.
+define react_candidate_post_result_forced_action_from_state with ctx as Map and tool_result as Str and active_bytes as Str returning Str:
+    set recorded to react_record_candidate_gate_correction(ctx and tool_result)
+    if recorded == 0:
+        return ""
+    set correction to ptr_to_str(map_get_val(ctx and "durable_protocol_correction"))
+    return react_candidate_reset_forced_action_from_state(active_bytes and correction)
+
+define react_candidate_post_result_forced_action with ctx as Map and tool_result as Str returning Str:
+    if file_exists("config/improvements/active.json") == 0:
+        return ""
+    return react_candidate_post_result_forced_action_from_state(ctx and tool_result and read_file("config/improvements/active.json"))
+
+# The first frozen implementation decision must see the complete current bytes of
+# the exact planned production file. Interface snippets in the durable plan are not
+# a substitute for preserving every existing import, schema and dispatch branch in a
+# whole-file write. Select that read mechanically before any model-authored candidate.
+define react_initial_frozen_read_required with active_bytes as Str and latest_tool as Str and latest_observation as Str returning Int:
+    if string_contains(active_bytes and "\"state\": \"frozen\"") == 0 and also string_contains(active_bytes and "\"state\":\"frozen\"") == 0:
+        return 0
+    if string_contains(active_bytes and "\"status\": \"rejected\"") == 1 or else string_contains(active_bytes and "\"status\":\"rejected\"") == 1:
+        return 0
+    if (latest_tool equals "codebase_read" or else latest_tool equals "codebase_read_range") and also react_observation_has_reread_receipt(latest_observation) == 1:
+        return 0
+    return 1
+
+define react_initial_frozen_read_forced_action with ctx as Map returning Str:
+    if map_contains(ctx and "improvement_test_frozen") == 0 or else map_get_val(ctx and "improvement_test_frozen") != 1:
+        return ""
+    if file_exists("config/improvements/active.json") == 0:
+        return ""
+    set active_bytes to read_file("config/improvements/active.json")
+    set latest_tool to ""
+    set latest_observation to ""
+    if map_contains(ctx and "frozen_latest_tool") == 1 and also map_contains(ctx and "frozen_latest_observation") == 1:
+        set latest_tool to ptr_to_str(map_get_val(ctx and "frozen_latest_tool"))
+        set latest_observation to ptr_to_str(map_get_val(ctx and "frozen_latest_observation"))
+    if react_initial_frozen_read_required(active_bytes and latest_tool and latest_observation) == 0:
+        return ""
+    return react_frozen_planned_reread_action(ctx)
+
+# Once a requested deployment has a post-write green verification, there is exactly
+# one legal next transition. Select it in the controller before inference so stale
+# model reasoning cannot spend dozens of turns proposing blocked reads or rewrites.
+define react_verified_deploy_forced_action with ctx as Map returning Str:
+    set workflow_active to 0
+    set deploy_required to 0
+    set verify_required to 0
+    set verify_green to 0
+    set write_seen to 0
+    if map_contains(ctx and "repair_workflow_active") == 1:
+        set workflow_active to map_get_val(ctx and "repair_workflow_active")
+    if map_contains(ctx and "repair_deploy_required") == 1:
+        set deploy_required to map_get_val(ctx and "repair_deploy_required")
+    if map_contains(ctx and "repair_verify_required") == 1:
+        set verify_required to map_get_val(ctx and "repair_verify_required")
+    if map_contains(ctx and "repair_verify_green") == 1:
+        set verify_green to map_get_val(ctx and "repair_verify_green")
+    if map_contains(ctx and "repair_write_seen") == 1:
+        set write_seen to map_get_val(ctx and "repair_write_seen")
+    if workflow_active == 1 and also deploy_required == 1 and also verify_required == 0 and also verify_green == 1 and also write_seen == 1 and also map_contains(ctx and "upgrade_restart_requested") == 0:
+        return "Thought: The verified implementation now requires its transactional deployment.\nAction: system_recompile([])"
+    return ""
+
+# The first source verification in repair/feature work is a controller transition,
+# not a planning choice. Selecting it here also prevents an explicitly recognized
+# request from spending a model turn trying a later phase before the baseline exists.
+define react_initial_repair_baseline_forced_action with ctx as Map returning Str:
+    if map_contains(ctx and "repair_workflow_active") == 0 or else map_get_val(ctx and "repair_workflow_active") != 1:
+        return ""
+    set verify_required to 0
+    set baseline_seen to 0
+    set write_seen to 0
+    if map_contains(ctx and "repair_verify_required") == 1:
+        set verify_required to map_get_val(ctx and "repair_verify_required")
+    if map_contains(ctx and "repair_baseline_seen") == 1:
+        set baseline_seen to map_get_val(ctx and "repair_baseline_seen")
+    if map_contains(ctx and "repair_write_seen") == 1:
+        set write_seen to map_get_val(ctx and "repair_write_seen")
+    if verify_required == 1 and also baseline_seen == 0 and also write_seen == 0:
+        return "Thought: The protected controller requires an authoritative unchanged-source baseline before any investigation or implementation decision.\nAction: system_verify([])"
+    return ""
+
+# A typed investigation request that arrived before the baseline retains its exact
+# objective in the request context. Once system_verify is green, replay that exact
+# two-key envelope mechanically instead of asking the model to restate or remember it.
+define react_pending_investigation_forced_action with ctx as Map returning Str:
+    if map_contains(ctx and "pending_improvement_objective") == 0:
+        return ""
+    if map_contains(ctx and "repair_workflow_active") == 0 or else map_get_val(ctx and "repair_workflow_active") != 1:
+        return ""
+    if map_contains(ctx and "repair_baseline_seen") == 0 or else map_get_val(ctx and "repair_baseline_seen") != 1:
+        return ""
+    if map_contains(ctx and "repair_verify_green") == 0 or else map_get_val(ctx and "repair_verify_green") != 1:
+        return ""
+    if map_contains(ctx and "repair_write_seen") == 1 and also map_get_val(ctx and "repair_write_seen") != 0:
+        return ""
+    if map_contains(ctx and "improvement_investigation_started") == 1 and also map_get_val(ctx and "improvement_investigation_started") == 1:
+        return ""
+    set objective to ptr_to_str(map_get_val(ctx and "pending_improvement_objective"))
+    if string_length(objective) == 0:
+        return ""
+    return concat("{\"tool_name\":\"improvement_investigation_begin\",\"arguments\":[\"" and concat(llm_json_escape(objective) and "\"]}"))
+
+# Completion of the planned implementation set is a controller fact, not a model
+# judgment. Force the sealed verifier immediately so a compile-valid candidate cannot
+# drift into rereads or byte-identical replacements before its behavioral gate runs.
+define react_post_write_verify_forced_action_from_state with ctx as Map and active_bytes as Str returning Str:
+    if map_contains(ctx and "repair_workflow_active") == 0 or else map_get_val(ctx and "repair_workflow_active") != 1:
+        return ""
+    if map_contains(ctx and "repair_write_seen") == 0 or else map_get_val(ctx and "repair_write_seen") != 1:
+        return ""
+    if map_contains(ctx and "repair_verify_required") == 0 or else map_get_val(ctx and "repair_verify_required") != 1:
+        return ""
+    if tools_improvement_all_planned_paths_implemented_json(active_bytes) == 0:
+        return ""
+    return "Thought: Every production path in the immutable plan now has a promoted implementation receipt. The controller requires authoritative verification before any further source action.\nAction: system_verify([])"
+
+define react_post_write_verify_forced_action with ctx as Map returning Str:
+    if map_contains(ctx and "improvement_active_bound") == 0 or else map_get_val(ctx and "improvement_active_bound") != 1:
+        return ""
+    if file_exists("config/improvements/active.json") == 0:
+        return ""
+    return react_post_write_verify_forced_action_from_state(ctx and read_file("config/improvements/active.json"))
+
+# Once evaluators are frozen, explanation-only turns cannot advance the transaction.
+# Give the model one terse, phase-specific recovery instruction instead of letting it
+# spend repeated full token budgets re-deriving an immutable plan until the action is
+# truncated. This changes no authority: the resulting write still traverses preflight,
+# approval, Observer audit, compile verification, exact rollback, and the frozen gate.
+define react_frozen_implementation_action_nudge with ctx as Map and streak as Int returning Str:
+    set frozen to 0
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if frozen != 1 or else streak < 1:
+        return ""
+    return "[FROZEN IMPLEMENTATION ACTION RECOVERY — INVISIBLE TO USER]\nThe plan and evaluator are already immutable. New discovery remains closed: never search, list, inspect an unplanned path, or use Git. Do not restate the request, plan, workflow, source, or compiler diagnostic. Do not emit a long <think> block. If exact planned source bytes are not fully active, or an exact replacement matched zero times, emit exactly one line-anchored Action: codebase_read([planned_path]) now; the controller will allow only the frozen-plan path and verify its pre-write hash. Otherwise use no more than 200 words of private reasoning, then emit exactly one complete line-anchored Action: codebase_write([...]) or Action: codebase_replace([...]) for that path. If a controller Observation proves that an unplanned production path is required and no write was accepted, use improvement_test_abandon with the exact architectural reason and immediately reinvestigate instead of guessing functions inside the insufficient file. JSON does not escape '[' or ']'. Preserve every investigated existing interface exactly. The protected writer will compile-check and roll back automatically if correction is still needed.\n"
+
+# Repetition recovery must respect the current transaction phase. The generic repair
+# instruction used to tell a frozen improvement to search/read, even though the
+# controller correctly rejects all discovery after evaluator freeze. That contradiction
+# converted a recoverable exact-replacement typo into a terminal reasoning spiral.
+define react_thought_spiral_recovery_guidance with ctx as Map returning Str:
+    set frozen to 0
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if frozen == 1:
+        return "[THOUGHT SPIRAL RECOVERY — INVISIBLE TO USER] Your last reasoning stream repeated without a new action. The improvement contract is frozen, so new discovery remains closed: do not search, list, inspect an unplanned path, or use Git. If an authoritative Observation proved an omitted production dependency before any accepted write, call improvement_test_abandon with that exact reason and reinvestigate. Otherwise, if exact planned bytes are missing or exact_old matched zero times, emit exactly one codebase_read Action for the frozen-plan production path; its hash will be verified. Otherwise emit exactly one codebase_write or codebase_replace Action for that path. JSON does not escape '[' or ']'. Do not restart the diagnosis.\n"
+    return "[THOUGHT SPIRAL RECOVERY — INVISIBLE TO USER] Your last reasoning stream was stopped because it repeated without producing a new action. Do not restart the diagnosis. Use the most recent authoritative Observation and emit exactly one concrete next Action now. During self-repair before evaluator freeze: search the failing literal, read the exact implementation path, use codebase_replace for a localized fix, verify, then recompile.\n"
+
+# Resolve a deterministic frozen-plan reread after repeated reasoning could not emit
+# an action. Prefer the exact last source path involved in this turn; when a plan has
+# only one implementation path, that path is unambiguous even after a process wake.
+# Multiple-path plans without a recorded last path remain model-directed rather than
+# guessing. The eventual read still passes the normal frozen-plan/hash gate.
+define react_frozen_planned_reread_action_from_json with workflow_bytes as Str and last_path as Str returning Str:
+    if string_length(workflow_bytes) == 0:
+        return ""
+    set root to json_parse(workflow_bytes)
+    if root == 0:
+        return ""
+    set state_node to get_json_object_value(root and "state")
+    if state_node == 0:
+        return ""
+    set state to ptr_to_str(get_json_value(state_node))
+    if state equals "frozen" == 0 and also state equals "implementing" == 0 and also state equals "verified" == 0 and also state equals "repair_required" == 0:
+        return ""
+    set paths_node to get_json_object_value(root and "planned_files")
+    if paths_node == 0:
+        return ""
+    if get_json_type(paths_node) != 3:
+        return ""
+    set paths to get_json_value(paths_node)
+    set count to length_list(paths)
+    if count == 0:
+        return ""
+    set selected to ""
+    if string_length(last_path) > 0:
+        set idx to 0
+        repeat while idx < count and string_length(selected) == 0:
+            set candidate_node to get_list(paths and idx)
+            set candidate to ptr_to_str(get_json_value(candidate_node))
+            if candidate equals last_path:
+                set selected to candidate
+            set idx to idx + 1
+    if string_length(selected) == 0 and also count == 1:
+        set only_node to get_list(paths and 0)
+        set selected to ptr_to_str(get_json_value(only_node))
+    if string_length(selected) == 0 or else string_contains(selected and "\"") == 1 or else string_contains(selected and "\\") == 1:
+        return ""
+    return f"Thought: I will refresh the exact approved source bytes after the interrupted repair decision.\nAction: codebase_read([\"{selected}\"])"
+
+define react_frozen_planned_reread_action with ctx as Map returning Str:
+    if file_exists("config/improvements/active.json") == 0:
+        return ""
+    set last_path to ""
+    if map_contains(ctx and "last_codebase_path") == 1:
+        set last_path to ptr_to_str(map_get_val(ctx and "last_codebase_path"))
+    return react_frozen_planned_reread_action_from_json(read_file("config/improvements/active.json") and last_path)
+
+# Repetition recovery is consecutive, not a lifetime quota. A valid action proves
+# forward progress and starts a fresh bounded recovery window for the next decision.
+define react_note_valid_action with ctx as Map returning Int:
+    set ok to map_insert(ctx and "consecutive_no_action" and 0)
+    set ok to map_insert(ctx and "thought_spiral_recoveries" and 0)
+    return 0
+
+# Tool payloads for plans, evaluators and source candidates are already durable. Do
+# not append those large escaped bytes to every later model turn; retain only the
+# action identity and let the next read retrieve authoritative bytes when needed.
+define react_observation_action_text with tool_name as Str and assistant_text as Str returning Str:
+    if tool_name equals "improvement_investigation_begin" or else tool_name equals "improvement_plan_write" or else tool_name equals "improvement_plan_read" or else tool_name equals "improvement_status" or else tool_name equals "improvement_test_begin" or else tool_name equals "improvement_test_write" or else tool_name equals "improvement_test_scaffold" or else tool_name equals "improvement_test_read" or else tool_name equals "improvement_test_validate" or else tool_name equals "improvement_test_freeze":
+        return concat("Thought: I completed one staged improvement-test transition.\nAction: " and concat(tool_name and "([staged artifact bytes omitted from active context])"))
+    if tool_name equals "codebase_write" or else tool_name equals "codebase_replace":
+        return concat("Thought: I submitted one protected source candidate.\nAction: " and concat(tool_name and "([target path retained; candidate bytes omitted from active context])"))
+    return assistant_text
+
+# Frozen implementation decisions are rebuilt from the durable transaction and only
+# the latest authoritative observation. They never inherit the ever-growing exploratory
+# transcript. This preserves the complete long-horizon workflow while keeping every
+# individual decision grounded in the current objective, immutable plan and receipt.
+define react_frozen_action_class with active_bytes as Str returning Str:
+    set root to json_parse(active_bytes)
+    if root == 0:
+        return ""
+    set state_node to get_json_object_value(root and "state")
+    if state_node == 0:
+        return ""
+    set state to ptr_to_str(get_json_value(state_node))
+    if state equals "frozen":
+        if string_contains(active_bytes and "\"status\": \"rejected\"") == 1 or else string_contains(active_bytes and "\"status\":\"rejected\"") == 1:
+            return "CANDIDATE_REPAIR: use codebase_read on the original planned production path, then codebase_replace on that same production path."
+        if string_contains(active_bytes and "CANDIDATE_REPAIR_STALLED") == 1:
+            return "PLANNED_IMPLEMENTATION_RETRY: the prior rejected candidate and compiler diagnostic are archived in implementation_candidate_attempts. Read the exact planned production path, then submit a genuinely new complete additive candidate that fixes that diagnostic and satisfies the immutable evaluator contract. Do not reproduce the archived candidate hash or repeat its failed design."
+        return "PLANNED_IMPLEMENTATION: use codebase_read/codebase_read_range only on a planned production path, then codebase_write for the first complete candidate."
+    if state equals "implementing" or else state equals "repair_required":
+        return "IMPLEMENTATION_REPAIR_OR_VERIFY: use planned-path codebase_read/codebase_replace when repair evidence exists; otherwise call system_verify."
+    if state equals "verified":
+        return "VERIFIED_DEPLOYMENT: system_recompile is the only legal transition."
+    return ""
+
+define react_frozen_action_class_for_decision with active_bytes as Str and last_tool as Str and last_observation as Str returning Str:
+    set action_class to react_frozen_action_class(active_bytes)
+    if string_index_of(action_class and "CANDIDATE_REPAIR") == 0:
+        if react_observation_has_candidate_receipt(last_observation) == 1:
+            return "CANDIDATE_REPLACEMENT_ONLY: the rejected candidate bytes and compiler diagnostic are active. codebase_replace on the original planned production path is the only legal next action. Use exactly {\"tool_name\":\"codebase_replace\",\"arguments\":[\"production/path\",\"smallest exact defective fragment\",\"exact corrected fragment\",1]}. Never pass the whole candidate as one argument. Do not read again, regenerate the whole file, verify, or abandon."
+    if string_index_of(action_class and "PLANNED_IMPLEMENTATION") == 0:
+        if (last_tool equals "codebase_read" or else last_tool equals "codebase_read_range") and also react_observation_has_reread_receipt(last_observation) == 1:
+            return "PLANNED_IMPLEMENTATION_WRITE_ONLY: the exact planned production bytes, frozen interface evidence, evaluator contract, and any archived compiler diagnostic are active. codebase_write on the original planned production path is the only legal next action. Return one complete additive candidate using exactly {\"tool_name\":\"codebase_write\",\"arguments\":[\"production/path\",\"complete source bytes\"]}. Fix the archived cause; do not reproduce an archived candidate or its failed design. Do not read again, reorder read arguments, search, verify unchanged source, or reply."
+    return action_class
+
+# Frozen source reads append a controller-owned receipt as its own line. Never treat
+# an arbitrary occurrence inside the source bytes as state: tools.ep legitimately
+# contains these protocol literals, and a loose substring check turned reading that
+# source page into a false candidate/write transition and an unbounded retry loop.
+define react_observation_has_reread_receipt with observation as Str returning Int:
+    if string_index_of(observation and "IMPROVEMENT_REREAD_OK path=") == 0:
+        return 1
+    if string_contains(observation and "\nIMPROVEMENT_REREAD_OK path=") == 1:
+        return 1
+    return 0
+
+define react_observation_has_candidate_receipt with observation as Str returning Int:
+    if string_index_of(observation and "[RETAINED IMPLEMENTATION CANDIDATE") == 0:
+        return 1
+    if string_contains(observation and "\n[RETAINED IMPLEMENTATION CANDIDATE") == 1:
+        return 1
+    return 0
+
+define react_frozen_decision_prompt_from_state with active_bytes as Str and plan_bytes as Str and original_request as Str and last_tool as Str and last_observation_input as Str returning Str:
+    set action_class to react_frozen_action_class_for_decision(active_bytes and last_tool and last_observation_input)
+    if string_length(action_class) == 0:
+        return ""
+    set last_observation to last_observation_input
+    if string_length(last_observation) > 80000:
+        set last_observation to concat(substring(last_observation and 0 and 79000) and "\n[Latest observation truncated at a source-page boundary; use codebase_read_range on the same planned production path for omitted bytes.]")
+    set prompt to "[FROZEN TRANSACTION ACTION DECISION]\nThis is a fresh decision view rebuilt from durable state. Do not reconstruct or restate earlier exploratory reasoning.\n"
+    set prompt to concat(prompt and concat("Original user objective:\n" and concat(original_request and "\n\n")))
+    set prompt to concat(prompt and concat("Controller-selected legal action class:\n" and concat(action_class and "\n\n")))
+    set prompt to concat(prompt and concat("Durable active transaction JSON:\n" and concat(active_bytes and "\n\n")))
+    set prompt to concat(prompt and concat("Immutable implementation plan and progress:\n" and concat(plan_bytes and "\n\n")))
+    set prompt to concat(prompt and concat("Latest authoritative tool: " and concat(last_tool and "\nLatest authoritative observation:\n")))
+    set prompt to concat(prompt and concat(last_observation and "\n\n"))
+    set prompt to concat(prompt and "Return exactly one provider-constrained object: {\"tool_name\":\"name\",\"arguments\":[...]}. No prose or extra keys. Candidate storage is private: always address reads and replacements through the original production path shown in planned_files. Compiler failure is repair evidence, never permission to abandon. Only an observation carrying code=PLAN_SCOPE_MISSING permits improvement_test_abandon. Natural-language output is legal only as the single string argument of reply_request after the workflow is genuinely complete.\n")
+    return prompt
+
+define react_repeated_candidate_read_error with ctx as Map and tool_name as Str returning Str:
+    if tool_name equals "codebase_read" == 0 and also tool_name equals "codebase_read_range" == 0:
+        return ""
+    # This guard is legal only inside a controller-bound frozen transaction. Mutable
+    # investigation pages can contain the receipt literals as ordinary source text;
+    # they must never inherit a frozen candidate action class from those bytes.
+    if map_contains(ctx and "improvement_test_frozen") == 0 or else map_get_val(ctx and "improvement_test_frozen") != 1:
+        return ""
+    if map_contains(ctx and "improvement_active_bound") == 0 or else map_get_val(ctx and "improvement_active_bound") != 1:
+        return ""
+    if map_contains(ctx and "frozen_latest_tool") == 0 or else map_contains(ctx and "frozen_latest_observation") == 0:
+        return ""
+    set previous_tool to ptr_to_str(map_get_val(ctx and "frozen_latest_tool"))
+    set previous_observation to ptr_to_str(map_get_val(ctx and "frozen_latest_observation"))
+    if (previous_tool equals "codebase_read" or else previous_tool equals "codebase_read_range") and also react_observation_has_candidate_receipt(previous_observation) == 1:
+        return "IMPROVEMENT_GATE_FAILED code=CANDIDATE_REPLACE_REQUIRED message=The rejected candidate bytes are already active. The next legal action is a localized codebase_replace on the original planned production path using the exact compiler diagnostic; another read would make no progress."
+    if (previous_tool equals "codebase_read" or else previous_tool equals "codebase_read_range") and also react_observation_has_reread_receipt(previous_observation) == 1:
+        return "IMPROVEMENT_GATE_FAILED code=IMPLEMENTATION_WRITE_REQUIRED message=The exact planned production bytes are already active. codebase_write with the complete candidate is now the only legal transition; another read or reordered read arguments cannot make progress."
+    return ""
+
+define react_frozen_decision_prompt with ctx as Map returning Str:
+    set frozen to 0
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if frozen != 1:
+        return ""
+    if file_exists("config/improvements/active.json") == 0:
+        return ""
+    set original_request to ""
+    if map_contains(ctx and "repair_original_request") == 1:
+        set original_request to ptr_to_str(map_get_val(ctx and "repair_original_request"))
+    set plan_bytes to ""
+    if file_exists("config/improvements/staging/implementation_plan.md") == 1:
+        set plan_bytes to read_file("config/improvements/staging/implementation_plan.md")
+    set last_tool to "none"
+    if map_contains(ctx and "frozen_latest_tool") == 1:
+        set last_tool to ptr_to_str(map_get_val(ctx and "frozen_latest_tool"))
+    set last_observation to "none"
+    if map_contains(ctx and "frozen_latest_observation") == 1:
+        set last_observation to ptr_to_str(map_get_val(ctx and "frozen_latest_observation"))
+    # Candidate storage remains private. Resolve it from the registered production
+    # path and place the exact current bytes in this one fresh decision view. This
+    # preserves repair evidence without adding another read turn or extending history.
+    set active_bytes to read_file("config/improvements/active.json")
+    if string_contains(active_bytes and "\"status\": \"rejected\"") == 1 or else string_contains(active_bytes and "\"status\":\"rejected\"") == 1:
+        set candidate_production_path to ""
+        if map_contains(ctx and "last_codebase_path") == 1:
+            set candidate_production_path to ptr_to_str(map_get_val(ctx and "last_codebase_path"))
+        set candidate_storage_path to ""
+        if string_length(candidate_production_path) > 0:
+            set candidate_storage_path to tools_improvement_candidate_for_read(ctx and candidate_production_path)
+        if string_length(candidate_storage_path) > 0 and also file_exists(candidate_storage_path) == 1 and also is_directory(candidate_storage_path) == 0:
+            set retained_bytes to read_file(candidate_storage_path)
+            if string_length(retained_bytes) > 80000:
+                set retained_bytes to concat(substring(retained_bytes and 0 and 79000) and "\n[Retained candidate display truncated; use a same-production-path range read only if the diagnosed fragment is omitted.]\n")
+            set last_observation to concat(last_observation and concat("\n\n[RETAINED IMPLEMENTATION CANDIDATE — internally resolved from the registered production path]\n" and retained_bytes))
+    return react_frozen_decision_prompt_from_state(active_bytes and plan_bytes and original_request and last_tool and last_observation)
+
+
+# Mutable improvement phases are just as stateful as frozen implementation. Rebuild
+# every decision from the durable workflow instead of extending the exploratory ReAct
+# transcript forever. This keeps the exact objective, plan, phase and latest
+# authoritative observation while discarding stale rejected actions and old prose.
+define react_staging_action_class with workflow_bytes as Str returning Str:
+    set root to json_parse(workflow_bytes)
+    if root == 0:
+        return ""
+    set state_node to get_json_object_value(root and "state")
+    if state_node == 0:
+        return ""
+    set state to ptr_to_str(get_json_value(state_node))
+    if state equals "investigating":
+        set investigation_surface to ""
+        set surface_node to get_json_object_value(root and "required_surface")
+        if surface_node != 0:
+            set investigation_surface to ptr_to_str(get_json_value(surface_node))
+        if string_length(investigation_surface) > 0:
+            return concat("INVESTIGATION: use only codebase_list, codebase_search, codebase_read, codebase_read_range, lookup_ernos, improvement_plan_write, or improvement_plan_scaffold. Select exact paths returned by discovery; do not guess or reconstruct filenames. Before planning, read at least two distinct non-test production files. When ready, improvement_plan_scaffold argument 1 MUST be exact required_surface `" and concat(investigation_surface and "`; arguments 2+ MUST be exact discovered production paths."))
+        return "INVESTIGATION: use only codebase_list, codebase_search, codebase_read, codebase_read_range, lookup_ernos, improvement_plan_write, or improvement_plan_scaffold. Select exact paths returned by discovery; do not guess or reconstruct filenames. Before planning, read at least two distinct non-test production files."
+    if state equals "planned":
+        return "ACCEPTANCE_CONTRACT: improvement_test_begin is the only phase transition. Supply the exact planned surface name and 2-16 observable [criterion_id] outcome lines retaining every literal marker from the objective."
+    if state equals "tests_authoring":
+        set last_validation_node to get_json_object_value(root and "last_validation")
+        if last_validation_node != 0 and also get_json_type(last_validation_node) == 4:
+            set validation_status_node to get_json_object_value(last_validation_node and "status")
+            if validation_status_node != 0 and also ptr_to_str(get_json_value(validation_status_node)) equals "failed":
+                return "EVALUATOR_ARTIFACT_REWRITE: legal tool names are improvement_test_read, improvement_test_transport_template, improvement_test_write, improvement_test_scaffold, and improvement_test_validate. First inspect improvement_test_read([\"validation\"]). Then change the diagnosed evaluator bytes with improvement_test_write, or rerun improvement_test_scaffold([]) when the retained artifacts were controller-scaffolded. Never emit EVALUATOR_REPAIR as a tool name and never validate unchanged failed bytes."
+        return "EVALUATOR_AUTHORING: use the controller-owned evaluator scaffold when artifacts are absent; otherwise validate the retained exact artifacts. Do not call improvement_test_begin again."
+    if state equals "tests_validated":
+        return "EVALUATOR_REVIEW: If the retained criteria and evaluators match the immutable objective, call improvement_test_freeze. If the user rejected freeze because the evidence is semantically wrong, repair the exact acceptance/regression/E2E artifacts with improvement_test_write and validate again; never repeat the rejected freeze unchanged."
+    return ""
+
+
+define react_staging_decision_prompt_from_state with workflow_bytes as Str and plan_bytes_input as Str and original_request as Str and last_tool as Str and last_observation_input as Str returning Str:
+    set action_class to react_staging_action_class(workflow_bytes)
+    if string_length(action_class) == 0:
+        return ""
+    set plan_bytes to plan_bytes_input
+    if string_length(plan_bytes) > 24000:
+        set plan_bytes to concat(substring(plan_bytes and 0 and 23000) and "\n[Plan display truncated; durable plan bytes remain authoritative.]\n")
+    set last_observation to last_observation_input
+    if string_length(last_observation) > 64000:
+        set last_observation to concat(substring(last_observation and 0 and 63000) and "\n[Latest observation truncated at a source-page boundary; request the next exact range if required.]\n")
+    set prompt to "[DURABLE IMPROVEMENT ACTION DECISION]\nThis is a fresh decision view rebuilt from durable transaction state. Do not repeat or reconstruct earlier exploratory reasoning.\n"
+    set prompt to concat(prompt and concat("Original user request:\n" and concat(original_request and "\n\n")))
+    set prompt to concat(prompt and concat("Controller-selected legal action class:\n" and concat(action_class and "\n\n")))
+    set prompt to concat(prompt and concat("Durable workflow JSON:\n" and concat(workflow_bytes and "\n\n")))
+    if string_length(plan_bytes) > 0:
+        set prompt to concat(prompt and concat("Durable implementation plan and controller progress:\n" and concat(plan_bytes and "\n\n")))
+    set prompt to concat(prompt and concat("Latest authoritative tool: " and concat(last_tool and "\nLatest authoritative observation:\n")))
+    set prompt to concat(prompt and concat(last_observation and "\n\n"))
+    set prompt to concat(prompt and "Return exactly one provider-constrained object: {\"tool_name\":\"name\",\"arguments\":[...]}. No prose or extra keys. Follow only the controller-selected action class. A rejected action is diagnostic evidence, never permission to restart, abandon, weaken tests, or repeat the same call. Natural-language output is legal only as the single string argument of reply_request after the durable workflow is genuinely complete.\n")
+    return prompt
+
+
+define react_ctx_has_elevated_role with ctx as Map returning Int:
+    if map_contains(ctx and "sender_role") == 0:
+        return 0
+    set role to ptr_to_str(map_get_val(ctx and "sender_role"))
+    if role equals "admin" or else role equals "owner":
+        return 1
+    return 0
+
+
+define react_improvement_decision_prompt with ctx as Map returning Str:
+    if map_contains(ctx and "repair_workflow_active") == 0 or else map_get_val(ctx and "repair_workflow_active") != 1:
+        return ""
+    if react_ctx_has_elevated_role(ctx) == 0:
+        return ""
+    if file_exists("config/improvements/active.json") == 1:
+        return react_frozen_decision_prompt(ctx)
+    if file_exists("config/improvements/staging/workflow.json") == 0:
+        return ""
+    set workflow_bytes to read_file("config/improvements/staging/workflow.json")
+    set action_class to react_staging_action_class(workflow_bytes)
+    if string_length(action_class) == 0:
+        return ""
+    set original_request to ""
+    if map_contains(ctx and "repair_original_request") == 1:
+        set original_request to ptr_to_str(map_get_val(ctx and "repair_original_request"))
+    set plan_bytes to ""
+    if file_exists("config/improvements/staging/implementation_plan.md") == 1:
+        set plan_bytes to read_file("config/improvements/staging/implementation_plan.md")
+    set last_tool to "none"
+    if map_contains(ctx and "frozen_latest_tool") == 1:
+        set last_tool to ptr_to_str(map_get_val(ctx and "frozen_latest_tool"))
+    set last_observation to "none"
+    if map_contains(ctx and "frozen_latest_observation") == 1:
+        set last_observation to ptr_to_str(map_get_val(ctx and "frozen_latest_observation"))
+    return react_staging_decision_prompt_from_state(workflow_bytes and plan_bytes and original_request and last_tool and last_observation)
+
+# Dangerous-action and reply audits must see the same fresh durable decision view as
+# the main model. Feeding the accumulated ReAct transcript here defeats compaction,
+# evicts the useful KV prefix and turns a small action into a very large second call.
+define react_audit_prompt_from_state with durable_input as Str and accumulated_prompt as Str and correction as Str returning Str:
+    set durable to durable_input
+    if string_length(durable) == 0:
+        return accumulated_prompt
+    if string_length(correction) > 0:
+        set durable to concat(durable and concat("\n[LAST CONTROLLER REJECTION]\n" and concat(correction and "\n[/LAST CONTROLLER REJECTION]\n")))
+    return durable
+
+define react_audit_prompt_for_state with ctx as Map and accumulated_prompt as Str returning Str:
+    set correction to ""
+    if map_contains(ctx and "durable_protocol_correction") == 1:
+        set correction to ptr_to_str(map_get_val(ctx and "durable_protocol_correction"))
+    return react_audit_prompt_from_state(react_improvement_decision_prompt(ctx) and accumulated_prompt and correction)
+
+
+define react_staging_forced_action_from_state with state as Str and regression_ready as Int and e2e_ready as Int and validation_status as Str returning Str:
+    if state equals "tests_validated":
+        return "Thought: The retained evaluators have a successful durable validation receipt and now require immutable freeze.\nAction: improvement_test_freeze([])"
+    if state equals "tests_authoring":
+        if regression_ready == 0 or else e2e_ready == 0:
+            return "Thought: Evaluator artifacts are absent, so the controller will generate the exact plan-bound production evaluators.\nAction: improvement_test_scaffold([])"
+        if string_length(validation_status) == 0:
+            return "Thought: Both retained evaluator artifacts exist and have no validation receipt, so the controller will validate them against unchanged production now.\nAction: improvement_test_validate([])"
+    return ""
+
+define react_staging_force_rejected with last_tool as Str and last_observation as Str returning Int:
+    if string_contains(last_observation and "IMPROVEMENT_GATE_FAILED") == 0 and also string_index_of(last_observation and "Error:") != 0:
+        return 0
+    if last_tool equals "improvement_plan_scaffold" or else last_tool equals "improvement_test_begin" or else last_tool equals "improvement_test_scaffold" or else last_tool equals "improvement_test_validate" or else last_tool equals "improvement_test_freeze":
+        return 1
+    return 0
+
+
+# improvement_test_begin is fully derived from already-validated durable controller
+# state. If that exact mechanical transition is rejected, another model generation
+# cannot repair it and must never be allowed to alternate malformed variants forever.
+define react_controller_transition_invariant_error with tool_name as Str and tool_result as Str returning Str:
+    if tool_name equals "improvement_test_begin" == 0:
+        return ""
+    if string_contains(tool_result and "IMPROVEMENT_GATE_FAILED") == 0 and also string_index_of(tool_result and "Error:") != 0:
+        return ""
+    return concat("Error: Protected improvement controller invariant failed while beginning evaluator authoring. The validated planned transaction has been preserved unchanged for diagnosis. No retry or additional inference was run. Diagnostic: " and tool_result)
+
+# Cross-component objectives have controller-known trust boundaries. Read each exact
+# required source once, then generate the plan from those hash-recorded facts. Relevance
+# selection is deterministic here; the model never spends turns guessing filenames or
+# searching for a new surface that cannot exist before implementation.
+define react_required_investigation_action_from_state with workflow_bytes as Str returning Str:
+    set root to json_parse(workflow_bytes)
+    if root == 0:
+        return ""
+    set state_node to get_json_object_value(root and "state")
+    if state_node == 0 or else ptr_to_str(get_json_value(state_node)) equals "investigating" == 0:
+        return ""
+    set required_node to get_json_object_value(root and "required_discovery_paths")
+    if required_node == 0 or else get_json_type(required_node) != 3:
+        return ""
+    set required_paths to get_json_value(required_node)
+    set discovery_node to get_json_object_value(root and "discovery")
+    set discovery_entries to create_list()
+    if discovery_node != 0 and also get_json_type(discovery_node) == 3:
+        set discovery_entries to get_json_value(discovery_node)
+    set req_i to 0
+    repeat while req_i < length_list(required_paths):
+        set req_item to get_list(required_paths and req_i)
+        set req_path to ptr_to_str(get_json_value(req_item))
+        set found_read to 0
+        set disc_i to 0
+        repeat while disc_i < length_list(discovery_entries) and also found_read == 0:
+            set disc_item to get_list(discovery_entries and disc_i)
+            set disc_path_node to get_json_object_value(disc_item and "path")
+            set disc_mode_node to get_json_object_value(disc_item and "mode")
+            if disc_path_node != 0 and also disc_mode_node != 0:
+                set disc_path to ptr_to_str(get_json_value(disc_path_node))
+                set disc_mode to ptr_to_str(get_json_value(disc_mode_node))
+                if disc_path equals req_path and also (disc_mode equals "read" or else disc_mode equals "read_range"):
+                    set found_read to 1
+            set disc_i to disc_i + 1
+        if found_read == 0:
+            if string_length(req_path) == 0 or else string_contains(req_path and "\"") == 1 or else string_contains(req_path and "\\") == 1:
+                return ""
+            return f"Thought: The controller selected the next unread production dependency from the immutable objective.\nAction: codebase_read([\"{req_path}\"])"
+        set req_i to req_i + 1
+    set surface_node to get_json_object_value(root and "required_surface")
+    set production_node to get_json_object_value(root and "required_production_paths")
+    if surface_node == 0 or else production_node == 0 or else get_json_type(production_node) != 3:
+        return ""
+    set surface to ptr_to_str(get_json_value(surface_node))
+    set production_paths to get_json_value(production_node)
+    if string_length(surface) == 0 or else length_list(production_paths) != 1:
+        return ""
+    set production_item to get_list(production_paths and 0)
+    set production_path to ptr_to_str(get_json_value(production_item))
+    if string_contains(surface and "\"") == 1 or else string_contains(production_path and "\"") == 1 or else string_contains(production_path and "\\") == 1:
+        return ""
+    return f"Thought: Every controller-required production dependency now has a current hash-recorded read, so the exact interface-evidence plan can be generated deterministically.\nAction: improvement_plan_scaffold([\"{surface}\",\"{production_path}\"])"
+
+define react_required_acceptance_action_from_state with workflow_bytes as Str returning Str:
+    set root to json_parse(workflow_bytes)
+    if root == 0:
+        return ""
+    set state_node to get_json_object_value(root and "state")
+    if state_node == 0 or else ptr_to_str(get_json_value(state_node)) equals "planned" == 0:
+        return ""
+    set surface_node to get_json_object_value(root and "required_surface")
+    set acceptance_node to get_json_object_value(root and "required_acceptance")
+    if surface_node == 0 or else acceptance_node == 0:
+        return ""
+    set surface to ptr_to_str(get_json_value(surface_node))
+    set acceptance to ptr_to_str(get_json_value(acceptance_node))
+    if string_length(surface) == 0 or else string_length(acceptance) == 0:
+        return ""
+    set surface_json to llm_json_escape(surface)
+    set acceptance_json to llm_json_escape(acceptance)
+    return concat("{\"tool_name\":\"improvement_test_begin\",\"arguments\":[\"" and concat(surface_json and concat("\",\"" and concat(acceptance_json and "\"]}") )))
+
+
+# When durable staging state makes the next transition mechanical, execute that exact
+# transition without spending another model decision. Semantic repair after a failed
+# validation remains model-directed from the compact durable prompt.
+define react_staging_forced_action with ctx as Map returning Str:
+    # Forced actions are phase selection, not an authorization bypass. Only a run
+    # already admitted to the protected repair workflow may receive one.
+    if map_contains(ctx and "repair_workflow_active") == 0 or else map_get_val(ctx and "repair_workflow_active") != 1:
+        return ""
+    if react_ctx_has_elevated_role(ctx) == 0:
+        return ""
+    if file_exists("config/improvements/active.json") == 1 or else file_exists("config/improvements/staging/workflow.json") == 0:
+        return ""
+    if map_contains(ctx and "was_cancelled") == 1 and also map_get_val(ctx and "was_cancelled") == 1:
+        return ""
+    # A denied mechanical transition is a user decision, not a transient parser
+    # failure. Yield exactly one fresh typed decision from durable state so Echo can
+    # acknowledge a semantic objection and repair retained artifacts instead of
+    # immediately presenting the identical approval card again.
+    if map_contains(ctx and "last_denied_tool") == 1:
+        set denied_transition to ptr_to_str(map_get_val(ctx and "last_denied_tool"))
+        set ok to map_delete(ctx and "last_denied_tool")
+        if denied_transition equals "improvement_test_freeze" or else denied_transition equals "system_verify" or else denied_transition equals "system_recompile":
+            return ""
+    # A mechanical transition that the gate just rejected must never be selected
+    # again from unchanged state. Hand the structured diagnostic to one fresh typed
+    # model decision so it can perform the requested source read/repair instead of
+    # creating a zero-inference retry loop.
+    if map_contains(ctx and "frozen_latest_tool") == 1 and also map_contains(ctx and "frozen_latest_observation") == 1:
+        set staging_last_tool to ptr_to_str(map_get_val(ctx and "frozen_latest_tool"))
+        set staging_last_observation to ptr_to_str(map_get_val(ctx and "frozen_latest_observation"))
+        if react_staging_force_rejected(staging_last_tool and staging_last_observation) == 1:
+            return ""
+    if map_contains(ctx and "durable_protocol_correction") == 1:
+        set durable_corr to ptr_to_str(map_get_val(ctx and "durable_protocol_correction"))
+        if string_contains(durable_corr and "IMPROVEMENT_GATE_FAILED") == 1 or else string_index_of(durable_corr and "Error:") == 0:
+            return ""
+    set workflow_bytes to read_file("config/improvements/staging/workflow.json")
+    set required_investigation_action to react_required_investigation_action_from_state(workflow_bytes)
+    if string_length(required_investigation_action) > 0:
+        return required_investigation_action
+    set required_acceptance_action to react_required_acceptance_action_from_state(workflow_bytes)
+    if string_length(required_acceptance_action) > 0:
+        return required_acceptance_action
+    set root to json_parse(workflow_bytes)
+    if root == 0:
+        return ""
+    set state_node to get_json_object_value(root and "state")
+    if state_node == 0:
+        return ""
+    set state to ptr_to_str(get_json_value(state_node))
+    set regression_ready to 0
+    set e2e_ready to 0
+    set validation_status to ""
+    if state equals "tests_authoring":
+        if file_exists("config/improvements/staging/regression.py") == 1:
+            if string_length(string_trim(read_file("config/improvements/staging/regression.py"))) > 0:
+                set regression_ready to 1
+        if file_exists("config/improvements/staging/e2e.py") == 1:
+            if string_length(string_trim(read_file("config/improvements/staging/e2e.py"))) > 0:
+                set e2e_ready to 1
+        if file_exists("config/improvements/staging/validation.json") == 1:
+            set validation_bytes to read_file("config/improvements/staging/validation.json")
+            if string_contains(validation_bytes and "\"status\": \"passed\"") == 1 or else string_contains(validation_bytes and "\"status\":\"passed\"") == 1:
+                set validation_status to "passed"
+            else if string_contains(validation_bytes and "\"status\": \"failed\"") == 1 or else string_contains(validation_bytes and "\"status\":\"failed\"") == 1:
+                set validation_status to "failed"
+            else:
+                set validation_status to "unknown"
+    return react_staging_forced_action_from_state(state and regression_ready and e2e_ready and validation_status)
+
 
 define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as Map and ctx as Map and current_prompt as Str and start_loop_idx as Int and values_list as List and auto_approve_flag as Int returning Str:
     set loop_idx to start_loop_idx
@@ -728,16 +1857,16 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         if length_list(vocab_node) > 0:
             set use_simulation to 0
 
-    # Tool-chaining horizon. The loop chains as many tools as the task needs, one per
-    # turn; this is only a runaway guard (a model that never replies would otherwise
-    # grow the prompt without bound). Default raised to 50 for long-horizon/complex
-    # work and overridable per request via ctx "max_iterations".
+    # Long-running work must not be converted into a false terminal failure merely
+    # because it crosses an arbitrary number of model decisions. Keep the historical
+    # ctx key for compatibility, but use it only as a checkpoint interval. At each
+    # boundary the same prompt, observations and durable transaction continue.
     set max_iters to 50
     if map_contains(ctx and "max_iterations") == 1:
         set ov to map_get_val(ctx and "max_iterations")
         if ov > 0:
             set max_iters to ov
-    repeat while finished == 0 and also loop_idx < max_iters:
+    repeat while finished == 0:
         # F4: cancellation checkpoint — halt cleanly between turns (before spending
         # another inference). An in-flight LLM call cannot be interrupted here; that
         # is phase 2 (abortable socket). 'continue' re-checks the while condition,
@@ -760,6 +1889,12 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             set trace_sid to map_get_val(ctx and "session_id")
         
         set query_prompt to current_prompt
+        set durable_prompt to react_improvement_decision_prompt(ctx)
+        if string_length(durable_prompt) > 0:
+            set query_prompt to durable_prompt
+            if map_contains(ctx and "durable_protocol_correction") == 1:
+                set query_prompt to concat(query_prompt and concat("\n[LAST CONTROLLER REJECTION]\n" and concat(ptr_to_str(map_get_val(ctx and "durable_protocol_correction")) and "\n[/LAST CONTROLLER REJECTION]\n")))
+            set ok to trace_emit(trace_db and trace_sid and "durable_prompt_rebuild" and f"durable_chars={string_length(durable_prompt)} accumulated_chars_bypassed={string_length(current_prompt)}")
         # Whisper checkpoint — drain any mid-turn user guidance before the LLM call.
         set trace_turn_id to ""
         if map_contains(ctx and "turn_id") == 1:
@@ -783,7 +1918,51 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set ok to trace_emit(trace_db and trace_sid and "subagent_result" and sub_done)
                 set query_prompt to concat(query_prompt and concat("\n[SUB-AGENT RESULTS — background agents you dispatched have finished. The following are THEIR outputs (not user input). Use them and report to the user as appropriate.]\n" and concat(sub_done and "[/SUB-AGENT RESULTS]\n")))
 
+        # Controller-owned deployment transition. This is inserted before inference
+        # and still traverses normal parsing, approval, Observer audit and execution.
+        if string_length(override_output) == 0:
+            set forced_pending_investigation to react_pending_investigation_forced_action(ctx)
+            if string_length(forced_pending_investigation) > 0:
+                set override_output to forced_pending_investigation
+                display "[ReAct] Retained typed improvement objective selected after green baseline; no inference call."
+        if string_length(override_output) == 0:
+            set forced_initial_baseline to react_initial_repair_baseline_forced_action(ctx)
+            if string_length(forced_initial_baseline) > 0:
+                set override_output to forced_initial_baseline
+                display "[ReAct] Protected initial source baseline selected by controller; no inference call."
+        if string_length(override_output) == 0:
+            set forced_plan_reinvestigation to react_missing_plan_evidence_forced_action(ctx)
+            if string_length(forced_plan_reinvestigation) > 0:
+                set override_output to forced_plan_reinvestigation
+                display "[ReAct] Legacy frozen plan lacks exact interface evidence; preserved re-investigation selected by controller."
+        if string_length(override_output) == 0:
+            set forced_candidate_reset to react_incomplete_candidate_reset_forced_action(ctx)
+            if string_length(forced_candidate_reset) > 0:
+                set override_output to forced_candidate_reset
+                display "[ReAct] Structurally incomplete candidate selected for provenance-preserving reset; no inference call."
+        if string_length(override_output) == 0:
+            set forced_initial_frozen_read to react_initial_frozen_read_forced_action(ctx)
+            if string_length(forced_initial_frozen_read) > 0:
+                set override_output to forced_initial_frozen_read
+                display "[ReAct] Exact planned production bytes selected before first candidate; no inference call."
+        if string_length(override_output) == 0:
+            set forced_post_write_verify to react_post_write_verify_forced_action(ctx)
+            if string_length(forced_post_write_verify) > 0:
+                set override_output to forced_post_write_verify
+                display "[ReAct] Complete planned implementation selected for mandatory verification; no inference call."
+        if string_length(override_output) == 0:
+            set forced_verified_deploy to react_verified_deploy_forced_action(ctx)
+            if string_length(forced_verified_deploy) > 0:
+                set override_output to forced_verified_deploy
+                display "[ReAct] Verified deployment transition selected by controller; no inference call."
+        if string_length(override_output) == 0:
+            set forced_staging_action to react_staging_forced_action(ctx)
+            if string_length(forced_staging_action) > 0:
+                set override_output to forced_staging_action
+                display "[ReAct] Durable staging transition selected by controller; no inference call."
+
         set raw_output to ""
+        set typed_model_output to 0
         # A batched turn re-uses a queued action from THIS response (override_output) with no
         # new inference. It must NOT count against max_iters, which guards LLM ROUND-TRIPS, not
         # tool executions — otherwise a legitimate 20-tool batch could trip the runaway cap.
@@ -796,6 +1975,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         else:
             set ok to map_delete(ctx and "subagent_turn_auto_approve")
             if is_test == 0:
+                set typed_model_output to 1
                 set selected_model to ""
                 if map_contains(ctx and "selected_model") == 1:
                     set selected_model to map_get_val(ctx and "selected_model")
@@ -808,6 +1988,41 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     set raw_output to query_local_llm_image(query_prompt and turn_image_path and selected_model)
                 else:
                     set raw_output to query_local_llm(query_prompt and selected_model)
+
+                # HIVE-compatible recovery lives at the action controller, where the
+                # authoritative Observation and repair phase are visible. Each recovery
+                # is a fresh ReAct decision, never a hidden retry of the same request.
+                if raw_output equals llm_repetition_abort_marker():
+                    set spiral_recoveries to 0
+                    if map_contains(ctx and "thought_spiral_recoveries") == 1:
+                        set spiral_recoveries to map_get_val(ctx and "thought_spiral_recoveries")
+                    set spiral_recoveries to spiral_recoveries + 1
+                    set ok to map_insert(ctx and "thought_spiral_recoveries" and spiral_recoveries)
+                    set ok to trace_emit(trace_db and trace_sid and "thought_spiral_recovery" and int_to_string(spiral_recoveries))
+                    if spiral_recoveries <= 2:
+                        set current_prompt to concat(current_prompt and concat("\n" and react_thought_spiral_recovery_guidance(ctx)))
+                        set loop_idx to loop_idx + 1
+                        continue
+                    # A retry count is a checkpoint, never a reason to abandon an
+                    # unfinished improvement. Frozen work has a deterministic safe
+                    # transition: refresh the exact planned path (hash-gated by the
+                    # controller), then let the next decision author the correction.
+                    set checkpoint_action to react_repetition_checkpoint_action(ctx)
+                    set ok to map_insert(ctx and "thought_spiral_recoveries" and 0)
+                    if string_length(checkpoint_action) > 0:
+                        if string_contains(checkpoint_action and "Action: improvement_candidate_reset([])") == 1:
+                            display "[ReAct] Repeated reasoning checkpoint reached; preserving and resetting rejected candidate."
+                            set ok to trace_emit(trace_db and trace_sid and "thought_spiral_checkpoint" and "Preserved rejected candidate and reopened frozen implementation; transaction remains active")
+                        else:
+                            display "[ReAct] Repeated reasoning checkpoint reached; forcing exact frozen-plan reread and continuing."
+                            set ok to trace_emit(trace_db and trace_sid and "thought_spiral_checkpoint" and "Forced exact frozen-plan reread; transaction remains active")
+                        set override_output to checkpoint_action
+                    else:
+                        display "[ReAct] Repeated reasoning checkpoint reached; continuing with stricter action guidance."
+                        set ok to trace_emit(trace_db and trace_sid and "thought_spiral_checkpoint" and "No deterministic planned path; transaction remains active")
+                        set current_prompt to concat(current_prompt and "\n[REPEATED-REASONING CHECKPOINT — INVISIBLE TO USER] This is not a terminal condition and the unfinished task remains active. Emit one concrete next Action only. Do not restate prior reasoning.\n")
+                    set loop_idx to loop_idx + 1
+                    continue
                 
             if string_length(raw_output) == 0:
                 if is_test == 1:
@@ -871,10 +2086,19 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 set current_prompt to concat(current_prompt and f"\n[SELF-CHECK — INVISIBLE TO USER] Your previous output drifted from your operating values ({lb_note}). Correct course now: speak as ErnOS in the first person, never use pre-trained-assistant disclaimers or claim to be another company's model, and state things plainly. Do not mention this note to the user.\n")
             free_map(lookback)
 
-        set action_map to react_parse_action(raw_output)
+        set action_map to 0
+        # Controller-owned deterministic transitions may also use the exact typed
+        # envelope. Route those through the same one-pass parser as provider output;
+        # otherwise valid controller JSON is misclassified as final prose and the
+        # model is asked to reconstruct arguments the controller already owns.
+        set raw_clean_for_protocol to string_trim(raw_output)
+        if typed_model_output == 1 or else string_index_of(raw_clean_for_protocol and "{\"tool_name\"") == 0:
+            set action_map to react_parse_action_envelope(raw_output)
+        else:
+            set action_map to react_parse_action(raw_output)
         set found_action to map_get_val(action_map and "found")
         set implicit_reply to 0
-        if found_action == 0 and also react_is_implicit_reply(raw_output) == 1:
+        if typed_model_output == 0 and also found_action == 0 and also react_is_implicit_reply(raw_output) == 1:
             # The model already wrote the answer; only its transport wrapper is missing.
             # Route the text through the normal reply tool, formatter, Observer and
             # continuity capture without another model call.
@@ -892,7 +2116,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             # Root terminal-contract invariant: never discard native final prose merely
             # because a later Action marker exists. Mixed output is rejected before any
             # tool executes; the model must choose a tool turn OR a final-prose turn.
-            if implicit_reply == 0 and also react_action_turn_is_valid(raw_output and map_get_val(action_map and "start_pos") and map_get_val(action_map and "end_pos")) == 0:
+            if typed_model_output == 0 and also implicit_reply == 0 and also react_action_turn_is_valid(raw_output and map_get_val(action_map and "start_pos") and map_get_val(action_map and "end_pos")) == 0:
                 display "[ReAct] Mixed final prose and Action output rejected; no content or tool was executed."
                 set ok to trace_emit(trace_db and trace_sid and "no_action" and "Mixed final prose and Action output rejected")
                 set current_prompt to concat(current_prompt and "\n[PROTOCOL CORRECTION — INVISIBLE TO USER]\nYour previous response mixed user-facing prose with an Action call. Nothing from it was delivered or executed. Choose exactly one response type: if the task is complete, output the complete answer again as plain final prose with no Thought, Action, JSON, or reply_request wrapper; if a tool is still needed, output only one short Thought line followed by Action lines.\n")
@@ -900,6 +2124,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 if is_batched_turn == 0:
                     set loop_idx to loop_idx + 1
                 continue
+            set ok to react_note_valid_action(ctx)
             set tool_name to map_get_val(action_map and "tool_name")
             set args_str to map_get_val(action_map and "args_str")
             # BATCHING: if the model emitted MORE than one Action: in this single response,
@@ -911,7 +2136,9 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             # steps after the pause, which is self-healing. `assistant_text` records ONLY this
             # action in the transcript when more follow, so chained iterations don't restate the
             # whole remainder each time.
-            set batch_rest to react_slice_from_next_action(raw_output and map_get_val(action_map and "end_pos"))
+            set batch_rest to ""
+            if typed_model_output == 0:
+                set batch_rest to react_slice_from_next_action(raw_output and map_get_val(action_map and "end_pos"))
             set assistant_text to raw_output
             # P10: detect orphaned `tool([...])` continuations in the segment the slicer
             # DROPS — between this action's end and the next Action: marker (or the end of
@@ -939,6 +2166,21 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             display f"Parsed action: '{tool_name}' with args: '{args_str}'"
             set ok to trace_emit(trace_db and trace_sid and "action" and f"{tool_name}({args_str})")
             set ok to append_list(values_list and action_map)
+
+            # Accept the local model's stable split-positional dialect, but normalize
+            # it into the registered one-array contract before json_parse can accept a
+            # valid prefix and discard the trailing expressions. Ambiguous/invalid
+            # split syntax fails closed and is re-prompted with the canonical shape.
+            set normalization_error to ""
+            set split_default_close to react_split_default_expression_close(args_str)
+            if split_default_close >= 0:
+                set raw_split_args to args_str
+                set normalized_split_args to react_normalize_split_default_expression(args_str)
+                if string_length(normalized_split_args) == 0:
+                    set normalization_error to concat("Invalid split-argument tool expression rejected before execution: " and concat(raw_split_args and ". Put every argument inside one JSON array, following the registered tool example."))
+                else:
+                    set args_str to normalized_split_args
+                    set ok to trace_emit(trace_db and trace_sid and "tool_normalization" and concat(tool_name and concat(" raw=" and concat(raw_split_args and concat(" canonical=" and normalized_split_args)))))
             
             # Parse arguments as JSON array or fallback to raw string
             set args_list to create_list()
@@ -975,6 +2217,15 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                         if parsed_len < raw_len / 2:
                             display f"[react] JSON truncation detected ({parsed_len} vs {raw_len} chars). Using raw extraction."
                             set ok to set_list(args_list and 0 and react_extract_raw_arg(args_str))
+                    # Models frequently wrap a long Python source argument in
+                    # triple quotes. Although invalid JSON, the boundaries are
+                    # deterministic. Recover it here before the tool sees a NULL
+                    # second value; its normal artifact linter remains authoritative.
+                    if items_len == 2:
+                        set triple_payload to react_extract_triple_quoted_second_arg(args_str)
+                        if string_length(triple_payload) > 0:
+                            display f"[react] Recovered triple-quoted multiline argument ({string_length(triple_payload)} chars)."
+                            set ok to set_list(args_list and 1 and triple_payload)
                 else:
                     if get_json_type(json_node) == 1:
                         set ok to append_list(args_list and int_to_string(get_json_value(json_node)))
@@ -983,11 +2234,145 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             else if implicit_reply == 0:
                 set ok to append_list(args_list and args_str)
 
+            if length_list(args_list) == 1 and also string_length(string_trim(ptr_to_str(get_list(args_list and 0)))) == 0:
+                set registered_schemas to map_get_val(tools_mgr and "schemas")
+                if react_schema_declares_zero_args(tool_name and registered_schemas) == 1:
+                    set ok to remove_list(args_list and 0)
+                    set args_str to "[]"
+                    set ok to trace_emit(trace_db and trace_sid and "tool_normalization" and concat(tool_name and " raw=[empty-string] canonical=[]"))
+
+            # Gemma's stable recovery form sometimes emits codebase_replace with
+            # [production_path, complete_candidate] instead of repeating two large,
+            # nearly identical old/new strings. Canonicalize that provider expression
+            # internally to the registered exact-replacement contract by resolving the
+            # hidden retained candidate from the production path. Authorization,
+            # approval, Observer audit, compile checks and promotion are unchanged.
+            if tool_name equals "codebase_replace" and also length_list(args_list) == 2:
+                set complete_candidate to ptr_to_str(get_list(args_list and 1))
+                if string_length(complete_candidate) >= 200 and also string_contains(complete_candidate and "define ") == 1:
+                    set complete_path to tools_improvement_canonical_production_path(ptr_to_str(get_list(args_list and 0)))
+                    set complete_actual to tools_resolve_read_path_for_ctx(ctx and complete_path)
+                    set complete_source to complete_actual
+                    if string_length(complete_actual) > 0:
+                        set complete_retained to tools_improvement_candidate_for_read(ctx and complete_actual)
+                        if string_length(complete_retained) > 0:
+                            set complete_source to complete_retained
+                    if string_length(complete_source) == 0 or else file_exists(complete_source) == 0:
+                        set normalization_error to "IMPROVEMENT_GATE_FAILED code=CANDIDATE_REPAIR_REQUIRED message=complete-candidate replacement could not resolve the transaction-bound retained source from the production path."
+                    else:
+                        set complete_old to read_file(complete_source)
+                        # Lists own only their pointer slots; clone every borrowed
+                        # decoded/path value before replacing the sole reference to
+                        # the provider-decoded list.
+                        set complete_path_copy to concat("" and complete_path)
+                        set complete_old_copy to concat("" and complete_old)
+                        set complete_candidate_copy to concat("" and complete_candidate)
+                        # Mutate the decoded list in place so its allocation remains
+                        # the owner through validation, approval and execution.
+                        set ok to set_list(args_list and 0 and complete_path_copy)
+                        set ok to set_list(args_list and 1 and complete_old_copy)
+                        set ok to append_list(args_list and complete_candidate_copy)
+                        # Parsed JSON numbers are represented as strings in args_list;
+                        # preserve that invariant for controller-synthesized arguments.
+                        # Supplying the raw integer here made ptr_to_str(1) dereference
+                        # address 0x1 in react_validate_tool_args.
+                        set ok to append_list(args_list and "1")
+                        set args_str to "[production_path,transaction_bound_retained_bytes,complete_candidate,1]"
+                        set ok to trace_emit(trace_db and trace_sid and "tool_normalization" and "codebase_replace complete-candidate envelope canonicalized to exact transaction-bound replacement")
+
+            # Retain the exact path from source operations so a frozen improvement can
+            # recover deterministically from a later repeated-reasoning checkpoint.
+            # This records no new authority and never bypasses the planned-path gate.
+            if (tool_name equals "codebase_read" or else tool_name equals "codebase_read_range" or else tool_name equals "codebase_write" or else tool_name equals "codebase_replace") and also length_list(args_list) > 0:
+                set ok to map_insert(ctx and "last_codebase_path" and ptr_to_str(get_list(args_list and 0)))
+
             # Do this after JSON decoding (where the corruption is introduced) and
             # before observer, memory, tool execution, persistence or platform delivery.
             if tool_name equals "reply_request" and also length_list(args_list) > 0:
                 set reply_arg to get_list(args_list and 0)
                 set ok to set_list(args_list and 0 and reply_format_normalize(reply_arg))
+
+            # Reject malformed calls before approval. Feed the exact rejected layout and
+            # canonical shape back as an Observation, then re-infer; nothing is audited,
+            # approved, persisted, or executed on this path.
+            set tool_arg_error to normalization_error
+            if string_length(tool_arg_error) == 0:
+                set tool_arg_error to react_validate_tool_args(tool_name and args_list and args_str)
+            if string_length(tool_arg_error) > 0:
+                display f"[ReAct] Tool call rejected before approval: {tool_arg_error}"
+                set ok to trace_emit(trace_db and trace_sid and "tool_validation" and tool_arg_error)
+                set invalid_fingerprint to concat(tool_name and concat(":" and args_str))
+                set invalid_repeats to 1
+                if map_contains(ctx and "last_invalid_tool_call") == 1:
+                    if ptr_to_str(map_get_val(ctx and "last_invalid_tool_call")) equals invalid_fingerprint:
+                        if map_contains(ctx and "invalid_tool_call_repeats") == 1:
+                            set invalid_repeats to map_get_val(ctx and "invalid_tool_call_repeats") + 1
+                set ok to map_insert(ctx and "last_invalid_tool_call" and invalid_fingerprint)
+                set ok to map_insert(ctx and "invalid_tool_call_repeats" and invalid_repeats)
+                set ok to map_insert(ctx and "durable_protocol_correction" and tool_arg_error)
+                set ok to map_insert(ctx and "frozen_latest_tool" and tool_name)
+                set ok to map_insert(ctx and "frozen_latest_observation" and tool_arg_error)
+                if string_contains(tool_arg_error and "code=NO_CHANGE") == 1 and also invalid_repeats > 1:
+                    set no_change_correction to "IMPROVEMENT_GATE_FAILED code=NO_CHANGE_REPEAT message=The identical byte-no-op replacement has repeated. Do not reuse either fragment. Repair the earliest compiler diagnostic with a genuinely different exact_new. ErnosPlain uses 'or else' for boolean disjunction, binary concat(left and right) nesting, and int_to_string for integers; source code must not contain a trailing JSON transport bracket. Rebuild this decision only from the retained candidate, exact diagnostic, and frozen working-call-site evidence."
+                    set ok to map_insert(ctx and "durable_protocol_correction" and no_change_correction)
+                set durable_error_prompt to react_improvement_decision_prompt(ctx)
+                if string_length(durable_error_prompt) == 0:
+                    set current_prompt to concat(current_prompt and "\n")
+                    set current_prompt to concat(current_prompt and assistant_text)
+                    set current_prompt to concat(current_prompt and "\nObservation: [TOOL CALL REJECTED BEFORE APPROVAL — nothing was executed] ")
+                    set current_prompt to concat(current_prompt and tool_arg_error)
+                    if invalid_repeats > 1:
+                        set current_prompt to concat(current_prompt and concat(" This identical malformed call has now been rejected " and concat(int_to_string(invalid_repeats) and " times. Copy the canonical Action shape from this Observation; do not improvise another positional layout.")))
+                    set current_prompt to concat(current_prompt and "\n")
+                else:
+                    set ok to trace_emit(trace_db and trace_sid and "durable_prompt_bounded" and "Malformed-call correction retained in durable state without extending accumulated prompt")
+                # Do not execute later actions composed under the malformed call's
+                # assumption; regenerate the batch from the corrective Observation.
+                set override_output to ""
+                free_list(args_list)
+                if is_batched_turn == 0:
+                    set loop_idx to loop_idx + 1
+                continue
+
+            set ok to map_delete(ctx and "durable_protocol_correction")
+
+            # Repair sequencing is a controller invariant, not model guidance. Reject
+            # divergent calls before approval/audit/execution and regenerate from the
+            # precise corrective Observation.
+            set repair_action_error to react_repeated_candidate_read_error(ctx and tool_name)
+            if string_length(repair_action_error) == 0:
+                set repair_action_error to tools_repair_action_error(ctx and tool_name)
+            if string_length(repair_action_error) > 0:
+                display f"[ReAct] Repair workflow call rejected before approval: {repair_action_error}"
+                set ok to trace_emit(trace_db and trace_sid and "repair_gate" and repair_action_error)
+                # Retain repeated-gate provenance, but never convert it into a terminal
+                # reply. A deterministic controller transition below must continue any
+                # state whose next action is mechanically knowable.
+                set repair_gate_fingerprint to concat(tool_name and concat(":" and repair_action_error))
+                set repair_gate_repeats to 1
+                if map_contains(ctx and "last_repair_gate_call") == 1:
+                    if ptr_to_str(map_get_val(ctx and "last_repair_gate_call")) equals repair_gate_fingerprint:
+                        if map_contains(ctx and "repair_gate_call_repeats") == 1:
+                            set repair_gate_repeats to map_get_val(ctx and "repair_gate_call_repeats") + 1
+                set ok to map_insert(ctx and "last_repair_gate_call" and repair_gate_fingerprint)
+                set ok to map_insert(ctx and "repair_gate_call_repeats" and repair_gate_repeats)
+                set ok to map_insert(ctx and "durable_protocol_correction" and repair_action_error)
+                set ok to map_insert(ctx and "frozen_latest_tool" and tool_name)
+                set ok to map_insert(ctx and "frozen_latest_observation" and repair_action_error)
+                set durable_repair_prompt to react_improvement_decision_prompt(ctx)
+                if string_length(durable_repair_prompt) == 0:
+                    set current_prompt to concat(current_prompt and "\n")
+                    set current_prompt to concat(current_prompt and assistant_text)
+                    set current_prompt to concat(current_prompt and "\nObservation: [REPAIR WORKFLOW GATE — nothing was executed] ")
+                    set current_prompt to concat(current_prompt and repair_action_error)
+                    set current_prompt to concat(current_prompt and "\n")
+                else:
+                    set ok to trace_emit(trace_db and trace_sid and "durable_prompt_bounded" and "Repair-gate correction retained in durable state without extending accumulated prompt")
+                set override_output to react_repair_gate_forced_action(repair_action_error)
+                free_list(args_list)
+                if is_batched_turn == 0:
+                    set loop_idx to loop_idx + 1
+                continue
                 
             set action_allowed to 1
             set action_reason to ""
@@ -1220,7 +2605,9 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                                 set current_prompt to concat(current_prompt and concat("\nObservation: " and observation))
                                 set loop_idx to loop_idx + 1
                                 if loop_idx >= max_iters:
-                                    return "Max turns reached."
+                                    set ok to trace_emit(trace_db and trace_sid and "iteration_checkpoint" and f"Continuing unfinished work after {max_iters} model decisions")
+                                    set current_prompt to concat(current_prompt and "\n[LONG-RUN CHECKPOINT — INVISIBLE TO USER]\nThe current task is unfinished. Continue from the exact accumulated prompt and tool observations. Do not report completion, stop, roll back, or ask the user to retry merely because this checkpoint was reached. Continue investigating, implementing, repairing and verifying until the requested outcome is genuinely complete or a real cancellation, permission decision, moderation boundary, or unrecoverable error requires a truthful terminal response.\n[/LONG-RUN CHECKPOINT]\n")
+                                    set loop_idx to 0
                                 continue
                         else:
                             free_list(args_list)
@@ -1240,7 +2627,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 if length_list(args_list) >= 1:
                     if get_list(args_list and 0) equals "execute":
                         set is_grid_exec to 1
-            if tool_name equals "run_command" or else tool_name equals "codebase_write" or else tool_name equals "self_prompt_set" or else tool_name equals "persona_set" or else tool_name equals "persona_register" or else is_grid_exec == 1:
+            if tool_name equals "run_command" or else tool_name equals "codebase_write" or else tool_name equals "codebase_replace" or else tool_name equals "improvement_test_freeze" or else tool_name equals "improvement_test_abandon" or else tool_name equals "system_recompile" or else tool_name equals "self_prompt_set" or else tool_name equals "persona_set" or else tool_name equals "persona_register" or else is_grid_exec == 1:
                 set audit_payload to ""
                 if tool_name equals "run_command":
                     if length_list(args_list) >= 1:
@@ -1253,6 +2640,13 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                     if length_list(args_list) >= 1:
                         set sec_arg to get_list(args_list and 0)
                         set audit_payload to concat("self_prompt_set: agent is rewriting its own prompt section " and sec_arg)
+                else if tool_name equals "system_recompile":
+                    set audit_payload to "system_recompile: build, test, and transactionally replace Echo's running cognitive executable with authenticated health validation and exact rollback"
+                else if tool_name equals "improvement_test_freeze":
+                    set audit_payload to "improvement_test_freeze: hash-lock the retained, prevalidated causal regression and live E2E artifacts before implementation"
+                else if tool_name equals "improvement_test_abandon":
+                    if length_list(args_list) >= 1:
+                        set audit_payload to concat("improvement_test_abandon before implementation: " and get_list(args_list and 0))
                 else if tool_name equals "persona_set" or else tool_name equals "persona_register":
                     # P9: swapping/registering the agent's IDENTITY is as powerful as a
                     # self-prompt rewrite — audited by the same rule.
@@ -1262,10 +2656,10 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 else:
                     if length_list(args_list) >= 1:
                         set path_arg to get_list(args_list and 0)
-                        set audit_payload to concat("codebase_write: " and path_arg)
+                        set audit_payload to concat(tool_name and concat(": " and path_arg))
                 
                 if string_length(audit_payload) > 0:
-                    set audit_map to observer_audit(ctx and current_prompt and audit_payload)
+                    set audit_map to observer_audit(ctx and query_prompt and audit_payload)
                     set verdict to map_get_val(audit_map and "verdict")
                     set audit_record_reason to map_get_val(audit_map and "reason")
                     set ok to map_insert(ctx and "last_observer_verdict" and verdict)
@@ -1298,13 +2692,45 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
                 # prefix on the same model slot — it evicts the main prompt's KV cache and
                 # the next main call re-prefills the whole prompt from zero (~turn-1 TTFT).
                 # With the real prompt as system context the audit shares the prefix.
-                set ok to map_insert(ctx and "current_prompt" and current_prompt)
+                set ok to map_insert(ctx and "current_prompt" and query_prompt)
                 # Artifact provenance records the actual tool that created/shared the
                 # bytes. This is per-turn context, so concurrent sessions cannot race.
                 set ok to map_insert(ctx and "current_action_name" and tool_name)
                 set tool_result to tools_execute(tools_mgr and ctx and tool_name and args_list)
                 display f"Tool result: {tool_result}"
                 set ok to trace_emit(trace_db and trace_sid and "tool_result" and tool_result)
+                set ok to map_insert(ctx and "frozen_latest_tool" and tool_name)
+                set ok to map_insert(ctx and "frozen_latest_observation" and tool_result)
+                set controller_invariant_error to react_controller_transition_invariant_error(tool_name and tool_result)
+                if string_length(controller_invariant_error) > 0:
+                    set ok to trace_emit(trace_db and trace_sid and "controller_invariant_failure" and controller_invariant_error)
+                    set final_answer to controller_invariant_error
+                    set finished to 1
+                    set override_output to ""
+                set candidate_post_result_action to react_candidate_post_result_forced_action(ctx and tool_result)
+                if string_length(candidate_post_result_action) > 0:
+                    display "[ReAct] Structured candidate failure selected an immediate provenance-preserving reset."
+                    set ok to trace_emit(trace_db and trace_sid and "candidate_reset" and "Structured post-tool failure selected deterministic candidate reset")
+                    set override_output to candidate_post_result_action
+
+            # Candidate syntax/addressing failures are repair transitions, never scope
+            # failures. Refresh the retained bytes through their production alias before
+            # any further inference so the exact compiler evidence cannot be lost.
+            set candidate_repair_action to react_candidate_repair_action(ctx and tool_result)
+            if string_length(candidate_repair_action) > 0:
+                display "[ReAct] Candidate repair required; forcing canonical production-path reread."
+                set ok to trace_emit(trace_db and trace_sid and "candidate_repair" and "Canonical production-path reread selected")
+                set override_output to candidate_repair_action
+
+            # A rejected pre-write operation can prove that the frozen plan omitted
+            # a required architectural dependency. Supersede any stale batched action
+            # with the one legal recovery transition instead of asking the model to
+            # rediscover that conclusion until its context repeats.
+            set scope_replan_action to react_frozen_scope_replan_action(ctx and tool_result)
+            if string_length(scope_replan_action) > 0:
+                display "[ReAct] Frozen plan omitted a required production path; forcing preserved abandonment and re-investigation."
+                set ok to trace_emit(trace_db and trace_sid and "frozen_scope_replan" and "Controller-proven missing production dependency before first accepted write")
+                set override_output to scope_replan_action
                 
             set ok to append_list(values_list and tool_result)
             
@@ -1324,7 +2750,7 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             else if tool_name equals "reply_request":
                 # Single inference-only audit — all LLM, no hardcoded checks
                 set ok to map_insert(ctx and "observer_capture_continuity" and 1)
-                set audit_map to observer_audit(ctx and current_prompt and tool_result)
+                set audit_map to observer_audit(ctx and query_prompt and tool_result)
                 set ok to map_delete(ctx and "observer_capture_continuity")
                 set verdict to map_get_val(audit_map and "verdict")
                 set audit_reason to map_get_val(audit_map and "reason")
@@ -1371,35 +2797,42 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
             else:
                 # Standard tool observation back to prompt — fit it to the model's
                 # remaining context window (derived, never a fixed cap).
-                set obs_model to ""
-                if map_contains(ctx and "selected_model") == 1:
-                    set obs_model to map_get_val(ctx and "selected_model")
-                # Align the budget with the model the LLM call ACTUALLY uses. When no
-                # model is selected, query_local_llm falls back to gemma4:26b — so the
-                # budget must use that too, otherwise it'd size for the unknown-model
-                # default (8192) and clamp tool output to 2048 chars, truncating file
-                # reads even though the real model window is large.
-                if string_length(obs_model) == 0:
-                    set obs_model to "gemma4:26b"
-                set obs_budget to react_observation_budget(obs_model and string_length(current_prompt))
-                set current_prompt to concat(current_prompt and "\n")
-                set current_prompt to concat(current_prompt and assistant_text)
-                # Guard: empty tool results cause the LLM to continuation-complete the
-                # Observation line instead of starting a new Thought/Action block.
-                set obs_text to tool_result
-                if string_length(string_trim(tool_result)) == 0:
-                    set obs_text to "[empty result — the tool returned no output]"
-                set current_prompt to concat(current_prompt and "\nObservation: ")
-                set current_prompt to concat(current_prompt and react_fit_observation(obs_text and obs_budget))
-                set current_prompt to concat(current_prompt and "\n")
-                if string_length(orphan_nudge) > 0:
-                    set current_prompt to concat(current_prompt and orphan_nudge)
+                set durable_observation_prompt to react_improvement_decision_prompt(ctx)
+                if string_length(durable_observation_prompt) == 0:
+                    set obs_model to ""
+                    if map_contains(ctx and "selected_model") == 1:
+                        set obs_model to map_get_val(ctx and "selected_model")
+                    # Align the budget with the model the LLM call ACTUALLY uses. When no
+                    # model is selected, query_local_llm falls back to gemma4:26b — so the
+                    # budget must use that too, otherwise it'd size for the unknown-model
+                    # default (8192) and clamp tool output to 2048 chars, truncating file
+                    # reads even though the real model window is large.
+                    if string_length(obs_model) == 0:
+                        set obs_model to "gemma4:26b"
+                    set obs_budget to react_observation_budget(obs_model and string_length(current_prompt))
+                    set current_prompt to concat(current_prompt and "\n")
+                    set observation_action_text to react_observation_action_text(tool_name and assistant_text)
+                    set current_prompt to concat(current_prompt and observation_action_text)
+                    # Guard: empty tool results cause the LLM to continuation-complete the
+                    # Observation line instead of starting a new Thought/Action block.
+                    set obs_text to tool_result
+                    if string_length(string_trim(tool_result)) == 0:
+                        set obs_text to "[empty result — the tool returned no output]"
+                    set current_prompt to concat(current_prompt and "\nObservation: ")
+                    set current_prompt to concat(current_prompt and react_fit_observation(obs_text and obs_budget))
+                    set current_prompt to concat(current_prompt and "\n")
+                    if string_contains(tool_result and "code=CANDIDATE_REPAIR_REQUIRED") == 1:
+                        set current_prompt to concat(current_prompt and "[CANDIDATE REPAIR — INVISIBLE TO USER] The live source is unchanged and the failed candidate remains available through codebase_read on the original production path. Do not regenerate the file or repeat codebase_write. Read the retained candidate, apply a localized codebase_replace for the exact compiler diagnostic, and continue until the candidate compiles.\n")
+                    if string_length(orphan_nudge) > 0:
+                        set current_prompt to concat(current_prompt and orphan_nudge)
+                else:
+                    set ok to trace_emit(trace_db and trace_sid and "durable_prompt_bounded" and "Latest tool and observation retained in durable decision state without extending accumulated prompt")
 
                 set denials to 0
                 if map_contains(ctx and "consecutive_denials") == 1:
                     set denials to map_get_val(ctx and "consecutive_denials")
                 if denials >= 2:
-                    set current_prompt to concat(current_prompt and "\n[SYSTEM: The user has denied tool execution twice in a row. You must call reply_request now to return your final answer based on the information you have. Do not use any other tool.]\n")
+                    set current_prompt to concat(current_prompt and "\n[SYSTEM: The user has denied tool execution twice in a row. Return your final answer now as plain user-facing prose based on the information you have. Do not use any tool or protocol wrapper.]\n")
             # Free args_list AFTER all tool_result consumers (memory_store, observer_audit,
             # observation injection) are done. tool_result may alias args_list elements
             # via get_list — freeing earlier is use-after-free.
@@ -1407,24 +2840,40 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
         else:
             display "No valid action parsed. Re-prompting for correct Action grammar..."
             set ok to trace_emit(trace_db and trace_sid and "no_action" and "No valid action parsed, re-prompting")
+            set no_action_streak to 1
+            if map_contains(ctx and "consecutive_no_action") == 1:
+                set no_action_streak to map_get_val(ctx and "consecutive_no_action") + 1
+            set ok to map_insert(ctx and "consecutive_no_action" and no_action_streak)
             # Enforce Turn Boundary Rejection — tell the model EXACTLY what it did wrong
             # and what it must do. Common cause: the LLM continuation-completed an empty
             # Observation instead of starting a new Thought/Action block.
-            set current_prompt to concat(current_prompt and "\n")
-            set current_prompt to concat(current_prompt and "[FORMAT CORRECTION — INVISIBLE TO USER]\nYour output attempted protocol scaffolding but contained no syntactically valid line-anchored Action call. Do not revisit, quote, summarize or analyze the rejected output. The current task remains the exact User Request above. Output one short Thought and then a valid line beginning `Action:`. To answer directly use: Action: reply_request([\"your response\"])\n")
+            set ok to map_insert(ctx and "durable_protocol_correction" and "IMPROVEMENT_GATE_FAILED code=TOOL_ENVELOPE_INVALID message=Return exactly one two-key object with tool_name and arguments. Do not emit reasoning or prose in an unfinished durable transaction.")
+            set durable_no_action_prompt to react_improvement_decision_prompt(ctx)
+            if string_length(durable_no_action_prompt) == 0:
+                set current_prompt to concat(current_prompt and "\n")
+                set current_prompt to concat(current_prompt and "[FORMAT CORRECTION — INVISIBLE TO USER]\nThe provider response did not decode as the required two-key action envelope. Do not revisit or summarize it. Return exactly {\"tool_name\":\"registered_tool\",\"arguments\":[...]}; use reply_request with one natural-language string argument only when the task is complete.\n")
+            else:
+                set ok to trace_emit(trace_db and trace_sid and "durable_prompt_bounded" and "Envelope correction retained in durable state without extending accumulated prompt")
+            set frozen_action_nudge to react_frozen_implementation_action_nudge(ctx and no_action_streak)
+            if string_length(frozen_action_nudge) > 0:
+                if string_length(durable_no_action_prompt) == 0:
+                    set current_prompt to concat(current_prompt and frozen_action_nudge)
+                set forced_frozen_reread to react_frozen_planned_reread_action(ctx)
+                if string_length(forced_frozen_reread) > 0:
+                    set override_output to forced_frozen_reread
+                    set ok to trace_emit(trace_db and trace_sid and "typed_action_recovery" and "Malformed/reasoning-only decision replaced by canonical frozen-plan reread")
 
-        # Batched actions (queued from a single response) do NOT count against the LLM-turn cap;
+        # Batched actions (queued from a single response) do NOT count against the
+        # fresh-decision checkpoint interval;
         # only a turn that made a fresh inference call advances loop_idx.
         if is_batched_turn == 0:
             set loop_idx to loop_idx + 1
-
-    # E3: if the loop exited on the iteration cap (not a natural reply_request), abort
-    # instead of spinning — a model that never replies would otherwise run forever with
-    # an ever-growing prompt (cost/compute DoS).
-    if finished == 0:
-        display f"[ReAct] Iteration cap ({max_iters}) reached — aborting."
-        set ok to trace_emit(trace_db and trace_sid and "done" and f"Iteration cap ({max_iters}) reached")
-        set final_answer to "I could not complete this request within the allowed number of steps."
+            if loop_idx >= max_iters:
+                set ok to trace_emit(trace_db and trace_sid and "iteration_checkpoint" and f"Continuing unfinished work after {max_iters} model decisions")
+                set durable_checkpoint_prompt to react_improvement_decision_prompt(ctx)
+                if string_length(durable_checkpoint_prompt) == 0:
+                    set current_prompt to concat(current_prompt and "\n[LONG-RUN CHECKPOINT — INVISIBLE TO USER]\nThe current task is unfinished. Continue from the exact accumulated prompt and tool observations. Do not report completion, stop, roll back, or ask the user to retry merely because this checkpoint was reached. Continue investigating, implementing, repairing and verifying until the requested outcome is genuinely complete or a real cancellation, permission decision, moderation boundary, or unrecoverable error requires a truthful terminal response.\n[/LONG-RUN CHECKPOINT]\n")
+                set loop_idx to 0
     free_list(values_list)
     set ok to tools_set_active_session("")
     return reply_format_normalize(final_answer)
@@ -1467,8 +2916,10 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
 
     if approved == 1:
         set denials to 0
+        set ok to map_delete(ctx and "last_denied_tool")
     else:
         set denials to denials + 1
+        set ok to map_insert(ctx and "last_denied_tool" and tool_name)
     set ok to map_insert(ctx and "consecutive_denials" and denials)
 
     set tool_result to ""
@@ -1477,7 +2928,7 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
         
         # Run observer security audit for dangerous commands before executing
         set action_allowed to 1
-        if tool_name equals "run_command" or else tool_name equals "codebase_write" or else tool_name equals "self_prompt_set":
+        if tool_name equals "run_command" or else tool_name equals "codebase_write" or else tool_name equals "codebase_replace" or else tool_name equals "improvement_test_freeze" or else tool_name equals "improvement_test_abandon" or else tool_name equals "system_recompile" or else tool_name equals "self_prompt_set":
             set audit_payload to ""
             if tool_name equals "run_command":
                 if length_list(args_list) >= 1:
@@ -1487,13 +2938,21 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
                 if length_list(args_list) >= 1:
                     set sec_arg to get_list(args_list and 0)
                     set audit_payload to concat("self_prompt_set: agent is rewriting its own prompt section " and sec_arg)
+            else if tool_name equals "system_recompile":
+                set audit_payload to "system_recompile: build, test, and transactionally replace Echo's running cognitive executable with authenticated health validation and exact rollback"
+            else if tool_name equals "improvement_test_freeze":
+                set audit_payload to "improvement_test_freeze: hash-lock the retained, prevalidated causal regression and live E2E artifacts before implementation"
+            else if tool_name equals "improvement_test_abandon":
+                if length_list(args_list) >= 1:
+                    set audit_payload to concat("improvement_test_abandon before implementation: " and get_list(args_list and 0))
             else:
                 if length_list(args_list) >= 1:
                     set path_arg to get_list(args_list and 0)
-                    set audit_payload to concat("codebase_write: " and path_arg)
+                    set audit_payload to concat(tool_name and concat(": " and path_arg))
 
             if string_length(audit_payload) > 0:
-                set audit_map to observer_audit(ctx and current_prompt and audit_payload)
+                set resume_audit_prompt to react_audit_prompt_for_state(ctx and current_prompt)
+                set audit_map to observer_audit(ctx and resume_audit_prompt and audit_payload)
                 set verdict to map_get_val(audit_map and "verdict")
                 set audit_record_reason to map_get_val(audit_map and "reason")
                 set ok to map_insert(ctx and "last_observer_verdict" and verdict)
@@ -1509,9 +2968,19 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
         
         if action_allowed == 1:
             # KV-CACHE: same as the main loop — let tool-run audits share the prompt prefix.
-            set ok to map_insert(ctx and "current_prompt" and current_prompt)
+            set ok to map_insert(ctx and "current_prompt" and react_audit_prompt_for_state(ctx and current_prompt))
             set tool_result to tools_execute(tools_mgr and ctx and tool_name and args_list)
             display f"Tool result: {tool_result}"
+            # Approved actions execute through this resume path rather than the main
+            # loop's immediate-execution branch. Preserve the same authoritative
+            # result and structured candidate transition here so approval cannot
+            # bypass deterministic repair routing.
+            set ok to map_insert(ctx and "frozen_latest_tool" and tool_name)
+            set ok to map_insert(ctx and "frozen_latest_observation" and tool_result)
+            set resume_candidate_action to react_candidate_post_result_forced_action(ctx and tool_result)
+            if string_length(resume_candidate_action) > 0:
+                display "[ReAct] Approved structured candidate failure selected deterministic reset for the resumed loop."
+                set ok to trace_emit(trace_db and trace_sid and "candidate_reset" and "Approved post-tool failure selected deterministic candidate reset")
     else:
         display f"User DENIED tool: {tool_name}. Skipping."
         # F2: distinguish a USER decision from a policy gate. The user actively chose
@@ -1520,11 +2989,20 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
     
     # Store event in Tier 3 Timeline
     set ok to memory_store(memory_mgr and 3 and f"Action: {tool_name}" and f"Result: {tool_result}")
+
+    # Approval resume is the same foreground lifecycle as immediate execution.
+    # A successful terminal tool must be returned to node_resume_turn now so it can
+    # persist the correlated reply and hand a staged upgrade to the supervisor once.
+    # Re-entering react_run_loop here made the durable state keep selecting
+    # system_recompile after it was already staged, producing an unbounded retry.
+    if approved == 1 and also react_tool_result_finishes_turn(tool_name and 1 and tool_result) == 1:
+        set ok to trace_emit(trace_db and trace_sid and "done" and concat("Approved terminal tool completed: " and tool_name))
+        return reply_format_normalize(tool_result)
     
     if tool_name equals "reply_request" and approved == 1:
         # reply_request was approved — run observer audit on the reply content
         set ok to map_insert(ctx and "observer_capture_continuity" and 1)
-        set audit_map to observer_audit(ctx and current_prompt and tool_result)
+        set audit_map to observer_audit(ctx and react_audit_prompt_for_state(ctx and current_prompt) and tool_result)
         set ok to map_delete(ctx and "observer_capture_continuity")
         set verdict to map_get_val(audit_map and "verdict")
         set audit_reason to map_get_val(audit_map and "reason")
@@ -1552,7 +3030,7 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
     set current_prompt to concat(current_prompt and "\n")
     
     if denials >= 2:
-        set current_prompt to concat(current_prompt and "\n[SYSTEM: The user has denied tool execution twice in a row. You must call reply_request now to return your final answer based on the information you have. Do not use any other tool.]\n")
+        set current_prompt to concat(current_prompt and "\n[SYSTEM: The user has denied tool execution twice in a row. Return your final answer now as plain user-facing prose based on the information you have. Do not use any tool or protocol wrapper.]\n")
 
     # Set approval flag so the loop can continue without re-gating
     set ok to map_insert(ctx and "tool_approved" and 0)
@@ -1665,6 +3143,8 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     # the current value at start, so old bumps are already behind them).
     set ok to ep_cancel_set(0)
     set sanitized_user_prompt to prompt_sanitize_input(user_prompt)
+    set ok to map_insert(ctx and "repair_original_request" and sanitized_user_prompt)
+    set ok to tools_repair_begin(ctx and sanitized_user_prompt)
     # Trigger Hebbian learning on prompt concepts
     set ok to react_hebbian_trigger(memory_mgr and sanitized_user_prompt)
     

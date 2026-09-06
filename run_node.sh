@@ -14,6 +14,7 @@ LOG="${HOME}/.ernosdecent/node.log"
 mkdir -p "$(dirname "$LOG")"
 LOCK_DIR="${HOME}/.ernosdecent/node-runtime.lock"
 LOCK_PID="${LOCK_DIR}/pid"
+CURRENT_NODE_PID=""
 
 # Atomic single-instance guard. The lock belongs to this wrapper, which owns the node
 # pipeline for its whole lifetime. A stale lock is removed only after its recorded PID
@@ -32,6 +33,9 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 echo "$$" > "$LOCK_PID"
 cleanup_runtime_lock() {
+  if [ -n "$CURRENT_NODE_PID" ] && kill -0 "$CURRENT_NODE_PID" 2>/dev/null; then
+    kill -TERM "$CURRENT_NODE_PID" 2>/dev/null || true
+  fi
   rm -f "$LOCK_PID"
   rmdir "$LOCK_DIR" 2>/dev/null || true
 }
@@ -131,19 +135,208 @@ fi
 
 echo "[run_node] $(date '+%Y-%m-%d %H:%M:%S') starting node — logging to $LOG"
 # Combine stdout+stderr and tee to the logfile (live in terminal AND persisted).
-set -o pipefail
+# run_node.sh owns all process replacement. A staged self-upgrade is activated only
+# after the old node exits 75, then committed only after authenticated replacement
+# health and in-node rights-ledger reconciliation. Any failed gate restores the exact
+# pre-upgrade executable before the old process is relaunched.
+ipc_cmd() {
+  local timeout_seconds="$1"
+  local command="$2"
+  local token
+  token=$(tr -d '\r\n ' < "${HOME}/.ernosdecent/ipc-token" 2>/dev/null) || return 1
+  [ -n "$token" ] || return 1
+  printf 'AUTH %s %s\n' "$token" "$command" | nc -w "$timeout_seconds" 127.0.0.1 5000 2>/dev/null
+}
+
+runtime_hash_file() {
+  local path="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+verify_operator_regression_gate() {
+  local seal="${HOME}/.ernosdecent/mandatory-regressions.seal"
+  local manifest="config/upgrades/mandatory-regressions.sha256"
+  local expected actual
+  [ -f "$seal" ] && [ ! -L "$seal" ] || return 1
+  [ -f "$manifest" ] && [ ! -L "$manifest" ] || return 1
+  expected=$(tr -d '\r\n ' < "$seal") || return 1
+  actual=$(runtime_hash_file "$manifest") || return 1
+  [ ${#expected} -eq 64 ] && [ "$actual" = "$expected" ] || return 1
+  bash scripts/run_mandatory_regressions.sh --verify-only
+}
+
+launch_node_process() {
+  if [ "$PRESERVE_DISCORD_BRIDGE" -eq 1 ]; then
+    ERNOS_PRESERVE_DISCORD_BRIDGE=1 ./node > >(tee -a "$LOG") 2>&1 &
+  else
+    ./node > >(tee -a "$LOG") 2>&1 &
+  fi
+  CURRENT_NODE_PID=$!
+}
+
+wait_for_node_health() {
+  local attempt response
+  for attempt in $(seq 1 60); do
+    if ! kill -0 "$CURRENT_NODE_PID" 2>/dev/null; then
+      return 1
+    fi
+    response=$(ipc_cmd 1 "STATUS" || true)
+    if echo "$response" | grep -q "status:active"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+stop_current_node() {
+  local attempt
+  if [ -z "$CURRENT_NODE_PID" ] || ! kill -0 "$CURRENT_NODE_PID" 2>/dev/null; then
+    wait "$CURRENT_NODE_PID" 2>/dev/null || true
+    CURRENT_NODE_PID=""
+    return 0
+  fi
+  kill -TERM "$CURRENT_NODE_PID" 2>/dev/null || true
+  for attempt in $(seq 1 25); do
+    if ! kill -0 "$CURRENT_NODE_PID" 2>/dev/null; then
+      wait "$CURRENT_NODE_PID" 2>/dev/null || true
+      CURRENT_NODE_PID=""
+      return 0
+    fi
+    sleep 0.2
+  done
+  kill -KILL "$CURRENT_NODE_PID" 2>/dev/null || true
+  wait "$CURRENT_NODE_PID" 2>/dev/null || true
+  CURRENT_NODE_PID=""
+}
+
+upgrade_outcome_status() {
+  sed -n 's/^status=//p' config/upgrades/outcome.env 2>/dev/null | head -n 1
+}
+
 PRESERVE_DISCORD_BRIDGE=0
 while true; do
-  if [ "$PRESERVE_DISCORD_BRIDGE" -eq 1 ]; then
-    ERNOS_PRESERVE_DISCORD_BRIDGE=1 ./node 2>&1 | tee -a "$LOG"
-  else
-    ./node 2>&1 | tee -a "$LOG"
+  UPGRADE_PENDING=0
+  if [ -f "config/upgrades/pending.env" ]; then
+    UPGRADE_PENDING=1
+    if ! verify_operator_regression_gate; then
+      echo "[run_node] staged upgrade trust root changed after validation; keeping the previous executable live and leaving the transaction for inspection." >&2
+      UPGRADE_PENDING=0
+    elif [ ! -f "config/upgrades/outcome.env" ]; then
+      if ! bash upgrade.sh activate; then
+        echo "[run_node] staged upgrade activation failed before launch; refusing an unverified runtime." >&2
+        exit 1
+      fi
+    fi
   fi
-  NODE_RC=${PIPESTATUS[0]}
+
+  launch_node_process
+
+  if [ "$UPGRADE_PENDING" -eq 1 ]; then
+    if ! wait_for_node_health; then
+      OUTCOME_STATUS=$(upgrade_outcome_status)
+      stop_current_node
+      if [ "$OUTCOME_STATUS" = "failed" ]; then
+        echo "[run_node] rollback executable failed authenticated health; transaction remains for inspection." >&2
+        exit 1
+      fi
+      echo "[run_node] candidate failed authenticated health; restoring exact pre-upgrade executable." >&2
+      if ! python3 scripts/improvement_test_gate.py record-failure --detail replacement_failed_authenticated_health; then
+        echo "[run_node] could not persist the active improvement health failure; rollback still takes priority." >&2
+      fi
+      if ! bash upgrade.sh rollback || ! bash upgrade.sh failure replacement_failed_authenticated_health; then
+        echo "[run_node] automatic executable rollback failed; refusing further launch." >&2
+        exit 1
+      fi
+      PRESERVE_DISCORD_BRIDGE=1
+      continue
+    fi
+
+    # Generic health is necessary but not sufficient for a self-authored feature.
+    # Run every frozen live E2E test against the replacement before recording success.
+    # The test bytes were frozen before implementation and execute read-only with
+    # localhost-only networking, so the implementation cannot rewrite its evaluator.
+    OUTCOME_STATUS=$(upgrade_outcome_status)
+    if [ "$OUTCOME_STATUS" != "failed" ]; then
+      if ! python3 scripts/improvement_test_gate.py live; then
+        echo "[run_node] candidate failed a frozen live E2E contract; restoring exact pre-upgrade executable." >&2
+        stop_current_node
+        if ! python3 scripts/improvement_test_gate.py record-failure --detail frozen_improvement_live_e2e_failed; then
+          echo "[run_node] could not persist a complete frozen live-E2E failure receipt; rollback still takes priority." >&2
+        fi
+        if ! bash upgrade.sh rollback || ! bash upgrade.sh failure frozen_improvement_live_e2e_failed; then
+          echo "[run_node] rollback after frozen live E2E failure failed." >&2
+          exit 1
+        fi
+        PRESERVE_DISCORD_BRIDGE=1
+        continue
+      fi
+    fi
+
+    if [ ! -f "config/upgrades/outcome.env" ]; then
+      if ! bash upgrade.sh success; then
+        echo "[run_node] healthy candidate could not produce an outcome receipt; rolling back." >&2
+        stop_current_node
+        if ! python3 scripts/improvement_test_gate.py record-failure --detail outcome_receipt_failed; then
+          echo "[run_node] could not persist the active improvement outcome-receipt failure; rollback still takes priority." >&2
+        fi
+        if ! bash upgrade.sh rollback || ! bash upgrade.sh failure outcome_receipt_failed; then
+          echo "[run_node] rollback after outcome failure failed; refusing further launch." >&2
+          exit 1
+        fi
+        PRESERVE_DISCORD_BRIDGE=1
+        continue
+      fi
+    fi
+
+    RECONCILE_RESPONSE=$(ipc_cmd 5 "UPGRADE RECONCILE" || true)
+    if echo "$RECONCILE_RESPONSE" | grep -qE '^upgrade:(committed|rolled_back),'; then
+      echo "[run_node] $RECONCILE_RESPONSE"
+      if echo "$RECONCILE_RESPONSE" | grep -q '^upgrade:committed,' && [ -f "config/improvements/active.json" ]; then
+        if ! python3 scripts/improvement_test_gate.py complete; then
+          echo "[run_node] upgrade committed but its frozen improvement receipt could not be finalized." >&2
+          stop_current_node
+          exit 1
+        fi
+      fi
+      if ! bash upgrade.sh cleanup; then
+        echo "[run_node] upgrade committed but transaction cleanup failed; refusing ambiguous continuation." >&2
+        stop_current_node
+        exit 1
+      fi
+      UPGRADE_PENDING=0
+    else
+      OUTCOME_STATUS=$(upgrade_outcome_status)
+      echo "[run_node] rights reconciliation failed: ${RECONCILE_RESPONSE:-no response}" >&2
+      stop_current_node
+      if [ "$OUTCOME_STATUS" = "applied" ]; then
+        if ! python3 scripts/improvement_test_gate.py record-failure --detail rights_reconciliation_failed; then
+          echo "[run_node] could not persist the active improvement reconciliation failure; rollback still takes priority." >&2
+        fi
+        if ! bash upgrade.sh rollback || ! bash upgrade.sh failure rights_reconciliation_failed; then
+          echo "[run_node] rollback after rights reconciliation failure failed." >&2
+          exit 1
+        fi
+        PRESERVE_DISCORD_BRIDGE=1
+        continue
+      fi
+      echo "[run_node] rolled-back executable could not reconcile its failure receipt; transaction remains for inspection." >&2
+      exit 1
+    fi
+  fi
+
+  wait "$CURRENT_NODE_PID"
+  NODE_RC=$?
+  CURRENT_NODE_PID=""
   if [ "$NODE_RC" -ne 75 ]; then
     exit "$NODE_RC"
   fi
-  echo "[run_node] authenticated restart requested; relaunching clean node."
+  echo "[run_node] authenticated restart requested; supervisor is evaluating pending state."
   PRESERVE_DISCORD_BRIDGE=1
-  sleep 1
 done

@@ -1,0 +1,404 @@
+# ErnosDecent -- Local control-plane framing
+# Component: decent_net/ipc_framing.ep
+
+import "collections"
+import "string"
+
+set IPC_FRAME_MAX_REQUEST_BYTES to 65536
+set IPC_FRAME_MAX_RESPONSE_BYTES to 67108864
+set IPC_FRAME_MAX_TIMEOUT_MS to 3600000
+
+# Synchronous poll(2) for a connected local socket. Returns 1 for readable,
+# 2 for an unambiguous hang-up, 0 for timeout, and -1 for validation/system error.
+define ipc_poll_readable with fd as Int and timeout_ms as Int returning Int:
+    if fd < 0 or else timeout_ms < 0 or else timeout_ms > IPC_FRAME_MAX_TIMEOUT_MS:
+        return 0 - 1
+    set libc to ep_dlopen("/usr/lib/libSystem.B.dylib")
+    if libc == 0:
+        set libc to ep_dlopen("libc.so.6")
+    if libc == 0:
+        set libc to ep_dlopen("libc.so")
+    if libc == 0:
+        return 0 - 1
+    set poll_fn to ep_dlsym(libc and "poll")
+    if poll_fn == 0:
+        set missing_symbol_close to ep_dlclose(libc)
+        if missing_symbol_close != 0:
+            display "[IPC] ERROR: could not close libc after poll symbol lookup failed."
+        return 0 - 1
+    set pollfd to alloc_bytes(8)
+    if pollfd == 0:
+        set allocation_close to ep_dlclose(libc)
+        if allocation_close != 0:
+            display "[IPC] ERROR: could not close libc after poll descriptor allocation failed."
+        return 0 - 1
+    set write_ok to 1
+    if poke_byte(pollfd and 0 and fd % 256) != 0:
+        set write_ok to 0
+    if poke_byte(pollfd and 1 and (fd / 256) % 256) != 0:
+        set write_ok to 0
+    if poke_byte(pollfd and 2 and (fd / 65536) % 256) != 0:
+        set write_ok to 0
+    if poke_byte(pollfd and 3 and (fd / 16777216) % 256) != 0:
+        set write_ok to 0
+    if poke_byte(pollfd and 4 and 1) != 0:
+        set write_ok to 0
+    if poke_byte(pollfd and 5 and 0) != 0:
+        set write_ok to 0
+    if poke_byte(pollfd and 6 and 0) != 0:
+        set write_ok to 0
+    if poke_byte(pollfd and 7 and 0) != 0:
+        set write_ok to 0
+    if write_ok == 0:
+        set write_free to free_bytes(pollfd)
+        set write_close to ep_dlclose(libc)
+        if write_free != 0 or else write_close != 0:
+            display "[IPC] ERROR: poll setup and cleanup both failed."
+        return 0 - 1
+    set poll_result to ep_dlcall3(poll_fn and pollfd and 1 and timeout_ms)
+    set revents to peek_byte(pollfd and 6) + peek_byte(pollfd and 7) * 256
+    set free_result to free_bytes(pollfd)
+    set close_result to ep_dlclose(libc)
+    if free_result != 0 or else close_result != 0:
+        return 0 - 1
+    if poll_result == 0:
+        return 0
+    # The dynamic integer bridge cannot portably represent poll's C-width -1;
+    # a failed poll has no event flags, whereas every successful event has flags.
+    if revents == 0:
+        return 0 - 1
+    set has_readable to revents % 2
+    set has_error to (revents / 8) % 2
+    set has_hangup to (revents / 16) % 2
+    set has_invalid_fd to (revents / 32) % 2
+    if has_invalid_fd == 1:
+        return 0 - 1
+    # POLLERR is fail-closed even when POLLIN is also present. POLLIN+POLLHUP
+    # without POLLERR is the normal "buffered final bytes, then EOF" sequence.
+    if has_error == 1:
+        return 0 - 1
+    if has_readable == 1:
+        return 1
+    if has_hangup == 1:
+        return 2
+    return 1
+
+define ipc_wait_readable_until with fd as Int and deadline_ms as Int returning Int:
+    set remaining_ms to deadline_ms - ep_time_now_ms()
+    if remaining_ms <= 0:
+        return 0
+    if remaining_ms > IPC_FRAME_MAX_TIMEOUT_MS:
+        return 0 - 1
+    return ipc_poll_readable(fd and remaining_ms)
+
+define ipc_frame_result with success as Int and payload as Str and frame_error as Str returning Map:
+    set result to create_map()
+    if result == 0:
+        return 0
+    set inserted_ok to map_insert(result and "ok" and success)
+    set inserted_payload to map_insert(result and "payload" and payload)
+    set inserted_error to map_insert(result and "error" and frame_error)
+    set result_complete to 1
+    if map_contains(result and "ok") == 0 or else map_get_val(result and "ok") != success:
+        set result_complete to 0
+    if map_contains(result and "payload") == 0 or else (concat(map_get_val(result and "payload") and "") equals payload) == 0:
+        set result_complete to 0
+    if map_contains(result and "error") == 0 or else (concat(map_get_val(result and "error") and "") equals frame_error) == 0:
+        set result_complete to 0
+    if result_complete == 0:
+        set release_result to free_map(result)
+        if release_result != 0:
+            display "[IPC] ERROR: could not release an incomplete frame result."
+        return 0
+    return result
+
+define ipc_response_result with success as Int and response as Str and response_error as Str returning Map:
+    set result to create_map()
+    if result == 0:
+        return 0
+    set inserted_ok to map_insert(result and "ok" and success)
+    set inserted_response to map_insert(result and "response" and response)
+    set inserted_error to map_insert(result and "error" and response_error)
+    set result_complete to 1
+    if map_contains(result and "ok") == 0 or else map_get_val(result and "ok") != success:
+        set result_complete to 0
+    if map_contains(result and "response") == 0 or else (concat(map_get_val(result and "response") and "") equals response) == 0:
+        set result_complete to 0
+    if map_contains(result and "error") == 0 or else (concat(map_get_val(result and "error") and "") equals response_error) == 0:
+        set result_complete to 0
+    if result_complete == 0:
+        set release_result to free_map(result)
+        if release_result != 0:
+            display "[IPC] ERROR: could not release an incomplete response result."
+        return 0
+    return result
+
+# The length parser never calls string_to_int until the complete field is known to
+# contain at most five decimal digits. This avoids atoll overflow on hostile headers.
+define ipc_canonical_request_length with length_text as Str returning Int:
+    set n to string_length(length_text)
+    if n <= 0 or else n > 5:
+        return 0
+    set i to 0
+    repeat while i < n:
+        set digit to get_character(length_text and i)
+        if digit < 48 or else digit > 57:
+            return 0
+        set i to i + 1
+    set parsed to string_to_int(length_text)
+    if parsed <= 0 or else parsed > IPC_FRAME_MAX_REQUEST_BYTES:
+        return 0
+    if (int_to_string(parsed) equals length_text) == 0:
+        return 0
+    return parsed
+
+# IPC is a UTF-8 text protocol. Reject overlong encodings, surrogate code points,
+# values above U+10FFFF, and incomplete continuation sequences before dispatch.
+define ipc_utf8_valid with text as Str returning Int:
+    set byte_count to string_length(text)
+    if byte_count <= 0:
+        return 0
+    set bytes to string_to_list(text)
+    if bytes == 0 or else length_list(bytes) != byte_count:
+        if bytes != 0:
+            set release_failed_list to free_list(bytes)
+            if release_failed_list != 0:
+                display "[IPC] ERROR: could not release malformed UTF-8 bytes."
+        return 0
+    set valid to 1
+    set i to 0
+    repeat while i < byte_count and also valid == 1:
+        set first to get_list(bytes and i)
+        if first <= 127:
+            set i to i + 1
+        else if first >= 194 and also first <= 223:
+            if i + 1 >= byte_count:
+                set valid to 0
+            else:
+                set second to get_list(bytes and i + 1)
+                if second < 128 or else second > 191:
+                    set valid to 0
+                else:
+                    set i to i + 2
+        else if first >= 224 and also first <= 239:
+            if i + 2 >= byte_count:
+                set valid to 0
+            else:
+                set second to get_list(bytes and i + 1)
+                set third to get_list(bytes and i + 2)
+                set second_valid to 0
+                if first == 224 and also second >= 160 and also second <= 191:
+                    set second_valid to 1
+                else if first == 237 and also second >= 128 and also second <= 159:
+                    set second_valid to 1
+                else if first != 224 and also first != 237 and also second >= 128 and also second <= 191:
+                    set second_valid to 1
+                if second_valid == 0 or else third < 128 or else third > 191:
+                    set valid to 0
+                else:
+                    set i to i + 3
+        else if first >= 240 and also first <= 244:
+            if i + 3 >= byte_count:
+                set valid to 0
+            else:
+                set second to get_list(bytes and i + 1)
+                set third to get_list(bytes and i + 2)
+                set fourth to get_list(bytes and i + 3)
+                set second_valid to 0
+                if first == 240 and also second >= 144 and also second <= 191:
+                    set second_valid to 1
+                else if first == 244 and also second >= 128 and also second <= 143:
+                    set second_valid to 1
+                else if first > 240 and also first < 244 and also second >= 128 and also second <= 191:
+                    set second_valid to 1
+                if second_valid == 0 or else third < 128 or else third > 191 or else fourth < 128 or else fourth > 191:
+                    set valid to 0
+                else:
+                    set i to i + 4
+        else:
+            set valid to 0
+    set release_bytes to free_list(bytes)
+    if release_bytes != 0:
+        display "[IPC] ERROR: could not release validated UTF-8 bytes."
+        return 0
+    return valid
+
+define ipc_discard_builder with builder as Int returning Int:
+    if builder == 0:
+        return 0
+    set discarded to ep_sb_to_string(builder)
+    if discarded == 0:
+        return 0
+    return 1
+
+# Read exactly `ERNOS_IPC/1 <decimal-byte-length>\n<payload>`. An absolute
+# deadline covers the complete frame, so a peer cannot hold the single control-plane
+# dispatcher by dripping one byte per socket timeout. Extra coalesced bytes are not
+# interpreted as a second request: one connection carries exactly one request.
+define ipc_read_request_frame with client_fd as Int and timeout_ms as Int returning Map:
+    if client_fd < 0:
+        return ipc_frame_result(0 and "" and "invalid_descriptor")
+    if timeout_ms <= 0 or else timeout_ms > IPC_FRAME_MAX_TIMEOUT_MS:
+        return ipc_frame_result(0 and "" and "invalid_timeout")
+    set deadline_ms to ep_time_now_ms() + timeout_ms
+    set wire to ""
+    set header_end to 0 - 1
+    set reading_header to 1
+    repeat while reading_header == 1:
+        set header_ready to ipc_wait_readable_until(client_fd and deadline_ms)
+        if header_ready == 0:
+            return ipc_frame_result(0 and "" and "header_timeout")
+        if header_ready < 0:
+            return ipc_frame_result(0 and "" and "header_read_failed")
+        if header_ready == 2:
+            return ipc_frame_result(0 and "" and "incomplete_header")
+        set header_chunk to ep_net_recv(client_fd and 64)
+        if string_length(header_chunk) == 0:
+            return ipc_frame_result(0 and "" and "incomplete_header")
+        set wire to concat(wire and header_chunk)
+        set header_end to string_index_of(wire and "\n")
+        if header_end >= 0:
+            if header_end >= 64:
+                return ipc_frame_result(0 and "" and "header_too_large")
+            set reading_header to 0
+        else if string_length(wire) > 64:
+            return ipc_frame_result(0 and "" and "header_too_large")
+
+    set prefix to "ERNOS_IPC/1 "
+    set prefix_len to string_length(prefix)
+    if string_index_of(wire and prefix) != 0 or else header_end <= prefix_len:
+        return ipc_frame_result(0 and "" and "invalid_header")
+    set length_text to substring(wire and prefix_len and header_end - prefix_len)
+    set expected to ipc_canonical_request_length(length_text)
+    if expected == 0:
+        return ipc_frame_result(0 and "" and "invalid_length")
+
+    set payload_builder to create_builder()
+    if payload_builder == 0:
+        return ipc_frame_result(0 and "" and "payload_allocation_failed")
+    set payload_length to 0
+    set payload_start to header_end + 1
+    set wire_len to string_length(wire)
+    if wire_len > payload_start:
+        set initial_payload to substring(wire and payload_start and wire_len - payload_start)
+        set initial_length to string_length(initial_payload)
+        if initial_length > expected:
+            set discarded to ipc_discard_builder(payload_builder)
+            if discarded == 0:
+                return ipc_frame_result(0 and "" and "payload_cleanup_failed")
+            return ipc_frame_result(0 and "" and "payload_overrun")
+        set appended_initial to ep_sb_append(payload_builder and initial_payload)
+        if appended_initial == 0:
+            set discarded to ipc_discard_builder(payload_builder)
+            return ipc_frame_result(0 and "" and "payload_allocation_failed")
+        set payload_length to initial_length
+
+    repeat while payload_length < expected:
+        set body_ready to ipc_wait_readable_until(client_fd and deadline_ms)
+        if body_ready == 0:
+            set discarded to ipc_discard_builder(payload_builder)
+            if discarded == 0:
+                return ipc_frame_result(0 and "" and "payload_cleanup_failed")
+            return ipc_frame_result(0 and "" and "payload_timeout")
+        if body_ready < 0:
+            set discarded to ipc_discard_builder(payload_builder)
+            if discarded == 0:
+                return ipc_frame_result(0 and "" and "payload_cleanup_failed")
+            return ipc_frame_result(0 and "" and "payload_read_failed")
+        if body_ready == 2:
+            set discarded to ipc_discard_builder(payload_builder)
+            if discarded == 0:
+                return ipc_frame_result(0 and "" and "payload_cleanup_failed")
+            return ipc_frame_result(0 and "" and "payload_truncated")
+        set remaining to expected - payload_length
+        set body_chunk to ep_net_recv(client_fd and remaining)
+        set body_length to string_length(body_chunk)
+        if body_length == 0:
+            set discarded to ipc_discard_builder(payload_builder)
+            if discarded == 0:
+                return ipc_frame_result(0 and "" and "payload_cleanup_failed")
+            return ipc_frame_result(0 and "" and "payload_truncated")
+        if body_length > remaining:
+            set discarded to ipc_discard_builder(payload_builder)
+            if discarded == 0:
+                return ipc_frame_result(0 and "" and "payload_cleanup_failed")
+            return ipc_frame_result(0 and "" and "payload_overrun")
+        set appended_body to ep_sb_append(payload_builder and body_chunk)
+        if appended_body == 0:
+            set discarded to ipc_discard_builder(payload_builder)
+            return ipc_frame_result(0 and "" and "payload_allocation_failed")
+        set payload_length to payload_length + body_length
+
+    if payload_length != expected:
+        set discarded to ipc_discard_builder(payload_builder)
+        if discarded == 0:
+            return ipc_frame_result(0 and "" and "payload_cleanup_failed")
+        return ipc_frame_result(0 and "" and "payload_length_mismatch")
+    set payload to ep_sb_to_string(payload_builder)
+    if payload == 0 or else string_length(payload) != expected:
+        return ipc_frame_result(0 and "" and "payload_allocation_failed")
+    if ipc_utf8_valid(payload) == 0:
+        return ipc_frame_result(0 and "" and "invalid_utf8")
+    return ipc_frame_result(1 and payload and "")
+
+# Read one unframed UTF-8 response through the server's checked close. Polling makes
+# clean EOF distinguishable from readiness failure and imposes one absolute deadline.
+define ipc_read_response with fd as Int and max_bytes as Int and timeout_ms as Int returning Map:
+    if fd < 0:
+        return ipc_response_result(0 and "" and "invalid_descriptor")
+    if max_bytes <= 0 or else max_bytes > IPC_FRAME_MAX_RESPONSE_BYTES:
+        return ipc_response_result(0 and "" and "invalid_size_limit")
+    if timeout_ms <= 0 or else timeout_ms > IPC_FRAME_MAX_TIMEOUT_MS:
+        return ipc_response_result(0 and "" and "invalid_timeout")
+    set deadline_ms to ep_time_now_ms() + timeout_ms
+    set response_builder to create_builder()
+    if response_builder == 0:
+        return ipc_response_result(0 and "" and "response_allocation_failed")
+    set response_length to 0
+    set reading to 1
+    repeat while reading == 1:
+        set ready to ipc_wait_readable_until(fd and deadline_ms)
+        if ready == 0:
+            set discarded to ipc_discard_builder(response_builder)
+            if discarded == 0:
+                return ipc_response_result(0 and "" and "response_cleanup_failed")
+            return ipc_response_result(0 and "" and "response_timeout")
+        if ready < 0:
+            set discarded to ipc_discard_builder(response_builder)
+            if discarded == 0:
+                return ipc_response_result(0 and "" and "response_cleanup_failed")
+            return ipc_response_result(0 and "" and "response_read_failed")
+        if ready == 2:
+            set reading to 0
+        else:
+            if response_length >= max_bytes:
+                set discarded to ipc_discard_builder(response_builder)
+                if discarded == 0:
+                    return ipc_response_result(0 and "" and "response_cleanup_failed")
+                return ipc_response_result(0 and "" and "response_too_large")
+            set read_limit to max_bytes - response_length
+            if read_limit > 65536:
+                set read_limit to 65536
+            set chunk to ep_net_recv(fd and read_limit)
+            set chunk_length to string_length(chunk)
+            if chunk_length == 0:
+                set reading to 0
+            else:
+                if chunk_length > read_limit:
+                    set discarded to ipc_discard_builder(response_builder)
+                    if discarded == 0:
+                        return ipc_response_result(0 and "" and "response_cleanup_failed")
+                    return ipc_response_result(0 and "" and "response_too_large")
+                set appended to ep_sb_append(response_builder and chunk)
+                if appended == 0:
+                    set discarded to ipc_discard_builder(response_builder)
+                    return ipc_response_result(0 and "" and "response_allocation_failed")
+                set response_length to response_length + chunk_length
+    set response to ep_sb_to_string(response_builder)
+    if response == 0 or else string_length(response) != response_length:
+        return ipc_response_result(0 and "" and "response_allocation_failed")
+    if response_length == 0:
+        return ipc_response_result(0 and "" and "empty_response")
+    if ipc_utf8_valid(response) == 0:
+        return ipc_response_result(0 and "" and "invalid_utf8")
+    return ipc_response_result(1 and response and "")

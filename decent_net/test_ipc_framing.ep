@@ -1,0 +1,332 @@
+# ErnosDecent -- executable local IPC framing tests
+# Component: decent_net/test_ipc_framing.ep
+
+import "ipc_framing"
+import "collections"
+import "string"
+
+set IPC_TEST_PASSED to 0
+set IPC_TEST_FAILED to 0
+
+define ipc_test_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("  PASS: " and label)
+        set IPC_TEST_PASSED to IPC_TEST_PASSED + 1
+        return 1
+    display concat("  FAIL: " and label)
+    set IPC_TEST_FAILED to IPC_TEST_FAILED + 1
+    return 0
+
+define ipc_test_free_port with first_port as Int returning Int:
+    set port to first_port
+    repeat while port <= 65000:
+        set probe to ep_net_listen_loopback(port)
+        if probe >= 0:
+            set close_result to ep_net_close(probe)
+            if close_result == 0:
+                return port
+            return 0
+        set port to port + 1
+    return 0
+
+define ipc_test_send_all with fd as Int and data as Str returning Int:
+    set total to string_length(data)
+    if fd < 0 or else total <= 0:
+        return 0
+    set offset to 0
+    repeat while offset < total:
+        set remaining to total - offset
+        set part to data
+        if offset > 0:
+            set part to substring(data and offset and remaining)
+        set sent to ep_net_send(fd and part)
+        if sent <= 0 or else sent > remaining:
+            return 0
+        set offset to offset + sent
+    if offset != total:
+        return 0
+    return 1
+
+# A one-shot peer can split the wire at two exact byte offsets. hold_ms happens
+# after connect, allowing timeout tests to keep a silent socket open without SIGPIPE.
+define ipc_test_sender with port as Int and wire as Str and split_one as Int and split_two as Int and hold_ms as Int and done as Int returning Int:
+    set result to 1
+    set startup_sleep to ep_sleep_ms(20)
+    if startup_sleep != 0:
+        set result to 0
+    set fd to 0 - 1
+    if result == 1:
+        set fd to ep_net_connect("127.0.0.1" and port)
+        if fd < 0:
+            set result to 0
+    if result == 1 and also hold_ms > 0:
+        set hold_result to ep_sleep_ms(hold_ms)
+        if hold_result != 0:
+            set result to 0
+    set total to string_length(wire)
+    if result == 1 and also total > 0:
+        if split_one > 0 and also split_one < total:
+            set first to substring(wire and 0 and split_one)
+            if ipc_test_send_all(fd and first) == 0:
+                set result to 0
+            set split_sleep_one to ep_sleep_ms(10)
+            if split_sleep_one != 0:
+                set result to 0
+            if result == 1 and also split_two > split_one and also split_two < total:
+                set middle to substring(wire and split_one and split_two - split_one)
+                if ipc_test_send_all(fd and middle) == 0:
+                    set result to 0
+                set split_sleep_two to ep_sleep_ms(10)
+                if split_sleep_two != 0:
+                    set result to 0
+                if result == 1:
+                    set tail to substring(wire and split_two and total - split_two)
+                    if ipc_test_send_all(fd and tail) == 0:
+                        set result to 0
+            else if result == 1:
+                set tail to substring(wire and split_one and total - split_one)
+                if ipc_test_send_all(fd and tail) == 0:
+                    set result to 0
+        else:
+            if ipc_test_send_all(fd and wire) == 0:
+                set result to 0
+    if fd >= 0:
+        set close_result to ep_net_close(fd)
+        if close_result != 0:
+            set result to 0
+    send result to done
+    return result
+
+define ipc_test_exchange_frame with wire as Str and split_one as Int and split_two as Int and hold_ms as Int and timeout_ms as Int and port_seed as Int returning Map:
+    set port to ipc_test_free_port(port_seed)
+    if port == 0:
+        return ipc_frame_result(0 and "" and "fixture_port_unavailable")
+    set listener to ep_net_listen_loopback(port)
+    if listener < 0:
+        return ipc_frame_result(0 and "" and "fixture_listen_failed")
+    set done to create_channel()
+    if done == 0:
+        set listener_close to ep_net_close(listener)
+        return ipc_frame_result(0 and "" and "fixture_channel_failed")
+    spawn ipc_test_sender(port and wire and split_one and split_two and hold_ms and done)
+    set client_fd to ep_net_accept(listener)
+    set result to 0
+    if client_fd < 0:
+        set result to ipc_frame_result(0 and "" and "fixture_accept_failed")
+    else:
+        set result to ipc_read_request_frame(client_fd and timeout_ms)
+        set client_close to ep_net_close(client_fd)
+        if client_close != 0 and also result != 0:
+            set inserted_close_error to map_insert(result and "fixture_close_ok" and 0)
+        else if result != 0:
+            set inserted_close_ok to map_insert(result and "fixture_close_ok" and 1)
+    set listener_close to ep_net_close(listener)
+    set sender_ok to receive from done
+    if result != 0:
+        set inserted_sender to map_insert(result and "fixture_sender_ok" and sender_ok)
+        set inserted_listener to map_insert(result and "fixture_listener_close_ok" and listener_close == 0)
+    return result
+
+define ipc_test_exchange_response with wire as Str and split_one as Int and split_two as Int and hold_ms as Int and max_bytes as Int and timeout_ms as Int and port_seed as Int returning Map:
+    set port to ipc_test_free_port(port_seed)
+    if port == 0:
+        return ipc_response_result(0 and "" and "fixture_port_unavailable")
+    set listener to ep_net_listen_loopback(port)
+    if listener < 0:
+        return ipc_response_result(0 and "" and "fixture_listen_failed")
+    set done to create_channel()
+    if done == 0:
+        set listener_close to ep_net_close(listener)
+        return ipc_response_result(0 and "" and "fixture_channel_failed")
+    spawn ipc_test_sender(port and wire and split_one and split_two and hold_ms and done)
+    set client_fd to ep_net_accept(listener)
+    set result to 0
+    if client_fd < 0:
+        set result to ipc_response_result(0 and "" and "fixture_accept_failed")
+    else:
+        set result to ipc_read_response(client_fd and max_bytes and timeout_ms)
+        set client_close to ep_net_close(client_fd)
+        if client_close != 0 and also result != 0:
+            set inserted_close_error to map_insert(result and "fixture_close_ok" and 0)
+        else if result != 0:
+            set inserted_close_ok to map_insert(result and "fixture_close_ok" and 1)
+    set listener_close to ep_net_close(listener)
+    set sender_ok to receive from done
+    if result != 0:
+        set inserted_sender to map_insert(result and "fixture_sender_ok" and sender_ok)
+        set inserted_listener to map_insert(result and "fixture_listener_close_ok" and listener_close == 0)
+    return result
+
+define ipc_test_frame_matches with result as Map and expected_ok as Int and expected_payload as Str and expected_error as Str returning Int:
+    if result == 0:
+        display "    diagnostic: frame result allocation failed"
+        return 0
+    if map_get_val(result and "ok") != expected_ok:
+        set actual_ok to map_get_val(result and "ok")
+        set actual_error to map_get_val(result and "error")
+        display f"    diagnostic: frame ok={actual_ok} expected={expected_ok} error={actual_error}"
+        return 0
+    if (concat(map_get_val(result and "payload") and "") equals expected_payload) == 0:
+        set actual_payload to concat(map_get_val(result and "payload") and "")
+        set actual_payload_length to string_length(actual_payload)
+        set expected_payload_length to string_length(expected_payload)
+        display f"    diagnostic: frame payload length={actual_payload_length} expected={expected_payload_length}"
+        return 0
+    if (concat(map_get_val(result and "error") and "") equals expected_error) == 0:
+        set actual_error to map_get_val(result and "error")
+        display f"    diagnostic: frame error={actual_error} expected={expected_error}"
+        return 0
+    if map_contains(result and "fixture_sender_ok") == 1 and also map_get_val(result and "fixture_sender_ok") != 1:
+        display "    diagnostic: frame sender failed"
+        return 0
+    if map_contains(result and "fixture_close_ok") == 1 and also map_get_val(result and "fixture_close_ok") != 1:
+        display "    diagnostic: accepted frame socket close failed"
+        return 0
+    if map_contains(result and "fixture_listener_close_ok") == 1 and also map_get_val(result and "fixture_listener_close_ok") != 1:
+        display "    diagnostic: frame listener close failed"
+        return 0
+    return 1
+
+define ipc_test_response_matches with result as Map and expected_ok as Int and expected_response as Str and expected_error as Str returning Int:
+    if result == 0:
+        display "    diagnostic: response result allocation failed"
+        return 0
+    if map_get_val(result and "ok") != expected_ok:
+        set actual_ok to map_get_val(result and "ok")
+        set actual_error to map_get_val(result and "error")
+        display f"    diagnostic: response ok={actual_ok} expected={expected_ok} error={actual_error}"
+        return 0
+    if (concat(map_get_val(result and "response") and "") equals expected_response) == 0:
+        set actual_response to concat(map_get_val(result and "response") and "")
+        set actual_response_length to string_length(actual_response)
+        set expected_response_length to string_length(expected_response)
+        display f"    diagnostic: response length={actual_response_length} expected={expected_response_length}"
+        return 0
+    if (concat(map_get_val(result and "error") and "") equals expected_error) == 0:
+        set actual_error to map_get_val(result and "error")
+        display f"    diagnostic: response error={actual_error} expected={expected_error}"
+        return 0
+    if map_contains(result and "fixture_sender_ok") == 1 and also map_get_val(result and "fixture_sender_ok") != 1:
+        display "    diagnostic: response sender failed"
+        return 0
+    if map_contains(result and "fixture_close_ok") == 1 and also map_get_val(result and "fixture_close_ok") != 1:
+        display "    diagnostic: accepted response socket close failed"
+        return 0
+    if map_contains(result and "fixture_listener_close_ok") == 1 and also map_get_val(result and "fixture_listener_close_ok") != 1:
+        display "    diagnostic: response listener close failed"
+        return 0
+    return 1
+
+define ipc_test_release_map with result as Map returning Int:
+    if result == 0:
+        display "    diagnostic: cannot release a null result"
+        return 0
+    if free_map(result) != 0:
+        display "    diagnostic: result map release failed"
+        return 0
+    return 1
+
+define ipc_test_max_payload returning Str:
+    set builder to create_builder()
+    if builder == 0:
+        return ""
+    set block to repeat_string("x" and 1024)
+    if string_length(block) != 1024:
+        set discarded to ipc_discard_builder(builder)
+        return ""
+    set i to 0
+    repeat while i < 64:
+        if ep_sb_append(builder and block) == 0:
+            set discarded to ipc_discard_builder(builder)
+            return ""
+        set i to i + 1
+    return ep_sb_to_string(builder)
+
+define main returning Int:
+    display "ErnosDecent IPC framing tests"
+
+    set token to "0123456789abcdef0123456789abcdef0123456789abcdef"
+    set fragmented_payload to concat("AUTH " and concat(token and " AI INFER café\nline two"))
+    set fragmented_wire to concat("ERNOS_IPC/1 " and concat(int_to_string(string_length(fragmented_payload)) and concat("\n" and fragmented_payload)))
+    set fragmented to ipc_test_exchange_frame(fragmented_wire and 5 and 19 and 0 and 1000 and 54700)
+    set ok to ipc_test_expect(ipc_test_frame_matches(fragmented and 1 and fragmented_payload and "") and "fragmented header/body preserves the exact UTF-8 payload")
+    set ok to ipc_test_expect(ipc_test_release_map(fragmented) and "fragmented-frame result is released")
+
+    set coalesced_payload to concat("AUTH " and concat(token and " STATUS"))
+    set coalesced_wire to concat("ERNOS_IPC/1 " and concat(int_to_string(string_length(coalesced_payload)) and concat("\n" and coalesced_payload)))
+    set coalesced to ipc_test_exchange_frame(coalesced_wire and 0 and 0 and 0 and 1000 and 54720)
+    set ok to ipc_test_expect(ipc_test_frame_matches(coalesced and 1 and coalesced_payload and "") and "coalesced header/body is parsed as one exact frame")
+    set ok to ipc_test_expect(ipc_test_release_map(coalesced) and "coalesced-frame result is released")
+
+    set overflow_header to ipc_test_exchange_frame("ERNOS_IPC/1 999999999999999999999999999999999999999999999999\nx" and 0 and 0 and 0 and 1000 and 54740)
+    set ok to ipc_test_expect(ipc_test_frame_matches(overflow_header and 0 and "" and "invalid_length") and "oversized numeric fields are rejected before integer conversion")
+    set ok to ipc_test_expect(ipc_test_release_map(overflow_header) and "numeric-overflow result is released")
+
+    set long_header to ipc_test_exchange_frame(repeat_string("A" and 65) and 0 and 0 and 0 and 1000 and 54750)
+    set ok to ipc_test_expect(ipc_test_frame_matches(long_header and 0 and "" and "header_too_large") and "headers without a delimiter are bounded at 64 bytes")
+    set ok to ipc_test_expect(ipc_test_release_map(long_header) and "overlong-header result is released")
+
+    set leading_zero to ipc_test_exchange_frame("ERNOS_IPC/1 01\nx" and 0 and 0 and 0 and 1000 and 54760)
+    set ok to ipc_test_expect(ipc_test_frame_matches(leading_zero and 0 and "" and "invalid_length") and "non-canonical leading-zero lengths are rejected")
+    set ok to ipc_test_expect(ipc_test_release_map(leading_zero) and "leading-zero result is released")
+
+    set oversized to ipc_test_exchange_frame("ERNOS_IPC/1 65537\nx" and 0 and 0 and 0 and 1000 and 54780)
+    set ok to ipc_test_expect(ipc_test_frame_matches(oversized and 0 and "" and "invalid_length") and "requests above 65,536 bytes are rejected")
+    set ok to ipc_test_expect(ipc_test_release_map(oversized) and "oversized-frame result is released")
+
+    set truncated to ipc_test_exchange_frame("ERNOS_IPC/1 5\nabc" and 0 and 0 and 0 and 1000 and 54800)
+    set ok to ipc_test_expect(ipc_test_frame_matches(truncated and 0 and "" and "payload_truncated") and "short payloads fail after checked peer close")
+    set ok to ipc_test_expect(ipc_test_release_map(truncated) and "truncated-frame result is released")
+
+    set legacy to ipc_test_exchange_frame(concat("AUTH " and concat(token and " STATUS")) and 0 and 0 and 0 and 1000 and 54820)
+    set ok to ipc_test_expect(ipc_test_frame_matches(legacy and 0 and "" and "incomplete_header") and "legacy unframed commands have no fallback")
+    set ok to ipc_test_expect(ipc_test_release_map(legacy) and "legacy-frame result is released")
+
+    set silent to ipc_test_exchange_frame("" and 0 and 0 and 100 and 20 and 54840)
+    set ok to ipc_test_expect(ipc_test_frame_matches(silent and 0 and "" and "header_timeout") and "one absolute deadline rejects a silent peer")
+    set ok to ipc_test_expect(ipc_test_release_map(silent) and "silent-peer result is released")
+
+    set bad_bytes to create_list()
+    set bad_append_one to append_list(bad_bytes and 195)
+    set bad_append_two to append_list(bad_bytes and 40)
+    set bad_text to string_from_list(bad_bytes)
+    set bad_bytes_release to free_list(bad_bytes)
+    set bad_wire to concat("ERNOS_IPC/1 2\n" and bad_text)
+    set invalid_utf8 to ipc_test_exchange_frame(bad_wire and 0 and 0 and 0 and 1000 and 54860)
+    set ok to ipc_test_expect(bad_append_one != 0 and also bad_append_two != 0 and also bad_bytes_release == 0 and also ipc_test_frame_matches(invalid_utf8 and 0 and "" and "invalid_utf8") and "malformed UTF-8 is rejected before command dispatch")
+    set ok to ipc_test_expect(ipc_test_release_map(invalid_utf8) and "invalid-UTF-8 frame result is released")
+
+    set max_payload to ipc_test_max_payload()
+    set max_wire to concat("ERNOS_IPC/1 65536\n" and max_payload)
+    set max_frame to ipc_test_exchange_frame(max_wire and 18 and 32786 and 0 and 3000 and 54880)
+    set ok to ipc_test_expect(string_length(max_payload) == 65536 and also ipc_test_frame_matches(max_frame and 1 and max_payload and "") and "the exact 65,536-byte request boundary succeeds across fragments")
+    set ok to ipc_test_expect(ipc_test_release_map(max_frame) and "maximum-frame result is released")
+
+    set response_text to "response café complete"
+    set response_ok to ipc_test_exchange_response(response_text and 4 and 12 and 0 and 1024 and 1000 and 54900)
+    set ok to ipc_test_expect(ipc_test_response_matches(response_ok and 1 and response_text and "") and "fragmented UTF-8 response completes only at checked EOF")
+    set ok to ipc_test_expect(ipc_test_release_map(response_ok) and "response result is released")
+
+    set response_timeout to ipc_test_exchange_response("" and 0 and 0 and 100 and 1024 and 20 and 54920)
+    set ok to ipc_test_expect(ipc_test_response_matches(response_timeout and 0 and "" and "response_timeout") and "silent response sockets hit the absolute deadline")
+    set ok to ipc_test_expect(ipc_test_release_map(response_timeout) and "response-timeout result is released")
+
+    set response_oversized to ipc_test_exchange_response("123456" and 0 and 0 and 0 and 5 and 1000 and 54940)
+    set ok to ipc_test_expect(ipc_test_response_matches(response_oversized and 0 and "" and "response_too_large") and "response data beyond the configured byte limit is rejected")
+    set ok to ipc_test_expect(ipc_test_release_map(response_oversized) and "oversized-response result is released")
+
+    set response_bad_bytes to create_list()
+    set response_bad_one to append_list(response_bad_bytes and 237)
+    set response_bad_two to append_list(response_bad_bytes and 160)
+    set response_bad_three to append_list(response_bad_bytes and 128)
+    set response_bad_text to string_from_list(response_bad_bytes)
+    set response_bad_release to free_list(response_bad_bytes)
+    set response_invalid_utf8 to ipc_test_exchange_response(response_bad_text and 0 and 0 and 0 and 1024 and 1000 and 54960)
+    set ok to ipc_test_expect(response_bad_one != 0 and also response_bad_two != 0 and also response_bad_three != 0 and also response_bad_release == 0 and also ipc_test_response_matches(response_invalid_utf8 and 0 and "" and "invalid_utf8") and "response surrogate encodings are rejected")
+    set ok to ipc_test_expect(ipc_test_release_map(response_invalid_utf8) and "invalid-UTF-8 response result is released")
+
+    set total to IPC_TEST_PASSED + IPC_TEST_FAILED
+    display f"  {IPC_TEST_PASSED}/{total} IPC framing tests passed."
+    if IPC_TEST_FAILED != 0:
+        return 1
+    return 0

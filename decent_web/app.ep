@@ -432,8 +432,56 @@ define appendMessageRaw with container and sender and text and type and timeStr:
         attachTtsButton(bubble and normalizeAiText(text))
     set container.scrollTop to container.scrollHeight
 
-# ---- TTS: request audio for an AI message and attach a 🔊 button ----
+# ---- TTS: one synthesis per AI message, with remove/replay from cache ----
+define setTtsButtonState with btn and state:
+    set btn.ttsState to state
+    if state == "pending":
+        set_prop(btn and "disabled" and true)
+        set btn.textContent to "⏳"
+        set btn.title to "Generating voice…"
+    else if state == "delivered":
+        set_prop(btn and "disabled" and false)
+        set btn.textContent to "🔇"
+        set btn.title to "Remove delivered voice"
+    else if state == "cached":
+        set_prop(btn and "disabled" and false)
+        set btn.textContent to "🔊"
+        set btn.title to "Replay cached voice"
+    else:
+        set_prop(btn and "disabled" and false)
+        set btn.textContent to "🔊"
+        set btn.title to "Generate voice (Fable)"
+    return 0
+
+define clearTtsPlayback with btn:
+    if btn.ttsAudio:
+        btn.ttsAudio.pause()
+        btn.ttsAudio.removeAttribute("src")
+        btn.ttsAudio.load()
+        set btn.ttsAudio to null
+    setTtsButtonState(btn and "cached")
+    return 0
+
+define playTtsUrl with btn and url:
+    if btn.ttsAudio:
+        clearTtsPlayback(btn)
+    set ttsAudio to document.createElement("audio")
+    set ttsAudio.src to url
+    set btn.ttsUrl to url
+    set btn.ttsAudio to ttsAudio
+    setTtsButtonState(btn and "delivered")
+    ttsAudio.play()
+    return 0
+
 define requestTts with text and btn:
+    if btn.ttsState == "pending":
+        return 0
+    if btn.ttsState == "delivered":
+        clearTtsPlayback(btn)
+        return 0
+    if btn.ttsUrl:
+        playTtsUrl(btn and btn.ttsUrl)
+        return 0
     if not text:
         return 0
     if text.length == 0:
@@ -442,20 +490,67 @@ define requestTts with text and btn:
         return 0
     if not window.isConnected:
         return 0
-    set_prop(btn and "disabled" and true)
-    set btn.textContent to "⏳"
-    set window.pendingTtsBtn to btn
+    set window.ttsRequestCounter to window.ttsRequestCounter + 1
+    set requestId to concat("tts-" and window.ttsRequestCounter)
+    set btn.ttsRequestId to requestId
+    set_prop(window.pendingTtsRequests and requestId and btn)
+    window.pendingTtsOrder.push(requestId)
+    setTtsButtonState(btn and "pending")
     set ttsMsg to Object()
     set ttsMsg.type to "tts_request"
     set ttsMsg.text to text
+    set ttsMsg.request_id to requestId
     send_msg(window.ws and JSON.stringify(ttsMsg))
     return 0
 
+define takePendingTtsButton with requestId:
+    set resolvedId to requestId
+    set btn to null
+    if resolvedId:
+        set btn to get_list(window.pendingTtsRequests and resolvedId)
+    # During a no-restart rollout, the already-running server can return its former
+    # response shape without request_id. WebSocket replies are ordered, so consume
+    # the oldest pending request until the rebuilt server begins echoing exact IDs.
+    if not btn:
+        if window.pendingTtsOrder.length > 0:
+            set resolvedId to window.pendingTtsOrder.shift()
+            set btn to get_list(window.pendingTtsRequests and resolvedId)
+    if btn:
+        set pendingIndex to window.pendingTtsOrder.indexOf(resolvedId)
+        if pendingIndex >= 0:
+            window.pendingTtsOrder.splice(pendingIndex and 1)
+        set_prop(window.pendingTtsRequests and resolvedId and null)
+        set btn.ttsRequestId to null
+    return btn
+
+define handleTtsReady with msg:
+    set btn to takePendingTtsButton(msg.request_id)
+    if not btn:
+        console.error(concat("TTS response has no matching request: " and msg.request_id))
+        return 0
+    playTtsUrl(btn and msg.url)
+    return 0
+
+define handleTtsError with msg:
+    set btn to takePendingTtsButton(msg.request_id)
+    if btn:
+        if btn.ttsUrl:
+            setTtsButtonState(btn and "cached")
+        else:
+            setTtsButtonState(btn and "ready")
+    console.error(concat("TTS error: " and msg.error))
+    return 0
+
 define attachTtsButton with bubble and text:
+    set existing to bubble.querySelector(".btn-tts")
+    if existing:
+        return 0
     set btn to document.createElement("button")
     set btn.className to "btn-tts"
-    set btn.title to "Play audio (Fable voice)"
-    set btn.textContent to "🔊"
+    set btn.ttsUrl to null
+    set btn.ttsAudio to null
+    set btn.ttsRequestId to null
+    setTtsButtonState(btn and "ready")
     set btn.onclick to given e:
         requestTts(text and btn)
     bubble.appendChild(btn)
@@ -2302,20 +2397,10 @@ define handleDaemonMessage with msg:
         set window.currentAiRawText to ""
         
     else if type == "tts_ready":
-        if window.pendingTtsBtn:
-            set_prop(window.pendingTtsBtn and "disabled" and false)
-            set window.pendingTtsBtn.textContent to "🔊"
-        set window.pendingTtsBtn to null
-        set ttsAudio to document.createElement("audio")
-        set ttsAudio.src to msg.url
-        ttsAudio.play()
+        handleTtsReady(msg)
 
     else if type == "tts_error":
-        if window.pendingTtsBtn:
-            set_prop(window.pendingTtsBtn and "disabled" and false)
-            set window.pendingTtsBtn.textContent to "🔇"
-        set window.pendingTtsBtn to null
-        console.error(concat("TTS error: " and msg.error))
+        handleTtsError(msg)
 
     else if type == "ai_models":
         updateAiModelsUI(msg.models || [])
@@ -3841,6 +3926,9 @@ define main:
     set window.selectedAiModel to ""
     set window.currentAiResponseBubble to null
     set window.currentAiRawText to ""
+    set window.pendingTtsRequests to Object()
+    set window.pendingTtsOrder to []
+    set window.ttsRequestCounter to 0
     set window.graphNodes to Object()
     set window.graphLinks to []
     set window.canvasElement to null

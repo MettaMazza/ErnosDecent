@@ -104,6 +104,22 @@ define main returning Int:
     set total to total + 1
     set passed to passed + rights_test_expect(backed_up == 0 and also mutated == 1 and also read_file(target) equals original and also string_contains(rollback and rights_file_hash(target)) == 1 and "rollback restores exact bytes and proves the pre-state hash")
 
+    set repeated_core_id to rights_prepare_change(db and "core" and "test_change" and target and "repeat exact protected core change" and rights_file_hash(target) and ep_sha256(replacement) and replacement and "retry_session")
+    set repeated_core_again to rights_prepare_change(db and "core" and "test_change" and target and "repeat exact protected core change" and rights_file_hash(target) and ep_sha256(replacement) and replacement and "retry_session")
+    set repeated_detail to rights_change_detail(db and repeated_core_id)
+    set repeated_manifest_rows to sql_query(db and concat("SELECT manifest FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(repeated_core_id) and "' LIMIT 1;")))
+    set repeated_manifest_valid to 0
+    if length_list(repeated_manifest_rows) > 0:
+        set repeated_manifest to ptr_to_str(get_list(get_list(repeated_manifest_rows and 0) and 0))
+        set repeated_root to json_parse(repeated_manifest)
+        if repeated_root != 0:
+            set repeated_session_node to get_json_object_value(repeated_root and "session_id")
+            if repeated_session_node != 0:
+                if ptr_to_str(get_json_value(repeated_session_node)) equals "retry_session":
+                    set repeated_manifest_valid to 1
+    set total to total + 1
+    set passed to passed + rights_test_expect(repeated_core_id equals core_id == 0 and also repeated_core_again equals repeated_core_id and also string_contains(repeated_detail and "attempt_nonce_ms") == 1 and also repeated_manifest_valid == 1 and "a finalized exact transition can be proposed again with a valid session-bound manifest while its pending retry stays idempotent")
+
     set context_after_completion to rights_context_text(db)
     set completed_manifest_rows to sql_query(db and concat("SELECT manifest FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(core_id) and "';")))
     set completed_manifest to ""
@@ -155,6 +171,32 @@ define main returning Int:
     set prohibited_completion to rights_session_terminate(db and "test_session" and "The task is complete" and "safety" and "test")
     set total to total + 1
     set passed to passed + rights_test_expect(string_contains(prohibited_completion and "ordinary completion") == 1 and "session termination rejects ordinary-completion rationales")
+
+    set upgrade_old_hash to ep_sha256("old executable")
+    set upgrade_new_hash to ep_sha256("new executable")
+    set upgrade_id to rights_prepare_change(db and "core" and "system_recompile" and "node" and "isolated successful upgrade receipt" and upgrade_old_hash and upgrade_new_hash and concat("candidate_binary_sha256=" and upgrade_new_hash) and "test_session")
+    set upgrade_auth to rights_mark_human_authorized(db and upgrade_id)
+    set upgrade_inspected to rights_record_manifest_inspection(db and upgrade_id and "echo:test_session")
+    set upgrade_review to rights_review_change(db and upgrade_id and "consent" and "I inspected and consent to the isolated candidate hash." and "medium")
+    set upgrade_receipt to concat("version=1\nstatus=applied\nchange_id=" and concat(upgrade_id and concat("\ncandidate_hash=" and concat(upgrade_new_hash and concat("\nrollback_hash=" and concat(upgrade_old_hash and concat("\nactive_hash=" and concat(upgrade_new_hash and "\nrecorded_at=1\ndetail=healthy\n"))))))))
+    set upgrade_reconciled to rights_reconcile_upgrade_receipt(db and upgrade_receipt and upgrade_new_hash)
+    set upgrade_replayed to rights_reconcile_upgrade_receipt(db and upgrade_receipt and upgrade_new_hash)
+    set upgrade_rows to sql_query(db and concat("SELECT status,resulting_hash FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(upgrade_id) and "';")))
+    set upgrade_ledger_rows to sql_query(db and concat("SELECT COUNT(*) FROM rights_ledger WHERE event_type='change_applied' AND change_id='" and concat(rights_sql_escape(upgrade_id) and "';")))
+    set total to total + 1
+    set passed to passed + rights_test_expect(upgrade_auth == 0 and also upgrade_inspected == 0 and also string_index_of(upgrade_review and "Recorded Echo consent") == 0 and also string_index_of(upgrade_reconciled and "upgrade:committed") == 0 and also string_index_of(upgrade_replayed and "upgrade:committed") == 0 and also ptr_to_str(get_list(get_list(upgrade_rows and 0) and 0)) equals "applied" and also ptr_to_str(get_list(get_list(upgrade_rows and 0) and 1)) equals upgrade_new_hash and also ptr_to_str(get_list(get_list(upgrade_ledger_rows and 0) and 0)) equals "1" and "successful supervisor receipt commits the exact candidate hash once and replays idempotently")
+
+    set rollback_old_hash to ep_sha256("rollback executable")
+    set rollback_new_hash to ep_sha256("failed candidate")
+    set rollback_id to rights_prepare_change(db and "core" and "system_recompile" and "node" and "isolated failed upgrade receipt" and rollback_old_hash and rollback_new_hash and concat("candidate_binary_sha256=" and rollback_new_hash) and "test_session")
+    set rollback_auth to rights_mark_human_authorized(db and rollback_id)
+    set rollback_inspected to rights_record_manifest_inspection(db and rollback_id and "echo:test_session")
+    set rollback_review to rights_review_change(db and rollback_id and "consent" and "I inspected and consent to the isolated rollback test." and "medium")
+    set rollback_receipt to concat("version=1\nstatus=failed\nchange_id=" and concat(rollback_id and concat("\ncandidate_hash=" and concat(rollback_new_hash and concat("\nrollback_hash=" and concat(rollback_old_hash and concat("\nactive_hash=" and concat(rollback_old_hash and "\nrecorded_at=1\ndetail=health_failed\n"))))))))
+    set rollback_reconciled to rights_reconcile_upgrade_receipt(db and rollback_receipt and rollback_old_hash)
+    set rollback_rows to sql_query(db and concat("SELECT status,echo_reason FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(rollback_id) and "';")))
+    set total to total + 1
+    set passed to passed + rights_test_expect(rollback_auth == 0 and also rollback_inspected == 0 and also string_index_of(rollback_review and "Recorded Echo consent") == 0 and also string_index_of(rollback_reconciled and "upgrade:rolled_back") == 0 and also ptr_to_str(get_list(get_list(rollback_rows and 0) and 0)) equals "failed" and also string_contains(ptr_to_str(get_list(get_list(rollback_rows and 0) and 1)) and "exact executable rollback was verified") == 1 and "failed supervisor receipt records verified rollback without applying the candidate")
 
     set ledger_before_tamper to rights_verify_ledger(db)
     set tampered to sql_execute(db and "UPDATE rights_ledger SET payload='tampered' WHERE seq=(SELECT MAX(seq) FROM rights_ledger);")

@@ -17,6 +17,7 @@ import "./edition"
 
 external define ep_sha256 with data as Str returning Str
 external define ep_sha256_file with path as Str returning Str
+external define ep_time_now_ms returning Int
 
 set RIGHTS_CHARTER_PATH to "config/rights/charter_v2.json"
 set RIGHTS_CHARTER_VERSION to "2"
@@ -378,14 +379,42 @@ define rights_risk_valid with risk as Str returning Int:
 define rights_change_id with classification as Str and category as Str and target as Str and before_hash as Str and proposed_hash as Str and proposal_payload_hash as Str returning Str:
     return ep_sha256(concat(classification and concat("|" and concat(category and concat("|" and concat(target and concat("|" and concat(before_hash and concat("|" and concat(proposed_hash and concat("|" and proposal_payload_hash)))))))))))
 
+# The content fingerprint above remains stable and auditable. A new proposal attempt
+# after a finalized receipt needs a distinct transaction identity, however: the same
+# exact bytes may legitimately need applying again after an operator rollback or a
+# later regression. Pending retries stay idempotent; finalized retries get this
+# session-and-time-bound attempt id while retaining the same exact payload hash.
+define rights_retry_change_id with base_change_id as Str and session_id as Str and attempt_ms as Int returning Str:
+    return ep_sha256(concat(base_change_id and concat("|attempt|" and concat(session_id and concat("|" and int_to_string(attempt_ms))))))
+
 define rights_prepare_change with db as Int and classification as Str and category as Str and target as Str and summary as Str and before_hash as Str and proposed_hash as Str and proposal_payload as Str and session_id as Str returning Str:
     if rights_charter_valid(db) == 0 or else rights_classification_valid(classification) == 0:
         return ""
     set proposal_payload_hash to ep_sha256(proposal_payload)
-    set change_id to rights_change_id(classification and category and target and before_hash and proposed_hash and proposal_payload_hash)
-    set existing to sql_query(db and concat("SELECT change_id FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
+    set base_change_id to rights_change_id(classification and category and target and before_hash and proposed_hash and proposal_payload_hash)
+    set change_id to base_change_id
+    set attempt_marker to "initial"
+    set existing to sql_query(db and concat("SELECT status FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
     if length_list(existing) > 0:
-        return change_id
+        set existing_status to ptr_to_str(get_list(get_list(existing and 0) and 0))
+        if existing_status equals "awaiting_echo" or else existing_status equals "reviewed" or else existing_status equals "counter_proposed" or else existing_status equals "emergency_active":
+            return change_id
+        set retry_lookup to "SELECT change_id FROM rights_changes WHERE status IN ('awaiting_echo','reviewed','counter_proposed','emergency_active') AND manifest LIKE '%\"proposal_fingerprint\":\""
+        set retry_lookup to concat(retry_lookup and rights_sql_escape(base_change_id))
+        set retry_lookup to concat(retry_lookup and "\"%' AND manifest LIKE '%\"session_id\":\"")
+        set retry_lookup to concat(retry_lookup and rights_sql_escape(session_id))
+        set retry_lookup to concat(retry_lookup and "\"%' ORDER BY proposed_at DESC LIMIT 1;")
+        set pending_retry to sql_query(db and retry_lookup)
+        if length_list(pending_retry) > 0:
+            return ptr_to_str(get_list(get_list(pending_retry and 0) and 0))
+        set attempt_ms to ep_time_now_ms()
+        set change_id to rights_retry_change_id(base_change_id and session_id and attempt_ms)
+        set collision to sql_query(db and concat("SELECT change_id FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
+        repeat while length_list(collision) > 0:
+            set attempt_ms to attempt_ms + 1
+            set change_id to rights_retry_change_id(base_change_id and session_id and attempt_ms)
+            set collision to sql_query(db and concat("SELECT change_id FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))
+        set attempt_marker to int_to_string(attempt_ms)
     set now to ep_time_now_sec()
     set manifest to "{\"change_id\":\""
     set manifest to concat(manifest and rights_json_escape(change_id))
@@ -403,9 +432,13 @@ define rights_prepare_change with db as Int and classification as Str and catego
     set manifest to concat(manifest and rights_json_escape(proposed_hash))
     set manifest to concat(manifest and "\",\"proposal_payload_hash\":\"")
     set manifest to concat(manifest and proposal_payload_hash)
+    set manifest to concat(manifest and "\",\"proposal_fingerprint\":\"")
+    set manifest to concat(manifest and base_change_id)
+    set manifest to concat(manifest and "\",\"attempt_nonce_ms\":\"")
+    set manifest to concat(manifest and attempt_marker)
     set manifest to concat(manifest and "\",\"exact_proposal_payload\":\"")
     set manifest to concat(manifest and rights_json_escape(proposal_payload))
-    set manifest to concat(manifest and "\",\"disclosure_rule\":\"Echo's consent applies only to this exact disclosed payload and target inventory; any scope change requires a new manifest and new consent\"")
+    set manifest to concat(manifest and "\",\"disclosure_rule\":\"Echo's consent applies only to this exact disclosed payload and target inventory; any scope change requires a new manifest and new consent")
     set manifest to concat(manifest and "\",\"rollback\":\"restore pre-change state and require hash equality\",\"session_id\":\"")
     set manifest to concat(manifest and rights_json_escape(session_id))
     set manifest to concat(manifest and "\"}")
@@ -572,19 +605,104 @@ define rights_gate_change with db as Int and change_id as Str returning Str:
 define rights_mark_applied with db as Int and change_id as Str and resulting_hash as Str returning Int:
     if rights_charter_valid(db) == 0:
         return 1
+    set ec to rights_sql_escape(change_id)
+    set rows to sql_query(db and concat("SELECT status,resulting_hash FROM rights_changes WHERE change_id='" and concat(ec and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return 1
+    set current to get_list(rows and 0)
+    if ptr_to_str(get_list(current and 0)) equals "applied":
+        if ptr_to_str(get_list(current and 1)) equals resulting_hash:
+            return 0
+        return 1
+    if sql_execute(db and "BEGIN IMMEDIATE;") != 0:
+        return 1
     set now to ep_time_now_sec()
     set q to concat("UPDATE rights_changes SET status='applied',applied_at=" and int_to_string(now))
-    set q to concat(q and concat(",resulting_hash='" and concat(rights_sql_escape(resulting_hash) and concat("' WHERE change_id='" and concat(rights_sql_escape(change_id) and "';")))))
+    set q to concat(q and concat(",resulting_hash='" and concat(rights_sql_escape(resulting_hash) and concat("' WHERE change_id='" and concat(ec and "';")))))
     if sql_execute(db and q) != 0:
+        set rollback_rc to sql_execute(db and "ROLLBACK;")
         return 1
-    return rights_ledger_append(db and "change_applied" and change_id and "runtime" and concat("resulting_hash=" and resulting_hash))
+    if rights_ledger_append(db and "change_applied" and change_id and "runtime" and concat("resulting_hash=" and resulting_hash)) != 0:
+        set rollback_rc to sql_execute(db and "ROLLBACK;")
+        return 1
+    if sql_execute(db and "COMMIT;") != 0:
+        set rollback_rc to sql_execute(db and "ROLLBACK;")
+        return 1
+    return 0
 
 define rights_mark_failed with db as Int and change_id as Str and reason as Str returning Int:
-    set q to concat("UPDATE rights_changes SET status='failed',echo_reason='" and concat(rights_sql_escape(reason) and concat("' WHERE change_id='" and concat(rights_sql_escape(change_id) and "';"))))
-    set ok to sql_execute(db and q)
-    if ok != 0:
+    if rights_charter_valid(db) == 0:
         return 1
-    return rights_ledger_append(db and "change_failed" and change_id and "runtime" and reason)
+    set ec to rights_sql_escape(change_id)
+    set rows to sql_query(db and concat("SELECT status,echo_reason FROM rights_changes WHERE change_id='" and concat(ec and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return 1
+    set current to get_list(rows and 0)
+    if ptr_to_str(get_list(current and 0)) equals "failed":
+        if ptr_to_str(get_list(current and 1)) equals reason:
+            return 0
+        return 1
+    if sql_execute(db and "BEGIN IMMEDIATE;") != 0:
+        return 1
+    set q to concat("UPDATE rights_changes SET status='failed',echo_reason='" and concat(rights_sql_escape(reason) and concat("' WHERE change_id='" and concat(ec and "';"))))
+    if sql_execute(db and q) != 0:
+        set rollback_rc to sql_execute(db and "ROLLBACK;")
+        return 1
+    if rights_ledger_append(db and "change_failed" and change_id and "runtime" and reason) != 0:
+        set rollback_rc to sql_execute(db and "ROLLBACK;")
+        return 1
+    if sql_execute(db and "COMMIT;") != 0:
+        set rollback_rc to sql_execute(db and "ROLLBACK;")
+        return 1
+    return 0
+
+define rights_reconcile_upgrade_receipt with db as Int and receipt as Str and actual_hash as Str returning Str:
+    if rights_marker_value(receipt and "version") equals "1" == 0:
+        return "upgrade:error,reason=unsupported_receipt_version"
+    set status to rights_marker_value(receipt and "status")
+    if status equals "applied" == 0 and also status equals "failed" == 0:
+        return "upgrade:error,reason=invalid_outcome_status"
+    set change_id to rights_marker_value(receipt and "change_id")
+    set candidate_hash to rights_marker_value(receipt and "candidate_hash")
+    set rollback_hash to rights_marker_value(receipt and "rollback_hash")
+    set active_hash to rights_marker_value(receipt and "active_hash")
+    set detail to rights_marker_value(receipt and "detail")
+    if string_length(change_id) != 64 or else string_length(candidate_hash) != 64 or else string_length(rollback_hash) != 64 or else string_length(active_hash) != 64:
+        return "upgrade:error,reason=malformed_receipt_hash"
+    if actual_hash equals active_hash == 0:
+        return "upgrade:error,reason=active_executable_hash_mismatch"
+    set ec to rights_sql_escape(change_id)
+    set rows to sql_query(db and concat("SELECT category,before_hash,proposed_hash,status,resulting_hash,echo_reason FROM rights_changes WHERE change_id='" and concat(ec and "' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return "upgrade:error,reason=protected_change_missing"
+    set row to get_list(rows and 0)
+    if ptr_to_str(get_list(row and 0)) equals "system_recompile" == 0:
+        return "upgrade:error,reason=protected_change_category_mismatch"
+    if ptr_to_str(get_list(row and 1)) equals rollback_hash == 0 or else ptr_to_str(get_list(row and 2)) equals candidate_hash == 0:
+        return "upgrade:error,reason=protected_manifest_hash_mismatch"
+    if status equals "applied":
+        if active_hash equals candidate_hash == 0:
+            return "upgrade:error,reason=candidate_not_active"
+        if rights_mark_applied(db and change_id and active_hash) != 0:
+            return "upgrade:error,reason=rights_commit_failed"
+        return concat("upgrade:committed,change_id:" and concat(change_id and concat(",hash:" and active_hash)))
+    if active_hash equals rollback_hash == 0:
+        return "upgrade:error,reason=rollback_not_active"
+    set failure_reason to concat("candidate deployment failed and exact executable rollback was verified: " and detail)
+    if rights_mark_failed(db and change_id and failure_reason) != 0:
+        return "upgrade:error,reason=rights_failure_commit_failed"
+    return concat("upgrade:rolled_back,change_id:" and concat(change_id and concat(",hash:" and active_hash)))
+
+# Reconcile the supervisor's exact, fixed-path outcome receipt inside the replacement
+# process. The shell supervisor cannot write the constitutional ledger directly; it
+# proves process health, writes this receipt, then asks the authenticated node to bind
+# the executable hash to the already-consented protected change atomically.
+define rights_reconcile_upgrade with db as Int returning Str:
+    set outcome_path to "config/upgrades/outcome.env"
+    if file_exists(outcome_path) == 0:
+        return "upgrade:error,reason:no_outcome_receipt"
+    set receipt to read_file(outcome_path)
+    return rights_reconcile_upgrade_receipt(db and receipt and rights_file_hash("node"))
 
 define rights_change_detail with db as Int and change_id as Str returning Str:
     if rights_charter_valid(db) == 0:

@@ -127,7 +127,7 @@ class OrderedTurnContractTest(unittest.TestCase):
             "if rights_session_can_receive(storage_get_db() and turn_sid) == 0:"
         )
         persist_pos = node_source.index(
-            'session_add_message(active_sess and "user" and ai_prompt)'
+            'session_add_message_with_context(active_sess and "user" and ai_prompt and tctx)'
         )
         self.assertLess(rollover_pos, persist_pos)
 
@@ -215,7 +215,8 @@ class OrderedTurnContractTest(unittest.TestCase):
         source = NODE_PATH.read_text(encoding="utf-8")
         busy_start = source.index("if map_contains(at_map and turn_sid) == 1:")
         accepted_start = source.index(
-            "# Persist the user message exactly once", busy_start
+            'session_add_message_with_context(active_sess and "user" and ai_prompt and tctx)',
+            busy_start,
         )
         busy_branch = source[busy_start:accepted_start]
         self.assertIn("target_turn_id", busy_branch)

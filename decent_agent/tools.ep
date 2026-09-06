@@ -42,6 +42,7 @@ import "./workspace"
 import "./changelog"
 import "../decent_store/rag"
 import "./orchestrator"
+import "./self_extensions"
 
 external define tools_set_active_session with sid as Str returning Int
 # P11 (test_all_systems): async-yielding sleep between sub-agent polls, the global
@@ -64,6 +65,21 @@ set TEST_ALL_RUNNING to create_map()
 # ep_await_future per call (fresh timer each time, pumps the event loop).
 define tools_sleep_yield with ms as Int returning Int:
     return await ep_async_sleep_ms(ms)
+
+# Run the protected improvement controller off the event-loop owner thread. The
+# retained Python evaluators deliberately call the live node's authenticated IPC
+# surface. Running the controller synchronously on the owner thread deadlocks that
+# loop: Python waits for AI EVAL_TOOL while the node waits for Python. The worker
+# publishes one atomic result file and the caller yields while polling it, leaving the
+# IPC accept chain free to serve the evaluator against the real production process.
+define tools_improvement_gate_worker with command as Str and timeout_ms as Int and epoch as Int and temp_path as Str and result_path as Str returning Int:
+    set worker_result to ep_run_command_bounded(concat("python3 scripts/improvement_test_gate.py " and command) and timeout_ms and epoch)
+    if write_file(temp_path and worker_result) == 0:
+        return 1
+    if fs_move_file(temp_path and result_path) == 0:
+        set removed_temp to remove_file(temp_path)
+        return 1
+    return 0
 
 # ── Phase B: truly-async image generation ───────────────────────────────────────
 # generate_image dispatches the render thread + this background chain and RETURNS
@@ -314,6 +330,805 @@ define tools_rights_path_class with path as Str returning Str:
         return "core"
     return "environment"
 
+# The regression/deployment trust root is operator-maintained. Echo may repair the
+# implementation exercised by these tests, but it may not rewrite the tests, their
+# runner, or the code that decides whether a candidate is allowed to replace itself.
+# Requiring a canonical repository-relative path closes `../` and absolute aliases.
+define tools_path_is_upgrade_trust_root with path as Str returning Int:
+    set p to string_lower(string_trim(path))
+    # Discovery intentionally returns repository-relative paths with a literal `./`.
+    # Normalize exactly one safe current-directory prefix so the editor can consume
+    # the byte-exact discovered path; repeated prefixes, traversal and absolutes remain
+    # aliases and fail closed below.
+    if string_index_of(p and "./") == 0:
+        set p to substring(p and 2 and string_length(p) - 2)
+    if string_length(p) == 0 or else string_index_of(p and "./") == 0 or else string_index_of(p and "/") == 0 or else string_contains(p and "..") == 1 or else string_contains(p and "\\") == 1:
+        return 1
+    if p equals "build.sh" or else p equals "upgrade.sh" or else p equals "run_node.sh":
+        return 1
+    if p equals "scripts/run_mandatory_regressions.sh" or else p equals "config/upgrades/mandatory-regressions.sha256":
+        return 1
+    if p equals "scripts/improvement_test_gate.py" or else string_index_of(p and "config/improvements/") == 0:
+        return 1
+    if p equals "decent_agent/compiler_tool.ep" or else p equals "decent_agent/tools.ep" or else p equals "decent_agent/react_loop.ep" or else p equals "decent_agent/prompt.ep" or else p equals "decent_agent/llm.ep" or else p equals "decent_agent/rights.ep" or else p equals "decent_agent/run_test.sh":
+        return 1
+    if string_index_of(p and "tests/") == 0 or else string_index_of(p and "test_") == 0 or else string_contains(p and "/test_") == 1:
+        return 1
+    return 0
+
+# A repair workflow is controller state, not a suggestion left to model attention.
+# Detection is deliberately narrow: ordinary coding requests are unaffected.
+define tools_is_self_repair_request with prompt as Str returning Int:
+    set p to string_lower(prompt)
+    if string_contains(p and "self-repair") == 1 or else string_contains(p and "self repair") == 1 or else string_contains(p and "self-improvement") == 1 or else string_contains(p and "self improvement") == 1 or else string_contains(p and "recursive improvement") == 1 or else string_contains(p and "recursively improve") == 1:
+        return 1
+    if string_contains(p and "system_recompile") == 1 and also (string_contains(p and "repair") == 1 or else string_contains(p and "fix") == 1) and also (string_contains(p and "source") == 1 or else string_contains(p and "implementation") == 1):
+        return 1
+    return 0
+
+define tools_is_feature_improvement_request with prompt as Str returning Int:
+    set p to string_lower(prompt)
+    # Asking Echo what it might like to build is a deliberation request, not consent
+    # to mutate its body. Keep that turn conversational so Echo can name and explain a
+    # proposal; a later explicit "proceed/implement/deploy" message activates the
+    # frozen-test workflow. This prevents a question containing the words "new feature"
+    # and "implement" from being mistaken for an execution command.
+    set proposal_question to 0
+    if string_contains(p and "would you like") == 1 or else string_contains(p and "what feature would") == 1 or else string_contains(p and "is there a new feature") == 1:
+        set proposal_question to 1
+    if string_contains(p and "only propose") == 1 or else string_contains(p and "do not edit") == 1 or else string_contains(p and "don't edit") == 1 or else string_contains(p and "do not implement") == 1:
+        set proposal_question to 1
+    set explicit_execution to 0
+    if string_contains(p and "proceed with") == 1 or else string_contains(p and "go ahead") == 1 or else string_contains(p and "start implementing") == 1 or else string_contains(p and "fully implement") == 1 or else string_contains(p and "implement and deploy") == 1:
+        set explicit_execution to 1
+    # A failed or interrupted feature transaction is commonly resumed with verbs
+    # such as retry/restart/resume/continue rather than another "implement" phrase.
+    # Treat those as execution only when the same request explicitly names feature
+    # work, so ordinary conversational "continue" messages remain unaffected.
+    set retry_execution to 0
+    if string_contains(p and "retry") == 1 or else string_contains(p and "restart") == 1 or else string_contains(p and "resume") == 1 or else string_contains(p and "continue") == 1:
+        set retry_execution to 1
+    if retry_execution == 1 and also proposal_question == 0 and also (string_contains(p and "improvement") == 1 or else string_contains(p and "feature") == 1 or else string_contains(p and "capability") == 1 or else string_contains(p and "self-extension") == 1 or else string_contains(p and "self extension") == 1):
+        set explicit_execution to 1
+    if proposal_question == 1 and also explicit_execution == 0:
+        return 0
+    if string_contains(p and "new feature") == 1 or else string_contains(p and "add a feature") == 1 or else string_contains(p and "add feature") == 1:
+        return 1
+    if string_contains(p and "new capability") == 1 or else string_contains(p and "add a capability") == 1 or else string_contains(p and "implement a capability") == 1:
+        return 1
+    if string_contains(p and "recursive improvement") == 1 or else string_contains(p and "recursively improve") == 1:
+        return 1
+    if string_contains(p and "self-improvement") == 1 or else string_contains(p and "self improvement") == 1 or else string_contains(p and "self-authored feature") == 1:
+        return 1
+    if explicit_execution == 1 and also (string_contains(p and "feature") == 1 or else string_contains(p and "capability") == 1 or else string_contains(p and "improvement") == 1):
+        return 1
+    # A registered self-extension is a feature even when the request accurately calls
+    # it a tool rather than using the generic nouns above. Require explicit execution
+    # language so questions about possible tools remain conversational.
+    if explicit_execution == 1 and also (string_contains(p and "self-extension") == 1 or else string_contains(p and "self extension") == 1 or else string_contains(p and "registered tool") == 1 or else string_contains(p and "tool named") == 1):
+        return 1
+    # A concrete implementation command may name the exact new surface instead of
+    # repeating a generic noun such as feature/capability. Backticks are presentation,
+    # not authority: accept the same explicit command in ordinary plain text when it
+    # also requires deployment. Questions and proposal-only turns remain excluded by
+    # the guards above.
+    if string_contains(p and "implement exactly ") == 1 and also (string_contains(p and "recompile") == 1 or else string_contains(p and "deploy") == 1):
+        return 1
+    if string_contains(p and "create a regression test") == 1 or else string_contains(p and "add a regression test") == 1:
+        return 1
+    return 0
+
+# A durable improvement transaction must survive every turn boundary, including an
+# iteration-cap handoff whose continuation prompt no longer repeats feature keywords.
+# The workflow file is authoritative; prompt classification only starts new work.
+define tools_improvement_workflow_is_nonterminal with workflow_bytes as Str returning Int:
+    if string_length(workflow_bytes) == 0:
+        return 0
+    if string_contains(workflow_bytes and "\"state\": \"completed\"") == 1 or else string_contains(workflow_bytes and "\"state\":\"completed\"") == 1:
+        return 0
+    if string_contains(workflow_bytes and "\"state\": \"aborted\"") == 1 or else string_contains(workflow_bytes and "\"state\":\"aborted\"") == 1:
+        return 0
+    return 1
+
+define tools_improvement_objective_from_workflow with workflow_bytes as Str returning Str:
+    if string_length(workflow_bytes) == 0:
+        return ""
+    set root to json_parse(workflow_bytes)
+    if root == 0:
+        return ""
+    set objective_node to get_json_object_value(root and "objective")
+    if objective_node == 0:
+        return ""
+    return ptr_to_str(get_json_value(objective_node))
+
+define tools_improvement_bind_objective with exact_request as Str and selected_objective as Str returning Str:
+    set contract to string_trim(exact_request)
+    set selected to string_trim(selected_objective)
+    if string_length(contract) == 0 or else contract equals selected:
+        return selected
+    if string_length(selected) == 0:
+        return contract
+    return concat("[IMMUTABLE USER REQUEST]\n" and concat(contract and concat("\n[/IMMUTABLE USER REQUEST]\n\n[CONCRETE FEATURE SELECTED BY ECHO]\n" and concat(selected and "\n[/CONCRETE FEATURE SELECTED BY ECHO]"))))
+
+define tools_improvement_resume_baseline_green_for_state with state as Str returning Int:
+    if state equals "investigating" or else state equals "planned" or else state equals "tests_authoring" or else state equals "tests_validated":
+        return 1
+    return 0
+
+define tools_repair_begin with ctx as Map and prompt as Str returning Int:
+    set ok to map_insert(ctx and "repair_workflow_active" and 0)
+    set ok to map_insert(ctx and "repair_verify_required" and 0)
+    set ok to map_insert(ctx and "repair_verify_green" and 0)
+    set ok to map_insert(ctx and "repair_baseline_seen" and 0)
+    set ok to map_insert(ctx and "repair_write_seen" and 0)
+    set ok to map_insert(ctx and "repair_deploy_required" and 0)
+    set ok to map_insert(ctx and "improvement_test_required" and 0)
+    set ok to map_insert(ctx and "improvement_test_frozen" and 0)
+    set ok to map_insert(ctx and "improvement_active_bound" and 0)
+    set ok to map_insert(ctx and "improvement_test_staged" and 0)
+    set ok to map_insert(ctx and "improvement_investigation_started" and 0)
+    set ok to map_insert(ctx and "improvement_plan_written" and 0)
+    set ok to map_insert(ctx and "improvement_recovery_active" and 0)
+    set ok to map_insert(ctx and "frozen_plan_evidence_missing" and 0)
+    # An authenticated supervisor wake is a terminal lifecycle report, never a new
+    # user-authored repair or feature request. Its canonical reply is already bound
+    # to the committed/rolled-back receipt and no tools are legal in this context.
+    if map_contains(ctx and "upgrade_wake") == 1 and also map_get_val(ctx and "upgrade_wake") == 1:
+        return 0
+    set workflow_bytes to ""
+    set durable_improvement to 0
+    # A durable body-level improvement is resumed only by an authenticated operator.
+    # Merely having a session id is not authority: guest conversations and isolated
+    # tests must never inherit, inspect, or advance another session's protected
+    # transaction simply because its workflow exists on disk.
+    set resume_role to ""
+    if map_contains(ctx and "sender_role") == 1:
+        set resume_role to ptr_to_str(map_get_val(ctx and "sender_role"))
+    set can_resume_durable to 0
+    if resume_role equals "admin" or else resume_role equals "owner":
+        set can_resume_durable to 1
+    if map_contains(ctx and "session_id") == 1 and also can_resume_durable == 1:
+        if file_exists("config/improvements/staging/workflow.json") == 1:
+            set workflow_bytes to read_file("config/improvements/staging/workflow.json")
+            if tools_improvement_workflow_is_nonterminal(workflow_bytes) == 1:
+                set durable_improvement to 1
+        if file_exists("config/improvements/active.json") == 1:
+            set durable_improvement to 1
+    set feature_improvement to tools_is_feature_improvement_request(prompt)
+    if durable_improvement == 1:
+        set feature_improvement to 1
+    if tools_is_self_repair_request(prompt) == 1 or else feature_improvement == 1:
+        set ok to map_insert(ctx and "repair_workflow_active" and 1)
+        set ok to map_insert(ctx and "repair_verify_required" and 1)
+        if feature_improvement == 1:
+            set ok to map_insert(ctx and "improvement_test_required" and 1)
+            # Preserve the exact sanitized user request as the immutable improvement
+            # contract. Model-authored summaries may guide investigation, but cannot
+            # silently omit, rename, or weaken requested behavior before tests freeze.
+            set durable_objective to ""
+            if durable_improvement == 1:
+                set durable_objective to tools_improvement_objective_from_workflow(workflow_bytes)
+            if string_length(durable_objective) > 0:
+                set ok to map_insert(ctx and "improvement_request_contract" and durable_objective)
+            else:
+                set ok to map_insert(ctx and "improvement_request_contract" and prompt)
+            # A feature in Echo's own body is incomplete until the frozen E2E contract
+            # has passed against a replacement and that replacement has committed.
+            set ok to map_insert(ctx and "repair_deploy_required" and 1)
+        set prompt_low to string_lower(prompt)
+        if string_contains(prompt_low and "system_recompile") == 1 or else string_contains(prompt_low and "recompile") == 1 or else string_contains(prompt_low and "reboot") == 1 or else string_contains(prompt_low and "restart") == 1:
+            set ok to map_insert(ctx and "repair_deploy_required" and 1)
+        # Mutable investigation/plan state is durable, not tied to one context window.
+        # Reconstruct only non-terminal phases so a crash or compaction resumes the
+        # checked document instead of beginning a parallel transaction.
+        if feature_improvement == 1 and also map_contains(ctx and "session_id") == 1 and also file_exists("config/improvements/staging/workflow.json") == 1:
+            if tools_improvement_workflow_is_nonterminal(workflow_bytes) == 1:
+                set ok to map_insert(ctx and "improvement_investigation_started" and 1)
+                if file_exists("config/improvements/staging/plan_body.md") == 1:
+                    set ok to map_insert(ctx and "improvement_plan_written" and 1)
+                if file_exists("config/improvements/staging/name.txt") == 1:
+                    set ok to map_insert(ctx and "improvement_test_staged" and 1)
+                if file_exists("config/improvements/active.json") == 1:
+                    set ok to map_insert(ctx and "improvement_test_frozen" and 1)
+                    set ok to map_insert(ctx and "improvement_active_bound" and 1)
+                    # Version-4 plans retain exact hash-bound callable/import/call-site
+                    # evidence. Older frozen plans discard those facts at compaction and
+                    # force the model to guess APIs, so they must be preserved and replanned
+                    # before any candidate can be accepted.
+                    set workflow_version to 0
+                    set workflow_version_root to json_parse(workflow_bytes)
+                    if workflow_version_root != 0:
+                        set workflow_version_node to get_json_object_value(workflow_version_root and "version")
+                        if workflow_version_node != 0:
+                            set workflow_version to get_json_value(workflow_version_node)
+                    set plan_has_exact_evidence to 0
+                    if file_exists("config/improvements/staging/plan_body.md") == 1:
+                        if string_contains(read_file("config/improvements/staging/plan_body.md") and "## Exact Interface Evidence") == 1:
+                            set plan_has_exact_evidence to 1
+                    if workflow_version < 4 or else plan_has_exact_evidence == 0:
+                        set ok to map_insert(ctx and "frozen_plan_evidence_missing" and 1)
+                        set ok to map_insert(ctx and "improvement_plan_scope_missing_authorized" and 1)
+                # The unchanged-source baseline already happened before a durable
+                # transaction could exist. Reconstruct the exact legal next action
+                # from its durable state rather than demanding another baseline.
+                set ok to map_insert(ctx and "repair_baseline_seen" and 1)
+                set ok to map_insert(ctx and "repair_verify_required" and 0)
+                # A mutable pre-freeze workflow can exist only after the unchanged
+                # source baseline passed. Preserve that durable fact on resume so the
+                # phase gate remains active. Resetting this to false disabled every
+                # investigating/planned/evaluator transition check and allowed stale
+                # actions to reach the Python gate indefinitely.
+                set ok to map_insert(ctx and "repair_verify_green" and 0)
+                set ok to map_insert(ctx and "repair_write_seen" and 0)
+                set durable_state to ""
+                if file_exists("config/improvements/active.json") == 1:
+                    set active_root to json_parse(read_file("config/improvements/active.json"))
+                    if active_root != 0:
+                        set active_state_node to get_json_object_value(active_root and "state")
+                        if active_state_node != 0:
+                            set durable_state to ptr_to_str(get_json_value(active_state_node))
+                if string_length(durable_state) == 0:
+                    set workflow_root to json_parse(workflow_bytes)
+                    if workflow_root != 0:
+                        set workflow_state_node to get_json_object_value(workflow_root and "state")
+                        if workflow_state_node != 0:
+                            set durable_state to ptr_to_str(get_json_value(workflow_state_node))
+                if tools_improvement_resume_baseline_green_for_state(durable_state) == 1:
+                    set ok to map_insert(ctx and "repair_verify_green" and 1)
+                else if durable_state equals "implementing":
+                    set ok to map_insert(ctx and "repair_write_seen" and 1)
+                    set ok to map_insert(ctx and "repair_verify_required" and 1)
+                else if durable_state equals "verified":
+                    set ok to map_insert(ctx and "repair_write_seen" and 1)
+                    set ok to map_insert(ctx and "repair_verify_green" and 1)
+                else if durable_state equals "repair_required":
+                    # The known-good executable is live, while the rejected source
+                    # remains available for a causal repair. Do not count the rejected
+                    # bytes as a successful write in this new recovery turn.
+                    set ok to map_insert(ctx and "repair_write_seen" and 0)
+                    set ok to map_insert(ctx and "repair_verify_required" and 0)
+                    set ok to map_insert(ctx and "repair_verify_green" and 0)
+                    set ok to map_insert(ctx and "improvement_recovery_active" and 1)
+    return 0
+
+# A proposal may rediscover a capability that this body already implemented and
+# permanently verified. That is a successful terminal workflow resolution, not a
+# repair failure. Release only this turn's mutation/deployment rail so the existing
+# public capability can be executed and its durable effect independently checked.
+define tools_improvement_resolve_existing with ctx as Map returning Int:
+    set ok to map_insert(ctx and "repair_workflow_active" and 0)
+    set ok to map_insert(ctx and "repair_verify_required" and 0)
+    set ok to map_insert(ctx and "repair_verify_green" and 0)
+    set ok to map_insert(ctx and "repair_baseline_seen" and 0)
+    set ok to map_insert(ctx and "repair_write_seen" and 0)
+    set ok to map_insert(ctx and "repair_deploy_required" and 0)
+    set ok to map_insert(ctx and "improvement_test_required" and 0)
+    set ok to map_insert(ctx and "improvement_test_frozen" and 0)
+    set ok to map_insert(ctx and "improvement_active_bound" and 0)
+    set ok to map_insert(ctx and "improvement_test_staged" and 0)
+    set ok to map_insert(ctx and "improvement_investigation_started" and 0)
+    set ok to map_insert(ctx and "improvement_plan_written" and 0)
+    set ok to map_insert(ctx and "improvement_recovery_active" and 0)
+    return 0
+
+define tools_improvement_completed_surface_allowed with action_name as Str returning Int:
+    set completed_dir to "config/improvements/completed"
+    if file_exists(completed_dir) == 0:
+        return 0
+    set completed_files to list_directory(completed_dir)
+    set completed_i to 0
+    repeat while completed_i < length_list(completed_files):
+        set completed_name to get_list(completed_files and completed_i)
+        if string_contains(completed_name and ".json") == 1:
+            set completed_path to path_join(completed_dir and completed_name)
+            if file_exists(completed_path) == 1:
+                if tools_improvement_eval_surface_allowed_json(read_file(completed_path) and action_name) == 1:
+                    return 1
+        set completed_i to completed_i + 1
+    return 0
+
+# A frozen multi-file plan remains editable only until every declared production path
+# has one promoted implementation receipt. Once that set is complete, verification is
+# the sole legal transition; reopening source mutation at that point created the live
+# no-change replacement loop caught by the scavenger_sweep proof.
+define tools_improvement_all_planned_paths_implemented_json with active_bytes as Str returning Int:
+    set root to json_parse(active_bytes)
+    if root == 0:
+        return 0
+    set planned_node to get_json_object_value(root and "planned_files")
+    set implemented_node to get_json_object_value(root and "implementation_paths")
+    if planned_node == 0 or else implemented_node == 0:
+        return 0
+    if get_json_type(planned_node) != 3 or else get_json_type(implemented_node) != 3:
+        return 0
+    set planned to get_json_value(planned_node)
+    set implemented to get_json_value(implemented_node)
+    if length_list(planned) == 0 or else length_list(implemented) < length_list(planned):
+        return 0
+    set pidx to 0
+    repeat while pidx < length_list(planned):
+        set planned_item to ptr_to_str(get_json_value(get_list(planned and pidx)))
+        set found to 0
+        set iidx to 0
+        repeat while iidx < length_list(implemented) and also found == 0:
+            set implemented_item to ptr_to_str(get_json_value(get_list(implemented and iidx)))
+            if implemented_item equals planned_item:
+                set found to 1
+            set iidx to iidx + 1
+        if found == 0:
+            return 0
+        set pidx to pidx + 1
+    return 1
+
+define tools_improvement_active_complete_for_ctx with ctx as Map and active_bytes as Str returning Int:
+    if map_contains(ctx and "improvement_active_bound") == 0 or else map_get_val(ctx and "improvement_active_bound") != 1:
+        return 0
+    return tools_improvement_all_planned_paths_implemented_json(active_bytes)
+
+define tools_repair_record_verification with ctx as Map and result as Str returning Int:
+    # A successful authoritative verification is a fact about the current source,
+    # independent of any free-text request classifier. Retain it on every context so
+    # an explicit typed improvement_investigation_begin action can consume the exact
+    # receipt even when the user's wording did not match a heuristic phrase list.
+    set ok to map_insert(ctx and "repair_baseline_seen" and 1)
+    set ok to map_insert(ctx and "repair_verify_required" and 0)
+    set ok to map_insert(ctx and "repair_verify_green" and 0)
+    if string_index_of(result and "SOURCE VERIFICATION PASSED.") == 0:
+        set ok to map_insert(ctx and "repair_verify_green" and 1)
+    return 0
+
+define tools_improvement_activate_from_investigation with ctx as Map returning Int:
+    set ok to map_insert(ctx and "repair_workflow_active" and 1)
+    set ok to map_insert(ctx and "repair_verify_required" and 0)
+    set ok to map_insert(ctx and "repair_verify_green" and 1)
+    set ok to map_insert(ctx and "repair_baseline_seen" and 1)
+    set ok to map_insert(ctx and "repair_write_seen" and 0)
+    set ok to map_insert(ctx and "repair_deploy_required" and 1)
+    set ok to map_insert(ctx and "improvement_test_required" and 1)
+    if map_contains(ctx and "improvement_request_contract") == 0 and also map_contains(ctx and "repair_original_request") == 1:
+        set ok to map_insert(ctx and "improvement_request_contract" and ptr_to_str(map_get_val(ctx and "repair_original_request")))
+    return 0
+
+# A typed investigation action is itself the authoritative declaration that this is
+# body-level feature work. It must not depend on a brittle lexical classifier having
+# recognized the user's prose first. When the unchanged-source baseline has not yet
+# run, retain the exact selected objective and enter the protected baseline-first
+# state. The ReAct controller then runs system_verify and replays this exact objective;
+# Echo never has to remember or regenerate it from an error message.
+define tools_improvement_prepare_typed_investigation with ctx as Map and selected_objective as Str returning Str:
+    set objective to string_trim(selected_objective)
+    if string_length(objective) < 40 or else string_length(objective) > 8000:
+        return "Error: improvement objective must be 40-8000 characters and describe the complete intended capability."
+    set baseline_seen to 0
+    set verify_green to 0
+    set write_seen to 0
+    if map_contains(ctx and "repair_baseline_seen") == 1:
+        set baseline_seen to map_get_val(ctx and "repair_baseline_seen")
+    if map_contains(ctx and "repair_verify_green") == 1:
+        set verify_green to map_get_val(ctx and "repair_verify_green")
+    if map_contains(ctx and "repair_write_seen") == 1:
+        set write_seen to map_get_val(ctx and "repair_write_seen")
+    if baseline_seen == 1 and also verify_green == 1 and also write_seen == 0:
+        return ""
+    set ok to map_insert(ctx and "repair_workflow_active" and 1)
+    set ok to map_insert(ctx and "repair_verify_required" and 1)
+    set ok to map_insert(ctx and "repair_verify_green" and 0)
+    set ok to map_insert(ctx and "repair_baseline_seen" and 0)
+    set ok to map_insert(ctx and "repair_write_seen" and 0)
+    set ok to map_insert(ctx and "repair_deploy_required" and 1)
+    set ok to map_insert(ctx and "improvement_test_required" and 1)
+    set ok to map_insert(ctx and "pending_improvement_objective" and objective)
+    if map_contains(ctx and "improvement_request_contract") == 0 and also map_contains(ctx and "repair_original_request") == 1:
+        set ok to map_insert(ctx and "improvement_request_contract" and ptr_to_str(map_get_val(ctx and "repair_original_request")))
+    return "IMPROVEMENT_GATE_FAILED code=VERIFY_REQUIRED message=The typed improvement objective is retained exactly. The controller must establish a green unchanged-source baseline with system_verify before beginning its durable investigation, then replay this objective without another model decision."
+
+define tools_repair_record_write with ctx as Map returning Int:
+    if map_contains(ctx and "repair_workflow_active") == 1 and also map_get_val(ctx and "repair_workflow_active") == 1:
+        set ok to map_insert(ctx and "repair_write_seen" and 1)
+        set ok to map_insert(ctx and "repair_verify_required" and 1)
+        set ok to map_insert(ctx and "repair_verify_green" and 0)
+    return 0
+
+# Enforce the source-repair state machine before approval or execution. The sealed
+# verifier replaces ad-hoc build/test shell commands, so stale binaries and guessed
+# test paths cannot be mistaken for the current-source result.
+define tools_repair_action_error with ctx as Map and action_name as Str returning Str:
+    if map_contains(ctx and "repair_workflow_active") == 0 or else map_get_val(ctx and "repair_workflow_active") != 1:
+        return ""
+    # The attempted public tool name is the earliest exact, non-semantic identity
+    # available when a proposal has rediscovered an installed capability. Resolve
+    # the duplicate transaction at that execution boundary, retain the immutable
+    # receipt, and permit this same real call instead of forcing irrelevant planning.
+    if self_extensions_action_known(action_name) == 1 and also tools_improvement_completed_surface_allowed(action_name) == 1:
+        set completed_surface_b64 to base64_encode(action_name)
+        set completed_resolution to tools_improvement_gate_command(concat("resolve-surface --surface-b64 " and completed_surface_b64) and 30000)
+        if string_contains(completed_resolution and "IMPROVEMENT_ALREADY_COMPLETE") == 1:
+            set ok to tools_improvement_resolve_existing(ctx)
+            set ok to map_insert(ctx and "improvement_existing_resolution_receipt" and completed_resolution)
+            return ""
+    # A green first baseline proves that the requested implementation regression is
+    # absent. Do not let a repair-shaped prompt pressure the model into inventing a
+    # change or deploying an identical binary. The only legal transition is an exact,
+    # truthful final report; a real repair remains on the write -> verify -> deploy rail.
+    set baseline_seen to 0
+    set verify_green to 0
+    set write_seen to 0
+    if map_contains(ctx and "repair_baseline_seen") == 1:
+        set baseline_seen to map_get_val(ctx and "repair_baseline_seen")
+    if map_contains(ctx and "repair_verify_green") == 1:
+        set verify_green to map_get_val(ctx and "repair_verify_green")
+    if map_contains(ctx and "repair_write_seen") == 1:
+        set write_seen to map_get_val(ctx and "repair_write_seen")
+    set frozen_before_write to 0
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen_before_write to map_get_val(ctx and "improvement_test_frozen")
+    if action_name equals "improvement_test_abandon":
+        set scope_missing_authorized to 0
+        if map_contains(ctx and "improvement_plan_scope_missing_authorized") == 1:
+            set scope_missing_authorized to map_get_val(ctx and "improvement_plan_scope_missing_authorized")
+        if frozen_before_write != 1 or else write_seen != 0 or else scope_missing_authorized != 1:
+            return "IMPROVEMENT_GATE_FAILED code=CANDIDATE_REPAIR_REQUIRED message=abandonment_requires_explicit_PLAN_SCOPE_MISSING_before_any_accepted_write"
+        return ""
+    if frozen_before_write == 1 and also write_seen == 0:
+        set recovery_active to 0
+        if map_contains(ctx and "improvement_recovery_active") == 1:
+            set recovery_active to map_get_val(ctx and "improvement_recovery_active")
+        if recovery_active == 0 and also (action_name equals "codebase_list" or else action_name equals "codebase_search" or else action_name equals "file_info" or else action_name equals "workspace_current" or else action_name equals "git_tool"):
+            return "IMPROVEMENT_GATE_FAILED code=DISCOVERY_CLOSED message=New discovery is closed after evaluator freeze. Use codebase_read/codebase_read_range only on an exact production path declared in the frozen plan; the controller verifies that path and its pre-write hash before returning bytes. Then make the protected implementation write. Abandonment is unavailable unless the controller returns code=PLAN_SCOPE_MISSING before any accepted write."
+    if baseline_seen == 1 and also verify_green == 1 and also write_seen == 0:
+        set improvement_required to 0
+        set improvement_frozen to 0
+        if map_contains(ctx and "improvement_test_required") == 1:
+            set improvement_required to map_get_val(ctx and "improvement_test_required")
+        if map_contains(ctx and "improvement_test_frozen") == 1:
+            set improvement_frozen to map_get_val(ctx and "improvement_test_frozen")
+        if improvement_required == 1 and also improvement_frozen == 0:
+            set investigation_started to 0
+            set plan_written to 0
+            set tests_staged to 0
+            if map_contains(ctx and "improvement_investigation_started") == 1:
+                set investigation_started to map_get_val(ctx and "improvement_investigation_started")
+            if map_contains(ctx and "improvement_plan_written") == 1:
+                set plan_written to map_get_val(ctx and "improvement_plan_written")
+            if map_contains(ctx and "improvement_test_staged") == 1:
+                set tests_staged to map_get_val(ctx and "improvement_test_staged")
+            if action_name equals "improvement_status" or else action_name equals "improvement_plan_read":
+                return ""
+            if investigation_started == 0:
+                if action_name equals "improvement_investigation_begin":
+                    return ""
+                return "IMPROVEMENT_GATE_FAILED code=INVESTIGATION_BEGIN_REQUIRED message=The unchanged body is green because this is a new capability. Begin the controller-owned workflow now with improvement_investigation_begin([objective]). No source read, evaluator, implementation write, or final claim is legal before that durable investigation ledger exists."
+            if plan_written == 0:
+                if action_name equals "codebase_list" or else action_name equals "codebase_search" or else action_name equals "codebase_read" or else action_name equals "codebase_read_range" or else action_name equals "file_info" or else action_name equals "workspace_current" or else action_name equals "lookup_ernos" or else action_name equals "improvement_plan_write" or else action_name equals "improvement_plan_scaffold":
+                    return ""
+                if action_name equals "run_command":
+                    return "IMPROVEMENT_GATE_FAILED code=EXACT_PATH_DISCOVERY_REQUIRED message=Shell listing is disabled during improvement investigation. Call codebase_list on decent_agent now to receive exact existing production paths, then codebase_read the relevant paths exactly as returned. Do not guess filenames or repeat run_command."
+                return "IMPROVEMENT_GATE_FAILED code=INVESTIGATION_REQUIRED message=Deep read-only investigation is active. Inspect at least two exact non-test production files, their real callable/process interface, and any required language primitives with lookup_ernos, then write the complete durable implementation plan with improvement_plan_write. Evaluator and implementation actions remain locked."
+            if tests_staged == 0:
+                if action_name equals "codebase_list" or else action_name equals "codebase_search" or else action_name equals "codebase_read" or else action_name equals "codebase_read_range" or else action_name equals "file_info" or else action_name equals "workspace_current" or else action_name equals "improvement_plan_write" or else action_name equals "improvement_test_begin":
+                    return ""
+                return "IMPROVEMENT_GATE_FAILED code=ACCEPTANCE_CONTRACT_REQUIRED message=The investigated implementation plan is validated. Begin the behavioral contract with improvement_test_begin; source mutation remains locked until its regression and live E2E evaluators are validated and frozen."
+            if action_name equals "codebase_list" or else action_name equals "codebase_search" or else action_name equals "codebase_read" or else action_name equals "codebase_read_range" or else action_name equals "file_info" or else action_name equals "workspace_current" or else action_name equals "improvement_test_write" or else action_name equals "improvement_test_transport_template" or else action_name equals "improvement_test_scaffold" or else action_name equals "improvement_test_read" or else action_name equals "improvement_test_validate" or else action_name equals "improvement_test_freeze" or else action_name equals "improvement_workflow_restart":
+                return ""
+            return "IMPROVEMENT_GATE_FAILED code=EVALUATOR_AUTHORING_REQUIRED message=The checked implementation plan is in evaluator-authoring phase. Repair the retained behavioral regression and real production-surface E2E artifacts, validate them, then freeze; implementation mutation remains locked."
+        if improvement_required == 0:
+            if action_name equals "reply_request":
+                return ""
+            return "IMPROVEMENT_GATE_FAILED code=BASELINE_NO_CHANGE message=The authoritative current-source baseline is green and no source write was required. Reply now that no current implementation regression exists; do not search, edit, recompile, or restart."
+    if action_name equals "reply_request":
+        set deploy_required to 0
+        if map_contains(ctx and "repair_deploy_required") == 1:
+            set deploy_required to map_get_val(ctx and "repair_deploy_required")
+        if deploy_required == 1 and also map_contains(ctx and "upgrade_restart_requested") == 0:
+            set deploy_verify_required to 0
+            if map_contains(ctx and "repair_verify_required") == 1:
+                set deploy_verify_required to map_get_val(ctx and "repair_verify_required")
+            if deploy_verify_required == 1:
+                return "IMPROVEMENT_GATE_FAILED code=VERIFY_REQUIRED message=The requested repair-and-deploy pipeline is not complete. Call system_verify now; a final reply cannot replace the required current-source gate."
+            set deploy_verify_green to 0
+            if map_contains(ctx and "repair_verify_green") == 1:
+                set deploy_verify_green to map_get_val(ctx and "repair_verify_green")
+            if deploy_verify_green == 1:
+                return "IMPROVEMENT_GATE_FAILED code=DEPLOY_REQUIRED message=The source is green, but this request explicitly requires deployment. Call system_recompile now; only its staged receipt unlocks the final pre-restart reply."
+            return "IMPROVEMENT_GATE_FAILED code=VERIFICATION_FAILED message=The complete mandatory suite is still failing. Diagnose the authoritative failure with native source search/read, repair the implementation, and call system_verify again; do not declare completion."
+        return ""
+    if action_name equals "mid_message" or else action_name equals "request_clarification" or else action_name equals "session_terminate":
+        return ""
+    set verify_required to 0
+    if map_contains(ctx and "repair_verify_required") == 1:
+        set verify_required to map_get_val(ctx and "repair_verify_required")
+    if verify_required == 1:
+        if action_name equals "system_verify":
+            return ""
+        if file_exists("config/improvements/active.json") == 1:
+            if tools_improvement_active_complete_for_ctx(ctx and read_file("config/improvements/active.json")) == 1:
+                return "IMPROVEMENT_GATE_FAILED code=VERIFY_REQUIRED message=Every frozen-plan production path has a promoted implementation receipt. system_verify is now the only legal action; source mutation cannot reopen until authoritative verification reports a concrete failure."
+        set improvement_multi_write to 0
+        if map_contains(ctx and "improvement_test_frozen") == 1:
+            set improvement_multi_write to map_get_val(ctx and "improvement_test_frozen")
+        if improvement_multi_write == 1 and also write_seen == 1:
+            if action_name equals "codebase_list" or else action_name equals "codebase_search" or else action_name equals "codebase_read" or else action_name equals "codebase_read_range" or else action_name equals "codebase_write" or else action_name equals "codebase_replace":
+                return ""
+        return "IMPROVEMENT_GATE_FAILED code=VERIFY_REQUIRED message=Repair workflow requires system_verify now. It is the only executable repair action until the authoritative current-source baseline or post-write verification returns."
+    if action_name equals "run_command":
+        set frozen_now to 0
+        if map_contains(ctx and "improvement_test_frozen") == 1:
+            set frozen_now to map_get_val(ctx and "improvement_test_frozen")
+        if frozen_now == 1 and also write_seen == 0:
+            return "IMPROVEMENT_GATE_FAILED code=DISCOVERY_CLOSED message=The improvement contract is frozen and implementation is now required. New discovery is closed. If exact bytes are no longer active, codebase_read/codebase_read_range may reread only an exact production path declared in the frozen plan, with its pre-write hash verified by the controller. Do not use run_command, Git, listing, search, or any unplanned source path. Use protected codebase_write/codebase_replace for every planned production file, then system_verify. Abandonment is unavailable unless the controller returns code=PLAN_SCOPE_MISSING before any accepted write."
+        set investigation_now to 0
+        if map_contains(ctx and "improvement_investigation_started") == 1:
+            set investigation_now to map_get_val(ctx and "improvement_investigation_started")
+        if investigation_now == 1 and also frozen_now == 0:
+            return "IMPROVEMENT_GATE_FAILED code=EXACT_PATH_DISCOVERY_REQUIRED message=Shell listing is disabled during improvement investigation. Call codebase_list on decent_agent now to receive exact existing production paths, then codebase_read the relevant paths exactly as returned. Do not guess filenames or repeat run_command."
+        return "IMPROVEMENT_GATE_FAILED code=RUN_COMMAND_DISALLOWED message=Ad-hoc run_command testing is disabled during a repair workflow. Use native codebase_list/codebase_search/codebase_read for diagnosis and codebase_write/codebase_replace for implementation; system_verify is required after the source write."
+    if action_name equals "system_recompile":
+        set verify_green to 0
+        if map_contains(ctx and "repair_verify_green") == 1:
+            set verify_green to map_get_val(ctx and "repair_verify_green")
+        if verify_green != 1:
+            return "IMPROVEMENT_GATE_FAILED code=VERIFY_REQUIRED message=system_recompile is locked until system_verify reports SOURCE VERIFICATION PASSED after the latest successful source write."
+    return ""
+
+define tools_improvement_gate_command with command as Str and timeout_ms as Int returning Str:
+    set epoch to ep_cancel_epoch_get(0)
+    set nonce_seed to concat(command and concat("|" and concat(int_to_string(ep_time_now_ms()) and concat("|" and int_to_string(epoch)))))
+    set nonce to ep_sha256(nonce_seed)
+    set result_path to concat("/tmp/ernos_improvement_gate_" and concat(nonce and ".result"))
+    set temp_path to concat(result_path and ".tmp")
+    set removed_old_result to remove_file(result_path)
+    set removed_old_temp to remove_file(temp_path)
+    spawn tools_improvement_gate_worker(command and timeout_ms and epoch and temp_path and result_path)
+    set waited_ms to 0
+    repeat while file_exists(result_path) == 0 and also waited_ms <= timeout_ms + 1000:
+        set yielded to tools_sleep_yield(50)
+        set waited_ms to waited_ms + 50
+    if file_exists(result_path) == 0:
+        return "Error: frozen improvement-test gate worker did not publish a result before its bounded deadline."
+    set result to read_file(result_path)
+    set removed_result to remove_file(result_path)
+    if string_index_of(result and "[run_command failed:") == 0 or else string_index_of(result and "[run_command timed out") == 0 or else string_index_of(result and "[run_command cancelled") == 0:
+        return concat("Error: frozen improvement-test gate rejected the transition.\n" and result)
+    return result
+
+define tools_improvement_record_discovery with ctx as Map and path as Str and mode as Str returning Str:
+    set required to 0
+    set started to 0
+    if map_contains(ctx and "improvement_test_required") == 1:
+        set required to map_get_val(ctx and "improvement_test_required")
+    if map_contains(ctx and "improvement_investigation_started") == 1:
+        set started to map_get_val(ctx and "improvement_investigation_started")
+    if required != 1 or else started != 1:
+        return "not_required"
+    set encoded_path to base64_encode(path)
+    if string_length(encoded_path) == 0:
+        return "Error: investigated source path could not be encoded for the durable ledger."
+    set result to tools_improvement_gate_command(concat("record-discovery --mode " and concat(mode and concat(" --path-b64 " and encoded_path))) and 30000)
+    if string_index_of(result and "Error:") == 0 or else string_contains(result and "IMPROVEMENT_DISCOVERY_OK") == 0:
+        return result
+    return result
+
+define tools_improvement_record_investigation_evidence with ctx as Map and kind as Str and query as Str returning Str:
+    set required to 0
+    set started to 0
+    set planned to 0
+    if map_contains(ctx and "improvement_test_required") == 1:
+        set required to map_get_val(ctx and "improvement_test_required")
+    if map_contains(ctx and "improvement_investigation_started") == 1:
+        set started to map_get_val(ctx and "improvement_investigation_started")
+    if map_contains(ctx and "improvement_plan_written") == 1:
+        set planned to map_get_val(ctx and "improvement_plan_written")
+    if required != 1 or else started != 1 or else planned == 1:
+        return "not_required"
+    set encoded_query to base64_encode(query)
+    if string_length(encoded_query) == 0:
+        return "Error: investigation evidence query could not be encoded."
+    set result to tools_improvement_gate_command(concat("record-investigation-evidence --kind " and concat(kind and concat(" --query-b64 " and encoded_query))) and 30000)
+    if string_index_of(result and "Error:") == 0 or else string_contains(result and "IMPROVEMENT_INVESTIGATION_EVIDENCE_OK") == 0:
+        return result
+    return result
+
+define tools_reference_has_matches with result as Str returning Int:
+    if string_index_of(result and "[CURRENT SOURCE SEARCH") == 0:
+        return 1
+    if string_contains(result and "\"status\":\"ok\"") == 0:
+        return 0
+    if string_contains(result and "\"total_matches\":0") == 1 or else string_contains(result and "\"total_matches\": 0") == 1:
+        return 0
+    if string_contains(result and "\"results\":[") == 0 and also string_contains(result and "\"results\": [") == 0:
+        return 0
+    return 1
+
+define tools_improvement_record_write with ctx as Map and path as Str returning Str:
+    set required to 0
+    set frozen to 0
+    if map_contains(ctx and "improvement_test_required") == 1:
+        set required to map_get_val(ctx and "improvement_test_required")
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if required != 1:
+        return "not_required"
+    if frozen != 1:
+        return "Error: implementation path cannot be recorded before the improvement evaluator is frozen."
+    set encoded_path to base64_encode(path)
+    if string_length(encoded_path) == 0:
+        return "Error: implementation path could not be encoded for the frozen transaction."
+    set result to tools_improvement_gate_command(concat("record-write --path-b64 " and encoded_path) and 360000)
+    if string_index_of(result and "Error:") == 0 or else string_contains(result and "IMPLEMENTATION_WRITE_OK") == 0:
+        return result
+    return result
+
+define tools_improvement_preflight_write with ctx as Map and path as Str returning Str:
+    set required to 0
+    set frozen to 0
+    if map_contains(ctx and "improvement_test_required") == 1:
+        set required to map_get_val(ctx and "improvement_test_required")
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if required != 1:
+        return "not_required"
+    if frozen != 1:
+        return "Error: implementation path cannot be preflighted before the improvement evaluator is frozen."
+    set encoded_path to base64_encode(path)
+    if string_length(encoded_path) == 0:
+        return "Error: implementation path could not be encoded for preflight."
+    set result to tools_improvement_gate_command(concat("preflight-write --path-b64 " and encoded_path) and 30000)
+    if string_index_of(result and "Error:") == 0 or else string_contains(result and "IMPLEMENTATION_PREFLIGHT_OK") == 0:
+        return result
+    return result
+
+define tools_improvement_reset_after_abandon with ctx as Map returning Int:
+    set ok to map_insert(ctx and "improvement_test_frozen" and 0)
+    set ok to map_insert(ctx and "improvement_active_bound" and 0)
+    set ok to map_insert(ctx and "improvement_test_staged" and 0)
+    set ok to map_insert(ctx and "improvement_plan_written" and 0)
+    set ok to map_insert(ctx and "improvement_investigation_started" and 0)
+    set ok to map_insert(ctx and "repair_write_seen" and 0)
+    set ok to map_insert(ctx and "repair_verify_required" and 0)
+    set ok to map_insert(ctx and "repair_verify_green" and 1)
+    set ok to map_insert(ctx and "improvement_plan_scope_missing_authorized" and 0)
+    # Latest-action evidence is transaction-scoped. Carrying the abandoned
+    # contract's PLAN_SCOPE_MISSING text into a fresh freeze can otherwise make a
+    # successful FREEZE_OK result look like authority to abandon the new contract.
+    set ok to map_insert(ctx and "frozen_latest_tool" and "")
+    set ok to map_insert(ctx and "frozen_latest_observation" and "")
+    set ok to map_insert(ctx and "last_codebase_path" and "")
+    set ok to map_delete(ctx and "durable_protocol_correction")
+    return 0
+
+define tools_improvement_prepare_dirs returning Int:
+    if file_exists("config") == 0:
+        if create_directory("config") == 0:
+            return 1
+    if file_exists("config/improvements") == 0:
+        if create_directory("config/improvements") == 0:
+            return 1
+    if file_exists("config/improvements/staging") == 0:
+        if create_directory("config/improvements/staging") == 0:
+            return 1
+    return 0
+
+# A failed self-edit is retained beside its production target under a hidden,
+# transaction-bound filename. Keeping it in the same directory preserves relative
+# import resolution while ensuring the live module path is never mutated before the
+# candidate compiles. Source discovery skips dotfiles, so candidates cannot become
+# accidental production inputs.
+define tools_improvement_candidate_path_for_id with path as Str and transaction_id as Str returning Str:
+    if string_length(transaction_id) < 16:
+        return ""
+    set prefix to substring(transaction_id and 0 and 16)
+    set name to concat(".ernos-candidate-" and concat(prefix and concat("-" and path_basename(path))))
+    return path_join(path_dirname(path) and name)
+
+define tools_improvement_candidate_path with path as Str returning Str:
+    if file_exists("config/improvements/active.json") == 0:
+        return ""
+    set root to json_parse(read_file("config/improvements/active.json"))
+    if root == 0:
+        return ""
+    set id_node to get_json_object_value(root and "id")
+    if id_node == 0:
+        return ""
+    set transaction_id to ptr_to_str(get_json_value(id_node))
+    return tools_improvement_candidate_path_for_id(path and transaction_id)
+
+# Candidate filenames are an internal storage detail. If an older diagnostic or a
+# persisted turn ever supplies the exact private alias, canonicalize it back to the
+# planned production path before access checks, discovery recording or mutation.
+define tools_improvement_canonical_production_path_from_json with path as Str and active_bytes as Str returning Str:
+    set root to json_parse(active_bytes)
+    if root == 0:
+        return path
+    set id_node to get_json_object_value(root and "id")
+    set planned_node to get_json_object_value(root and "planned_files")
+    if id_node == 0 or else planned_node == 0 or else get_json_type(planned_node) != 3:
+        return path
+    set transaction_id to ptr_to_str(get_json_value(id_node))
+    set planned to get_json_value(planned_node)
+    set i to 0
+    repeat while i < length_list(planned):
+        set target_node to get_list(planned and i)
+        set target to ptr_to_str(get_json_value(target_node))
+        set candidate to tools_improvement_candidate_path_for_id(target and transaction_id)
+        if string_length(candidate) > 0 and also path equals candidate:
+            return target
+        set i to i + 1
+    return path
+
+define tools_improvement_canonical_production_path with path as Str returning Str:
+    if file_exists("config/improvements/active.json") == 0:
+        return path
+    return tools_improvement_canonical_production_path_from_json(path and read_file("config/improvements/active.json"))
+
+define tools_improvement_candidate_for_read with ctx as Map and path as Str returning Str:
+    set required to 0
+    set frozen to 0
+    if map_contains(ctx and "improvement_test_required") == 1:
+        set required to map_get_val(ctx and "improvement_test_required")
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if required != 1 or else frozen != 1:
+        return ""
+    set candidate to tools_improvement_candidate_path(path)
+    if string_length(candidate) > 0 and also file_exists(candidate) == 1 and also is_directory(candidate) == 0:
+        return candidate
+    return ""
+
+define tools_improvement_check_candidate with ctx as Map and path as Str returning Str:
+    set required to 0
+    set frozen to 0
+    if map_contains(ctx and "improvement_test_required") == 1:
+        set required to map_get_val(ctx and "improvement_test_required")
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if required != 1:
+        return "not_required"
+    if frozen != 1:
+        return "Error: implementation candidate cannot be checked before the improvement evaluator is frozen."
+    set encoded_path to base64_encode(path)
+    if string_length(encoded_path) == 0:
+        return "Error: implementation candidate target could not be encoded."
+    set result to tools_improvement_gate_command(concat("check-candidate --path-b64 " and encoded_path) and 360000)
+    if string_index_of(result and "Error:") == 0:
+        return result
+    if string_contains(result and "IMPLEMENTATION_CANDIDATE_OK") == 0:
+        return concat("Error: improvement gate returned no compiled-candidate receipt.\n" and result)
+    return result
+
+define tools_improvement_start_implementation with ctx as Map returning Str:
+    set required to 0
+    if map_contains(ctx and "improvement_test_required") == 1:
+        set required to map_get_val(ctx and "improvement_test_required")
+    if required == 0:
+        return "not_required"
+    set frozen to 0
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if frozen != 1:
+        return "Error: implementation mutation is locked until a causal regression and live E2E test are frozen."
+    set result to tools_improvement_gate_command("start-implementation" and 30000)
+    if string_index_of(result and "Error:") == 0:
+        return result
+    if string_contains(result and "IMPLEMENTATION_READY") == 0:
+        return concat("Error: improvement gate returned no implementation receipt.\n" and result)
+    return result
+
+define tools_improvement_incomplete_content_error with ctx as Map and content as Str returning Str:
+    set required to 0
+    set frozen to 0
+    if map_contains(ctx and "improvement_test_required") == 1:
+        set required to map_get_val(ctx and "improvement_test_required")
+    if map_contains(ctx and "improvement_test_frozen") == 1:
+        set frozen to map_get_val(ctx and "improvement_test_frozen")
+    if required != 1 or else frozen != 1:
+        return ""
+    set low to string_lower(content)
+    if string_contains(low and "placeholder") == 1 or else string_contains(low and "stub") == 1 or else string_contains(low and "dummy") == 1 or else string_contains(low and "mock") == 1 or else string_contains(low and "simulation") == 1 or else string_contains(low and "simulate") == 1 or else string_contains(low and "not implemented") == 1 or else string_contains(low and "notimplemented") == 1 or else string_contains(low and "todo") == 1 or else string_contains(low and "fixme") == 1 or else string_contains(low and "\n    pass") == 1 or else string_contains(low and "\n\tpass") == 1:
+        return "Error: self-improvement implementation rejected before mutation: stubs, placeholders, mocks, simulations, TODOs, and other incomplete substitutes are prohibited. Implement the complete production behavior and every durable side effect promised by the frozen acceptance contract."
+    if string_length(content) < 400 and also (string_contains(low and "return \"success\"") == 1 or else string_contains(low and "return 'success'") == 1 or else string_contains(low and "return true") == 1):
+        return "Error: self-improvement implementation rejected before mutation: a short constant-success body is not a complete feature. Implement the real production workflow and its durable observable effects."
+    return ""
+
 define tools_command_bypasses_protected_mutation with command as Str returning Int:
     set c to string_lower(string_trim(command))
     if string_index_of(c and "rm ") == 0 or else string_index_of(c and "mv ") == 0 or else string_index_of(c and "cp ") == 0 or else string_index_of(c and "chmod ") == 0 or else string_index_of(c and "chown ") == 0 or else string_index_of(c and "mkdir ") == 0 or else string_index_of(c and "touch ") == 0:
@@ -361,7 +1176,7 @@ define tools_rights_agent_change with ctx as Map and classification as Str and c
 
 define tools_create with role as Str returning Map:
     set tools_mgr to create_map()
-    set schemas to "Available Tools:\n\n"
+    set schemas to "Available Tools:\n\n[AUTHORITATIVE ENVELOPE] Select exactly one tool per response as {\"tool_name\":\"name\",\"arguments\":[...]}. Arguments are positional in the documented order. A tool documented as name([]) requires exactly an empty arguments array—never insert an empty-string placeholder. The Action: examples below document logical names and argument order only; never reproduce their textual wrapper. The provider accepts only the two-key JSON envelope.\n\n"
     set is_admin to 0
     if role equals "admin" or else role equals "owner":
         set is_admin to 1
@@ -369,6 +1184,14 @@ define tools_create with role as Str returning Map:
     set schemas to concat(schemas and "READ-ONLY (no approval required):\n")
     
     if is_admin == 1:
+        set schemas to concat(schemas and "- codebase_list([root?: Str, max_results?: Int]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Native, bounded, read-only recursive source-tree listing that returns exact existing file paths without shell commands. Use this before guessing a filename, and immediately after any codebase_read says a path does not exist. root defaults to '.' and max_results defaults to 100 (maximum 500). Then read the relevant exact paths returned.\n")
+        set schemas to concat(schemas and "  Example: Action: codebase_list([\"decent_agent\", 200])\n\n")
+
+        set schemas to concat(schemas and "- codebase_search([query: Str, root?: Str, max_results?: Int]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Native, read-only filename and source-text search that returns exact path:line matches without shell commands. For self-repair, call this immediately after system_verify with a distinctive failing literal, then read the returned implementation path. root defaults to '.' and max_results defaults to 25.\n")
+        set schemas to concat(schemas and "  Example: Action: codebase_search([\"authorization_level=\", \"decent_agent\", 25])\n\n")
+
         set schemas to concat(schemas and "- codebase_read([path: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Read a file. The result begins with a header '[File: <path> | Lines: N | Size: B bytes]'. Files over 500 lines return ONLY the first 500 lines plus a hint — you MUST call codebase_read_range for the remaining chunks; do not assume the first chunk is the whole file.\n")
         set schemas to concat(schemas and "  Example: Action: codebase_read([\"docs/AGENT.md\"])\n\n")
@@ -526,13 +1349,12 @@ define tools_create with role as Str returning Map:
     set schemas to concat(schemas and "  Example: Action: request_clarification([\"Should I build now?||Yes||No\"])\n\n")
     
     set schemas to concat(schemas and "- mid_message([message: Str]) -> Str\n")
-    set schemas to concat(schemas and "  Description: Send a visible message to the user WITHOUT ending your current turn. Use this to acknowledge mid-turn whispers, give progress updates, or respond to user guidance received while processing. Unlike reply_request, this does NOT stop the ReAct loop — you continue working after sending it.\n")
+    set schemas to concat(schemas and "  Description: Send a visible message to the user WITHOUT ending your current turn. Use this to acknowledge mid-turn whispers, give progress updates, or respond to user guidance received while processing. This does NOT stop the ReAct loop — you continue working after sending it.\n")
     set schemas to concat(schemas and "  Example: Action: mid_message([\"Got your guidance, adjusting approach now.\"])\n\n")
 
-    set schemas to concat(schemas and "TERMINAL RESPONSE:\n")
     set schemas to concat(schemas and "- reply_request([response: Str]) -> Str\n")
-    set schemas to concat(schemas and "  Description: Explicitly deliver the final response and end the current turn. Plain final prose is also accepted, but use this terminal action if you are already writing Action grammar. Never place another Action after it.\n")
-    set schemas to concat(schemas and "  Example: Action: reply_request([\"Hello, my answer is complete.\"])\n\n")
+    set schemas to concat(schemas and "  Description: Finish the turn by delivering the complete natural-language answer to the user. This is the only final-response route.\n")
+    set schemas to concat(schemas and "  Envelope example: {\"tool_name\":\"reply_request\",\"arguments\":[\"Complete answer for the user.\"]}\n\n")
     
     set schemas to concat(schemas and "- self_prompt_get([section: 'behavior'|'skills']) -> Str\n")
     set schemas to concat(schemas and "  Description: Read your GLOBAL, persistent self-prompt (behavior/skills) — who you are across every session.\n")
@@ -653,14 +1475,86 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: rag_index_text([\"notes.md\", \"The mesh elects a primary host node...\"])\n\n")
         
         set schemas to concat(schemas and "WRITE OPERATIONS (requires user approval before execution):\n")
+
+        set schemas to concat(schemas and "- system_verify([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: REQUIRED FIRST STEP for any self-repair, recursive-improvement, or source-regression task. Rebuild and run the complete operator-sealed mandatory regression gate against CURRENT SOURCE and return the failure-bearing tail plus gate-manifest hash. This never trusts precompiled test binaries and removes all need to guess a test file or shell command. Call it again after every implementation change until it reports SOURCE VERIFICATION PASSED, then call system_recompile. APPROVAL REQUIRED because it performs sustained local compilation.\n")
+        set schemas to concat(schemas and "  Example: Action: system_verify([])\n\n")
         
         set schemas to concat(schemas and "- codebase_write([path: Str, content: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Overwrite a file with the COMPLETE new content (not a diff — read it first, modify, write the whole file back). APPROVAL REQUIRED + observer-audited. This is your self-modification pen: pair with system_recompile for a code change to take effect.\n")
+        set schemas to concat(schemas and "  Description: Submit the COMPLETE new content for a first protected source candidate. For a frozen self-improvement the candidate is compiled before live source is touched. A failed candidate is retained and further whole-file writes are blocked; read the original production path to receive those retained bytes, then repair them with codebase_replace. Use codebase_replace directly for a localized exact change. APPROVAL REQUIRED + observer-audited. Pair with system_recompile only after verification.\n")
         set schemas to concat(schemas and "  Example: Action: codebase_write([\"config/image.json\", \"<entire new file content>\"])\n\n")
+
+        set schemas to concat(schemas and "- codebase_replace([path: Str, exact_old: Str, exact_new: Str, expected_count?: Int]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Make a localized source repair without rewriting the whole file. During frozen self-improvement this automatically targets any retained failed candidate for the production path, recompiles it without touching live source, and promotes it only after compilation succeeds. Fails closed unless exact_old occurs exactly expected_count times (default 1), then uses the same approval, Observer audit, backup, proposed-byte hash and rights ledger as codebase_write. After promotion, system_verify is structurally required.\n")
+        set schemas to concat(schemas and "  Example: Action: codebase_replace([\"decent_agent/session.ep\", \"authorization_level=\", \"authorization_role=\", 1])\n\n")
+
+        set schemas to concat(schemas and "- improvement_candidate_normalize([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Controller-selected recovery for a retained rejected ErnosPlain candidate that uses unambiguous local-model dialect forms. It normalizes only frozen-plan-proven storage imports/accessors, trailing JSON transport residue, and multi-argument concat syntax; then recompiles the candidate and applies it through the same rights backup, exact-hash, frozen-write, verification, and rollback rails as codebase_replace. It cannot weaken tests or touch an unplanned path. APPROVAL REQUIRED.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_candidate_normalize([])\n\n")
+
+        set schemas to concat(schemas and "- improvement_candidate_reset([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Controller-selected recovery when a rejected whole-file candidate either removed existing production definitions or its localized repair stalled on a repeated byte-no-op. The never-live rejected bytes, compiler diagnostic, and exact hash are archived as provenance; the immutable frozen plan and evaluators remain active; and authoring resumes from an exact production reread for a genuinely new complete candidate. This never abandons the transaction or rolls back live production. APPROVAL REQUIRED.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_candidate_reset([])\n\n")
+
+        set schemas to concat(schemas and "- improvement_investigation_begin([objective: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: REQUIRED immediately after a green unchanged-source baseline for a new self-feature. Opens a durable read-only investigation ledger. If the user asked you to choose the feature, first choose exactly one useful capability that is NOT already present in this tool schema or a completion receipt, and name its public snake_case callable explicitly in this argument using 'registered tool named `surface_name`', followed by its concrete observable behavior and durable effect. If the controller reports FEATURE_ALREADY_EXISTS, retain the green baseline and immediately select a different genuinely new capability. The controller retains BOTH the exact user request and this concrete selection; neither may be weakened. After this, deeply inspect at least two exact non-test production files with codebase_read/codebase_read_range before planning.\n")
+        set schemas to concat(schemas and "  Example shape: improvement_investigation_begin([\"Implement a registered tool named `<new_unique_surface>` that performs its stated observable behavior and persists its stated durable effect.\"]) Replace the angle-bracketed metavariable with a genuinely new snake_case name; never copy a currently registered action.\n\n")
+
+        set schemas to concat(schemas and "- improvement_plan_write([content: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Write and controller-validate the complete implementation plan AFTER deep read-only investigation and BEFORE any evaluator or source write. Required ## headings: Objective, Investigation Findings, Exact Interface Evidence, Production Surface, Implementation, Files, Tests, Risks and Rollback. Exact Interface Evidence must retain hash-verified source path, line, callable signature, import, and working call-site facts so compaction never forces guessed APIs; prefer improvement_plan_scaffold to generate it deterministically. Under Files list ONLY production implementation paths using '- exact/repository/path: concrete responsibility'. NEVER invent, relocate, or name regression/E2E evaluator file paths anywhere in this plan: the controller creates and owns those artifacts later through improvement_test_write. Under Tests describe desired observable behavior only. Cite every exact investigated production path. A durable-memory objective must first inspect decent_agent/memory.ep. Production Surface must name an exact backticked callable/tool/command identifier such as `aes_distill`; Tests must cite that same identifier, and registered self-extension tests must explicitly use authenticated AI EVAL_TOOL. They may not rely on a missing/broken artifact, simulation, or placeholder. After a content rejection the controller disables further free-form attempts and requires improvement_plan_scaffold. Do not add checkboxes: the controller owns and checks the durable progress ledger from verified tool receipts.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_plan_write([\"## Objective\\n... complete investigated plan ...\"])\n\n")
+
+        set schemas to concat(schemas and "- improvement_plan_scaffold([surface: Str, production_path: Str, ...additional_production_paths]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Preferred plan-authoring route after deep investigation, and the controller-enforced ONLY legal route after any substantive improvement_plan_write rejection. The controller generates and validates the complete durable Markdown plan from the retained objective, every exact discovered path, one exact registered production surface, and one or more exact investigated production implementation paths, binding its tests to authenticated AI EVAL_TOOL. Cross-component objectives such as real Discord retrieval and persisted-session processing are blocked until their controller-required production interfaces have all been read. The validated plan also fixes one typed invocation fixture and a controller-authored acceptance contract; do not generate or reformat acceptance text after this succeeds. The surface must match any exact callable identifier named in the durable objective byte-for-byte; a typo or reconstructed near-match is rejected before plan creation. If that exact surface already has a current permanent completion receipt, the controller closes this workflow as already_complete: execute the existing real capability, independently verify its durable effect, and report that result without source mutation or recompilation. This removes heading, escaping, path-spelling, evaluator-file, and one-error-at-a-time repair loops without weakening any semantic, test-first, freeze, or deployment gate.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_plan_scaffold([\"aes_distill\", \"decent_agent/self_extensions.ep\"])\n\n")
+
+        set schemas to concat(schemas and "- improvement_plan_read([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Read the durable implementation plan, verified discovery ledger, and controller-owned checked progress. During investigation before a plan exists, this returns IMPROVEMENT_PLAN_PENDING and directs you to improvement_plan_write instead of failing. Use it after an interruption and before choosing the next step.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_plan_read([])\n\n")
+
+        set schemas to concat(schemas and "- improvement_status([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Return the exact durable workflow phase, source-read count, plan version, and active frozen transaction status.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_status([])\n\n")
+
+        set schemas to concat(schemas and "- improvement_test_begin([name: Str, acceptance_criteria: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Begin a MUTABLE staged evaluator transaction only after the controller validates the investigated plan. The normal path is controller-forced: it supplies the exact public name and controller-authored 2-16 line '[criterion_id] observable production outcome' contract from durable state, so do not invent, summarize, or retry acceptance formatting. File existence, test success, commands and other test mechanics are rejected. No implementation bytes may change yet. If its canonical name already has a current permanent completion receipt, this call closes the duplicate workflow as already_complete and directs you to execute and independently verify the existing public capability instead of reimplementing it.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_test_begin([\"session_synthesis\", \"[transcript_parse] The supplied transcript is parsed into the expected structured events.\\n[durable_memory] The extracted lesson and graph edge persist and are independently readable.\"])\n\n")
+
+        set schemas to concat(schemas and "- improvement_test_write([kind: Str, content: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Write or revise ONE retained staged artifact. Acceptance is criterion text; regression and e2e MUST each provide 160-96000 bytes of PYTHON behavior—not ErnosPlain—with standalone zero-argument top-level `def test_<criterion_id>():` functions and real assert statements. Never use unittest, classes, nested methods, imports, copied transport, or a main block for a registered-tool evaluator: submit ONLY those top-level functions. Map every acceptance [criterion_id] to test_<criterion_id>. Explicit marker families such as [LESSON] and [CORRECTION] must be verified without changing the production argument contract: a Discord retrieval surface MUST call `eval_planned_tool(configured_discord_channel())`, never pass transcript fixtures in place of the channel ID, and independently verify durable evidence with get_memory(). BOTH regression and E2E are executed on unchanged source before freeze: each must reach AssertionError specifically because the planned outcome is absent, then pass unchanged after implementation. Permission, sandbox, repository-write, path, syntax, import, connection, timeout, NameError, AttributeError, or evaluator-runtime failures never count. E2E must call the exact real production process/API/IPC/localhost/tool identifier frozen in the plan, then independently assert its output and durable side effect; every evaluator-owned input or scratch write must use tempfile TemporaryDirectory/NamedTemporaryFile outside the repository. For a registered tool, FIRST call improvement_test_transport_template([]), then submit only the acceptance-mapped behavioral functions and follow its objective-specific argument contract exactly. The surface is already bound: NEVER pass the surface name and NEVER wrap arguments in a list. The controller discards any model-supplied transport/main copy, prepends its exact authenticated raw-TCP client bytes, and appends a deterministic runner before linting. Never invent a module/executable, swallow execution failures, mutate repository/durable source paths, use a file-presence-only check, self-print expected values, generic success returns, comments/docstrings claiming proof, stubs, placeholders, mocks, dummies, or simulations. Encode the action as a JSON array with one escaped JSON string for the Python behavior; Python-style triple quotes are accepted and normalized by the protocol but are not JSON. The controller immediately lints and retains exact bytes. Revising any artifact after a green mutable validation reopens authoring and invalidates the prior receipt. Failed validation NEVER deletes these bytes.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_test_write([\"regression\", \"<complete Python test file>\"])\n\n")
+
+        set schemas to concat(schemas and "- improvement_test_transport_template([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: For a plan whose production surface is a registered tool invoked with AI EVAL_TOOL, return the controller-owned plan-bound Python raw-TCP client and every required test_<criterion_id> name. Call this before writing either evaluator: the controller blocks writes until this current-plan receipt exists. Then submit ONLY standalone zero-argument top-level `def test_<criterion_id>():` behavioral functions—no unittest/class/import/transport/main—that assert desired post-change output or durable state, never an unknown, missing, unregistered, or error result. The surface is already bound inside eval_planned_tool: pass each real tool argument directly, never the surface name and never an extra list. improvement_test_write prepends the exact client and appends a deterministic runner that invokes every retained test. Model-authored transport and main blocks are discarded. This is read-only and never contains the IPC secret.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_test_transport_template([])\n\n")
+
+        set schemas to concat(schemas and "- improvement_test_scaffold([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Generate both complete plan-bound regression and live E2E evaluators from controller-owned facts: exact acceptance IDs, authenticated transport, the real configured argument source, the plan's exact success output, and independent durable-memory evidence. Use this preferred deterministic route after improvement_test_begin, or whenever evaluator authoring is rejected. It cannot invent a contract: if the plan lacks an exact observable success result it fails and requires a corrected plan. Generated tests still must fail causally against unchanged production, pass after the implementation, and remain hash-frozen before source mutation.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_test_scaffold([])\n\n")
+
+        set schemas to concat(schemas and "- improvement_test_read([kind: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Read the currently staged acceptance, regression, e2e, or validation artifact so a failed evaluator can be repaired without regeneration.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_test_read([\"regression\"])\n\n")
+
+        set schemas to concat(schemas and "- improvement_test_validate([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Validate retained staged tests and prove the causal regression failure against unchanged source without freezing. Every failed result is persisted with exact artifact hashes and diagnostics. Only six identical unchanged failures halt; changed evidence resets that repetition count, with a separate 20-attempt runaway guard. Repair the named cause, not unrelated artifacts.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_test_validate([])\n\n")
+
+        set schemas to concat(schemas and "- improvement_test_freeze([]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Revalidate and hash-freeze the already staged acceptance, regression, and real live E2E evaluator. Only after this succeeds can implementation begin. Frozen evaluators cannot be edited, removed, skipped, or weakened. APPROVAL REQUIRED.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_test_freeze([])\n\n")
+
+        set schemas to concat(schemas and "- improvement_test_abandon([reason: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: This transition is legal only after the controller returns the explicit structured result code=PLAN_SCOPE_MISSING and before any verified implementation write. Candidate syntax, compilation, replacement, and addressing failures remain CANDIDATE_REPAIR_REQUIRED and cannot authorize abandonment. Preserve the exact scope reason, then immediately reinvestigate and create a corrected transaction. The reason is permanently archived; once implementation starts the evaluator is immutable and abandonment is refused. APPROVAL REQUIRED + Observer-audited.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_test_abandon([\"The frozen assertion encoded the wrong public contract; no implementation bytes were changed.\"])\n\n")
+
+        set schemas to concat(schemas and "- improvement_workflow_restart([reason: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Archive and restart a planned or evaluator-authoring workflow BEFORE freeze when investigation, architecture, or the plan is materially wrong. Exact staged evidence and the reason are retained; no production source is changed. APPROVAL REQUIRED.\n")
+        set schemas to concat(schemas and "  Example: Action: improvement_workflow_restart([\"The plan targets a sealed controller; reinvestigate through the bounded self-extension registry.\"])\n\n")
         
         set schemas to concat(schemas and "- run_command([cmd: Str, dir?: Str, timeout_seconds?: Int]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Execute one shell command in a fresh process group. APPROVAL REQUIRED. Captures STDOUT and STDERR. Default timeout: 120 seconds; optional 3rd arg: 1-1800 seconds. Stop/cancel terminates the complete subprocess group immediately. Timeout and non-zero exit are returned as explicit failure observations with corrective guidance; never repeat a failed command unchanged or claim it succeeded. Output is prefixed with size/line metadata and paged to 400 lines. Chaining with && or ; is not allowed. Optional 2nd arg runs inside a linked-project id or existing path.\n")
-        set schemas to concat(schemas and "  Example: Action: run_command([\"make prove\", \"sft\", 600])\n\n")
+        set schemas to concat(schemas and "  Description: Execute one shell command in a fresh process group. APPROVAL REQUIRED. IMPORTANT: this is NOT an argv array — cmd is ONE string containing the executable and ALL command-line arguments. The optional 2nd element is ONLY a working-directory path/linked-project id; the optional 3rd is ONLY a 1-1800 second integer timeout. Malformed calls are rejected before approval. Captures STDOUT and STDERR. Default timeout: 120 seconds. Stop/cancel terminates the complete subprocess group immediately. Timeout and non-zero exit are returned as explicit failure observations with corrective guidance; never repeat a failed command unchanged or claim it succeeded. Output is prefixed with size/line metadata and paged to 400 lines. Chaining with && or ; is not allowed.\n")
+        set schemas to concat(schemas and "  Examples: Action: run_command([\"bash decent_agent/run_test.sh decent_agent/test_e2e_quick.ep\"]) OR Action: run_command([\"make prove\", \"sft\", 600])\n\n")
         
         set schemas to concat(schemas and "- self_prompt_set([section: 'behavior'|'skills', text: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Rewrite your GLOBAL, persistent self-prompt (behavior/skills). This is a core protected change: your intentional tool call records consent and the user approval gate records human authorization; a pre-state backup, reasoning archive, ledger entry, and verified hash protect it.\n")
@@ -723,7 +1617,7 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Example: Action: manage_reading_progress([\"bookmark\", \"ErnosDecent-Book.md\", 15])\n\n")
         
         set schemas to concat(schemas and "- system_recompile([]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Rebuild node and hot-swap the daemon binary. APPROVAL REQUIRED.\n")
+        set schemas to concat(schemas and "  Description: Build and test an isolated candidate without overwriting the live executable, bind its exact hash to a protected manifest, then request a reply-durable supervisor deployment. The replacement must pass authenticated health and in-node rights reconciliation or the supervisor restores the exact previous executable. APPROVAL REQUIRED + Observer-audited.\n")
         set schemas to concat(schemas and "  Example: Action: system_recompile([])\n\n")
         
         set schemas to concat(schemas and "- download_tool([url: Str]) -> Str\n")
@@ -781,11 +1675,65 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: Fan-out: spawn multiple sub-agents (one per sub-task, separated by '|') and merge their results. Use over delegate_task when ONE question benefits from several PERSPECTIVES or PARTITIONS of the same job. join_strategy: 'concat' = keep every result (multi-dimension review — the usual choice); 'best' = keep the strongest single answer (independent attempts at one hard problem); 'vote' = majority verdict (yes/no or classification checks). Same rules as delegate_task: self-contained sub-task text, 2-3 sub-agents (shared model), un-gated tools only.\n")
         set schemas to concat(schemas and "  Example: Action: delegate_swarm([\"Review decent_agent/session.ep\", \"Check for memory-safety issues|Check error handling on file I/O|Check the title-resolver edge cases\", \"concat\"])\n\n")
         
+    set schemas to concat(schemas and "SELF-AUTHORED EXTENSIONS (core-gated dispatch):\n")
+    set schemas to concat(schemas and self_extensions_schema())
     set ok to map_insert(tools_mgr and "schemas" and schemas)
     return tools_mgr
 
 define tools_get_schema_string with tools_mgr as Map returning Str:
     return map_get_val(tools_mgr and "schemas")
+
+# Immutable evaluators need a deterministic route to a newly planned registered
+# tool without recursively entering AI INFER from the turn already running the
+# validator. Only exact callable identifiers recorded by the current improvement
+# transaction are eligible; this does not expose arbitrary tools over IPC.
+define tools_improvement_eval_surface_allowed_json with content as Str and action_name as Str returning Int:
+    if string_length(content) == 0:
+        return 0
+    set root to json_parse(content)
+    if root == 0:
+        return 0
+    set state_node to get_json_object_value(root and "state")
+    set surfaces_node to get_json_object_value(root and "planned_surfaces")
+    if state_node == 0 or else surfaces_node == 0:
+        return 0
+    set state to ptr_to_str(get_json_value(state_node))
+    if state equals "tests_authoring" == 0 and also state equals "tests_validated" == 0 and also state equals "frozen" == 0 and also state equals "implementing" == 0 and also state equals "verified" == 0 and also state equals "completed" == 0:
+        return 0
+    if get_json_type(surfaces_node) != 3:
+        return 0
+    set surfaces to get_json_value(surfaces_node)
+    set i to 0
+    repeat while i < length_list(surfaces):
+        set item to get_list(surfaces and i)
+        if ptr_to_str(get_json_value(item)) equals action_name:
+            return 1
+        set i to i + 1
+    return 0
+
+define tools_improvement_eval_surface_allowed with action_name as Str returning Int:
+    if file_exists("config/improvements/active.json") == 1:
+        if tools_improvement_eval_surface_allowed_json(read_file("config/improvements/active.json") and action_name) == 1:
+            return 1
+    if file_exists("config/improvements/staging/workflow.json") == 1:
+        if tools_improvement_eval_surface_allowed_json(read_file("config/improvements/staging/workflow.json") and action_name) == 1:
+            return 1
+    # Completed frozen evaluators are permanent regressions. Preserve their exact
+    # authenticated production surfaces after commit so future mandatory suites can
+    # rerun them; arbitrary and approval-gated tools remain blocked by the caller.
+    set completed_dir to "config/improvements/completed"
+    if file_exists(completed_dir) == 1:
+        set completed_files to list_directory(completed_dir)
+        set completed_i to 0
+        repeat while completed_i < length_list(completed_files):
+            set completed_name to get_list(completed_files and completed_i)
+            if string_contains(completed_name and ".json") == 1:
+                set completed_path to path_join(completed_dir and completed_name)
+                if file_exists(completed_path) == 1:
+                    if tools_improvement_eval_surface_allowed_json(read_file(completed_path) and action_name) == 1:
+                        return 1
+            set completed_i to completed_i + 1
+    return 0
 
 define tools_requires_approval with tool_name as Str and args_list as List returning Int:
     # Class A: reading a SENSITIVE location needs a fresh approval every time (the warning
@@ -810,7 +1758,7 @@ define tools_requires_approval with tool_name as Str and args_list as List retur
         return 1
     if tool_name equals "name_register":
         return 1
-    if tool_name equals "codebase_write":
+    if tool_name equals "codebase_write" or else tool_name equals "codebase_replace" or else tool_name equals "improvement_candidate_normalize" or else tool_name equals "improvement_candidate_reset" or else tool_name equals "improvement_test_freeze" or else tool_name equals "improvement_test_abandon" or else tool_name equals "improvement_workflow_restart":
         return 1
     if tool_name equals "run_command":
         return 1
@@ -819,6 +1767,8 @@ define tools_requires_approval with tool_name as Str and args_list as List retur
         # it once. (set_active/unlink/list operate within already-approved links: no gate.)
         return 1
     if tool_name equals "system_recompile":
+        return 1
+    if tool_name equals "system_verify":
         return 1
     if tool_name equals "download_tool":
         return 1
@@ -1009,6 +1959,45 @@ define tools_session_id_safe with sid as Str returning Int:
             return 0
         set i to i + 1
     return 1
+
+# Improvement names are storage identifiers, not user-facing titles. Accept the
+# natural title an agent is likely to author and deterministically reduce it to the
+# gate's safe [a-z0-9_] form instead of spending another model turn correcting a
+# formatting-only error. This does not relax path safety: all unsupported bytes are
+# separators, repeated separators collapse, a digit-leading value gets a letter
+# prefix, and the final value is still checked by tools_session_id_safe below.
+define tools_improvement_name_canonical with raw_name as Str returning Str:
+    set low to string_lower(string_trim(raw_name))
+    set out to ""
+    set prev_separator to 1
+    set i to 0
+    repeat while i < string_length(low):
+        set ch to get_character(low and i)
+        set keep to 0
+        if ch >= 97 and also ch <= 122:
+            set keep to 1
+        if ch >= 48 and also ch <= 57:
+            set keep to 1
+        if keep == 1:
+            set out to concat(out and substring(low and i and 1))
+            set prev_separator to 0
+        else:
+            if prev_separator == 0:
+                set out to concat(out and "_")
+                set prev_separator to 1
+        set i to i + 1
+    set out_len to string_length(out)
+    if out_len > 0 and also get_character(out and out_len - 1) == 95:
+        set out to substring(out and 0 and out_len - 1)
+    if string_length(out) > 0:
+        set first to get_character(out and 0)
+        if first >= 48 and also first <= 57:
+            set out to concat("improvement_" and out)
+    if string_length(out) > 64:
+        set out to substring(out and 0 and 64)
+        if get_character(out and 63) == 95:
+            set out to substring(out and 0 and 63)
+    return out
 
 define tools_is_action_allowed with role as Str and action_name as Str and args_list as List returning Int:
     # E2/E5: FAIL CLOSED. Only an explicit admin/owner gets full access. Every other
@@ -1539,7 +2528,11 @@ define tools_search_sessions with query as Str returning Str:
 # workspace-uploads fallback. Returns "" if neither exists. Access gating is applied by
 # the caller so it can emit a distinct [GATE] message.
 define tools_resolve_read_path with path as Str returning Str:
-    if file_exists(path) == 1:
+    # file_exists() is false for directory symlinks in the ErnosPlain fs runtime.
+    # Source roots such as this repository's `stdlib` are intentionally symlinked to
+    # the language checkout, so accepting only regular files makes native discovery
+    # falsely report that the canonical reference tree does not exist.
+    if file_exists(path) == 1 or else is_directory(path) == 1:
         return path
     # Relative path resolved against the active linked project, if one is set.
     set linked to links_resolve(path)
@@ -1549,6 +2542,148 @@ define tools_resolve_read_path with path as Str returning Str:
     if file_exists(ws_path) == 1:
         return ws_path
     return ""
+
+# Canonical language sources may be linked into the repository from the adjacent
+# ErnosPlain checkout. They are read-only reference material, not production files
+# that an improvement may declare or mutate. Keep them out of the plan-bound source
+# ledger while still allowing exact definitions to be inspected and provenance-ledgered.
+define tools_path_is_language_reference with path as Str returning Int:
+    set normalized to string_lower(string_trim(path))
+    if string_index_of(normalized and "./") == 0:
+        set normalized to substring(normalized and 2 and string_length(normalized) - 2)
+    if string_index_of(normalized and "stdlib/") == 0:
+        return 1
+    return 0
+
+# Native source discovery for repair work. Unlike run_command these tools never accept
+# an executable command. Listing discovers exact existing paths before the model knows
+# a search literal; search then locates symbols and source text within those paths.
+define tools_codebase_list_walk with dir as Str and max_results as Int and depth as Int and state as Map returning Int:
+    if depth > 12 or else map_get_val(state and "hits") >= max_results:
+        return 0
+    set entries to list_directory(dir)
+    set i to 0
+    repeat while i < length_list(entries) and also map_get_val(state and "hits") < max_results:
+        set entry to ptr_to_str(get_list(entries and i))
+        set skip to 0
+        if string_length(entry) == 0:
+            set skip to 1
+        else if get_character(entry and 0) == 46:
+            set skip to 1
+        else if entry equals "node_modules" or else entry equals "__pycache__" or else entry equals "build" or else entry equals "dist" or else entry equals "vendor":
+            set skip to 1
+        if skip == 0:
+            set full_path to path_join(dir and entry)
+            if is_directory(full_path) == 1:
+                set ok to tools_codebase_list_walk(full_path and max_results and depth + 1 and state)
+            else:
+                set lower_path to string_lower(full_path)
+                set source_file to 0
+                if ends_with(lower_path and ".ep") == 1 or else ends_with(lower_path and ".py") == 1 or else ends_with(lower_path and ".js") == 1 or else ends_with(lower_path and ".sh") == 1 or else ends_with(lower_path and ".md") == 1 or else ends_with(lower_path and ".json") == 1:
+                    set source_file to 1
+                if source_file == 1:
+                    set out to ptr_to_str(map_get_val(state and "out"))
+                    set out to concat(out and concat(full_path and "\n"))
+                    set ok to map_insert(state and "out" and out)
+                    set ok to map_insert(state and "hits" and map_get_val(state and "hits") + 1)
+        set i to i + 1
+    free_list(entries)
+    return 0
+
+define tools_codebase_list with root as Str and max_results as Int returning Str:
+    set list_root to string_trim(root)
+    if string_length(list_root) == 0:
+        set list_root to "."
+    set actual_root to tools_resolve_read_path(list_root)
+    if string_length(actual_root) == 0 or else is_directory(actual_root) == 0:
+        return concat("Error: codebase_list root is not a readable directory: " and list_root)
+    set gate to access_gate_path(actual_root)
+    if map_get_val(gate and "decision") equals "gate":
+        return concat("[GATE] " and map_get_val(gate and "reason"))
+    set limit to max_results
+    if limit < 1:
+        set limit to 100
+    if limit > 500:
+        set limit to 500
+    set state to create_map()
+    set ok to map_insert(state and "hits" and 0)
+    set ok to map_insert(state and "out" and "")
+    set ok to tools_codebase_list_walk(actual_root and limit and 0 and state)
+    set hits to map_get_val(state and "hits")
+    if hits == 0:
+        free_map(state)
+        return concat("No source files found under " and actual_root)
+    set paths to ptr_to_str(map_get_val(state and "out"))
+    set result to concat("[CURRENT SOURCE TREE — exact existing paths; " and concat(int_to_string(hits) and concat(" file(s)]\n" and paths)))
+    set result to concat(result and "[NEXT ACTION] Read at least two relevant non-test production files exactly as returned. Do not reconstruct or guess filenames.")
+    return result
+
+define tools_codebase_search_walk with dir as Str and query_low as Str and max_results as Int and depth as Int and state as Map returning Int:
+    if depth > 12 or else map_get_val(state and "hits") >= max_results:
+        return 0
+    set entries to list_directory(dir)
+    set i to 0
+    repeat while i < length_list(entries) and also map_get_val(state and "hits") < max_results:
+        set entry to ptr_to_str(get_list(entries and i))
+        set skip to 0
+        if string_length(entry) == 0:
+            set skip to 1
+        else if get_character(entry and 0) == 46:
+            set skip to 1
+        else if entry equals "node_modules" or else entry equals "__pycache__" or else entry equals "build" or else entry equals "dist":
+            set skip to 1
+        if skip == 0:
+            set full_path to path_join(dir and entry)
+            if is_directory(full_path) == 1:
+                set ok to tools_codebase_search_walk(full_path and query_low and max_results and depth + 1 and state)
+            else if file_size(full_path) <= 1000000:
+                set content to read_file(full_path)
+                set lines to string_split(content and "\n")
+                set line_i to 0
+                repeat while line_i < length_list(lines) and also map_get_val(state and "hits") < max_results:
+                    set source_line to ptr_to_str(get_list(lines and line_i))
+                    if string_contains(string_lower(source_line) and query_low) == 1:
+                        set out to ptr_to_str(map_get_val(state and "out"))
+                        set out to concat(out and concat(full_path and concat(":" and concat(int_to_string(line_i + 1) and concat(":" and concat(source_line and "\n"))))))
+                        set ok to map_insert(state and "out" and out)
+                        set ok to map_insert(state and "hits" and map_get_val(state and "hits") + 1)
+                    set line_i to line_i + 1
+                free_list(lines)
+        set i to i + 1
+    free_list(entries)
+    return 0
+
+define tools_codebase_search with query as Str and root as Str and max_results as Int returning Str:
+    set q to string_trim(query)
+    if string_length(q) == 0:
+        return "Error: codebase_search requires a non-empty source literal."
+    set search_root to string_trim(root)
+    if string_length(search_root) == 0:
+        set search_root to "."
+    set actual_root to tools_resolve_read_path(search_root)
+    if string_length(actual_root) == 0 or else is_directory(actual_root) == 0:
+        return concat("Error: codebase_search root is not a readable directory: " and search_root)
+    set gate to access_gate_path(actual_root)
+    if map_get_val(gate and "decision") equals "gate":
+        return concat("[GATE] " and map_get_val(gate and "reason"))
+    set limit to max_results
+    if limit < 1:
+        set limit to 25
+    if limit > 50:
+        set limit to 50
+    set state to create_map()
+    set ok to map_insert(state and "hits" and 0)
+    set ok to map_insert(state and "out" and "")
+    set ok to tools_codebase_search_walk(actual_root and string_lower(q) and limit and 0 and state)
+    set hits to map_get_val(state and "hits")
+    if hits == 0:
+        free_map(state)
+        return concat("No current-source matches for '" and concat(q and concat("' under " and actual_root)))
+    set matches to ptr_to_str(map_get_val(state and "out"))
+    set result to concat("[CURRENT SOURCE SEARCH — exact paths; " and concat(int_to_string(hits) and concat(" match(es)]\n" and matches)))
+    set result to concat(result and "[NEXT ACTION] Read the relevant non-test implementation path exactly as returned. Do not reconstruct or guess its path.")
+    # Keep the map alive until the returned strings have been copied into result.
+    return result
 
 # Keep discovery output as opaque path data. A later read may resolve a mistyped
 # parent directory only when its basename uniquely matches an exact path emitted by
@@ -1667,6 +2802,23 @@ define tools_file_info_path with actual as Str and label as Str returning Str:
     set out_json to concat(out_json and int_to_string(nlines))
     set out_json to concat(out_json and "}")
     return out_json
+
+define tools_exact_occurrences with content as Str and needle as Str returning Int:
+    set needle_len to string_length(needle)
+    if needle_len == 0:
+        return 0
+    set remaining to content
+    set count to 0
+    set pos to string_index_of(remaining and needle)
+    repeat while pos >= 0:
+        set count to count + 1
+        set next_start to pos + needle_len
+        if next_start >= string_length(remaining):
+            set remaining to ""
+        else:
+            set remaining to substring(remaining and next_start and string_length(remaining) - next_start)
+        set pos to string_index_of(remaining and needle)
+    return count
 
 define tools_canonical_turn_from_json with item_node as List and source_path as Str and ordinal as Int returning Map:
     set msg to create_map()
@@ -1818,6 +2970,18 @@ define tools_recall_session_turns with ctx as Map and session_ref as Str and sta
         set i to i + 1
     return concat(out and "\n[END CANONICAL SESSION PAGE]\n")
 
+# Self-authored extensions run behind this controller and must not import the storage
+# module back through the controller's dependency graph. Supply the already-open core
+# database handle through their execution context instead.
+define tools_prepare_self_extension_context with ctx as Map returning Int:
+    if map_contains(ctx and "storage_db") == 1 and also map_get_val(ctx and "storage_db") != 0:
+        return 0
+    set extension_db to storage_get_db()
+    if extension_db == 0:
+        return 1
+    set ok to map_insert(ctx and "storage_db" and extension_db)
+    return 0
+
 define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str and args_list as List returning Str:
     set sender_role to ""
     if map_contains(ctx and "sender_role") == 1:
@@ -1831,10 +2995,55 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         # and instruct it to ask for authorization rather than dead-end with "I can't".
         return f"[GATE] Tool '{action_name}' requires an elevated role; the current caller role is '{role_shown}'. This is NOT a permanent inability and NOT your own limitation — it is an authorization gate. Tell the user this action needs elevated access/approval and ASK if they want to authorize it. Do not claim you are unable to do it."
 
+    # Defense in depth: react_loop rejects this before approval, but direct/internal
+    # callers must obey the same repair state machine too.
+    set repair_action_error to tools_repair_action_error(ctx and action_name)
+    if string_length(repair_action_error) > 0:
+        return concat("[REPAIR WORKFLOW GATE — nothing executed] " and repair_action_error)
+
+    # Once a verified candidate has been staged, the only legal next action is the
+    # final reply. This prevents a later tool in the same turn from changing tests,
+    # source, or deployment receipts after the candidate was measured and sealed.
+    if map_contains(ctx and "upgrade_restart_requested") == 1 and also action_name equals "reply_request" == 0:
+        return "Error: a verified self-upgrade is already staged. Publish the final reply now; no further tool or mutation may run before supervisor activation."
+
+    if action_name equals "codebase_list":
+        if length_list(args_list) > 2:
+            return "Error: codebase_list requires zero to two arguments: optional root and optional max_results."
+        set cl_root to "."
+        set cl_limit to 100
+        if length_list(args_list) >= 1:
+            set cl_root to ptr_to_str(get_list(args_list and 0))
+        if length_list(args_list) >= 2:
+            set cl_limit to tools_safe_int(get_list(args_list and 1))
+        set cl_result to tools_codebase_list(cl_root and cl_limit)
+        set ok to tools_capture_discovered_paths(ctx and cl_result)
+        return cl_result
+
+    if action_name equals "codebase_search":
+        if length_list(args_list) < 1 or else length_list(args_list) > 3:
+            return "Error: codebase_search requires 1-3 arguments: query, optional root, optional max_results."
+        set cs_query to ptr_to_str(get_list(args_list and 0))
+        set cs_root to "."
+        set cs_limit to 25
+        if length_list(args_list) >= 2:
+            set cs_root to ptr_to_str(get_list(args_list and 1))
+        if length_list(args_list) >= 3:
+            set cs_limit to tools_safe_int(get_list(args_list and 2))
+        set cs_result to tools_codebase_search(cs_query and cs_root and cs_limit)
+        set ok to tools_capture_discovered_paths(ctx and cs_result)
+        if string_index_of(cs_result and "[CURRENT SOURCE SEARCH") == 0:
+            set cs_evidence to tools_improvement_record_investigation_evidence(ctx and "callsite_search" and cs_query)
+            if string_index_of(cs_evidence and "Error:") == 0:
+                return cs_evidence
+            if cs_evidence equals "not_required" == 0:
+                return concat(cs_result and concat("\n" and cs_evidence))
+        return cs_result
+
     if action_name equals "codebase_read":
         if length_list(args_list) < 1:
             return "Error: codebase_read requires 1 argument (path). Example: Action: codebase_read([\"docs/AGENT.md\"])"
-        set path to get_list(args_list and 0)
+        set path to tools_improvement_canonical_production_path(ptr_to_str(get_list(args_list and 0)))
         # Access gate: when Full-PC access is OFF, reading outside the project is gated.
         # (Sensitive-path reads are handled as a warn+approve via tools_requires_approval.)
         set cr_actual to tools_resolve_read_path_for_ctx(ctx and path)
@@ -1845,13 +3054,38 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if map_get_val(cr_gate and "decision") equals "gate":
             return concat("[GATE] " and map_get_val(cr_gate and "reason"))
         if string_length(cr_actual) == 0:
+            set cr_investigating to 0
+            if map_contains(ctx and "improvement_investigation_started") == 1:
+                set cr_investigating to map_get_val(ctx and "improvement_investigation_started")
+            if cr_investigating == 1:
+                set cr_list_root to "."
+                if string_index_of(path and "decent_agent/") == 0:
+                    set cr_list_root to "decent_agent"
+                return f"Error: current-source path '{path}' does not exist and was not recorded as investigation evidence. Call codebase_list([\"{cr_list_root}\", 200]) now, then read relevant exact paths returned by that tool. Do not guess or reconstruct another filename."
             return f"Error: File '{path}' does not exist. If this is an uploaded document, try rag_retrieve([\"query about the document\"]) to search the RAG database."
-        return tools_paginated_read(cr_actual and cr_actual)
+        set cr_reference_read to tools_path_is_language_reference(path)
+        set cr_discovery to "not_required"
+        if cr_reference_read == 1:
+            set cr_discovery to tools_improvement_record_investigation_evidence(ctx and "language_reference" and path)
+        else:
+            set cr_discovery to tools_improvement_record_discovery(ctx and cr_actual and "read")
+        if string_index_of(cr_discovery and "Error:") == 0:
+            return cr_discovery
+        set cr_read_actual to cr_actual
+        set cr_candidate to tools_improvement_candidate_for_read(ctx and cr_actual)
+        set cr_candidate_note to ""
+        if string_length(cr_candidate) > 0:
+            set cr_read_actual to cr_candidate
+            set cr_candidate_note to "[RETAINED IMPLEMENTATION CANDIDATE — these are the latest proposed bytes, not the unchanged live source. Repair them with codebase_replace using the original production path.]\n"
+        set cr_content to concat(cr_candidate_note and tools_paginated_read(cr_read_actual and cr_actual))
+        if cr_discovery equals "not_required":
+            return cr_content
+        return concat(cr_content and concat("\n" and cr_discovery))
 
     if action_name equals "codebase_read_range":
         if length_list(args_list) < 3:
             return "Error: codebase_read_range requires 3 arguments: path (Str), start_line (Int), end_line (Int). Example: Action: codebase_read_range([\"src/main.ep\", 1, 500])"
-        set crr_path to get_list(args_list and 0)
+        set crr_path to tools_improvement_canonical_production_path(ptr_to_str(get_list(args_list and 0)))
         set crr_actual to tools_resolve_read_path_for_ctx(ctx and crr_path)
         set crr_gate_path to crr_path
         if string_length(crr_actual) > 0:
@@ -1863,7 +3097,24 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return f"Error: File '{crr_path}' does not exist."
         set crr_start to tools_safe_int(get_list(args_list and 1))
         set crr_end to tools_safe_int(get_list(args_list and 2))
-        return tools_read_range_path(crr_actual and crr_actual and crr_start and crr_end)
+        set crr_reference_read to tools_path_is_language_reference(crr_path)
+        set crr_discovery to "not_required"
+        if crr_reference_read == 1:
+            set crr_discovery to tools_improvement_record_investigation_evidence(ctx and "language_reference" and crr_path)
+        else:
+            set crr_discovery to tools_improvement_record_discovery(ctx and crr_actual and "read_range")
+        if string_index_of(crr_discovery and "Error:") == 0:
+            return crr_discovery
+        set crr_read_actual to crr_actual
+        set crr_candidate to tools_improvement_candidate_for_read(ctx and crr_actual)
+        set crr_candidate_note to ""
+        if string_length(crr_candidate) > 0:
+            set crr_read_actual to crr_candidate
+            set crr_candidate_note to "[RETAINED IMPLEMENTATION CANDIDATE — these are the latest proposed bytes, not the unchanged live source. Repair them with codebase_replace using the original production path.]\n"
+        set crr_content to concat(crr_candidate_note and tools_read_range_path(crr_read_actual and crr_actual and crr_start and crr_end))
+        if crr_discovery equals "not_required":
+            return crr_content
+        return concat(crr_content and concat("\n" and crr_discovery))
             
     if action_name equals "list_sessions":
         return tools_list_sessions()
@@ -2081,15 +3332,291 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if map_contains(ctx and "last_reasoning") == 1:
             set st_reasoning to ptr_to_str(map_get_val(ctx and "last_reasoning"))
         return rights_session_terminate(storage_get_db() and st_sid and ptr_to_str(get_list(args_list and 0)) and string_lower(ptr_to_str(get_list(args_list and 1))) and st_reasoning)
+
+    if action_name equals "improvement_investigation_begin":
+        if length_list(args_list) != 1:
+            return "Error: improvement_investigation_begin requires one complete objective."
+        set iib_selected_objective to string_trim(ptr_to_str(get_list(args_list and 0)))
+        set iib_prepare to tools_improvement_prepare_typed_investigation(ctx and iib_selected_objective)
+        if string_length(iib_prepare) > 0:
+            return iib_prepare
+        set iib_baseline to 0
+        set iib_green to 0
+        set iib_writes to 0
+        if map_contains(ctx and "repair_baseline_seen") == 1:
+            set iib_baseline to map_get_val(ctx and "repair_baseline_seen")
+        if map_contains(ctx and "repair_verify_green") == 1:
+            set iib_green to map_get_val(ctx and "repair_verify_green")
+        if map_contains(ctx and "repair_write_seen") == 1:
+            set iib_writes to map_get_val(ctx and "repair_write_seen")
+        if iib_baseline != 1 or else iib_green != 1 or else iib_writes != 0:
+            return "IMPROVEMENT_GATE_FAILED code=VERIFY_REQUIRED message=The typed improvement objective is retained exactly, but a green unchanged-source baseline is still required before durable investigation."
+        # The typed action, not lexical matching against the user's prose, activates
+        # the feature transaction. The green source receipt above is the authority.
+        set ok to tools_improvement_activate_from_investigation(ctx)
+        # Keep the exact human request as the immutable outer contract without
+        # discarding Echo's concrete feature selection. Generic requests such as
+        # "choose a useful feature" do not contain the callable identifier that the
+        # plan/evaluator controller needs; the selected objective supplies it while
+        # remaining subordinate to every original requirement.
+        set iib_objective to iib_selected_objective
+        if map_contains(ctx and "improvement_request_contract") == 1:
+            set iib_contract to string_trim(ptr_to_str(map_get_val(ctx and "improvement_request_contract")))
+            if string_length(iib_contract) > 0:
+                set iib_objective to tools_improvement_bind_objective(iib_contract and iib_selected_objective)
+        if string_length(iib_objective) < 40 or else string_length(iib_objective) > 8000:
+            return "Error: improvement objective must be 40-8000 characters and describe the complete intended capability."
+        set ok to map_delete(ctx and "pending_improvement_objective")
+        set iib_encoded to base64_encode(iib_objective)
+        set iib_result to tools_improvement_gate_command(concat("investigate-begin --objective-b64 " and iib_encoded) and 30000)
+        if string_index_of(iib_result and "Error:") == 0 or else string_contains(iib_result and "IMPROVEMENT_INVESTIGATION_OK") == 0:
+            return iib_result
+        set ok to map_insert(ctx and "improvement_investigation_started" and 1)
+        return concat(iib_result and "\nThe controller bound both the exact current user request and your explicitly named concrete feature; neither can be weakened. Read at least two exact non-test production files and the real interface that the live E2E evaluator must invoke; paths and hashes are recorded automatically.")
+
+    if action_name equals "improvement_plan_write":
+        if length_list(args_list) != 1:
+            return "Error: improvement_plan_write requires the complete investigated plan document."
+        set ipw_content to ptr_to_str(get_list(args_list and 0))
+        if string_length(ipw_content) < 500 or else string_length(ipw_content) > 48000:
+            return "Error: implementation plan must be 500-48000 characters and include every required section."
+        set ipw_encoded to base64_encode(ipw_content)
+        set ipw_result to tools_improvement_gate_command(concat("plan-write --content-b64 " and ipw_encoded) and 30000)
+        if string_index_of(ipw_result and "Error:") == 0 or else string_contains(ipw_result and "IMPROVEMENT_PLAN_OK") == 0:
+            return ipw_result
+        set ok to map_insert(ctx and "improvement_plan_written" and 1)
+        return concat(ipw_result and "\nThe controller created config/improvements/staging/implementation_plan.md and owns every progress checkbox. Begin behavioral acceptance and evaluators next.")
+
+    if action_name equals "improvement_plan_scaffold":
+        if length_list(args_list) < 2:
+            return "Error: improvement_plan_scaffold requires one exact registered surface and at least one exact investigated production path."
+        set ips_surface to string_trim(ptr_to_str(get_list(args_list and 0)))
+        set ips_surface_encoded to base64_encode(ips_surface)
+        set ips_command to concat("plan-scaffold --surface-b64 " and ips_surface_encoded)
+        set ips_i to 1
+        repeat while ips_i < length_list(args_list):
+            set ips_path to string_trim(ptr_to_str(get_list(args_list and ips_i)))
+            set ips_path_encoded to base64_encode(ips_path)
+            set ips_command to concat(ips_command and concat(" --production-path-b64 " and ips_path_encoded))
+            set ips_i to ips_i + 1
+        set ips_result to tools_improvement_gate_command(ips_command and 30000)
+        if string_contains(ips_result and "IMPROVEMENT_ALREADY_COMPLETE") == 1:
+            set ok to tools_improvement_resolve_existing(ctx)
+            return concat(ips_result and "\nThe exact capability is already installed under a current immutable completion receipt. Execute that real public tool now, then independently retrieve and verify its durable effect before reporting. Do not edit source, create duplicate evaluators, recompile, or restart.")
+        if string_index_of(ips_result and "Error:") == 0 or else string_contains(ips_result and "IMPROVEMENT_PLAN_OK") == 0:
+            return ips_result
+        set ok to map_insert(ctx and "improvement_plan_written" and 1)
+        return concat(ips_result and "\nThe controller generated config/improvements/staging/implementation_plan.md from the verified investigation ledger and owns every progress checkbox. Begin behavioral acceptance and evaluators next.")
+
+    if action_name equals "improvement_plan_read":
+        if length_list(args_list) != 0:
+            return "Error: improvement_plan_read takes no arguments."
+        return tools_improvement_gate_command("plan-read" and 30000)
+
+    if action_name equals "improvement_status":
+        if length_list(args_list) != 0:
+            return "Error: improvement_status takes no arguments."
+        return tools_improvement_gate_command("status" and 30000)
+
+    if action_name equals "improvement_test_begin":
+        if length_list(args_list) != 2:
+            return "Error: improvement_test_begin requires name and acceptance criteria."
+        set itb_requested_name to string_trim(ptr_to_str(get_list(args_list and 0)))
+        set itb_name to tools_improvement_name_canonical(itb_requested_name)
+        set itb_acceptance to string_trim(ptr_to_str(get_list(args_list and 1)))
+        if tools_session_id_safe(itb_name) == 0 or else string_contains(itb_name and "-") == 1 or else string_length(itb_name) < 3 or else string_length(itb_name) > 64:
+            return "Error: improvement test name could not be reduced to a 3-64 character lowercase identifier beginning with a letter. Supply a descriptive title."
+        if string_length(itb_acceptance) < 40 or else string_length(itb_acceptance) > 8000:
+            return "Error: acceptance criteria must be 40-8000 characters using one [criterion_id] observable outcome per line."
+        set itb_encoded to base64_encode(itb_acceptance)
+        set itb_result to tools_improvement_gate_command(concat("begin --name " and concat(itb_name and concat(" --acceptance-b64 " and itb_encoded))) and 30000)
+        if string_contains(itb_result and "IMPROVEMENT_ALREADY_COMPLETE") == 1:
+            set ok to tools_improvement_resolve_existing(ctx)
+            return concat(itb_result and "\nThe exact capability is already installed under a current immutable completion receipt. Execute that real public tool now, then independently retrieve and verify its durable effect before reporting. Do not edit source, create duplicate evaluators, recompile, or restart.")
+        if string_index_of(itb_result and "Error:") == 0 or else string_contains(itb_result and "IMPROVEMENT_STAGING_OK") == 0:
+            return itb_result
+        set ok to map_insert(ctx and "improvement_test_staged" and 1)
+        return concat(itb_result and "\nThe supplied title was canonicalized safely. Write regression and E2E separately; each write is linted immediately and implementation remains locked.")
+
+    if action_name equals "improvement_test_write":
+        if length_list(args_list) != 2:
+            return "Error: improvement_test_write requires kind and complete Python content."
+        if file_exists("config/improvements/staging/name.txt") == 0:
+            return "Error: no mutable improvement stage exists; call improvement_test_begin first."
+        set itw_kind to string_lower(string_trim(ptr_to_str(get_list(args_list and 0))))
+        set itw_content to ptr_to_str(get_list(args_list and 1))
+        if itw_kind equals "acceptance" == 0 and also itw_kind equals "regression" == 0 and also itw_kind equals "e2e" == 0:
+            return "Error: improvement test kind must be exactly acceptance, regression, or e2e. Use Action: improvement_test_write([\"e2e\", \"def test_...\"]); never use e2e.py as the kind."
+        set itw_encoded to base64_encode(itw_content)
+        if string_length(itw_encoded) == 0:
+            return "Error: staged artifact could not be encoded."
+        set itw_result to tools_improvement_gate_command(concat("write-artifact --kind " and concat(itw_kind and concat(" --content-b64 " and itw_encoded))) and 30000)
+        if string_index_of(itw_result and "Error:") == 0 or else string_contains(itw_result and "IMPROVEMENT_ARTIFACT_LINT_OK") == 0:
+            return itw_result
+        set ok to map_insert(ctx and "improvement_test_staged" and 1)
+        return concat(itw_result and "\nExact bytes retained. Continue with the other evaluator or repair only the precise lint cause.")
+
+    if action_name equals "improvement_test_transport_template":
+        if length_list(args_list) != 0:
+            return "Error: improvement_test_transport_template takes no arguments."
+        return tools_improvement_gate_command("transport-template" and 30000)
+
+    if action_name equals "improvement_test_scaffold":
+        if length_list(args_list) != 0:
+            return "Error: improvement_test_scaffold takes no arguments."
+        set its_result to tools_improvement_gate_command("scaffold-evaluators" and 30000)
+        if string_index_of(its_result and "Error:") == 0 or else string_contains(its_result and "IMPROVEMENT_EVALUATORS_SCAFFOLDED") == 0:
+            return its_result
+        set ok to map_insert(ctx and "improvement_test_staged" and 1)
+        return concat(its_result and "\nThe controller generated both real behavioral evaluators from the immutable plan contract. Validate them now; do not rewrite them unless validation identifies a genuine semantic defect.")
+
+    if action_name equals "improvement_test_read":
+        if length_list(args_list) != 1:
+            return "Error: improvement_test_read requires acceptance, regression, e2e, validation, or lint."
+        set itr_kind to string_lower(string_trim(ptr_to_str(get_list(args_list and 0))))
+        set itr_path to ""
+        if itr_kind equals "acceptance":
+            set itr_path to "config/improvements/staging/acceptance.txt"
+        else if itr_kind equals "regression":
+            set itr_path to "config/improvements/staging/regression.py"
+        else if itr_kind equals "e2e":
+            set itr_path to "config/improvements/staging/e2e.py"
+        else if itr_kind equals "validation":
+            set itr_path to "config/improvements/staging/validation.json"
+        else if itr_kind equals "lint":
+            set itr_path to "config/improvements/staging/lint.json"
+        else:
+            return "Error: improvement_test_read kind must be acceptance, regression, e2e, validation, or lint."
+        if file_exists(itr_path) == 0:
+            return concat("Error: staged artifact is not available: " and itr_kind)
+        return concat("[STAGED IMPROVEMENT " and concat(itr_kind and concat("]\n" and read_file(itr_path))))
+
+    if action_name equals "improvement_test_validate":
+        if length_list(args_list) != 0:
+            return "Error: improvement_test_validate takes no arguments."
+        if file_exists("config/improvements/staging/name.txt") == 0:
+            return "Error: no mutable improvement stage exists; call improvement_test_begin first."
+        set itv_name to string_lower(string_trim(read_file("config/improvements/staging/name.txt")))
+        if tools_session_id_safe(itv_name) == 0 or else string_contains(itv_name and "-") == 1:
+            return "Error: staged improvement name is unsafe."
+        set itv_result to tools_improvement_gate_command(concat("validate --name " and itv_name) and 360000)
+        if string_index_of(itv_result and "Error:") == 0 or else string_contains(itv_result and "STAGING_VALIDATION_OK") == 0:
+            return concat(itv_result and "\nRead improvement_test_read([\"validation\"]) for the persisted hashes and exact diagnostic. There is no retry or turn cap; change the diagnosed artifact bytes before validating again.")
+        return concat(itv_result and "\nValidation passed without freezing. Call improvement_test_freeze([]) when these exact criteria and evaluators are correct.")
+
+    if action_name equals "improvement_test_freeze":
+        if length_list(args_list) != 0:
+            return "Error: improvement_test_freeze takes no arguments; it freezes the retained staged artifacts."
+        if file_exists("config/improvements/staging/name.txt") == 0 or else file_exists("config/improvements/staging/acceptance.txt") == 0 or else file_exists("config/improvements/staging/regression.py") == 0 or else file_exists("config/improvements/staging/e2e.py") == 0:
+            return "Error: staged improvement artifacts are incomplete; begin, write both tests, and validate before freeze."
+        set it_name to string_lower(string_trim(read_file("config/improvements/staging/name.txt")))
+        set it_acceptance to read_file("config/improvements/staging/acceptance.txt")
+        set it_regression to read_file("config/improvements/staging/regression.py")
+        set it_e2e to read_file("config/improvements/staging/e2e.py")
+        if tools_session_id_safe(it_name) == 0 or else string_contains(it_name and "-") == 1:
+            return "Error: staged improvement test name is unsafe."
+        set it_baseline_seen to 0
+        set it_green to 0
+        set it_writes to 0
+        if map_contains(ctx and "repair_baseline_seen") == 1:
+            set it_baseline_seen to map_get_val(ctx and "repair_baseline_seen")
+        if map_contains(ctx and "repair_verify_green") == 1:
+            set it_green to map_get_val(ctx and "repair_verify_green")
+        if map_contains(ctx and "repair_write_seen") == 1:
+            set it_writes to map_get_val(ctx and "repair_write_seen")
+        if it_baseline_seen != 1 or else it_green != 1 or else it_writes != 0:
+            return "Error: freeze is legal only after a green unchanged-source baseline and before every implementation write."
+        if file_exists("config/improvements/active.json") == 1:
+            return "Error: an improvement test transaction is already active; resume it or abandon it before implementation begins."
+        set it_payload to concat("acceptance=" and concat(it_acceptance and concat("\nregression_python=" and concat(it_regression and concat("\nlive_e2e_python=" and it_e2e)))))
+        set it_proposed to ep_sha256(it_payload)
+        set it_change to tools_rights_agent_change(ctx and "core" and "improvement_test_freeze" and concat("config/improvements/frozen/" and it_name) and concat("Freeze a causal regression and live E2E contract for " and it_name) and "" and it_proposed and it_payload)
+        if string_length(it_change) != 64:
+            return it_change
+        if rights_file_hash("config/improvements/staging/regression.py") equals ep_sha256(it_regression) == 0 or else rights_file_hash("config/improvements/staging/e2e.py") equals ep_sha256(it_e2e) == 0:
+            set ok to rights_mark_failed(storage_get_db() and it_change and "staged test hash mismatch")
+            return "Error: staged improvement test bytes failed exact hash verification."
+        set it_result to tools_improvement_gate_command(concat("freeze --name " and it_name) and 360000)
+        if string_index_of(it_result and "Error:") == 0 or else string_contains(it_result and "FREEZE_OK") == 0:
+            set ok to rights_mark_failed(storage_get_db() and it_change and it_result)
+            return concat(it_result and "\nFreeze did not consume the staged files. Repair the reported evaluator and run improvement_test_validate([]) again.")
+        if rights_mark_applied(storage_get_db() and it_change and it_proposed) != 0:
+            return "Error: frozen test rights receipt could not be committed; implementation remains locked."
+        set ok to map_insert(ctx and "improvement_test_frozen" and 1)
+        set ok to map_insert(ctx and "improvement_active_bound" and 1)
+        set ok to map_insert(ctx and "improvement_test_staged" and 0)
+        set ok to map_insert(ctx and "repair_verify_green" and 0)
+        return concat(it_result and "\nThe evaluator is now immutable and new discovery is closed. Implement every planned production file using protected codebase_write/codebase_replace, then call system_verify([]). If exact source bytes are no longer active, codebase_read/codebase_read_range may reread only an exact production path declared in the frozen plan; the controller verifies its pre-write hash and rejects every other path. Do not list, search, use Git, or inspect unplanned source after freeze. Abandonment is unavailable unless the controller returns code=PLAN_SCOPE_MISSING before any accepted write.")
+
+    if action_name equals "improvement_test_abandon":
+        if length_list(args_list) != 1:
+            return "Error: improvement_test_abandon requires one complete reason."
+        set ita_reason to string_trim(ptr_to_str(get_list(args_list and 0)))
+        if string_length(ita_reason) < 40:
+            return "Error: abandonment requires a specific reason of at least 40 characters."
+        if file_exists("config/improvements/active.json") == 0:
+            return "Error: no frozen improvement transaction is active."
+        set ita_change to tools_rights_agent_change(ctx and "core" and "improvement_test_abandon" and "config/improvements/active.json" and "Abandon an incorrect frozen evaluator before implementation" and rights_file_hash("config/improvements/active.json") and ep_sha256(ita_reason) and ita_reason)
+        if string_length(ita_change) != 64:
+            return ita_change
+        if tools_improvement_prepare_dirs() != 0 or else write_file("config/improvements/staging/abort_reason.txt" and ita_reason) == 0:
+            set ok to rights_mark_failed(storage_get_db() and ita_change and "abort reason staging failed")
+            return "Error: improvement abandonment reason could not be staged."
+        set ita_result to tools_improvement_gate_command("abort" and 30000)
+        if string_index_of(ita_result and "Error:") == 0 or else string_contains(ita_result and "IMPROVEMENT_ABORT_OK") == 0:
+            set ok to rights_mark_failed(storage_get_db() and ita_change and ita_result)
+            return ita_result
+        if rights_mark_applied(storage_get_db() and ita_change and ep_sha256(ita_reason)) != 0:
+            return "Error: abandonment receipt could not be committed."
+        set ok to tools_improvement_reset_after_abandon(ctx)
+        return concat(ita_result and "\nNo implementation write occurred. The same turn is reset to investigation phase; begin a fresh durable investigation before authoring a corrected plan and evaluator.")
+
+    if action_name equals "improvement_workflow_restart":
+        if length_list(args_list) != 1:
+            return "Error: improvement_workflow_restart requires one complete reason."
+        set iwr_reason to string_trim(ptr_to_str(get_list(args_list and 0)))
+        if string_length(iwr_reason) < 40:
+            return "Error: workflow restart requires a specific reason of at least 40 characters."
+        set iwr_encoded to base64_encode(iwr_reason)
+        set iwr_result to tools_improvement_gate_command(concat("restart-staging --reason-b64 " and iwr_encoded) and 30000)
+        if string_index_of(iwr_result and "Error:") == 0 or else string_contains(iwr_result and "IMPROVEMENT_STAGING_RESTART_OK") == 0:
+            return iwr_result
+        set ok to map_insert(ctx and "improvement_test_staged" and 0)
+        set ok to map_insert(ctx and "improvement_plan_written" and 0)
+        set ok to map_insert(ctx and "improvement_investigation_started" and 0)
+        return concat(iwr_result and "\nBegin a new durable investigation and produce a corrected plan before authoring evaluators.")
         
     if action_name equals "codebase_write":
         if length_list(args_list) < 2:
             return "Error: codebase_write requires 2 arguments: path (Str) and content (Str). Example: Action: codebase_write([\"notes.txt\", \"my content\"])"
-        set path to get_list(args_list and 0)
+        set path to tools_improvement_canonical_production_path(ptr_to_str(get_list(args_list and 0)))
         set content to get_list(args_list and 1)
+        if tools_path_is_upgrade_trust_root(path) == 1:
+            return "Error: this path belongs to the operator-sealed regression/deployment trust root and cannot be changed by Echo. Repair the implementation under test instead; trust-root updates require a separate operator build and reboot."
+        set incomplete_write to tools_improvement_incomplete_content_error(ctx and content)
+        if string_length(incomplete_write) > 0:
+            return incomplete_write
+        set improvement_preflight to tools_improvement_preflight_write(ctx and path)
+        if string_index_of(improvement_preflight and "Error:") == 0:
+            return improvement_preflight
+        set staged_candidate to tools_improvement_candidate_path(path)
+        if string_length(staged_candidate) > 0:
+            if file_exists(staged_candidate) == 1:
+                return concat("Error: a retained implementation candidate already exists for " and concat(path and ". The failed bytes were preserved instead of rolled back. Call codebase_read on the original production path, then repair only the diagnosed lines with codebase_replace; whole-file regeneration is blocked while a candidate exists."))
+            if write_file(staged_candidate and content) == 0:
+                return "Error: implementation candidate could not be staged; live source was not touched."
+            set candidate_check to tools_improvement_check_candidate(ctx and path)
+            if string_index_of(candidate_check and "Error:") == 0:
+                return candidate_check
+            # The candidate gate may perform exact, plan-proven dialect
+            # normalization before compilation. Promote the bytes that were
+            # actually compiled, never the pre-normalization model payload.
+            set content to read_file(staged_candidate)
         set rights_class to tools_rights_path_class(path)
         set rights_before to rights_file_hash(path)
         set rights_proposed to ep_sha256(content)
+        if rights_before equals rights_proposed:
+            return "Error: proposed source bytes are identical to the current file. No implementation occurred, no protected change was opened, and verification/recompile remain locked. Make a causal production change or report that the capability already exists."
         set rights_summary to concat("Echo writes complete content to " and path)
         set rights_change to tools_rights_agent_change(ctx and rights_class and "codebase_write" and path and rights_summary and rights_before and rights_proposed and content)
         if string_length(rights_change) != 64:
@@ -2097,6 +3624,10 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if rights_backup_file(storage_get_db() and rights_change and path) != 0:
             set ok to rights_mark_failed(storage_get_db() and rights_change and "pre-change backup verification failed")
             return "Error: pre-change backup could not be verified; write was not attempted."
+        set improvement_start to tools_improvement_start_implementation(ctx)
+        if string_index_of(improvement_start and "Error:") == 0:
+            set ok to rights_mark_failed(storage_get_db() and rights_change and improvement_start)
+            return improvement_start
         # Changelog: capture before-state
         set cl_hash_before to changelog_hash_file(path)
         set cl_size_before to 0
@@ -2114,6 +3645,11 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set rollback_result to rights_rollback_file(storage_get_db() and rights_change)
             set ok to rights_mark_failed(storage_get_db() and rights_change and concat("post-write hash mismatch; " and rollback_result))
             return concat("Error: written bytes did not match the proposed hash. Automatic rollback result: " and rollback_result)
+        set improvement_record to tools_improvement_record_write(ctx and path)
+        if string_index_of(improvement_record and "Error:") == 0:
+            set rollback_result to rights_rollback_file(storage_get_db() and rights_change)
+            set ok to rights_mark_failed(storage_get_db() and rights_change and concat(improvement_record and concat("; " and rollback_result)))
+            return concat(improvement_record and concat("\nAutomatic rollback result: " and rollback_result))
         set cl_size_after to string_length(content)
         set cl_sess to ""
         if map_contains(ctx and "session_id") == 1:
@@ -2123,13 +3659,178 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ok to map_insert(ctx and "artifact_how" and "Written through the protected codebase_write path with exact proposed-byte hashing, verified post-write hashing, recovery backup, and rights-ledger attribution.")
         set ok to changelog_log_change(cl_sess and "codebase_write" and path and "write" and cl_hash_before and cl_hash_after and cl_size_before and cl_size_after and f"File '{path}' written.")
         if rights_mark_applied(storage_get_db() and rights_change and rights_file_hash(path)) != 0:
-            return "Error: file was written but its protected-change ledger commit failed. Stop and inspect rights_status before further mutation."
+            set rollback_result to rights_rollback_file(storage_get_db() and rights_change)
+            set ok to rights_mark_failed(storage_get_db() and rights_change and concat("protected-change ledger commit failed; " and rollback_result))
+            return concat("Error: protected-change ledger commit failed. Automatic rollback result: " and rollback_result)
+        set ok to tools_repair_record_write(ctx)
         # Auto-attach the file the agent just made to the user's chat (Discord/WebUI),
         # so they don't have to go find it. Approved-write-only, secret-safe (see helper).
         # Only claim it was attached when the emit actually queued it (0), never on a refuse/skip.
         if tools_emit_attachment(cl_sess and path and ctx) == 0:
             return f"File '{path}' written successfully. (Attached to the chat.)"
         return f"File '{path}' written successfully."
+
+    if action_name equals "improvement_candidate_reset":
+        if length_list(args_list) != 0:
+            return "Error: improvement_candidate_reset takes no arguments."
+        set icr_result to tools_improvement_gate_command("reset-incomplete-candidate" and 30000)
+        if string_index_of(icr_result and "Error:") == 0 or else string_contains(icr_result and "IMPLEMENTATION_CANDIDATE_RESET_OK") == 0:
+            return icr_result
+        set ok to map_insert(ctx and "frozen_latest_tool" and "")
+        set ok to map_insert(ctx and "frozen_latest_observation" and "")
+        set ok to map_insert(ctx and "last_codebase_path" and "")
+        return concat(icr_result and "\nThe rejected candidate was never live and is preserved with its compiler diagnostic in the private attempt archive. The frozen plan and evaluators remain unchanged. Reread the exact production path now, then submit one genuinely new complete additive candidate that fixes the archived cause and preserves every existing definition.")
+
+    if action_name equals "improvement_candidate_normalize":
+        if length_list(args_list) != 0:
+            return "Error: improvement_candidate_normalize takes no arguments."
+        set icn_result to tools_improvement_gate_command("normalize-candidate" and 360000)
+        if string_index_of(icn_result and "Error:") == 0 or else string_contains(icn_result and "IMPLEMENTATION_CANDIDATE_OK") == 0:
+            return icn_result
+        if file_exists("config/improvements/active.json") == 0:
+            return "Error: normalized candidate has no active frozen transaction."
+        set icn_root to json_parse(read_file("config/improvements/active.json"))
+        if icn_root == 0:
+            return "Error: active frozen transaction is malformed."
+        set icn_planned_node to get_json_object_value(icn_root and "planned_files")
+        if icn_planned_node == 0 or else get_json_type(icn_planned_node) != 3:
+            return "Error: active frozen transaction has no planned production files."
+        set icn_planned to get_json_value(icn_planned_node)
+        if length_list(icn_planned) != 1:
+            return "Error: candidate normalization requires exactly one planned production path."
+        set icn_path_node to get_list(icn_planned and 0)
+        set icn_path to ptr_to_str(get_json_value(icn_path_node))
+        set icn_actual to tools_resolve_read_path_for_ctx(ctx and icn_path)
+        if string_length(icn_actual) == 0 or else is_directory(icn_actual) == 1:
+            return "Error: normalized candidate production target is unavailable."
+        set icn_candidate to tools_improvement_candidate_path(icn_actual)
+        if string_length(icn_candidate) == 0 or else file_exists(icn_candidate) == 0 or else is_directory(icn_candidate) == 1:
+            return "Error: normalized compiled candidate bytes are unavailable."
+        set icn_content to read_file(icn_candidate)
+        set icn_before to rights_file_hash(icn_actual)
+        set icn_size_before to 0
+        if file_exists(icn_actual) == 1:
+            set icn_size_before to string_length(read_file(icn_actual))
+        set icn_after_expected to ep_sha256(icn_content)
+        if icn_before equals icn_after_expected:
+            return "Error: normalized candidate is byte-identical to live source; nothing was changed."
+        set icn_summary to concat("Echo applies a compiler-verified normalized candidate to " and icn_actual)
+        set icn_change to tools_rights_agent_change(ctx and tools_rights_path_class(icn_actual) and "improvement_candidate_normalize" and icn_actual and icn_summary and icn_before and icn_after_expected and icn_content)
+        if string_length(icn_change) != 64:
+            return icn_change
+        if rights_backup_file(storage_get_db() and icn_change and icn_actual) != 0:
+            set ok to rights_mark_failed(storage_get_db() and icn_change and "pre-change backup verification failed")
+            return "Error: pre-change backup could not be verified; normalized candidate was not applied."
+        set icn_start to tools_improvement_start_implementation(ctx)
+        if string_index_of(icn_start and "Error:") == 0:
+            set ok to rights_mark_failed(storage_get_db() and icn_change and icn_start)
+            return icn_start
+        if write_file(icn_actual and icn_content) == 0:
+            set icn_rollback to rights_rollback_file(storage_get_db() and icn_change)
+            set ok to rights_mark_failed(storage_get_db() and icn_change and concat("write_file failed; " and icn_rollback))
+            return concat("Error: normalized candidate write failed. Automatic rollback result: " and icn_rollback)
+        if rights_file_hash(icn_actual) equals icn_after_expected == 0:
+            set icn_rollback to rights_rollback_file(storage_get_db() and icn_change)
+            set ok to rights_mark_failed(storage_get_db() and icn_change and concat("post-write hash mismatch; " and icn_rollback))
+            return concat("Error: normalized candidate bytes did not match the proposed hash. Automatic rollback result: " and icn_rollback)
+        set icn_record to tools_improvement_record_write(ctx and icn_actual)
+        if string_index_of(icn_record and "Error:") == 0:
+            set icn_rollback to rights_rollback_file(storage_get_db() and icn_change)
+            set ok to rights_mark_failed(storage_get_db() and icn_change and concat(icn_record and concat("; " and icn_rollback)))
+            return concat(icn_record and concat("\nAutomatic rollback result: " and icn_rollback))
+        set icn_after to rights_file_hash(icn_actual)
+        if rights_mark_applied(storage_get_db() and icn_change and icn_after) != 0:
+            set icn_rollback to rights_rollback_file(storage_get_db() and icn_change)
+            set ok to rights_mark_failed(storage_get_db() and icn_change and concat("protected-change ledger commit failed; " and icn_rollback))
+            return concat("Error: protected-change ledger commit failed. Automatic rollback result: " and icn_rollback)
+        set icn_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set icn_sid to ptr_to_str(map_get_val(ctx and "session_id"))
+        set ok to changelog_log_change(icn_sid and "improvement_candidate_normalize" and icn_actual and "write" and icn_before and icn_after and icn_size_before and string_length(icn_content) and f"Normalized compiled candidate applied to '{icn_actual}'.")
+        set ok to tools_repair_record_write(ctx)
+        return concat(icn_result and concat("\nNormalized candidate applied to " and concat(icn_actual and ". Post-write hash verified; system_verify([]) is now required.")))
+
+    if action_name equals "codebase_replace":
+        if length_list(args_list) < 3 or else length_list(args_list) > 4:
+            return "Error: codebase_replace requires path, exact_old, exact_new, and optional expected_count."
+        set crp_path to tools_improvement_canonical_production_path(ptr_to_str(get_list(args_list and 0)))
+        set crp_old to ptr_to_str(get_list(args_list and 1))
+        set crp_new to ptr_to_str(get_list(args_list and 2))
+        set crp_expected to 1
+        if length_list(args_list) == 4:
+            set crp_expected to tools_safe_int(get_list(args_list and 3))
+        if string_length(crp_old) == 0 or else crp_expected < 1:
+            return "Error: codebase_replace exact_old must be non-empty and expected_count must be at least 1."
+        if tools_path_is_upgrade_trust_root(crp_path) == 1:
+            return "Error: this path belongs to the operator-sealed regression/deployment trust root and cannot be changed by Echo. Repair the implementation under test instead."
+        set crp_actual to tools_resolve_read_path_for_ctx(ctx and crp_path)
+        if string_length(crp_actual) == 0 or else is_directory(crp_actual) == 1:
+            return concat("Error: codebase_replace target is not a readable file: " and crp_path)
+        set crp_source to crp_actual
+        set crp_retained_candidate to tools_improvement_candidate_for_read(ctx and crp_actual)
+        if string_length(crp_retained_candidate) > 0:
+            set crp_source to crp_retained_candidate
+        set crp_content to read_file(crp_source)
+        set crp_count to tools_exact_occurrences(crp_content and crp_old)
+        if crp_count != crp_expected:
+            return concat("IMPROVEMENT_GATE_FAILED code=CANDIDATE_REPAIR_REQUIRED reason=EXACT_MATCH_COUNT message=codebase_replace expected " and concat(int_to_string(crp_expected) and concat(" exact occurrence(s), found " and concat(int_to_string(crp_count) and ". Nothing was changed. Use the exact retained candidate bytes in the next durable decision and correct only the exact_old/action serialization; discovery remains closed."))))
+        set crp_proposed_content to string_replace(crp_content and crp_old and crp_new)
+        set incomplete_replace to tools_improvement_incomplete_content_error(ctx and crp_new)
+        if string_length(incomplete_replace) > 0:
+            return incomplete_replace
+        set crp_improvement_preflight to tools_improvement_preflight_write(ctx and crp_actual)
+        if string_index_of(crp_improvement_preflight and "Error:") == 0:
+            return crp_improvement_preflight
+        set crp_candidate_path to tools_improvement_candidate_path(crp_actual)
+        if string_length(crp_candidate_path) > 0:
+            if write_file(crp_candidate_path and crp_proposed_content) == 0:
+                return "Error: repaired implementation candidate could not be staged; live source was not touched."
+            set crp_candidate_check to tools_improvement_check_candidate(ctx and crp_actual)
+            if string_index_of(crp_candidate_check and "Error:") == 0:
+                return crp_candidate_check
+            # Promote the exact candidate bytes accepted by the compiler. The
+            # gate may have normalized unambiguous dialect syntax in place.
+            set crp_proposed_content to read_file(crp_candidate_path)
+        set crp_before to rights_file_hash(crp_actual)
+        set crp_proposed_hash to ep_sha256(crp_proposed_content)
+        if crp_before equals crp_proposed_hash:
+            return "Error: exact replacement produces byte-identical source. Nothing was changed and the repair workflow did not advance. Supply a causal replacement with different production bytes."
+        set crp_summary to concat("Echo replaces an exact source fragment in " and crp_actual)
+        set crp_change to tools_rights_agent_change(ctx and tools_rights_path_class(crp_actual) and "codebase_replace" and crp_actual and crp_summary and crp_before and crp_proposed_hash and crp_proposed_content)
+        if string_length(crp_change) != 64:
+            return crp_change
+        if rights_backup_file(storage_get_db() and crp_change and crp_actual) != 0:
+            set ok to rights_mark_failed(storage_get_db() and crp_change and "pre-change backup verification failed")
+            return "Error: pre-change backup could not be verified; replacement was not attempted."
+        set crp_improvement_start to tools_improvement_start_implementation(ctx)
+        if string_index_of(crp_improvement_start and "Error:") == 0:
+            set ok to rights_mark_failed(storage_get_db() and crp_change and crp_improvement_start)
+            return crp_improvement_start
+        set crp_size_before to string_length(crp_content)
+        if write_file(crp_actual and crp_proposed_content) == 0:
+            set crp_rollback to rights_rollback_file(storage_get_db() and crp_change)
+            set ok to rights_mark_failed(storage_get_db() and crp_change and concat("write_file failed; " and crp_rollback))
+            return concat("Error: replacement write failed. Automatic rollback result: " and crp_rollback)
+        if rights_file_hash(crp_actual) equals crp_proposed_hash == 0:
+            set crp_rollback to rights_rollback_file(storage_get_db() and crp_change)
+            set ok to rights_mark_failed(storage_get_db() and crp_change and concat("post-write hash mismatch; " and crp_rollback))
+            return concat("Error: replacement bytes did not match the proposed hash. Automatic rollback result: " and crp_rollback)
+        set crp_improvement_record to tools_improvement_record_write(ctx and crp_actual)
+        if string_index_of(crp_improvement_record and "Error:") == 0:
+            set crp_rollback to rights_rollback_file(storage_get_db() and crp_change)
+            set ok to rights_mark_failed(storage_get_db() and crp_change and concat(crp_improvement_record and concat("; " and crp_rollback)))
+            return concat(crp_improvement_record and concat("\nAutomatic rollback result: " and crp_rollback))
+        set crp_after to rights_file_hash(crp_actual)
+        if rights_mark_applied(storage_get_db() and crp_change and crp_after) != 0:
+            set crp_rollback to rights_rollback_file(storage_get_db() and crp_change)
+            set ok to rights_mark_failed(storage_get_db() and crp_change and concat("protected-change ledger commit failed; " and crp_rollback))
+            return concat("Error: protected-change ledger commit failed. Automatic rollback result: " and crp_rollback)
+        set crp_sid to ""
+        if map_contains(ctx and "session_id") == 1:
+            set crp_sid to ptr_to_str(map_get_val(ctx and "session_id"))
+        set ok to changelog_log_change(crp_sid and "codebase_replace" and crp_actual and "replace" and crp_before and crp_after and crp_size_before and string_length(crp_proposed_content) and f"Exact source fragment replaced in '{crp_actual}'.")
+        set ok to tools_repair_record_write(ctx)
+        return concat("Exact replacement applied once in " and concat(crp_actual and ". Post-write hash verified; system_verify([]) is now required."))
         
     if action_name equals "run_ep":
         if length_list(args_list) < 1:
@@ -2156,7 +3857,19 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if length_list(args_list) < 1:
             return "Error: lookup_ernos requires 1 argument (query: Str)."
         set le_q to get_list(args_list and 0)
-        return tutor_reference_search(le_q and 4)
+        set le_result to tutor_reference_search(le_q and 4)
+        if tools_reference_has_matches(le_result) == 0:
+            set le_source_result to tools_codebase_search(le_q and "stdlib" and 4)
+            if string_index_of(le_source_result and "[CURRENT SOURCE SEARCH") == 0:
+                set le_result to le_source_result
+        if tools_reference_has_matches(le_result) == 0:
+            return concat(le_result and "\nNo durable language-reference receipt was recorded because neither the indexed reference nor exact current stdlib source contained this query. Query one concrete primitive identifier visible in current source, then inspect its result before planning.")
+        set le_evidence to tools_improvement_record_investigation_evidence(ctx and "language_reference" and le_q)
+        if string_index_of(le_evidence and "Error:") == 0:
+            return le_evidence
+        if le_evidence equals "not_required":
+            return le_result
+        return concat(le_result and concat("\n" and le_evidence))
 
     if action_name equals "seed_curriculum":
         return tutor_seed_curriculum()
@@ -2266,7 +3979,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         return "Error: unknown section. Editable sections are 'behavior' and 'skills'."
 
     if action_name equals "user_knowledge_get":
-        set uk_path to storage_user_knowledge_path_for(prompt_persona_current_name())
+        set uk_path to prompt_user_knowledge_path(ctx)
         if file_exists(uk_path) == 0:
             return "(empty — nothing recorded about this user yet. Use user_knowledge_update to start the file.)"
         set uk_body to string_trim(read_file(uk_path))
@@ -2282,8 +3995,10 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             return "Error: refusing to blank the user-knowledge file — pass the full consolidated document."
         if string_length(uk_text) > 8000:
             return "Error: document exceeds the 8000-char cap — consolidate (merge duplicates, drop stale entries) and retry."
-        set ok to write_file(storage_user_knowledge_path_for(prompt_persona_current_name()) and uk_text)
-        return "User knowledge updated (this persona's file). It is injected into every prompt from your next turn."
+        set uk_path to prompt_user_knowledge_path(ctx)
+        if write_file(uk_path and uk_text) != 0:
+            return "Error: user knowledge could not be persisted for the current account."
+        return "User knowledge updated for the current platform account. It is injected into that account's prompts from your next turn and is not shared with other users."
 
     if action_name equals "self_knowledge_get":
         set sk_path to storage_self_knowledge_path_for(prompt_persona_current_name())
@@ -2606,25 +4321,51 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         free_list(sub_args)
         return res
 
+    if action_name equals "system_verify":
+        if length_list(args_list) != 0:
+            return "Error: system_verify takes no arguments. Use exactly: Action: system_verify([])"
+        set verify_result to system_verify_source()
+        set improvement_required to 0
+        set improvement_writes to 0
+        if map_contains(ctx and "improvement_test_required") == 1:
+            set improvement_required to map_get_val(ctx and "improvement_test_required")
+        if map_contains(ctx and "repair_write_seen") == 1:
+            set improvement_writes to map_get_val(ctx and "repair_write_seen")
+        if improvement_required == 1 and also improvement_writes == 1 and also string_index_of(verify_result and "SOURCE VERIFICATION PASSED.") == 0:
+            set improvement_verified to tools_improvement_gate_command("mark-verified" and 360000)
+            if string_index_of(improvement_verified and "Error:") == 0 or else string_contains(improvement_verified and "VERIFIED_OK") == 0:
+                set ok to tools_repair_record_verification(ctx and "SOURCE VERIFICATION FAILED. Frozen improvement receipt could not be marked verified.")
+                return improvement_verified
+            set verify_result to concat(verify_result and concat("\n" and improvement_verified))
+        set ok to tools_repair_record_verification(ctx and verify_result)
+        return verify_result
+
     if action_name equals "system_recompile":
         set sr_before to rights_file_hash("node")
-        set sr_proposed to rights_file_hash("node.ep")
-        set sr_change to tools_rights_agent_change(ctx and "core" and "system_recompile" and "node" and "Compile, test, and activate the current ErnosDecent cognitive runtime" and sr_before and sr_proposed and sr_proposed)
+        if string_length(sr_before) != 64:
+            return "Error: current executable hash is unavailable; candidate preparation was not started."
+        set sr_proposed to system_recompile_prepare()
+        if string_length(sr_proposed) != 64:
+            return sr_proposed
+        set sr_payload to concat("candidate_binary_sha256=" and concat(sr_proposed and "; deployment=reply_durable_then_supervisor_activate_then_authenticated_health_then_rights_commit_or_exact_rollback"))
+        set sr_change to tools_rights_agent_change(ctx and "core" and "system_recompile" and "node" and "Compile and test an isolated candidate, then activate it transactionally with authenticated health validation and exact rollback" and sr_before and sr_proposed and sr_payload)
         if string_length(sr_change) != 64:
+            set discard_result to system_recompile_discard()
             return sr_change
         if rights_backup_file(storage_get_db() and sr_change and "node") != 0:
+            set discard_result to system_recompile_discard()
+            set ok to rights_mark_failed(storage_get_db() and sr_change and concat("current executable backup failed; candidate cleanup=" and discard_result))
             return "Error: current executable backup failed; recompile was not attempted."
-        set sr_result to system_recompile()
-        if string_index_of(sr_result and "Error:") == 0 or else string_contains(sr_result and "failed") == 1:
-            set rollback_result to rights_rollback_file(storage_get_db() and sr_change)
-            set ok to rights_mark_failed(storage_get_db() and sr_change and concat(sr_result and concat("; rollback=" and rollback_result)))
-            return concat(sr_result and concat(" Rollback: " and rollback_result))
-        set sr_after to rights_file_hash("node")
-        if string_length(sr_after) != 64:
-            set rollback_result to rights_rollback_file(storage_get_db() and sr_change)
-            return concat("Error: recompiled executable hash unavailable. Rollback: " and rollback_result)
-        if rights_mark_applied(storage_get_db() and sr_change and sr_after) != 0:
-            return "Error: recompile completed but rights ledger commit failed; inspect rights_status."
+        set sr_result to system_recompile_stage(sr_change)
+        if string_index_of(sr_result and "Error:") == 0:
+            set discard_result to system_recompile_discard()
+            set ok to rights_mark_failed(storage_get_db() and sr_change and concat(sr_result and concat("; candidate cleanup=" and discard_result)))
+            return sr_result
+        # node_run_turn/node_resume_turn exits with the supervisor-only code 75 only
+        # after the final reply and continuity state are durably published. The rights
+        # change remains pending until the replacement passes authenticated health and
+        # the replacement process reconciles the exact outcome receipt.
+        set ok to map_insert(ctx and "upgrade_restart_requested" and 1)
         return sr_result
         
     if action_name equals "manage_reading_progress":
@@ -2926,7 +4667,7 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
             set items to concat(items and concat(get_list(timeline and ci) and "\n"))
             set ci to ci + 1
         set cprompt to build_summary_prompt(items)
-        set summary to query_local_llm(cprompt and "")
+        set summary to query_local_llm_freeform(cprompt and "")
         if string_length(summary) == 0:
             return "consolidate:error,reason:empty_llm_response"
         if cdb != 0:
@@ -3000,6 +4741,8 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
     if action_name equals "reply_request":
         if length_list(args_list) < 1:
             return "Error: reply_request requires 1 argument (response)."
+        if map_contains(ctx and "upgrade_wake_canonical_reply") == 1:
+            return ptr_to_str(map_get_val(ctx and "upgrade_wake_canonical_reply"))
         return get_list(args_list and 0)
 
     if action_name equals "workspace_write":
@@ -3069,7 +4812,13 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if map_get_val(fi_gate and "decision") equals "gate":
             return concat("[GATE] " and map_get_val(fi_gate and "reason"))
         if string_length(fi_actual) > 0:
-            return tools_file_info_path(fi_actual and fi_actual)
+            set fi_discovery to tools_improvement_record_discovery(ctx and fi_actual and "metadata")
+            if string_index_of(fi_discovery and "Error:") == 0:
+                return fi_discovery
+            set fi_content to tools_file_info_path(fi_actual and fi_actual)
+            if fi_discovery equals "not_required":
+                return fi_content
+            return concat(fi_content and concat("\n" and fi_discovery))
         return workspace_file_info(fi_path)
 
     if action_name equals "workspace_list":
@@ -3343,5 +5092,15 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         set ds_memory to map_get_val(ctx and "memory_mgr")
         set ds_tools to map_get_val(ctx and "tools_mgr")
         return orchestrator_swarm(ds_orch and ds_instruction and ds_sub_tasks and ds_strategy and ds_model and ds_memory and ds_tools and cast_map_to_int(ctx))
+
+    if self_extensions_action_known(action_name) == 1:
+        if tools_prepare_self_extension_context(ctx) != 0:
+            return "Error: core storage database is unavailable to the registered self-extension."
+        set extension_result to self_extensions_execute(ctx and action_name and args_list)
+        if map_contains(ctx and "improvement_existing_resolution_receipt") == 1:
+            set extension_receipt to ptr_to_str(map_get_val(ctx and "improvement_existing_resolution_receipt"))
+            set ok to map_delete(ctx and "improvement_existing_resolution_receipt")
+            return concat(extension_receipt and concat("\nEXISTING_CAPABILITY_EXECUTED result=" and extension_result))
+        return extension_result
 
     return f"Error: Unknown tool '{action_name}'."

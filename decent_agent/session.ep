@@ -81,6 +81,128 @@ define session_add_message with sess as Map and role as Str and content as Str r
     set ok to map_insert(sess and "next_turn_id" and int_to_string(turn_id + 1))
     return 0
 
+# Authenticated interaction identity is message provenance, not merely current-turn
+# prompt decoration. Copy only the runtime-owned fields that identify the speaker and
+# surface; never persist arbitrary context-map keys into the transcript.
+define session_actor_provenance_keys returning List:
+    set keys to create_list()
+    set ok to append_list(keys and "platform")
+    set ok to append_list(keys and "actor_id")
+    set ok to append_list(keys and "actor_username")
+    set ok to append_list(keys and "actor_global_name")
+    set ok to append_list(keys and "actor_display_name")
+    set ok to append_list(keys and "actor_type")
+    set ok to append_list(keys and "actor_is_host")
+    set ok to append_list(keys and "sender_role")
+    set ok to append_list(keys and "guild_id")
+    set ok to append_list(keys and "guild_name")
+    set ok to append_list(keys and "channel_name")
+    set ok to append_list(keys and "thread_id")
+    set ok to append_list(keys and "thread_name")
+    return keys
+
+define session_copy_actor_provenance with target as Map and source as Map returning Int:
+    set keys to session_actor_provenance_keys()
+    set i to 0
+    repeat while i < length_list(keys):
+        set key to ptr_to_str(get_list(keys and i))
+        if map_contains(source and key) == 1:
+            set value to ptr_to_str(map_get_val(source and key))
+            if string_length(value) > 0:
+                set ok to map_insert(target and key and value)
+        set i to i + 1
+    free_list(keys)
+    return 0
+
+define session_add_message_with_context with sess as Map and role as Str and content as Str and ctx as Map returning Int:
+    set rc to session_add_message(sess and role and content)
+    if rc != 0:
+        return rc
+    set messages_list to map_get_val(sess and "messages")
+    set count to length_list(messages_list)
+    if count <= 0:
+        return 1
+    set msg_map to get_list(messages_list and count - 1)
+    return session_copy_actor_provenance(msg_map and ctx)
+
+define session_actor_json_fields with msg_map as Map and separator as Str and indent as Str returning Str:
+    set out to ""
+    set keys to session_actor_provenance_keys()
+    set i to 0
+    repeat while i < length_list(keys):
+        set key to ptr_to_str(get_list(keys and i))
+        if map_contains(msg_map and key) == 1:
+            set value to ptr_to_str(map_get_val(msg_map and key))
+            if string_length(value) > 0:
+                set out to concat(out and separator)
+                set out to concat(out and indent)
+                set out to concat(out and concat("\"" and concat(key and "\":\"")))
+                set out to concat(out and concat(session_json_escape(value) and "\""))
+        set i to i + 1
+    free_list(keys)
+    return out
+
+define session_load_actor_provenance with msg_map as Map and item_node as Int returning Int:
+    set keys to session_actor_provenance_keys()
+    set i to 0
+    repeat while i < length_list(keys):
+        set key to ptr_to_str(get_list(keys and i))
+        set field_node to get_json_object_value(item_node and key)
+        if field_node != 0:
+            set value to ptr_to_str(get_json_value(field_node))
+            if string_length(value) > 0:
+                set ok to map_insert(msg_map and key and value)
+        set i to i + 1
+    free_list(keys)
+    return 0
+
+# Render an unambiguous historical speaker label. Legacy turns remain explicitly
+# unknown rather than inheriting the identity attached to the current request.
+define session_message_speaker_label with msg_map as Map returning Str:
+    set label to "User"
+    set has_identity to 0
+    set details to ""
+    if map_contains(msg_map and "actor_display_name") == 1:
+        set display_name to ptr_to_str(map_get_val(msg_map and "actor_display_name"))
+        if string_length(display_name) > 0:
+            set details to concat(details and concat("display=" and display_name))
+            set has_identity to 1
+    if map_contains(msg_map and "actor_username") == 1:
+        set username to ptr_to_str(map_get_val(msg_map and "actor_username"))
+        if string_length(username) > 0:
+            if string_length(details) > 0:
+                set details to concat(details and "; ")
+            set details to concat(details and concat("username=" and username))
+            set has_identity to 1
+    if map_contains(msg_map and "actor_id") == 1:
+        set actor_id to ptr_to_str(map_get_val(msg_map and "actor_id"))
+        if string_length(actor_id) > 0:
+            if string_length(details) > 0:
+                set details to concat(details and "; ")
+            set details to concat(details and concat("stable_id=" and actor_id))
+            set has_identity to 1
+    if map_contains(msg_map and "platform") == 1:
+        set platform to ptr_to_str(map_get_val(msg_map and "platform"))
+        if string_length(platform) > 0:
+            if string_length(details) > 0:
+                set details to concat(details and "; ")
+            set details to concat(details and concat("platform=" and platform))
+    if map_contains(msg_map and "actor_is_host") == 1:
+        set host_match to ptr_to_str(map_get_val(msg_map and "actor_is_host"))
+        if string_length(host_match) > 0:
+            if string_length(details) > 0:
+                set details to concat(details and "; ")
+            set details to concat(details and concat("host_match=" and host_match))
+    if map_contains(msg_map and "sender_role") == 1:
+        set sender_role to ptr_to_str(map_get_val(msg_map and "sender_role"))
+        if string_length(sender_role) > 0:
+            if string_length(details) > 0:
+                set details to concat(details and "; ")
+            set details to concat(details and concat("authorization_role=" and sender_role))
+    if has_identity == 0:
+        return "User [identity provenance unavailable: legacy turn; do not infer from the current speaker]"
+    return concat(label and concat(" [" and concat(details and "]")))
+
 # ---- Manual JSON Serializer ----
 define session_serialize with sess as Map and path as Str returning Int:
     set id_val to map_get_val(sess and "id")
@@ -138,7 +260,9 @@ define session_serialize with sess as Map and path as Str returning Int:
         set json_str to concat(json_str and f"      \"turn_id\": \"{session_json_escape(turn_val)}\",\n")
         set json_str to concat(json_str and f"      \"created_at\": \"{session_json_escape(created_val)}\",\n")
         set json_str to concat(json_str and f"      \"source_type\": \"{session_json_escape(source_type_val)}\",\n")
-        set json_str to concat(json_str and f"      \"source_id\": \"{session_json_escape(source_id_val)}\",\n")
+        set json_str to concat(json_str and f"      \"source_id\": \"{session_json_escape(source_id_val)}\"")
+        set json_str to concat(json_str and session_actor_json_fields(msg_map and ",\n" and "      "))
+        set json_str to concat(json_str and ",\n")
         set json_str to concat(json_str and f"      \"content_hash\": \"{session_json_escape(hash_val)}\"\n")
         if idx < m_len - 1:
             set json_str to concat(json_str and "    },\n")
@@ -239,6 +363,7 @@ define session_deserialize_json with content as Str returning Map:
                 set ok to map_insert(msg_map and "content_hash" and get_json_value(hash_node))
             else if c_node != 0:
                 set ok to map_insert(msg_map and "content_hash" and ep_sha256(get_json_value(c_node)))
+            set ok to session_load_actor_provenance(msg_map and item_node)
             set ok to append_list(msg_list and msg_map)
             set i to i + 1
     set ok to map_insert(sess and "messages" and msg_list)
@@ -649,7 +774,9 @@ define session_serialize_json_string with sess as Map returning Str:
         set item_str to concat(item_str and session_json_escape(source_type_val))
         set item_str to concat(item_str and "\",\"source_id\":\"")
         set item_str to concat(item_str and session_json_escape(source_id_val))
-        set item_str to concat(item_str and "\",\"content_hash\":\"")
+        set item_str to concat(item_str and "\"")
+        set item_str to concat(item_str and session_actor_json_fields(msg_map and "," and ""))
+        set item_str to concat(item_str and ",\"content_hash\":\"")
         set item_str to concat(item_str and session_json_escape(hash_val))
         set item_str to concat(item_str and "\"}")
         
@@ -753,7 +880,9 @@ define session_compress_active with mgr as Map and sess as Map and used_tokens a
         set json_str to concat(json_str and f"    \"turn_id\": \"{session_json_escape(turn_val)}\",\n")
         set json_str to concat(json_str and f"    \"created_at\": \"{session_json_escape(created_val)}\",\n")
         set json_str to concat(json_str and f"    \"source_type\": \"{session_json_escape(source_type_val)}\",\n")
-        set json_str to concat(json_str and f"    \"source_id\": \"{session_json_escape(source_id_val)}\",\n")
+        set json_str to concat(json_str and f"    \"source_id\": \"{session_json_escape(source_id_val)}\"")
+        set json_str to concat(json_str and session_actor_json_fields(msg_map and ",\n" and "    "))
+        set json_str to concat(json_str and ",\n")
         set json_str to concat(json_str and f"    \"content_hash\": \"{session_json_escape(hash_val)}\"\n")
         if idx < c_len - 1:
             set json_str to concat(json_str and "  },\n")
@@ -793,7 +922,7 @@ define session_compress_active with mgr as Map and sess as Map and used_tokens a
             set role_val to map_get_val(msg_map and "role")
             set content_val to continuity_cap(map_get_val(msg_map and "content") and 320)
             if role_val equals "user":
-                set summary_text to concat(summary_text and concat("User: " and concat(content_val and "\n")))
+                set summary_text to concat(summary_text and concat(session_message_speaker_label(msg_map) and concat(": " and concat(content_val and "\n"))))
             else:
                 set summary_text to concat(summary_text and concat("Echo: " and concat(content_val and "\n")))
             set i to i + 1

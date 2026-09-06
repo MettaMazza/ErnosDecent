@@ -58,16 +58,17 @@ define query_daemon_ipc with command as Str returning Str:
 # Phase A3: detached turns answer via a `final_reply` trace row instead of the socket.
 # Poll that row here — the web server is its OWN OS thread, so a blocking sleep only
 # stalls this connection, never the agent loop — and hand back the EXACT legacy payload
-# string every parser below already understands. 30-min cap.
+# string every parser below already understands. A live detached turn has no wall-clock
+# completion deadline; the durable terminal row, cancellation, or session end owns its
+# lifecycle. The 250ms sleep is only a polling interval.
 define web_wait_final_reply with sid as Str and turn_tag as Str returning Str:
-    set waited to 0
     # TURN CORRELATION: when the ack carried a turn id, only accept the row prefixed
     # "turn:<tag>," (strip it before returning) — otherwise a concurrent scheduler-job
     # turn in the same session gets delivered as this request's answer (the tick bug).
     set want to ""
     if string_length(turn_tag) > 0:
         set want to f"turn:{turn_tag},"
-    repeat while waited < 1800000:
+    repeat while 1 == 1:
         set db to storage_get_db()
         if db != 0:
             set es to string_replace(sid and "'" and "''")
@@ -87,8 +88,7 @@ define web_wait_final_reply with sid as Str and turn_tag as Str returning Str:
                         set content to substring(content and wlen and string_length(content) - wlen)
                 return content
         set ok to sleep_ms(250)
-        set waited to waited + 250
-    return "error:turn_timeout"
+    return "error:terminal_reply_loop_exited"
 
 # Normalize a daemon AI ack into the final legacy payload: detached acks are resolved by
 # waiting on THAT TURN's final_reply row (matched by the turn id in the ack); busy acks
@@ -607,11 +607,14 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     # on the session, so the tab stays Socratic across turns.
                     set mode_name to json_get_string(payload and "mode")
                     # E2: the WebUI is the authenticated local operator (the WS is
-                    # Origin/loopback-gated), so assert admin server-side as the FIRST
-                    # marker — role is locked before any [SYSTEM:] is parsed.
+                    # Origin/loopback-gated), so assert admin in the trusted prefix;
+                    # role is locked before any optional [SYSTEM:] marker is parsed.
                     # P7: platform tag — the agent knows this turn came from the WebUI
                     # (react/discord surface tools do not target a webui message).
-                    set ai_cmd to "AI INFER [ROLE:admin] [PLATFORM:webui] "
+                    # The local WebUI authenticates an admin capability, not a physical
+                    # person's name. Keep that distinction explicit so Echo never turns
+                    # "local admin" into an unsupported assumption that the speaker is Maria.
+                    set ai_cmd to "AI INFER [SENDER:Local WebUI operator] [ROLE:admin] [ACTOR_ID:local-webui-operator] [ACTOR_USERNAME:local-operator] [ACTOR_DISPLAY:Local WebUI operator] [ACTOR_TYPE:human] [ACTOR_IS_HOST:unknown] [PLATFORM:webui] "
                     if string_length(model_name) > 0:
                         set ai_cmd to concat(ai_cmd and "[MODEL:")
                         set ai_cmd to concat(ai_cmd and model_name)
@@ -786,8 +789,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                     # Synthesise the given text to a WAV (Kokoro, voice bm_fable @1.15x)
                     # and reply with a URL the browser fetches via GET /tts/<file>.wav.
                     set tts_text to json_get_string(payload and "text")
+                    set tts_request_id to json_get_string(payload and "request_id")
                     if string_length(tts_text) == 0:
-                        ws_send_text(client_fd and "{\"type\":\"tts_error\",\"error\":\"empty text\"}")
+                        ws_send_text(client_fd and concat("{\"type\":\"tts_error\",\"request_id\":\"" and concat(escape_json_string(tts_request_id) and "\",\"error\":\"empty text\"}")))
                     else:
                         set tts_name to tts_filename_for(tts_text)
                         set tts_path to concat("decent_web/tts/" and tts_name)
@@ -796,9 +800,9 @@ define websocket_session_loop with client_fd as Int and require_token as Int ret
                         if file_exists(tts_path) == 0:
                             set tts_rc to tts_speak(tts_text and tts_path)
                         if tts_rc == 0 and also file_exists(tts_path) == 1:
-                            ws_send_text(client_fd and concat("{\"type\":\"tts_ready\",\"url\":\"" and concat(escape_json_string(tts_url) and "\"}")))
+                            ws_send_text(client_fd and concat("{\"type\":\"tts_ready\",\"request_id\":\"" and concat(escape_json_string(tts_request_id) and concat("\",\"url\":\"" and concat(escape_json_string(tts_url) and "\"}")))))
                         else:
-                            ws_send_text(client_fd and concat("{\"type\":\"tts_error\",\"error\":\"" and concat(escape_json_string(concat("TTS failed (rc=" and concat(int_to_string(tts_rc) and ")"))) and "\"}")))
+                            ws_send_text(client_fd and concat("{\"type\":\"tts_error\",\"request_id\":\"" and concat(escape_json_string(tts_request_id) and concat("\",\"error\":\"" and concat(escape_json_string(concat("TTS failed (rc=" and concat(int_to_string(tts_rc) and ")"))) and "\"}")))))
                 else if msg_type equals "subagent_whisper":
                     # Send mid-turn guidance to a running sub-agent via trace_whispers.
                     # The sub-agent's react_drain_whispers picks it up on its next turn.

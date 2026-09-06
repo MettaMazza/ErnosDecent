@@ -1,0 +1,331 @@
+# ErnosDecent -- transactional reply delivery regression suite
+
+import "sql"
+import "fs"
+import "string"
+import "./storage"
+import "./decent_agent/trace"
+import "./decent_id/keys"
+
+set DELIVERY_TESTS_PASSED to 0
+set DELIVERY_TESTS_FAILED to 0
+
+define delivery_expect with name as Str and condition as Int returning Int:
+    if condition == 1:
+        display concat("  PASS: " and name)
+        set DELIVERY_TESTS_PASSED to DELIVERY_TESTS_PASSED + 1
+    else:
+        display concat("  FAIL: " and name)
+        set DELIVERY_TESTS_FAILED to DELIVERY_TESTS_FAILED + 1
+        return 0
+    return 1
+
+define delivery_scalar with db as Int and query as Str returning Str:
+    set rows to sql_query(db and query)
+    if length_list(rows) == 0:
+        return ""
+    set row to get_list(rows and 0)
+    return get_list(row and 0)
+
+define main returning Int:
+    display "==================================================="
+    display "  Transactional Delivery Outbox Regression Suite"
+    display "==================================================="
+
+    set test_dir to concat("/tmp/ernos_delivery_outbox_" and int_to_string(ep_time_now_ms()))
+    set init_rc to storage_init(test_dir)
+    delivery_expect("storage initializes delivery schema" and init_rc == STORAGE_ERR_NONE)
+    if init_rc != STORAGE_ERR_NONE:
+        exit_program(1)
+    set db to storage_get_db()
+    # Start from the pre-lease schema to prove in-place production migration.
+    set legacy_schema_rc to sql_execute(db and "CREATE TABLE trace_events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, event_type TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0);")
+    delivery_expect("legacy trace schema fixture is created" and legacy_schema_rc == 0)
+    set legacy_delete_schema_rc to sql_execute(db and "CREATE TABLE trace_pending_deletes (id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL, delete_after INTEGER NOT NULL, created_at INTEGER NOT NULL DEFAULT 0);")
+    delivery_expect("legacy pending-delete schema fixture is created" and legacy_delete_schema_rc == 0)
+    set legacy_whisper_schema_rc to sql_execute(db and "CREATE TABLE trace_whispers (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0);")
+    delivery_expect("legacy whisper schema fixture is created" and legacy_whisper_schema_rc == 0)
+    set trace_rc to trace_init(db)
+    delivery_expect("legacy trace schema migrates to leased delivery" and trace_rc == 0)
+    delivery_expect("legacy whisper schema migrates to leased receipt" and delivery_scalar(db and "SELECT COUNT(*) FROM pragma_table_info('trace_whispers') WHERE name IN ('claim_owner','claim_token','lease_until','attempts','last_error');") equals "5")
+
+    # User guidance is claimed without consumption. Only a provider-response ACK
+    # removes rows; failed requests release the exact token for retry.
+    set rc to sql_execute(db and f"INSERT INTO trace_whispers (session_id,content,created_at) VALUES ('whisper-session','first',{ep_time_now_sec()}),('whisper-session','second',{ep_time_now_sec()});")
+    delivery_expect("whisper fixture persists" and rc == 0)
+    set whisper_claim to trace_claim_whispers(db and "whisper-session" and "react-test")
+    set whisper_token to map_get_val(whisper_claim and "token")
+    delivery_expect("provider turn atomically claims all pending whispers" and map_get_val(whisper_claim and "ok") == 1 and also map_get_val(whisper_claim and "found") == 1 and also map_get_val(whisper_claim and "count") == 2 and also string_contains(map_get_val(whisper_claim and "content") and "first") == 1 and also string_contains(map_get_val(whisper_claim and "content") and "second") == 1)
+    delivery_expect("claiming guidance does not mark it consumed" and delivery_scalar(db and "SELECT COUNT(*) FROM trace_whispers WHERE session_id='whisper-session';") equals "2")
+    set competing_whisper_claim to trace_claim_whispers(db and "whisper-session" and "competing-react")
+    delivery_expect("live whisper claim is exclusive" and map_get_val(competing_whisper_claim and "ok") == 1 and also map_get_val(competing_whisper_claim and "found") == 0)
+    set wrong_whisper_ack to trace_ack_whispers(db and whisper_token and 3)
+    delivery_expect("wrong whisper receipt count cannot consume a partial batch" and wrong_whisper_ack != 0 and also delivery_scalar(db and "SELECT COUNT(*) FROM trace_whispers WHERE session_id='whisper-session';") equals "2")
+    set whisper_release to trace_release_whispers(db and whisper_token and 2 and "provider_request_failed")
+    delivery_expect("provider failure releases the exact whisper claim" and whisper_release == 0 and also delivery_scalar(db and "SELECT COUNT(*) FROM trace_whispers WHERE session_id='whisper-session' AND claim_token='';") equals "2")
+    set retry_whisper_claim to trace_claim_whispers(db and "whisper-session" and "react-retry")
+    set retry_whisper_token to map_get_val(retry_whisper_claim and "token")
+    delivery_expect("released whispers are retryable under a new token" and map_get_val(retry_whisper_claim and "count") == 2 and also (retry_whisper_token equals whisper_token) == 0)
+    set whisper_ack to trace_ack_whispers(db and retry_whisper_token and 2)
+    delivery_expect("provider response ACK is the only whisper consumption transition" and whisper_ack == 0 and also delivery_scalar(db and "SELECT COUNT(*) FROM trace_whispers WHERE session_id='whisper-session';") equals "0")
+    set broken_trace_query to trace_sql_query_checked(db and "SELECT missing_column FROM trace_whispers;")
+    delivery_expect("checked trace query distinguishes SQL failure from no rows" and map_get_val(broken_trace_query and "ok") == 0 and also map_get_val(broken_trace_query and "rc") != 0)
+    set broken_storage_query to storage_sql_query_checked("SELECT missing_column FROM delivery_turns;")
+    delivery_expect("checked storage query distinguishes SQL failure from no rows" and map_get_val(broken_storage_query and "ok") == 0 and also map_get_val(broken_storage_query and "rc") != 0)
+
+    # Publish is a state transition and a lost-result retry is idempotent.
+    set turn1 to "turn_111111111111111111111111111111111111111111111111"
+    set rc to storage_delivery_turn_create(turn1 and "session-a" and "discord" and "123|456|789")
+    delivery_expect("durable turn is created" and rc == STORAGE_ERR_NONE)
+    set rc to storage_delivery_publish(turn1 and "final" and "ai:ok|||RESPONSE|||answer-one" and 1)
+    delivery_expect("final stage publishes" and rc == STORAGE_ERR_NONE)
+    set retry_rc to storage_delivery_publish(turn1 and "final" and "ai:ok|||RESPONSE|||answer-one" and 1)
+    delivery_expect("publish retry after committed success is accepted" and retry_rc == STORAGE_ERR_NONE)
+    set turn1_escaped to string_replace(turn1 and "'" and "''")
+    set row_count to delivery_scalar(db and f"SELECT COUNT(*) FROM delivery_outbox WHERE turn_id='{turn1_escaped}';")
+    delivery_expect("publish retry does not append a duplicate stage" and string_to_int(row_count) == 1)
+    delivery_expect("publish atomically moves turn to awaiting_delivery" and storage_delivery_turn_state(turn1) equals "awaiting_delivery")
+
+    # Reproduce the live row-21330 failure fixture: generic trace polling must neither
+    # return nor consume a legacy final_reply row.
+    set now to ep_time_now_sec()
+    set ok to sql_execute(db and f"INSERT INTO trace_events (id,session_id,event_type,content,created_at,sent) VALUES (21330,'session-a','final_reply','legacy-reply-must-not-be-consumed',{now},0);")
+    set ok to trace_emit(db and "session-a" and "thinking" and "ordinary-trace-event")
+    set polled to trace_poll(db and "session-a")
+    delivery_expect("generic trace poll still returns transparency events" and string_contains(polled and "ordinary-trace-event") == 1)
+    delivery_expect("trace poll returns an ownership token" and string_contains(polled and "claim_token") == 1)
+    delivery_expect("generic trace poll never returns reply content" and string_contains(polled and "legacy-reply-must-not-be-consumed") == 0)
+    set ordinary_id_text to delivery_scalar(db and "SELECT id FROM trace_events WHERE content='ordinary-trace-event';")
+    set ordinary_id to string_to_int(ordinary_id_text)
+    set ordinary_sent to delivery_scalar(db and f"SELECT sent FROM trace_events WHERE id={ordinary_id};")
+    delivery_expect("polling does not mark a trace row sent" and string_to_int(ordinary_sent) == 0)
+    set second_poll to trace_poll(db and "session-a")
+    delivery_expect("a live trace lease is exclusive" and second_poll equals "[]")
+    set trace_token to delivery_scalar(db and f"SELECT claim_token FROM trace_events WHERE id={ordinary_id};")
+    set bad_trace_ack to trace_ack(db and ordinary_id and "wrong-trace-token")
+    delivery_expect("stale trace token cannot ACK" and bad_trace_ack != 0)
+    set trace_release_rc to trace_release(db and ordinary_id and trace_token)
+    delivery_expect("failed trace send releases its exact claim" and trace_release_rc == 0)
+    set trace_failure to delivery_scalar(db and f"SELECT last_error FROM trace_events WHERE id={ordinary_id};")
+    delivery_expect("trace release records the surface failure" and trace_failure equals "surface_send_failed")
+    set ok to sql_execute(db and f"UPDATE trace_events SET available_at=0 WHERE id={ordinary_id};")
+    set repolled to trace_poll(db and "session-a")
+    delivery_expect("released trace row is retryable" and string_contains(repolled and "ordinary-trace-event") == 1)
+    set retry_trace_token to delivery_scalar(db and f"SELECT claim_token FROM trace_events WHERE id={ordinary_id};")
+    set trace_ack_rc to trace_ack(db and ordinary_id and retry_trace_token)
+    delivery_expect("confirmed trace surface write can ACK" and trace_ack_rc == 0)
+    set ordinary_sent to delivery_scalar(db and f"SELECT sent FROM trace_events WHERE id={ordinary_id};")
+    delivery_expect("trace ACK is the only transition to sent" and string_to_int(ordinary_sent) == 1)
+    set trace_cleanup_rc to trace_cleanup(db and "session-a")
+    delivery_expect("trace cleanup reports SQL success" and trace_cleanup_rc == 0)
+    set ordinary_count to delivery_scalar(db and f"SELECT COUNT(*) FROM trace_events WHERE id={ordinary_id};")
+    delivery_expect("trace cleanup removes acknowledged rows" and string_to_int(ordinary_count) == 0)
+    set legacy_sent to delivery_scalar(db and "SELECT sent FROM trace_events WHERE id=21330;")
+    delivery_expect("legacy final_reply fixture remains unconsumed" and string_to_int(legacy_sent) == 0)
+    set legacy_count to delivery_scalar(db and "SELECT COUNT(*) FROM trace_events WHERE id=21330;")
+    delivery_expect("trace cleanup preserves unacknowledged rows for recovery" and string_to_int(legacy_count) == 1)
+
+    # Pending Discord thread deletion uses the same claim/confirm/retry contract.
+    set delete_schedule_rc to trace_schedule_delete(db and "discord-thread-1" and 0)
+    delivery_expect("pending thread deletion is durably scheduled" and delete_schedule_rc == 0)
+    set delete_id to string_to_int(delivery_scalar(db and "SELECT id FROM trace_pending_deletes WHERE thread_id='discord-thread-1';"))
+    set delete_poll to trace_get_pending_deletes(db)
+    delivery_expect("due thread deletion is claimed" and string_contains(delete_poll and "discord-thread-1") == 1)
+    delivery_expect("pending deletion poll returns claim token" and string_contains(delete_poll and "claim_token") == 1)
+    set delete_token to delivery_scalar(db and f"SELECT claim_token FROM trace_pending_deletes WHERE id={delete_id};")
+    set delete_poll_2 to trace_get_pending_deletes(db)
+    delivery_expect("live pending-delete lease is exclusive" and delete_poll_2 equals "[]")
+    set wrong_delete_ack to trace_complete_delete(db and delete_id and "wrong-delete-token")
+    delivery_expect("wrong pending-delete token cannot complete" and wrong_delete_ack != 0)
+    set delete_release_rc to trace_release_delete(db and delete_id and delete_token and "discord_delete_failed" and 0)
+    delivery_expect("failed Discord deletion releases queue claim" and delete_release_rc == 0)
+    set delete_error to delivery_scalar(db and f"SELECT last_error FROM trace_pending_deletes WHERE id={delete_id};")
+    delivery_expect("delete failure remains explicitly recorded" and delete_error equals "discord_delete_failed")
+    set delete_retry_poll to trace_get_pending_deletes(db)
+    delivery_expect("failed Discord deletion remains retryable" and string_contains(delete_retry_poll and "discord-thread-1") == 1)
+    set delete_retry_token to delivery_scalar(db and f"SELECT claim_token FROM trace_pending_deletes WHERE id={delete_id};")
+    set old_delete_ack to trace_complete_delete(db and delete_id and delete_token)
+    delivery_expect("released delete token stays stale after reclaim" and old_delete_ack != 0)
+    set delete_ack_rc to trace_complete_delete(db and delete_id and delete_retry_token)
+    delivery_expect("confirmed Discord deletion removes exact claimed row" and delete_ack_rc == 0)
+    set delete_count to delivery_scalar(db and f"SELECT COUNT(*) FROM trace_pending_deletes WHERE id={delete_id};")
+    delivery_expect("completed pending deletion leaves no queue row" and string_to_int(delete_count) == 0)
+
+    set rc to trace_schedule_delete(db and "discord-thread-2" and 0)
+    set delete2_id to string_to_int(delivery_scalar(db and "SELECT id FROM trace_pending_deletes WHERE thread_id='discord-thread-2';"))
+    set first_delete_claim_json to trace_get_pending_deletes(db)
+    set first_delete_token to delivery_scalar(db and f"SELECT claim_token FROM trace_pending_deletes WHERE id={delete2_id};")
+    set rc to sql_execute(db and f"UPDATE trace_pending_deletes SET lease_until={now - 1} WHERE id={delete2_id};")
+    set recovered_delete_claim_json to trace_get_pending_deletes(db)
+    set recovered_delete_token to delivery_scalar(db and f"SELECT claim_token FROM trace_pending_deletes WHERE id={delete2_id};")
+    delivery_expect("expired pending-delete lease is recoverable" and recovered_delete_token != first_delete_token)
+    set expired_delete_ack to trace_complete_delete(db and delete2_id and first_delete_token)
+    delivery_expect("expired pending-delete owner cannot ACK" and expired_delete_ack != 0)
+    set rc to trace_complete_delete(db and delete2_id and recovered_delete_token)
+    delivery_expect("recovery owner completes pending deletion" and rc == 0)
+
+    # Claim is exclusive and never marks delivered. Wrong tokens cannot ACK.
+    set claim1 to storage_delivery_claim(turn1 and "discord" and "bridge-a" and "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and 120)
+    delivery_expect("first exact-turn claim succeeds" and map_get_val(claim1 and "found") == 1)
+    set outbox_state to delivery_scalar(db and f"SELECT state FROM delivery_outbox WHERE turn_id='{turn1_escaped}';")
+    delivery_expect("claimed is not delivered" and outbox_state equals "claimed")
+    set claim2 to storage_delivery_claim(turn1 and "discord" and "bridge-b" and "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" and 120)
+    delivery_expect("second consumer cannot claim a live lease" and map_get_val(claim2 and "found") == 0)
+    set delivery_id to map_get_val(claim1 and "id")
+    set empty_receipt_ack to storage_delivery_ack(delivery_id and map_get_val(claim1 and "claim_token") and "")
+    set state_after_empty_receipt to delivery_scalar(db and f"SELECT state FROM delivery_outbox WHERE id={delivery_id};")
+    delivery_expect("empty external receipt cannot mark a claimed row delivered" and empty_receipt_ack != STORAGE_ERR_NONE and also (state_after_empty_receipt equals "claimed"))
+    set wrong_ack to storage_delivery_ack(delivery_id and "wrong-token" and "discord:wrong")
+    delivery_expect("wrong claim token cannot mark delivered" and wrong_ack != STORAGE_ERR_NONE)
+    set release_rc to storage_delivery_release(delivery_id and map_get_val(claim1 and "claim_token") and "simulated_send_failure" and 0)
+    delivery_expect("failed external send releases claim" and release_rc == STORAGE_ERR_NONE)
+    set released_state to delivery_scalar(db and f"SELECT state FROM delivery_outbox WHERE id={delivery_id};")
+    delivery_expect("released row returns to ready" and released_state equals "ready")
+    set claim3 to storage_delivery_claim(turn1 and "discord" and "bridge-c" and "cccccccccccccccccccccccccccccccc" and 120)
+    set ack_rc to storage_delivery_ack(map_get_val(claim3 and "id") and map_get_val(claim3 and "claim_token") and "discord:confirmed-1")
+    delivery_expect("confirmed external send can ACK" and ack_rc == STORAGE_ERR_NONE)
+    delivery_expect("terminal ACK completes durable turn" and storage_delivery_turn_state(turn1) equals "completed")
+
+    # The same logical payload may legitimately recur in a later delivered stage.
+    set turn2 to "turn_222222222222222222222222222222222222222222222222"
+    set rc to storage_delivery_turn_create(turn2 and "session-b" and "webui" and "session-b")
+    set rc to storage_delivery_publish(turn2 and "approval" and "ai:pending_approval,tool:same,summary:same" and 0)
+    set gate1 to storage_delivery_claim(turn2 and "webui" and "web-a" and "dddddddddddddddddddddddddddddddd" and 120)
+    set rc to storage_delivery_ack(map_get_val(gate1 and "id") and map_get_val(gate1 and "claim_token") and "websocket:confirmed-1")
+    delivery_expect("nonterminal ACK moves turn to awaiting_input" and storage_delivery_turn_state(turn2) equals "awaiting_input")
+    set rc to storage_delivery_turn_mark_running(turn2)
+    set rc to storage_delivery_publish(turn2 and "approval" and "ai:pending_approval,tool:same,summary:same" and 0)
+    set turn2_escaped to string_replace(turn2 and "'" and "''")
+    set stages to delivery_scalar(db and f"SELECT COUNT(*) FROM delivery_outbox WHERE turn_id='{turn2_escaped}';")
+    delivery_expect("identical payload after delivered resume is a new stage" and string_to_int(stages) == 2)
+
+    # Cancelling atomically invalidates a stale ready/claimed gate before publishing
+    # the terminal cancellation stage.
+    set turn3 to "turn_333333333333333333333333333333333333333333333333"
+    set rc to storage_delivery_turn_create(turn3 and "session-c" and "discord" and "123|456|789")
+    set rc to storage_delivery_publish(turn3 and "clarification" and "ai:clarify,questions:q" and 0)
+    set stale_claim to storage_delivery_claim(turn3 and "discord" and "bridge-a" and "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" and 120)
+    set stale_id to map_get_val(stale_claim and "id")
+    set cancel_rc to storage_delivery_turn_mark_cancelling(turn3)
+    delivery_expect("turn cancellation transaction succeeds" and cancel_rc == STORAGE_ERR_NONE)
+    set stale_state to delivery_scalar(db and f"SELECT state FROM delivery_outbox WHERE id={stale_id};")
+    delivery_expect("stale claimed gate becomes cancelled" and stale_state equals "cancelled")
+    set stale_ack to storage_delivery_ack(stale_id and map_get_val(stale_claim and "claim_token") and "discord:too-late")
+    delivery_expect("cancelled stale claim can no longer ACK" and stale_ack != STORAGE_ERR_NONE)
+    set rc to storage_delivery_publish(turn3 and "cancelled" and "ai:cancelled,response:Stopped by user." and 1)
+    delivery_expect("terminal cancellation publishes after stale gate cancellation" and rc == STORAGE_ERR_NONE)
+    set cancel_delivery to storage_delivery_claim(turn3 and "discord" and "bridge-b" and "ffffffffffffffffffffffffffffffff" and 120)
+    set rc to storage_delivery_ack(map_get_val(cancel_delivery and "id") and map_get_val(cancel_delivery and "claim_token") and "discord:cancel-confirmed")
+    delivery_expect("confirmed cancellation delivery marks turn cancelled" and storage_delivery_turn_state(turn3) equals "cancelled")
+
+    # Expired leases are recoverable, and the stale owner cannot ACK after reclaim.
+    set turn4 to "turn_444444444444444444444444444444444444444444444444"
+    set rc to storage_delivery_turn_create(turn4 and "session-d" and "discord" and "123|456|789")
+    set rc to storage_delivery_publish(turn4 and "final" and "ai:ok|||RESPONSE|||recover-me" and 1)
+    set old_claim to storage_delivery_claim(turn4 and "discord" and "old-process" and "11111111111111112222222222222222" and 5)
+    set old_id to map_get_val(old_claim and "id")
+    set ok to sql_execute(db and f"UPDATE delivery_outbox SET lease_until={now - 1} WHERE id={old_id};")
+    set recovered_claim to storage_delivery_claim(turn4 and "discord" and "new-process" and "33333333333333334444444444444444" and 120)
+    delivery_expect("restart consumer reclaims expired lease" and map_get_val(recovered_claim and "found") == 1)
+    set old_ack to storage_delivery_ack(old_id and map_get_val(old_claim and "claim_token") and "discord:stale")
+    delivery_expect("expired owner token is invalid after reclaim" and old_ack != STORAGE_ERR_NONE)
+    set rc to storage_delivery_ack(old_id and map_get_val(recovered_claim and "claim_token") and "discord:recovered")
+    delivery_expect("restart consumer ACKs recovered delivery" and rc == STORAGE_ERR_NONE)
+    set attempts to delivery_scalar(db and f"SELECT attempts FROM delivery_outbox WHERE id={old_id};")
+    delivery_expect("recovery records both claim attempts" and string_to_int(attempts) == 2)
+
+    # Generic IPC consumers use the identical lease/token contract. Reading a
+    # claimed payload does not itself mark it delivered; only the client's later,
+    # exact-token acknowledgement can do so.
+    set turn5 to "turn_555555555555555555555555555555555555555555555555"
+    set rc to storage_delivery_turn_create(turn5 and "session-e" and "ipc" and "ipc")
+    delivery_expect("IPC durable turn is created" and rc == STORAGE_ERR_NONE)
+    set rc to storage_delivery_publish(turn5 and "final" and "ai:ok|||RESPONSE|||ipc-answer" and 1)
+    delivery_expect("IPC final reply enters the durable outbox" and rc == STORAGE_ERR_NONE)
+    set ipc_claim1 to storage_delivery_claim(turn5 and "ipc" and "ipc:first-reader" and "55555555555555556666666666666666" and 120)
+    delivery_expect("IPC client claims its exact accepted turn" and map_get_val(ipc_claim1 and "found") == 1)
+    set ipc_id to map_get_val(ipc_claim1 and "id")
+    set ipc_state to delivery_scalar(db and f"SELECT state FROM delivery_outbox WHERE id={ipc_id};")
+    set ipc_delivered_at to delivery_scalar(db and f"SELECT delivered_at FROM delivery_outbox WHERE id={ipc_id};")
+    delivery_expect("receiving IPC claim bytes is not a delivery ACK" and ipc_state equals "claimed" and also string_to_int(ipc_delivered_at) == 0)
+    set ipc_wrong_ack to storage_delivery_ack(ipc_id and "not-the-reader-token" and "ipc:false")
+    delivery_expect("unrelated IPC client cannot ACK a received row" and ipc_wrong_ack != STORAGE_ERR_NONE)
+    set ipc_release to storage_delivery_release(ipc_id and map_get_val(ipc_claim1 and "claim_token") and "ipc_receive_failed" and 0)
+    delivery_expect("IPC receive failure releases without marking delivered" and ipc_release == STORAGE_ERR_NONE)
+    set ipc_claim2 to storage_delivery_claim(turn5 and "ipc" and "ipc:retry-reader" and "77777777777777778888888888888888" and 120)
+    set ipc_stale_ack to storage_delivery_ack(ipc_id and map_get_val(ipc_claim1 and "claim_token") and "ipc:stale")
+    delivery_expect("released IPC token remains stale after reclaim" and ipc_stale_ack != STORAGE_ERR_NONE)
+    set ipc_ack to storage_delivery_ack(ipc_id and map_get_val(ipc_claim2 and "claim_token") and "ipc:test-confirmed")
+    delivery_expect("IPC client confirmation completes its exact turn" and ipc_ack == STORAGE_ERR_NONE and also storage_delivery_turn_state(turn5) equals "completed")
+
+    # Independent background messages use ordinary one-row delivery turns. Their
+    # exact route is copied from the initiating foreground turn and queue insertion
+    # remains observably distinct from an external receipt.
+    set route5 to storage_delivery_turn_route(turn5)
+    delivery_expect("foreground route lookup returns immutable destination" and map_get_val(route5 and "found") == 1 and also (map_get_val(route5 and "session_id") equals "session-e") and also (map_get_val(route5 and "surface") equals "ipc") and also (map_get_val(route5 and "destination") equals "ipc"))
+    delivery_expect("terminal publication is independently queryable" and storage_delivery_terminal_published(turn5) == 1)
+    set background_turn to "background_666666666666666666666666666666666666666666666666"
+    set independent_rc to storage_delivery_publish_independent(background_turn and map_get_val(route5 and "session_id") and map_get_val(route5 and "surface") and map_get_val(route5 and "destination") and "progress" and "validation block one complete")
+    delivery_expect("independent progress atomically creates and publishes" and independent_rc == STORAGE_ERR_NONE)
+    set independent_retry_rc to storage_delivery_publish_independent(background_turn and "session-e" and "ipc" and "ipc" and "progress" and "validation block one complete")
+    delivery_expect("exact independent publication replay is idempotent" and independent_retry_rc == STORAGE_ERR_NONE)
+    set independent_conflict_rc to storage_delivery_publish_independent(background_turn and "session-e" and "ipc" and "ipc" and "progress" and "different payload")
+    delivery_expect("independent turn id cannot be reused for different content" and independent_conflict_rc == STORAGE_ERR_CONFLICT)
+    set queued_status to storage_delivery_exact_status(background_turn)
+    delivery_expect("queue insertion is not described as external delivery" and map_get_val(queued_status and "found") == 1 and also (map_get_val(queued_status and "state") equals "ready") and also string_length(map_get_val(queued_status and "external_message_id")) == 0)
+    set background_claim to storage_delivery_claim(background_turn and "ipc" and "background-reader" and "88888888888888889999999999999999" and 120)
+    set background_ack to storage_delivery_ack(map_get_val(background_claim and "id") and map_get_val(background_claim and "claim_token") and "ipc:background-confirmed")
+    set delivered_status to storage_delivery_exact_status(background_turn)
+    delivery_expect("independent row records only a confirmed external receipt" and background_ack == STORAGE_ERR_NONE and also (map_get_val(delivered_status and "state") equals "delivered") and also (map_get_val(delivered_status and "external_message_id") equals "ipc:background-confirmed"))
+
+    # The built-in exhaustive validator has one durable, cancellable coordinator
+    # record. Its partial unique index releases only on an exact terminal transition.
+    set job1 to "validation_777777777777777777777777777777777777777777777777"
+    set job_deadline to ep_time_now_sec() + 3600
+    set job_create to storage_validation_job_create(job1 and turn5 and "session-e" and "ipc" and "ipc" and "fixture-v1" and 14 and job_deadline)
+    delivery_expect("validation job reserves the single active slot" and job_create == STORAGE_ERR_NONE)
+    set job_loaded to storage_validation_job_load(job1)
+    delivery_expect("validation job load preserves route and deadline" and map_get_val(job_loaded and "found") == 1 and also (map_get_val(job_loaded and "status") equals "pending_parent") and also map_get_val(job_loaded and "job_deadline_at") == job_deadline)
+    set conflicting_job to "validation_888888888888888888888888888888888888888888888888"
+    set conflict_create to storage_validation_job_create(conflicting_job and turn5 and "session-e" and "ipc" and "ipc" and "fixture-v1" and 14 and job_deadline)
+    delivery_expect("a second active validation job is rejected" and conflict_create == STORAGE_ERR_CONFLICT)
+    set running_rc to storage_validation_job_mark_running(job1 and background_turn)
+    delivery_expect("validation starts only after parent terminal publication" and running_rc == STORAGE_ERR_NONE)
+    set checkpoint_rc to storage_validation_job_checkpoint(job1 and 3 and 2 and 1 and 0 and "agent_3" and ep_time_now_sec() and ep_time_now_sec() + 60 and "report-partial")
+    delivery_expect("validation checkpoint durably records progress evidence" and checkpoint_rc == STORAGE_ERR_NONE)
+    set cancel_result to storage_validation_request_cancel_for_session("session-e")
+    delivery_expect("session cancellation targets the exact durable validation job" and map_get_val(cancel_result and "found") == 1 and also (map_get_val(cancel_result and "job_id") equals job1) and also (map_get_val(cancel_result and "status") equals "cancelling"))
+    set active_job to storage_validation_job_load_active()
+    delivery_expect("coordinator observes persisted cancelling state" and map_get_val(active_job and "found") == 1 and also (map_get_val(active_job and "status") equals "cancelling"))
+    set finish_rc to storage_validation_job_finish(job1 and "cancelling" and "cancelled" and 3 and 2 and 1 and 0 and "report-partial" and "cancelled_by_user")
+    delivery_expect("exact terminal transition releases validation active slot" and finish_rc == STORAGE_ERR_NONE and also map_get_val(storage_validation_job_load_active() and "found") == 0)
+    set second_create to storage_validation_job_create(conflicting_job and turn5 and "session-e" and "ipc" and "ipc" and "fixture-v1" and 14 and job_deadline)
+    delivery_expect("a later validation job can reserve the released slot" and second_create == STORAGE_ERR_NONE)
+    set second_running to storage_validation_job_mark_running(conflicting_job and background_turn)
+    set second_finish to storage_validation_job_finish(conflicting_job and "running" and "completed" and 14 and 14 and 0 and 0 and "validation-report.md" and "")
+    delivery_expect("complete validation requires classified blocks and a report" and second_running == STORAGE_ERR_NONE and also second_finish == STORAGE_ERR_NONE)
+
+    set random_a to keys_random_hex(24)
+    set random_b to keys_random_hex(24)
+    delivery_expect("turn entropy source returns 192 bits" and string_length(random_a) == 48)
+    delivery_expect("successive random turn correlations differ" and random_a != random_b)
+
+    # A malformed pre-existing cancellation table must fail schema initialization;
+    # CREATE TABLE IF NOT EXISTS alone is not proof that the required column exists.
+    set rc to sql_execute(db and "DROP TABLE trace_cancellations;")
+    set rc to sql_execute(db and "CREATE TABLE trace_cancellations (wrong_column TEXT PRIMARY KEY);")
+    set malformed_cancel_schema to trace_init(db)
+    delivery_expect("trace initialization rejects malformed cancellation schema" and malformed_cancel_schema != 0)
+    set rc to sql_execute(db and "DROP TABLE trace_cancellations;")
+    set repaired_cancel_schema to trace_init(db)
+    delivery_expect("trace initialization recreates a valid cancellation schema" and repaired_cancel_schema == 0)
+
+    set close_rc to storage_close()
+    delivery_expect("storage close propagates success" and close_rc == STORAGE_ERR_NONE)
+
+    display ""
+    display f"Delivery tests passed: {DELIVERY_TESTS_PASSED}"
+    display f"Delivery tests failed: {DELIVERY_TESTS_FAILED}"
+    if DELIVERY_TESTS_FAILED > 0:
+        exit_program(1)
+    exit_program(0)

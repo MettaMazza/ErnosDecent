@@ -12,6 +12,8 @@ The Platform Adapters sub-tab allows you to enable or disable messaging gateways
 - **Toggle Switch**: Turns the Discord relay gateway online or offline.
 - **Bot Token**: The OAuth2 bot token generated via the Discord Developer Portal (under Applications -> Bot -> Token). It grants the node access to view and respond to messages.
 - **Channel IDs (comma separated)**: A comma-separated list of numeric Discord Channel IDs. The node only listens to and relays messages in these specific channels.
+- **Admin IDs / Admin Role ID**: Grant node authorization. Authorization does not identify the person using the account.
+- **Host ID / Host Name**: `discord.host_id` maps one stable Discord account to Echo's named host/steward (normally Maria); `discord.host_name` supplies that name. When `host_id` is absent, only the first legacy `admin_id` is treated as the host for backward compatibility. Other admins remain separately identified users.
 - **Save Discord Config Button**: Saves the current Discord configuration values and reloads the Discord gateway adapter.
 
 ### WhatsApp Adapter

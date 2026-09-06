@@ -132,6 +132,29 @@ define main:
         display "  FAIL: ReAct parser did not detect action block"
         set t2_ok to 0
 
+    set envelope_map to react_parse_action_envelope("{\"tool_name\":\"codebase_read\",\"arguments\":[\"decent_agent/react_loop.ep\",1,500]}")
+    set envelope_extra to react_parse_action_envelope("{\"tool_name\":\"codebase_read\",\"arguments\":[],\"prose\":\"not allowed\"}")
+    set envelope_prose to react_parse_action_envelope("I will read it. {\"tool_name\":\"codebase_read\",\"arguments\":[]}")
+    set envelope_named to react_parse_action_envelope("{\"tool_name\":\"codebase_read_range\",\"arguments\":[{\"path\":\"decent_agent/tools.ep\",\"start_line\":1,\"end_line\":5}]}")
+    set envelope_nested_positional to react_parse_action_envelope("{\"tool_name\":\"codebase_read_range\",\"arguments\":[[\"decent_agent/tools.ep\",501,1000]]}")
+    set envelope_deep_nested to react_parse_action_envelope("{\"tool_name\":\"codebase_read_range\",\"arguments\":[[[\"decent_agent/tools.ep\",501,1000]]]}")
+    if map_get_val(envelope_map and "found") == 1 and also map_get_val(envelope_map and "tool_name") equals "codebase_read" and also map_get_val(envelope_map and "args_str") equals "[\"decent_agent/react_loop.ep\",1,500]" and also map_get_val(envelope_nested_positional and "found") == 1 and also map_get_val(envelope_nested_positional and "args_str") equals "[\"decent_agent/tools.ep\",501,1000]" and also map_get_val(envelope_extra and "found") == 0 and also map_get_val(envelope_prose and "found") == 0 and also map_get_val(envelope_named and "found") == 0 and also map_get_val(envelope_deep_nested and "found") == 0:
+        display "  Typed action envelope canonicalizes one positional wrapper and rejects prose, extra keys, objects, and deeper nesting"
+    else:
+        display "  FAIL: Typed action envelope boundary is not exact"
+        set t2_ok to 0
+    if react_schema_declares_zero_args("self_extension_status" and "- self_extension_status([]) -> Str\n- codebase_list([root?: Str]) -> Str") == 1 and also react_schema_declares_zero_args("codebase_list" and "- self_extension_status([]) -> Str\n- codebase_list([root?: Str]) -> Str") == 0:
+        display "  Exact zero-argument declarations support bounded empty-placeholder normalization"
+    else:
+        display "  FAIL: zero-argument normalization was not bound to the exact registered schema"
+        set t2_ok to 0
+    set action_schema to llm_action_response_schema()
+    if string_contains(action_schema and "ernos_action_envelope") == 1 and also string_contains(action_schema and "\"required\":[\"tool_name\",\"arguments\"]") == 1 and also string_contains(action_schema and "\"additionalProperties\":false") == 1:
+        display "  Provider grammar requires the exact two-key action envelope"
+    else:
+        display "  FAIL: Provider action schema is not strict"
+        set t2_ok to 0
+
     # Regression: the old parser matched any `Action:` substring and scanned forward
     # to the next `(`, turning explanatory prose into a fabricated multi-line tool name.
     set contaminated_action to "The phrase `Action: reply_request` is only an example.\n```\nAction: fake_tool([])\n```\nAction: reply_request` call was malformed.\nAction: reply_request([\"real answer\"])"
@@ -151,7 +174,8 @@ define main:
 
     set reasoning_only_turn to llm_compose_turn(extract_message_from_response("{\"choices\":[{\"message\":{\"content\":\"\",\"reasoning\":\"I still need to call session_terminate after moderation.\"}}]}"))
     set reasoning_only_split to react_extract_reasoning(reasoning_only_turn)
-    if react_is_implicit_reply("This is a complete plain-language answer.") == 1 and also react_is_implicit_reply("Thought: I still need to act") == 0 and also react_is_implicit_reply("Action: reply_request missing parentheses") == 0 and also string_length(map_get_val(reasoning_only_split and "clean")) == 0 and also string_contains(map_get_val(reasoning_only_split and "reasoning") and "session_terminate") == 1:
+    set private_action_residue to react_extract_reasoning("<think>I still need the scheduler file.\nAction: codebase_read([\"decent_agent/scheduler_tool.ep\"])</think>---")
+    if react_is_implicit_reply("This is a complete plain-language answer.") == 1 and also react_is_implicit_reply("Thought: I still need to act") == 0 and also react_is_implicit_reply("Action: reply_request missing parentheses") == 0 and also react_is_implicit_reply("---") == 0 and also react_is_implicit_reply("***") == 0 and also string_length(map_get_val(reasoning_only_split and "clean")) == 0 and also string_contains(map_get_val(reasoning_only_split and "reasoning") and "session_terminate") == 1 and also map_get_val(private_action_residue and "clean") equals "---" and also string_contains(map_get_val(private_action_residue and "reasoning") and "codebase_read") == 1 and also react_is_implicit_reply(map_get_val(private_action_residue and "clean")) == 0:
         display "  Plain final prose recovers as a reply; scaffolding does not leak"
     else:
         display "  FAIL: Implicit-reply classification is incorrect"
@@ -173,6 +197,26 @@ define main:
         display "  FAIL: Valid tool turn prefix was rejected"
         set t2_ok to 0
 
+    # Live regression: a long, valid source-write action from the local model ended
+    # with the complete JSON array but omitted only the final outer `)`. That should
+    # not burn another full inference turn or strand a frozen improvement transaction.
+    set missing_terminal_close to "Thought: I will apply the verified source repair.\nAction: codebase_write([\"decent_agent/self_extensions.ep\", \"define probe with input as Str returning Str:\\n    return concat(\\\"e2e_probe:\\\" and input)\\n\"]"
+    set recovered_close_map to react_parse_action(missing_terminal_close)
+    if map_get_val(recovered_close_map and "found") == 1 and also map_get_val(recovered_close_map and "tool_name") equals "codebase_write" and also react_action_turn_is_valid(missing_terminal_close and map_get_val(recovered_close_map and "start_pos") and map_get_val(recovered_close_map and "end_pos")) == 1 and also map_get_val(recovered_close_map and "end_pos") == string_length(missing_terminal_close):
+        display "  Complete JSON-array Action recovers one omitted terminal parenthesis"
+    else:
+        display "  FAIL: Complete source-write Action with one omitted terminal parenthesis was lost"
+        set t2_ok to 0
+
+    set unterminated_write to "Action: codebase_write([\"decent_agent/self_extensions.ep\", \"unterminated]"
+    set unterminated_write_map to react_parse_action(unterminated_write)
+    set incomplete_array_map to react_parse_action("Action: codebase_write([\"decent_agent/self_extensions.ep\", 1")
+    if map_get_val(unterminated_write_map and "found") == 0 and also map_get_val(incomplete_array_map and "found") == 0:
+        display "  Terminal-close recovery still rejects malformed JSON and open strings"
+    else:
+        display "  FAIL: Terminal-close recovery accepted an incomplete action"
+        set t2_ok to 0
+
     set trailing_reply to "Thought: I will create it.\nAction: generate_image([\"a luminous sprout\"])\nYour image is on its way."
     set trailing_map to react_parse_action(trailing_reply)
     if map_get_val(trailing_map and "found") == 1 and also react_action_turn_is_valid(trailing_reply and map_get_val(trailing_map and "start_pos") and map_get_val(trailing_map and "end_pos")) == 0:
@@ -189,17 +233,202 @@ define main:
         display "  FAIL: Valid Action batch was rejected"
         set t2_ok to 0
 
-    if react_tool_result_finishes_turn("generate_image" and 1 and "Your image is rendering as job 42.") == 1 and also react_tool_result_finishes_turn("generate_image" and 1 and "ERROR: model missing") == 0 and also react_tool_result_finishes_turn("session_terminate" and 1 and "Session closed by Echo. Reason: safeguarding.") == 1 and also react_tool_result_finishes_turn("session_terminate" and 1 and "Error: checkpoint failed") == 0 and also react_tool_result_finishes_turn("session_terminate" and 0 and "Session closed by Echo.") == 0 and also react_tool_result_finishes_turn("workspace_read" and 1 and "contents") == 0:
-        display "  Successful image dispatch and session closure are terminal; failures, blocked actions, and ordinary tools are not"
+    # run_command is a shell-command string plus optional execution options, not an
+    # argv array. Invalid layouts must be detected before the approval path.
+    set valid_run_args to create_list()
+    set ok to append_list(valid_run_args and "bash decent_agent/run_test.sh decent_agent/test_e2e_quick.ep")
+    if string_length(react_validate_tool_args("run_command" and valid_run_args and "[\"bash decent_agent/run_test.sh decent_agent/test_e2e_quick.ep\"]")) == 0:
+        display "  Single-string run_command shape passes pre-approval validation"
+    else:
+        display "  FAIL: Valid single-string run_command shape was rejected"
+        set t2_ok to 0
+
+    set valid_run_opts to create_list()
+    set ok to append_list(valid_run_opts and "bash build.sh test")
+    set ok to append_list(valid_run_opts and ".")
+    set ok to append_list(valid_run_opts and "600")
+    if string_length(react_validate_tool_args("run_command" and valid_run_opts and "[\"bash build.sh test\", \".\", 600]")) == 0:
+        display "  Working-directory and timeout run_command shape passes validation"
+    else:
+        display "  FAIL: Valid run_command options were rejected"
+        set t2_ok to 0
+
+    set argv_run_args to create_list()
+    set ok to append_list(argv_run_args and "bash")
+    set ok to append_list(argv_run_args and "decent_agent/run_test.sh")
+    set ok to append_list(argv_run_args and "decent_agent/test_e2e_quick.ep")
+    set argv_run_error to react_validate_tool_args("run_command" and argv_run_args and "[\"bash\", \"decent_agent/run_test.sh\", \"decent_agent/test_e2e_quick.ep\"]")
+    if string_contains(argv_run_error and "rejected before approval") == 1 and also string_contains(argv_run_error and "element 1") == 1:
+        display "  Argv-style run_command is rejected with a canonical correction before approval"
+    else:
+        display f"  FAIL: Argv-style run_command validation was not corrective: {argv_run_error}"
+        set t2_ok to 0
+
+    set bad_timeout_args to create_list()
+    set ok to append_list(bad_timeout_args and "bash build.sh test")
+    set ok to append_list(bad_timeout_args and ".")
+    set ok to append_list(bad_timeout_args and "not-a-timeout")
+    set bad_timeout_error to react_validate_tool_args("run_command" and bad_timeout_args and "[\"bash build.sh test\", \".\", \"not-a-timeout\"]")
+    if string_contains(bad_timeout_error and "argument 3 must be an integer timeout") == 1:
+        display "  Non-numeric run_command timeout is rejected before approval"
+    else:
+        display f"  FAIL: Non-numeric timeout was not rejected correctly: {bad_timeout_error}"
+        set t2_ok to 0
+
+    set short_replace_args to create_list()
+    set ok to append_list(short_replace_args and "decent_agent/self_extensions.ep")
+    set ok to append_list(short_replace_args and "whole candidate bytes")
+    set short_replace_error to react_validate_tool_args("codebase_replace" and short_replace_args and "[path,whole]")
+    if string_contains(short_replace_error and "code=TOOL_ARGUMENTS_INVALID") == 1 and also string_contains(short_replace_error and "exact_old") == 1:
+        display "  Malformed codebase_replace is rejected before approval with its exact envelope"
+    else:
+        display f"  FAIL: Malformed codebase_replace reached approval: {short_replace_error}"
+        set t2_ok to 0
+    free_list(short_replace_args)
+
+    set no_change_replace_args to create_list()
+    set ok to append_list(no_change_replace_args and "decent_agent/self_extensions.ep")
+    set ok to append_list(no_change_replace_args and "same bytes")
+    set ok to append_list(no_change_replace_args and "same bytes")
+    set ok to append_list(no_change_replace_args and 1)
+    set no_change_replace_error to react_validate_tool_args("codebase_replace" and no_change_replace_args and "[path,old,old,1]")
+    if string_contains(no_change_replace_error and "code=NO_CHANGE") == 1:
+        display "  Byte-identical codebase_replace is rejected before approval"
+    else:
+        display f"  FAIL: No-op codebase_replace reached approval: {no_change_replace_error}"
+        set t2_ok to 0
+    free_list(no_change_replace_args)
+
+    set frozen_no_change_prompt to react_frozen_decision_prompt_from_state("{\"state\":\"frozen\",\"implementation_candidates\":{\"decent_agent/self_extensions.ep\":{\"status\":\"rejected\"}}}" and "## Exact Interface Evidence\nworking call site" and "implement feature" and "codebase_replace" and "IMPROVEMENT_GATE_FAILED code=NO_CHANGE_REPEAT")
+    if string_contains(frozen_no_change_prompt and "CANDIDATE_REPAIR") == 1 and also string_contains(frozen_no_change_prompt and "NO_CHANGE_REPEAT") == 1:
+        display "  Frozen no-change repairs rebuild from durable candidate evidence"
+    else:
+        display "  FAIL: Frozen no-change repair lost durable structured evidence"
+        set t2_ok to 0
+    set stalled_reset_action to react_candidate_reset_forced_action_from_state("{\"state\":\"frozen\",\"implementation_candidates\":{\"decent_agent/self_extensions.ep\":{\"status\":\"rejected\"}}}" and "IMPROVEMENT_GATE_FAILED code=NO_CHANGE_REPEAT message=byte-identical repair repeated")
+    set archived_reset_action to react_candidate_reset_forced_action_from_state("{\"state\":\"repair_required\",\"implementation_candidate_attempts\":[{\"reason\":\"CANDIDATE_BASELINE_INCOMPLETE\"}]}" and "")
+    if string_contains(stalled_reset_action and "Action: improvement_candidate_reset([])") == 1 and also string_length(react_candidate_reset_forced_action_from_state("{\"state\":\"frozen\"}" and "")) == 0 and also string_length(archived_reset_action) == 0:
+        display "  Repeated no-change repair becomes one deterministic candidate reset"
+    else:
+        display "  FAIL: repeated no-change repair could re-enter unrestricted inference"
+        set t2_ok to 0
+
+    set frozen_write_prompt to react_frozen_decision_prompt_from_state("{\"state\":\"frozen\"}" and "## Exact Interface Evidence\nworking call site" and "implement feature" and "codebase_read_range" and "[source bytes]\nIMPROVEMENT_REREAD_OK path=decent_agent/self_extensions.ep")
+    if string_contains(frozen_write_prompt and "PLANNED_IMPLEMENTATION_WRITE_ONLY") == 1 and also string_contains(frozen_write_prompt and "codebase_write") == 1:
+        display "  A successful frozen production read advances to write-only state"
+    else:
+        display "  FAIL: Frozen production read did not advance to write-only state"
+        set t2_ok to 0
+    if react_initial_frozen_read_required("{\"state\":\"frozen\"}" and "improvement_test_freeze" and "FREEZE_OK") == 1 and also react_initial_frozen_read_required("{\"state\":\"frozen\"}" and "codebase_read" and "IMPROVEMENT_REREAD_OK path=decent_agent/self_extensions.ep") == 0 and also react_initial_frozen_read_required("{\"state\":\"frozen\",\"implementation_candidates\":{\"x\":{\"status\":\"rejected\"}}}" and "codebase_write" and "compile failed") == 0:
+        display "  First frozen candidate requires exact current production bytes"
+    else:
+        display "  FAIL: Frozen candidate could bypass the deterministic current-source read"
+        set t2_ok to 0
+
+    set normalize_ctx to create_map()
+    set ok to map_insert(normalize_ctx and "improvement_test_frozen" and 1)
+    # The filesystem-backed selector is covered by the Python gate suite; this native
+    # assertion protects the registered controller envelope itself.
+    if string_contains(tools_get_schema_string(tools_create("admin")) and "improvement_candidate_normalize([])") == 1 and also string_contains(tools_get_schema_string(tools_create("admin")) and "improvement_candidate_reset([])") == 1:
+        display "  Candidate dialect normalization is a registered typed transition"
+    else:
+        display "  FAIL: Candidate dialect normalization tool is not registered"
+        set t2_ok to 0
+    free_map(normalize_ctx)
+
+    # Local-model compatibility: tolerate the stable split-positional expression
+    # while keeping the registered one-array contract authoritative.
+    set split_search_args to "[\"discord\"], \"decent_agent\", 25"
+    set normalized_search_args to react_normalize_split_default_expression(split_search_args)
+    set canonical_search_args to "[\"discord\", \"decent_agent\", 25]"
+    if react_split_default_expression_close(split_search_args) >= 0 and also normalized_search_args equals canonical_search_args and also react_split_default_expression_close(canonical_search_args) < 0:
+        display "  Split-positional model syntax normalizes to the registered JSON-array contract"
+    else:
+        display f"  FAIL: Split-positional normalization was incorrect: {normalized_search_args}"
+        set t2_ok to 0
+
+    set ambiguous_search_args to create_list()
+    set ok to append_list(ambiguous_search_args and "define discord_read_channel")
+    set ok to append_list(ambiguous_search_args and "define discord_list_channels")
+    set ok to append_list(ambiguous_search_args and "decent_agent")
+    set ok to append_list(ambiguous_search_args and "25")
+    set ambiguous_search_error to react_validate_tool_args("codebase_search" and ambiguous_search_args and "[\"define discord_read_channel\", \"define discord_list_channels\", \"decent_agent\", 25]")
+    if string_contains(ambiguous_search_error and "separate batched Action") == 1:
+        display "  Ambiguous multi-query search is rejected with exact batched-call guidance"
+    else:
+        display f"  FAIL: Ambiguous multi-query search was not rejected: {ambiguous_search_error}"
+        set t2_ok to 0
+
+    set reversed_scaffold_args to create_list()
+    set ok to append_list(reversed_scaffold_args and "decent_agent/react_loop.ep")
+    set ok to append_list(reversed_scaffold_args and "Implement a session summary generator")
+    set reversed_scaffold_error to react_validate_tool_args("improvement_plan_scaffold" and reversed_scaffold_args and "[]")
+    set valid_scaffold_args to create_list()
+    set ok to append_list(valid_scaffold_args and "session_summary_generator")
+    set ok to append_list(valid_scaffold_args and "decent_agent/self_extensions.ep")
+    set valid_scaffold_error to react_validate_tool_args("improvement_plan_scaffold" and valid_scaffold_args and "[]")
+    if string_contains(reversed_scaffold_error and "code=TOOL_ARGUMENTS_INVALID") == 1 and also string_contains(reversed_scaffold_error and "Argument 1") == 1 and also string_length(valid_scaffold_error) == 0:
+        display "  Reversed scaffold arguments are rejected before approval with canonical ordering"
+    else:
+        display f"  FAIL: Scaffold argument validation did not preserve exact surface-first ordering: {reversed_scaffold_error}"
+        set t2_ok to 0
+    free_list(reversed_scaffold_args)
+    free_list(valid_scaffold_args)
+
+    set generic_request_contract to "Choose one useful feature, implement it completely, test it, recompile, restart, and verify it live."
+    set concrete_feature_contract to "Implement a registered tool named `session_summary_generator` that returns and durably persists a structured session summary."
+    set bound_feature_contract to tools_improvement_bind_objective(generic_request_contract and concrete_feature_contract)
+    if string_contains(bound_feature_contract and "[IMMUTABLE USER REQUEST]") == 1 and also string_contains(bound_feature_contract and generic_request_contract) == 1 and also string_contains(bound_feature_contract and "[CONCRETE FEATURE SELECTED BY ECHO]") == 1 and also string_contains(bound_feature_contract and concrete_feature_contract) == 1:
+        display "  Generic user contract and Echo's concrete feature selection remain jointly immutable"
+    else:
+        display "  FAIL: Concrete autonomous feature selection was discarded from the immutable contract"
+        set t2_ok to 0
+
+    set self_repair_schema to tools_get_schema_string(tools_create("admin"))
+    set empty_verify_args to create_list()
+    if string_contains(self_repair_schema and "REQUIRED FIRST STEP for any self-repair") == 1 and also string_contains(self_repair_schema and "never trusts precompiled test binaries") == 1 and also string_contains(self_repair_schema and "codebase_list") == 1 and also string_contains(self_repair_schema and "before guessing a filename") == 1 and also string_contains(self_repair_schema and "improvement_investigation_begin") == 1 and also string_contains(self_repair_schema and "improvement_plan_write") == 1 and also string_contains(self_repair_schema and "controller owns and checks") == 1 and also string_contains(self_repair_schema and "improvement_test_begin") == 1 and also string_contains(self_repair_schema and "improvement_test_write") == 1 and also string_contains(self_repair_schema and "improvement_test_scaffold") == 1 and also string_contains(self_repair_schema and "improvement_test_validate") == 1 and also string_contains(self_repair_schema and "Failed validation NEVER deletes") == 1 and also tools_requires_approval("system_verify" and empty_verify_args) == 1 and also tools_requires_approval("improvement_test_freeze" and empty_verify_args) == 1:
+        display "  Self-repair routes through verification, durable investigation/plan, and retained staged tests"
+    else:
+        display "  FAIL: system_verify is not the authoritative self-repair route"
+        set t2_ok to 0
+
+    if string_contains(self_repair_schema and "NEVER invent, relocate, or name regression/E2E evaluator file paths") == 1:
+        display "  Improvement plans distinguish production paths from controller-owned evaluators"
+    else:
+        display "  FAIL: Improvement plan guidance permits invented evaluator paths"
+        set t2_ok to 0
+
+    if string_contains(self_repair_schema and "improvement_plan_scaffold") == 1 and also string_contains(self_repair_schema and "controller-enforced ONLY legal route after any substantive improvement_plan_write rejection") == 1 and also string_contains(self_repair_schema and "registered tool named `surface_name`") == 1:
+        display "  Rejected free-form plans recover through controller-owned structured authoring"
+    else:
+        display "  FAIL: Improvement plan rejection lacks a structured recovery route"
+        set t2_ok to 0
+
+    if llm_epoch_allows_fallback(41 and 41) == 1 and also llm_epoch_allows_fallback(41 and 42) == 0:
+        display "  A Stop terminates the entire provider fallback cascade"
+    else:
+        display "  FAIL: Provider fallback can continue after cancellation"
+        set t2_ok to 0
+
+    set eval_surface_workflow to "{\"state\":\"tests_authoring\",\"planned_surfaces\":[\"aes_distill\"]}"
+    set eval_surface_finished to "{\"state\":\"completed\",\"planned_surfaces\":[\"aes_distill\"]}"
+    if tools_improvement_eval_surface_allowed_json(eval_surface_workflow and "aes_distill") == 1 and also tools_improvement_eval_surface_allowed_json(eval_surface_workflow and "money_transfer") == 0 and also tools_improvement_eval_surface_allowed_json(eval_surface_finished and "aes_distill") == 1 and also tools_improvement_eval_surface_allowed_json(eval_surface_finished and "money_transfer") == 0:
+        display "  Improvement evaluator IPC is exact-surface and immutable-transaction bound"
+    else:
+        display "  FAIL: Improvement evaluator surface allowlist is not fail-closed"
+        set t2_ok to 0
+
+    if react_tool_result_finishes_turn("generate_image" and 1 and "Your image is rendering as job 42.") == 1 and also react_tool_result_finishes_turn("generate_image" and 1 and "ERROR: model missing") == 0 and also react_tool_result_finishes_turn("session_terminate" and 1 and "Session closed by Echo. Reason: safeguarding.") == 1 and also react_tool_result_finishes_turn("session_terminate" and 1 and "Error: checkpoint failed") == 0 and also react_tool_result_finishes_turn("session_terminate" and 0 and "Session closed by Echo.") == 0 and also react_tool_result_finishes_turn("system_recompile" and 1 and "RECOMPILE STAGED: candidate abc passed the complete test/build gate.") == 1 and also react_tool_result_finishes_turn("system_recompile" and 1 and "Error: build failed") == 0 and also react_tool_result_finishes_turn("improvement_test_validate" and 1 and "Error: gate diagnostics\nVALIDATION_RECEIPT_WRITTEN repeated=200 total=200") == 0 and also react_tool_result_finishes_turn("improvement_test_validate" and 1 and "Error: repair the retained stage") == 0 and also react_tool_result_finishes_turn("improvement_plan_scaffold" and 1 and "IMPROVEMENT_GATE_FAILED code=GATE_REJECTED message=controller invariant") == 0 and also react_tool_result_finishes_turn("improvement_plan_scaffold" and 1 and "IMPROVEMENT_PLAN_OK") == 0 and also react_tool_result_finishes_turn("workspace_read" and 1 and "contents") == 0:
+        display "  Successful async dispatch, session closure, and bounded staging halt are terminal; ordinary failures are not"
     else:
         display "  FAIL: Terminal tool policy is incorrect"
         set t2_ok to 0
 
     set active_kernel to prompt_get_kernel()
-    if string_contains(active_kernel and "output the complete user-facing answer as normal prose") == 1 and also string_contains(active_kernel and "MUST wrap your final response") == 0 and also string_contains(active_kernel and "MUST call the reply_request") == 0:
-        display "  Active prompt uses the native final-response contract"
+    if string_contains(active_kernel and "exactly one JSON object") == 1 and also string_contains(active_kernel and "\"tool_name\"") == 1 and also string_contains(active_kernel and "reply_request") == 1 and also string_contains(active_kernel and "Natural-language generation belongs only") == 1:
+        display "  Active prompt requires typed decisions and natural language only in final reply arguments"
     else:
-        display "  FAIL: Active prompt still mandates terminal reply_request serialization"
+        display "  FAIL: Active prompt does not enforce the typed action envelope"
         set t2_ok to 0
 
     set batched_text to "Action: workspace_current([])\nThe words Action: fake([]) are prose.\nAction: list_sessions([])"
@@ -209,6 +438,22 @@ define main:
         display "  Batch slicing ignores inline Action prose"
     else:
         display f"  FAIL: Batch slicer selected the wrong marker: {batched_rest}"
+        set t2_ok to 0
+
+    set triple_args to "[\"regression\", \"\"\"import tempfile\n\ndef test_live_surface():\n    \"\"\"internal docstring remains intact\"\"\"\n    assert True\n\"\"\"]"
+    set triple_payload to react_extract_triple_quoted_second_arg(triple_args)
+    if string_contains(triple_payload and "import tempfile") == 1 and also string_contains(triple_payload and "internal docstring remains intact") == 1 and also string_contains(triple_payload and "assert True") == 1:
+        display "  Triple-quoted multiline tool arguments recover without losing inner docstrings"
+    else:
+        display f"  FAIL: Triple-quoted multiline argument recovery was incomplete: {triple_payload}"
+        set t2_ok to 0
+
+    set escaped_triple_payload to "def test_encoded():\n    \\\"\\\"\\\"encoded docstring\\\"\\\"\\\"\n    value = \\\"ok\\\"\n    assert value == \\\"ok\\\""
+    set normalized_triple_payload to react_unescape_triple_payload(escaped_triple_payload)
+    if string_contains(normalized_triple_payload and "\\\"") == 0 and also string_contains(normalized_triple_payload and "\"\"\"encoded docstring\"\"\"") == 1 and also string_contains(normalized_triple_payload and "value = \"ok\"") == 1:
+        display "  JSON-escaped triple payloads lose exactly one escape layer"
+    else:
+        display f"  FAIL: JSON escape normalization corrupted multiline source: {normalized_triple_payload}"
         set t2_ok to 0
 
     if t2_ok == 1:
@@ -967,6 +1212,11 @@ define main:
     if llm_stream_has_repetition(t18_long_loop and "") != 1:
         display "  FAIL: a sustained 264-character repetition was not detected"
         set t18_ok to 0
+    set t18_hive_unit to "This reasoning segment keeps returning to the same obsolete diagnosis instead of using the authoritative current failure. "
+    set t18_hive_spiral to concat(t18_hive_unit and concat("brief separator " and concat(t18_hive_unit and concat("another separator " and t18_hive_unit))))
+    if detect_hive_thought_spiral(t18_hive_spiral) != 1:
+        display "  FAIL: HIVE-compatible non-consecutive thought spiral was not detected"
+        set t18_ok to 0
     if t18_ok == 1:
         display "  Private reasoning stripped; short false positive rejected; sustained loop detected"
         display "  PASS"
@@ -1042,6 +1292,613 @@ define main:
     set ok to remove_directory(t20_root)
     if t20_ok == 1:
         display "  Hyphens, underscores and spaces remain byte-exact after discovery"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 21: Trusted current-interlocutor identity + account memory isolation
+    # ===========================================================
+    display "TEST 21: Current interaction identity and account-scoped relationship memory"
+    set t21_ok to 1
+    set t21_identity to create_map()
+    set ok to map_insert(t21_identity and "did" and "did:key:echo-test")
+    set t21_alice to create_map()
+    set ok to map_insert(t21_alice and "identity" and t21_identity)
+    set ok to map_insert(t21_alice and "platform" and "discord")
+    set ok to map_insert(t21_alice and "session_id" and "identity-test")
+    set ok to map_insert(t21_alice and "selected_model" and "gemma4-test")
+    set ok to map_insert(t21_alice and "actor_id" and "111")
+    set ok to map_insert(t21_alice and "actor_username" and "alice_account")
+    set ok to map_insert(t21_alice and "actor_display_name" and "Alice")
+    set ok to map_insert(t21_alice and "actor_type" and "human")
+    set ok to map_insert(t21_alice and "actor_is_host" and "no")
+    set ok to map_insert(t21_alice and "sender_role" and "admin")
+    set t21_bob to create_map()
+    set ok to map_insert(t21_bob and "platform" and "discord")
+    set ok to map_insert(t21_bob and "actor_id" and "222")
+    set t21_block to prompt_interaction_identity_block(t21_alice)
+    if string_contains(t21_block and "display=Alice") == 0 or else string_contains(t21_block and "stable_id=111") == 0:
+        display "  FAIL: the trusted account identity was absent from the prompt block"
+        set t21_ok to 0
+    if string_contains(t21_block and "authorization_role=admin") == 0 or else string_contains(t21_block and "does NOT match the configured host account") == 0:
+        display "  FAIL: authorization was collapsed into personal/host identity"
+        set t21_ok to 0
+    if prompt_user_knowledge_scope(t21_alice) equals prompt_user_knowledge_scope(t21_bob):
+        display "  FAIL: distinct Discord accounts resolved to the same relationship memory scope"
+        set t21_ok to 0
+    if t21_ok == 1:
+        display "  Self, surface, account and host relation are explicit; account memories are isolated"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 22: Historical turns retain authenticated speaker provenance
+    # ===========================================================
+    display "TEST 22: Multi-user session speaker provenance"
+    set t22_ok to 1
+    set t22_sid to concat("speaker_provenance_" and int_to_string(ep_time_now_ms()))
+    set t22_path to concat("config/sessions/" and concat(t22_sid and ".json"))
+    set t22_sess to session_create_new(t22_sid and "Speaker Provenance" and "gemma4-test" and "")
+    set t22_ctx to create_map()
+    set ok to map_insert(t22_ctx and "platform" and "discord")
+    set ok to map_insert(t22_ctx and "actor_id" and "214561307385397250")
+    set ok to map_insert(t22_ctx and "actor_username" and "sunglancing")
+    set ok to map_insert(t22_ctx and "actor_display_name" and "ultraviolet")
+    set ok to map_insert(t22_ctx and "actor_type" and "human")
+    set ok to map_insert(t22_ctx and "actor_is_host" and "no")
+    set ok to map_insert(t22_ctx and "sender_role" and "guest")
+    set ok to map_insert(t22_ctx and "guild_name" and "ErnosLabs")
+    set ok to session_add_message_with_context(t22_sess and "user" and "hello echo" and t22_ctx)
+    set ok to session_add_message(t22_sess and "assistant" and "hello ultraviolet")
+    set t22_messages to map_get_val(t22_sess and "messages")
+    set t22_first to get_list(t22_messages and 0)
+    set t22_label to session_message_speaker_label(t22_first)
+    if string_contains(t22_label and "display=ultraviolet") == 0 or else string_contains(t22_label and "username=sunglancing") == 0 or else string_contains(t22_label and "stable_id=214561307385397250") == 0 or else string_contains(t22_label and "host_match=no") == 0:
+        display concat("  FAIL: live message speaker label is incomplete: " and t22_label)
+        set t22_ok to 0
+    if session_serialize(t22_sess and t22_path) != 0:
+        display "  FAIL: provenance fixture could not be serialized"
+        set t22_ok to 0
+    else:
+        set t22_loaded to session_load(t22_path)
+        set t22_loaded_messages to map_get_val(t22_loaded and "messages")
+        set t22_loaded_first to get_list(t22_loaded_messages and 0)
+        set t22_loaded_label to session_message_speaker_label(t22_loaded_first)
+        if string_contains(t22_loaded_label and "display=ultraviolet") == 0 or else string_contains(t22_loaded_label and "platform=discord") == 0 or else string_contains(t22_loaded_label and "authorization_role=guest") == 0:
+            display concat("  FAIL: serialized speaker provenance expected authorization_role=guest but observed: " and t22_loaded_label)
+            set t22_ok to 0
+    set t22_legacy to create_map()
+    set ok to map_insert(t22_legacy and "role" and "user")
+    set ok to map_insert(t22_legacy and "content" and "legacy message")
+    set t22_legacy_label to session_message_speaker_label(t22_legacy)
+    if string_contains(t22_legacy_label and "provenance unavailable") == 0:
+        display "  FAIL: a legacy turn silently inherited a current identity"
+        set t22_ok to 0
+    if file_exists(t22_path) == 1:
+        set ok to remove_file(t22_path)
+    if t22_ok == 1:
+        display "  Speaker identity survives storage; legacy turns remain explicitly unknown"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 23: Guest chronology without host-memory contamination
+    # ===========================================================
+    display "TEST 23: Guest continuity privacy boundary"
+    set t23_ok to 1
+    set t23_path to concat("/tmp/ernos_guest_continuity_" and concat(int_to_string(ep_time_now_ms()) and ".db"))
+    set t23_db to sql_open(t23_path)
+    set ok to continuity_ensure_schema(t23_db)
+    set t23_now to ep_time_now_sec()
+    set t23_json to "{\"verdict\":\"ALLOWED\",\"reason\":\"allowed\",\"recent_summary\":\"Echo spoke with ultraviolet in the shared Discord session.\",\"decisions\":[],\"emotional_context\":\"Friendly.\",\"changes\":[],\"open_loops\":[],\"memories\":[{\"kind\":\"relationship\",\"topic\":\"interlocutor\",\"content\":\"The current interlocutor is ultraviolet.\",\"confidence\":100,\"epistemic\":\"observed\",\"importance\":80,\"correction\":false,\"status\":\"active\"}]}"
+    set t23_evidence to "Echo spoke with ultraviolet in the shared Discord session. Friendly. The current interlocutor is ultraviolet."
+    set ok to continuity_apply_semantic_json(t23_db and "echo" and "guest_session" and "discord" and t23_now and "[0.2,0.8]" and t23_evidence and t23_json and 0)
+    set t23_state to sql_query(t23_db and "SELECT COUNT(*) FROM continuity_session_state WHERE session_id='guest_session';")
+    set t23_memory to sql_query(t23_db and "SELECT COUNT(*) FROM continuity_memories WHERE source_id='guest_session';")
+    if ptr_to_str(get_list(get_list(t23_state and 0) and 0)) equals "1" == 0:
+        display "  FAIL: guest turn did not advance shared session chronology"
+        set t23_ok to 0
+    if ptr_to_str(get_list(get_list(t23_memory and 0) and 0)) equals "0" == 0:
+        display "  FAIL: guest turn wrote into host durable memory"
+        set t23_ok to 0
+    set t23_lessons to create_map()
+    set t23_envelope to continuity_build_envelope_with_embedding(t23_db and "echo" and "guest_session" and "ultraviolet" and "[0.2,0.8]" and t23_lessons and 0)
+    if string_contains(t23_envelope and "spoke with ultraviolet") == 0 or else string_contains(t23_envelope and "Stable relationship memory") == 1 or else string_contains(t23_envelope and "Active state and prospective memory") == 1:
+        display concat("  FAIL: guest envelope crossed the privacy boundary: " and t23_envelope)
+        set t23_ok to 0
+    set ok to sql_close(t23_db)
+    if file_exists(t23_path) == 1:
+        set ok to remove_file(t23_path)
+    if t23_ok == 1:
+        display "  Shared chronology retained; host durable memories remain inaccessible"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 24: Operator-sealed regression/deployment trust root
+    # ===========================================================
+    display "TEST 24: Self-upgrade test-integrity lock"
+    set t24_ok to 1
+    if tools_improvement_name_canonical("Automated Epistemic Synthesis") equals "automated_epistemic_synthesis" == 0 or else tools_improvement_name_canonical("  123 / Unsafe Title  ") equals "improvement_123_unsafe_title" == 0 or else string_length(tools_improvement_name_canonical("This improvement title is deliberately much longer than sixty four characters so it must be bounded safely")) > 64:
+        display "  FAIL: human-readable improvement titles were not canonicalized into bounded safe identifiers"
+        set t24_ok to 0
+    if tools_path_is_upgrade_trust_root("tests/test_turn_queue_and_visual_memory.py") == 0 or else tools_path_is_upgrade_trust_root("./tests/test_turn_queue_and_visual_memory.py") == 0 or else tools_path_is_upgrade_trust_root("decent_agent/test_agent.ep") == 0 or else tools_path_is_upgrade_trust_root("decent_agent/run_test.sh") == 0 or else tools_path_is_upgrade_trust_root("decent_agent/prompt.ep") == 0 or else tools_path_is_upgrade_trust_root("build.sh") == 0 or else tools_path_is_upgrade_trust_root("scripts/improvement_test_gate.py") == 0 or else tools_path_is_upgrade_trust_root("config/improvements/active.json") == 0 or else tools_path_is_upgrade_trust_root("../tests/test_escape.py") == 0 or else tools_path_is_upgrade_trust_root("././decent_agent/session.ep") == 0:
+        display "  FAIL: a protected test, gate, or path alias remained writable"
+        set t24_ok to 0
+    if tools_path_is_upgrade_trust_root("decent_agent/session.ep") != 0 or else tools_path_is_upgrade_trust_root("./decent_agent/session.ep") != 0:
+        display "  FAIL: ordinary implementation source was incorrectly sealed"
+        set t24_ok to 0
+    set t24_repair_ctx to create_map()
+    set ok to tools_repair_begin(t24_repair_ctx and "Repair the source, then call system_recompile")
+    if string_length(tools_repair_action_error(t24_repair_ctx and "run_command")) == 0 or else string_length(tools_repair_action_error(t24_repair_ctx and "system_verify")) != 0:
+        display "  FAIL: initial verification was not structurally enforced"
+        set t24_ok to 0
+    set ok to tools_repair_record_verification(t24_repair_ctx and "SOURCE VERIFICATION FAILED. expected deliberate failure")
+    if string_length(tools_repair_action_error(t24_repair_ctx and "codebase_read")) != 0 or else string_length(tools_repair_action_error(t24_repair_ctx and "system_recompile")) == 0:
+        display "  FAIL: failed baseline did not unlock diagnosis while keeping recompile locked"
+        set t24_ok to 0
+    set ok to tools_repair_record_write(t24_repair_ctx)
+    if string_length(tools_repair_action_error(t24_repair_ctx and "codebase_read")) == 0:
+        display "  FAIL: successful source write did not force immediate re-verification"
+        set t24_ok to 0
+    set ok to tools_repair_record_verification(t24_repair_ctx and "SOURCE VERIFICATION PASSED. green")
+    if string_length(tools_repair_action_error(t24_repair_ctx and "system_recompile")) != 0:
+        display "  FAIL: verified-green source did not unlock transactional recompile"
+        set t24_ok to 0
+    if string_contains(tools_repair_action_error(t24_repair_ctx and "reply_request") and "code=DEPLOY_REQUIRED") == 0:
+        display "  FAIL: explicit repair deployment request allowed a premature final reply"
+        set t24_ok to 0
+    if string_contains(react_verified_deploy_forced_action(t24_repair_ctx) and "Action: system_recompile([])") == 0:
+        display "  FAIL: verified deployment still depended on another model decision"
+        set t24_ok to 0
+    set ok to map_insert(t24_repair_ctx and "upgrade_restart_requested" and 1)
+    if string_length(react_verified_deploy_forced_action(t24_repair_ctx)) != 0:
+        display "  FAIL: staged restart did not suppress duplicate forced deployment"
+        set t24_ok to 0
+    if string_length(tools_repair_action_error(t24_repair_ctx and "reply_request")) != 0:
+        display "  FAIL: staged deployment receipt did not unlock the final pre-restart reply"
+        set t24_ok to 0
+    if string_contains(react_repair_gate_forced_action("IMPROVEMENT_GATE_FAILED code=VERIFY_REQUIRED message=verify") and "Action: system_verify([])") == 0 or else string_contains(react_repair_gate_forced_action("IMPROVEMENT_GATE_FAILED code=DEPLOY_REQUIRED message=deploy") and "Action: system_recompile([])") == 0 or else string_length(react_repair_gate_forced_action("diagnose the failure")) != 0:
+        display "  FAIL: sole legal repair transitions were not deterministically scheduled"
+        set t24_ok to 0
+    set t24_clean_ctx to create_map()
+    set ok to tools_repair_begin(t24_clean_ctx and "Repair the source, then call system_recompile")
+    set ok to tools_repair_record_verification(t24_clean_ctx and "SOURCE VERIFICATION PASSED. green baseline")
+    set t24_clean_error to tools_repair_action_error(t24_clean_ctx and "codebase_search")
+    if string_contains(t24_clean_error and "code=BASELINE_NO_CHANGE") == 0 or else string_length(tools_repair_action_error(t24_clean_ctx and "reply_request")) != 0 or else string_contains(react_repair_gate_forced_action(t24_clean_error) and "Action: reply_request") == 0 or else string_contains(react_repair_gate_forced_action(t24_clean_error) and "system_recompile") == 1:
+        display "  FAIL: clean initial baseline did not terminate truthfully without edits or deployment"
+        set t24_ok to 0
+    free_map(t24_clean_ctx)
+    set t24_feature_ctx to create_map()
+    if tools_is_feature_improvement_request("While I sleep is there a new feature you would like to work on develop and implement for yourself?") != 0 or else tools_is_feature_improvement_request("Only propose a new capability; do not edit or implement yet.") != 0:
+        display "  FAIL: a proposal-only feature question activated body mutation mode"
+        set t24_ok to 0
+    if tools_is_feature_improvement_request("Proceed with the new feature you proposed. Fully implement and deploy it using system_recompile.") != 1:
+        display "  FAIL: an explicit feature implementation instruction did not activate the frozen-test workflow"
+        set t24_ok to 0
+    if tools_is_feature_improvement_request("Fully implement, test, recompile, and deploy a new registered self-extension tool named aes_distill.") != 1:
+        display "  FAIL: explicit registered self-extension implementation wording bypassed the frozen-test workflow"
+        set t24_ok to 0
+    if tools_is_feature_improvement_request("Implement exactly `scavenger_sweep`. Retrieve this configured Discord channel through the real live bridge, persist the result, then fully test, recompile, deploy, and verify it.") != 1:
+        display "  FAIL: exact named-surface implementation wording bypassed the frozen-test workflow"
+        set t24_ok to 0
+    if tools_is_feature_improvement_request("Implement exactly scavenger_sweep. Retrieve the configured Discord channel through the real live bridge, fully test and end-to-end verify the implementation, recompile, transactionally deploy, and report only after the completed receipt exists.") != 1:
+        display "  FAIL: plain-text exact named-surface implementation wording bypassed the frozen-test workflow"
+        set t24_ok to 0
+    set t24_exact_surface_ctx to create_map()
+    set ok to tools_repair_begin(t24_exact_surface_ctx and "Implement exactly `scavenger_sweep`. Retrieve this configured Discord channel through the real live bridge, persist the result, then fully test, recompile, deploy, and verify it.")
+    if map_get_val(t24_exact_surface_ctx and "repair_workflow_active") != 1 or else map_get_val(t24_exact_surface_ctx and "improvement_test_required") != 1 or else string_contains(tools_repair_action_error(t24_exact_surface_ctx and "improvement_investigation_begin") and "system_verify") == 0:
+        display "  FAIL: exact named-surface request did not enter the mandatory baseline-first controller state"
+        set t24_ok to 0
+    free_map(t24_exact_surface_ctx)
+    if tools_is_feature_improvement_request("Continue the autonomous self-improvement and fully implement your AES feature end to end.") != 1 or else tools_is_self_repair_request("Continue the autonomous self-improvement now.") != 1:
+        display "  FAIL: ordinary self-improvement wording did not activate the mandatory repair and feature rails"
+        set t24_ok to 0
+    if tools_is_feature_improvement_request("Retry the scavenger_sweep improvement from the beginning, using the prior requirements and completing the full verified end-to-end process.") != 1 or else tools_is_feature_improvement_request("Continue our discussion about possible improvements; do not implement anything.") != 0:
+        display "  FAIL: retry wording did not activate execution or proposal-only continuation activated mutation"
+        set t24_ok to 0
+    set t24_manual_trigger to "Choose and implement one genuinely new small feature for yourself. Run the complete protected recursive-improvement flow end to end."
+    set t24_manual_ctx to create_map()
+    set ok to tools_repair_begin(t24_manual_ctx and t24_manual_trigger)
+    # This exact wording intentionally matches no lexical classifier. The typed
+    # verification/investigation transition must still carry the durable receipt.
+    if map_get_val(t24_manual_ctx and "repair_workflow_active") != 0:
+        display "  FAIL: state-based manual trigger regression accidentally depended on lexical classification"
+        set t24_ok to 0
+    set ok to map_insert(t24_manual_ctx and "repair_original_request" and t24_manual_trigger)
+    set t24_typed_objective to "Implement a registered tool named `conversation_signal_indexer` that processes every requested marker and persists its exact durable evidence."
+    set t24_typed_prepare to tools_improvement_prepare_typed_investigation(t24_manual_ctx and t24_typed_objective)
+    if string_contains(t24_typed_prepare and "code=VERIFY_REQUIRED") == 0 or else map_get_val(t24_manual_ctx and "repair_workflow_active") != 1 or else map_get_val(t24_manual_ctx and "improvement_test_required") != 1 or else map_get_val(t24_manual_ctx and "repair_deploy_required") != 1 or else ptr_to_str(map_get_val(t24_manual_ctx and "pending_improvement_objective")) equals t24_typed_objective == 0 or else string_contains(react_initial_repair_baseline_forced_action(t24_manual_ctx) and "Action: system_verify([])") == 0:
+        display "  FAIL: classifier-independent typed investigation did not enter the protected baseline-first state"
+        set t24_ok to 0
+    set ok to tools_repair_record_verification(t24_manual_ctx and "SOURCE VERIFICATION PASSED. exact manual trigger baseline")
+    set t24_pending_action to react_pending_investigation_forced_action(t24_manual_ctx)
+    set t24_pending_map to react_parse_action_envelope(t24_pending_action)
+    if map_get_val(t24_pending_map and "found") != 1 or else ptr_to_str(map_get_val(t24_pending_map and "tool_name")) equals "improvement_investigation_begin" == 0 or else string_contains(t24_pending_action and "conversation_signal_indexer") == 0 or else string_length(react_initial_repair_baseline_forced_action(t24_manual_ctx)) != 0:
+        display "  FAIL: green baseline did not mechanically replay the exact retained typed objective"
+        set t24_ok to 0
+    free_map(t24_pending_map)
+    set ok to tools_improvement_activate_from_investigation(t24_manual_ctx)
+    if map_get_val(t24_manual_ctx and "repair_workflow_active") != 1 or else map_get_val(t24_manual_ctx and "improvement_test_required") != 1 or else map_get_val(t24_manual_ctx and "repair_baseline_seen") != 1 or else map_get_val(t24_manual_ctx and "repair_verify_green") != 1 or else map_get_val(t24_manual_ctx and "repair_deploy_required") != 1:
+        display "  FAIL: typed investigation did not consume the classifier-independent green baseline"
+        set t24_ok to 0
+    free_map(t24_manual_ctx)
+    set t24_retry_ctx to create_map()
+    set ok to tools_repair_begin(t24_retry_ctx and "Retry the scavenger_sweep improvement from the beginning, using the prior requirements and completing the full verified end-to-end process.")
+    set ok to tools_repair_record_verification(t24_retry_ctx and "SOURCE VERIFICATION PASSED. unchanged baseline")
+    if map_get_val(t24_retry_ctx and "repair_workflow_active") != 1 or else map_get_val(t24_retry_ctx and "improvement_test_required") != 1 or else map_get_val(t24_retry_ctx and "repair_baseline_seen") != 1 or else map_get_val(t24_retry_ctx and "repair_verify_green") != 1 or else string_length(tools_repair_action_error(t24_retry_ctx and "improvement_investigation_begin")) != 0:
+        display "  FAIL: live retry wording lost its green baseline before investigation"
+        set t24_ok to 0
+    free_map(t24_retry_ctx)
+    set t24_workflow_frozen to "{\"state\":\"frozen\",\"objective\":\"original durable objective\"}"
+    if tools_improvement_workflow_is_nonterminal(t24_workflow_frozen) != 1 or else tools_improvement_workflow_is_nonterminal("{\"state\":\"completed\"}") != 0 or else tools_improvement_workflow_is_nonterminal("{\"state\": \"aborted\"}") != 0 or else tools_improvement_objective_from_workflow(t24_workflow_frozen) equals "original durable objective" == 0:
+        display "  FAIL: durable improvement state/objective could not be reconstructed independently of continuation wording"
+        set t24_ok to 0
+    set ok to tools_repair_begin(t24_feature_ctx and "Add a new feature to your own body, fully test it, and system_recompile")
+    if map_get_val(t24_feature_ctx and "improvement_test_required") != 1 or else map_get_val(t24_feature_ctx and "repair_deploy_required") != 1:
+        display "  FAIL: body feature request did not require a frozen test and deployment"
+        set t24_ok to 0
+    set ok to tools_repair_record_verification(t24_feature_ctx and "SOURCE VERIFICATION PASSED. unchanged baseline")
+    set t24_feature_error to tools_repair_action_error(t24_feature_ctx and "reply_request")
+    if string_contains(t24_feature_error and "improvement_investigation_begin") == 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_investigation_begin")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "codebase_search")) == 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_test_begin")) == 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "codebase_write")) == 0:
+        display "  FAIL: durable investigation was not the sole legal post-baseline transition"
+        set t24_ok to 0
+    set ok to map_insert(t24_feature_ctx and "improvement_investigation_started" and 1)
+    if string_length(tools_repair_action_error(t24_feature_ctx and "codebase_list")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "codebase_search")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "codebase_read")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "lookup_ernos")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_plan_write")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_test_begin")) == 0:
+        display "  FAIL: deep read-only investigation did not keep evaluators locked until a validated plan"
+        set t24_ok to 0
+    if tools_reference_has_matches("{\"status\":\"ok\",\"total_matches\":0,\"results\":[]}") != 0 or else tools_reference_has_matches("{\"status\":\"ok\",\"total_matches\":2,\"results\":[{\"name\":\"substring\"}]}") != 1 or else tools_reference_has_matches("[CURRENT SOURCE SEARCH — exact paths; 1 match(es)]\nstdlib/string.ep:101:define string_index_of") != 1:
+        display "  FAIL: zero-result language reference could be recorded as investigation evidence"
+        set t24_ok to 0
+    set t24_stdlib_search to tools_codebase_search("string_index_of" and "stdlib" and 4)
+    if string_index_of(t24_stdlib_search and "[CURRENT SOURCE SEARCH") != 0 or else string_contains(t24_stdlib_search and "stdlib/string.ep") == 0 or else tools_path_is_language_reference("stdlib/string.ep") != 1 or else tools_path_is_language_reference("./stdlib/string.ep") != 1 or else tools_path_is_language_reference("decent_agent/self_extensions.ep") != 0:
+        display "  FAIL: native language-reference search could not traverse the canonical symlinked stdlib root"
+        set t24_ok to 0
+    set t24_ls_gate to tools_repair_action_error(t24_feature_ctx and "run_command")
+    if string_contains(t24_ls_gate and "codebase_list") == 0 or else string_contains(react_repair_gate_forced_action(t24_ls_gate) and "Action: codebase_list([\"decent_agent\", 200])") == 0:
+        display "  FAIL: blocked shell listing was not deterministically rerouted to native source-tree discovery"
+        set t24_ok to 0
+    set ok to map_insert(t24_feature_ctx and "improvement_plan_written" and 1)
+    if string_length(tools_repair_action_error(t24_feature_ctx and "improvement_test_begin")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_test_write")) == 0:
+        display "  FAIL: plan validation did not unlock only evaluator transaction creation"
+        set t24_ok to 0
+    set t24_existing_ctx to create_map()
+    set ok to tools_repair_begin(t24_existing_ctx and "Fully implement and deploy the existing aes_distill self-improvement capability.")
+    set ok to map_insert(t24_existing_ctx and "repair_baseline_seen" and 1)
+    set ok to map_insert(t24_existing_ctx and "repair_verify_green" and 1)
+    set ok to map_insert(t24_existing_ctx and "improvement_investigation_started" and 1)
+    set ok to map_insert(t24_existing_ctx and "improvement_plan_written" and 1)
+    set ok to tools_improvement_resolve_existing(t24_existing_ctx)
+    if map_get_val(t24_existing_ctx and "repair_workflow_active") != 0 or else map_get_val(t24_existing_ctx and "repair_deploy_required") != 0 or else map_get_val(t24_existing_ctx and "improvement_test_required") != 0 or else map_get_val(t24_existing_ctx and "improvement_plan_written") != 0 or else tools_improvement_completed_surface_allowed("aes_distill") != 1 or else string_length(tools_repair_action_error(t24_existing_ctx and "aes_distill")) != 0 or else string_length(tools_repair_action_error(t24_existing_ctx and "reply_request")) != 0:
+        display "  FAIL: already-completed capability resolution did not release the same-turn repair/deployment lock"
+        set t24_ok to 0
+    free_map(t24_existing_ctx)
+    set ok to map_insert(t24_feature_ctx and "improvement_test_staged" and 1)
+    if string_length(tools_repair_action_error(t24_feature_ctx and "improvement_test_write")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_test_scaffold")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_test_validate")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_test_freeze")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "codebase_write")) == 0:
+        display "  FAIL: staged evaluator phase was blocked or implementation mutation unlocked before freeze"
+        set t24_ok to 0
+    set ok to map_insert(t24_feature_ctx and "improvement_test_frozen" and 1)
+    set ok to map_insert(t24_feature_ctx and "repair_verify_green" and 0)
+    set t24_post_freeze_shell_error to tools_repair_action_error(t24_feature_ctx and "run_command")
+    if string_contains(t24_post_freeze_shell_error and "New discovery is closed") == 0 or else string_contains(t24_post_freeze_shell_error and "codebase_write") == 0:
+        display "  FAIL: post-freeze shell rejection did not enforce closed discovery and planned implementation"
+        set t24_ok to 0
+    if string_length(tools_repair_action_error(t24_feature_ctx and "codebase_read")) != 0 or else string_contains(tools_repair_action_error(t24_feature_ctx and "git_tool") and "New discovery is closed") == 0:
+        display "  FAIL: post-freeze exact planned reread was blocked or new Git discovery remained available"
+        set t24_ok to 0
+    set t24_action_nudge to react_frozen_implementation_action_nudge(t24_feature_ctx and 2)
+    if string_contains(t24_action_nudge and "Do not restate") == 0 or else string_contains(t24_action_nudge and "Action: codebase_write") == 0 or else string_contains(t24_action_nudge and "codebase_read([planned_path])") == 0 or else string_contains(t24_action_nudge and "JSON does not escape '[' or ']'") == 0:
+        display "  FAIL: frozen explanation-only turns did not receive a bounded implementation-action recovery"
+        set t24_ok to 0
+    set t24_frozen_spiral_guidance to react_thought_spiral_recovery_guidance(t24_feature_ctx)
+    if string_contains(t24_frozen_spiral_guidance and "new discovery remains closed") == 0 or else string_contains(t24_frozen_spiral_guidance and "codebase_read") == 0 or else string_contains(t24_frozen_spiral_guidance and "codebase_replace") == 0 or else string_contains(t24_frozen_spiral_guidance and "JSON does not escape '[' or ']'") == 0 or else string_contains(t24_frozen_spiral_guidance and "search the failing literal") == 1:
+        display "  FAIL: repetition recovery contradicted the frozen discovery boundary"
+        set t24_ok to 0
+    set t24_candidate_path to tools_improvement_candidate_path_for_id("decent_agent/self_extensions.ep" and "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    if t24_candidate_path equals "decent_agent/.ernos-candidate-0123456789abcdef-self_extensions.ep" == 0 or else string_length(tools_improvement_candidate_path_for_id("decent_agent/self_extensions.ep" and "short")) != 0:
+        display "  FAIL: retained candidate path was not deterministic, adjacent, and transaction-bound"
+        set t24_ok to 0
+    set t24_alias_state to "{\"id\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"planned_files\":[\"decent_agent/self_extensions.ep\"]}"
+    if tools_improvement_canonical_production_path_from_json(t24_candidate_path and t24_alias_state) equals "decent_agent/self_extensions.ep" == 0 or else tools_improvement_canonical_production_path_from_json("decent_agent/other.ep" and t24_alias_state) equals "decent_agent/other.ep" == 0:
+        display "  FAIL: private candidate aliases were not resolved internally to exact production paths"
+        set t24_ok to 0
+    set t24_compact_write to react_observation_action_text("codebase_write" and "Action: codebase_write([\"path\", \"VERY_LARGE_SOURCE_PAYLOAD\"])")
+    if string_contains(t24_compact_write and "candidate bytes omitted") == 0 or else string_contains(t24_compact_write and "VERY_LARGE_SOURCE_PAYLOAD") == 1 or else react_observation_action_text("reply_request" and "ordinary reply") equals "ordinary reply" == 0:
+        display "  FAIL: durable source payloads were re-appended to repair context"
+        set t24_ok to 0
+    set t24_single_plan_json to "{\"state\":\"implementing\",\"planned_files\":[\"decent_agent/self_extensions.ep\"]}"
+    set t24_multi_plan_json to "{\"state\":\"repair_required\",\"planned_files\":[\"decent_agent/a.ep\",\"decent_agent/b.ep\"]}"
+    set t24_single_reread to react_frozen_planned_reread_action_from_json(t24_single_plan_json and "")
+    set t24_last_reread to react_frozen_planned_reread_action_from_json(t24_multi_plan_json and "decent_agent/b.ep")
+    set t24_ambiguous_reread to react_frozen_planned_reread_action_from_json(t24_multi_plan_json and "")
+    set t24_completed_reread to react_frozen_planned_reread_action_from_json("{\"state\":\"completed\",\"planned_files\":[\"decent_agent/self_extensions.ep\"]}" and "")
+    if string_contains(t24_single_reread and "Action: codebase_read([\"decent_agent/self_extensions.ep\"])") == 0 or else string_contains(t24_last_reread and "Action: codebase_read([\"decent_agent/b.ep\"])") == 0 or else string_length(t24_ambiguous_reread) != 0 or else string_length(t24_completed_reread) != 0:
+        display "  FAIL: repeated reasoning could not deterministically resume the exact frozen-plan path"
+        set t24_ok to 0
+    set t24_rejected_checkpoint to react_repetition_checkpoint_action_from_state("{\"state\":\"frozen\",\"implementation_candidates\":{\"decent_agent/self_extensions.ep\":{\"status\":\"rejected\"}}}" and t24_single_reread)
+    set t24_clean_checkpoint to react_repetition_checkpoint_action_from_state("{\"state\":\"frozen\",\"implementation_candidates\":{}}" and t24_single_reread)
+    set t24_exact_miss_reset to react_candidate_reset_forced_action_from_state("{\"state\":\"frozen\",\"implementation_candidates\":{\"decent_agent/self_extensions.ep\":{\"status\":\"rejected\"}}}" and "IMPROVEMENT_GATE_FAILED code=CANDIDATE_REPAIR_REQUIRED reason=EXACT_MATCH_COUNT message=expected 1 exact occurrence, found 0")
+    if string_contains(t24_rejected_checkpoint and "Action: improvement_candidate_reset([])") == 0 or else t24_clean_checkpoint equals t24_single_reread == 0 or else string_contains(t24_exact_miss_reset and "Action: improvement_candidate_reset([])") == 0:
+        display "  FAIL: rejected-candidate repetition/addressing recovery could re-enter the illegal reread loop"
+        set t24_ok to 0
+    set t24_correction_ctx to create_map()
+    set t24_exact_miss_result to "IMPROVEMENT_GATE_FAILED code=CANDIDATE_REPAIR_REQUIRED reason=EXACT_MATCH_COUNT message=expected 1 exact occurrence, found 0"
+    set t24_recorded to react_record_candidate_gate_correction(t24_correction_ctx and t24_exact_miss_result)
+    set t24_ignored to react_record_candidate_gate_correction(t24_correction_ctx and "ordinary tool result")
+    if t24_recorded != 1 or else t24_ignored != 0 or else map_contains(t24_correction_ctx and "durable_protocol_correction") == 0 or else ptr_to_str(map_get_val(t24_correction_ctx and "durable_protocol_correction")) equals t24_exact_miss_result == 0:
+        display "  FAIL: post-execution candidate rejection was not retained for deterministic reset"
+        set t24_ok to 0
+    set t24_post_result_action to react_candidate_post_result_forced_action_from_state(t24_correction_ctx and t24_exact_miss_result and "{\"state\":\"frozen\",\"implementation_candidates\":{\"decent_agent/self_extensions.ep\":{\"status\":\"rejected\"}}}")
+    if string_contains(t24_post_result_action and "Action: improvement_candidate_reset([])") == 0:
+        display "  FAIL: post-execution exact-addressing failure did not atomically select candidate reset"
+        set t24_ok to 0
+    free_map(t24_correction_ctx)
+    set t24_frozen_class to react_frozen_action_class("{\"state\":\"frozen\",\"implementation_candidates\":{}}")
+    set t24_candidate_class to react_frozen_action_class("{\"state\":\"frozen\",\"implementation_candidates\":{\"decent_agent/self_extensions.ep\":{\"status\":\"rejected\"}}}")
+    set t24_candidate_replace_class to react_frozen_action_class_for_decision("{\"state\":\"frozen\",\"implementation_candidates\":{\"decent_agent/self_extensions.ep\":{\"status\":\"rejected\"}}}" and "codebase_replace" and "compiler diagnostic\n[RETAINED IMPLEMENTATION CANDIDATE] exact current bytes")
+    set t24_repair_class to react_frozen_action_class("{\"state\":\"repair_required\"}")
+    if string_index_of(t24_frozen_class and "PLANNED_IMPLEMENTATION") != 0 or else string_index_of(t24_candidate_class and "CANDIDATE_REPAIR") != 0 or else string_index_of(t24_candidate_replace_class and "CANDIDATE_REPLACEMENT_ONLY") != 0 or else string_index_of(t24_repair_class and "IMPLEMENTATION_REPAIR_OR_VERIFY") != 0:
+        display "  FAIL: durable transaction state did not select the legal frozen action class"
+        set t24_ok to 0
+    set t24_complete_plan_json to "{\"state\":\"implementing\",\"planned_files\":[\"decent_agent/self_extensions.ep\"],\"implementation_paths\":[\"decent_agent/self_extensions.ep\"]}"
+    set t24_incomplete_plan_json to "{\"state\":\"implementing\",\"planned_files\":[\"decent_agent/a.ep\",\"decent_agent/b.ep\"],\"implementation_paths\":[\"decent_agent/a.ep\"]}"
+    set t24_post_write_ctx to create_map()
+    set ok to map_insert(t24_post_write_ctx and "repair_workflow_active" and 1)
+    set ok to map_insert(t24_post_write_ctx and "repair_write_seen" and 1)
+    set ok to map_insert(t24_post_write_ctx and "repair_verify_required" and 1)
+    set t24_verify_action to react_post_write_verify_forced_action_from_state(t24_post_write_ctx and t24_complete_plan_json)
+    set t24_unbound_complete to tools_improvement_active_complete_for_ctx(t24_post_write_ctx and t24_complete_plan_json)
+    set ok to map_insert(t24_post_write_ctx and "improvement_active_bound" and 1)
+    set t24_bound_complete to tools_improvement_active_complete_for_ctx(t24_post_write_ctx and t24_complete_plan_json)
+    if tools_improvement_all_planned_paths_implemented_json(t24_complete_plan_json) != 1 or else tools_improvement_all_planned_paths_implemented_json(t24_incomplete_plan_json) != 0 or else t24_unbound_complete != 0 or else t24_bound_complete != 1 or else string_contains(t24_verify_action and "Action: system_verify([])") == 0 or else string_length(react_post_write_verify_forced_action_from_state(t24_post_write_ctx and t24_incomplete_plan_json)) != 0:
+        display "  FAIL: a complete implementation set could re-enter source mutation before verification"
+        set t24_ok to 0
+    free_map(t24_post_write_ctx)
+    set t24_candidate_read_ctx to create_map()
+    set ok to map_insert(t24_candidate_read_ctx and "frozen_latest_tool" and "codebase_read")
+    set ok to map_insert(t24_candidate_read_ctx and "frozen_latest_observation" and "[RETAINED IMPLEMENTATION CANDIDATE] exact bytes")
+    set t24_mutable_source_collision to react_repeated_candidate_read_error(t24_candidate_read_ctx and "codebase_read")
+    set ok to map_insert(t24_candidate_read_ctx and "improvement_test_frozen" and 1)
+    set ok to map_insert(t24_candidate_read_ctx and "improvement_active_bound" and 1)
+    set t24_frozen_candidate_required to react_repeated_candidate_read_error(t24_candidate_read_ctx and "codebase_read")
+    set ok to map_insert(t24_candidate_read_ctx and "frozen_latest_observation" and "source code mentions [RETAINED IMPLEMENTATION CANDIDATE] and IMPROVEMENT_REREAD_OK path=fake as ordinary literals")
+    set t24_embedded_literal_collision to react_repeated_candidate_read_error(t24_candidate_read_ctx and "codebase_read_range")
+    set ok to map_insert(t24_candidate_read_ctx and "frozen_latest_observation" and "[source bytes]\nIMPROVEMENT_REREAD_OK path=decent_agent/self_extensions.ep mode=read state=frozen sha256=fixture")
+    set t24_frozen_reread_required to react_repeated_candidate_read_error(t24_candidate_read_ctx and "codebase_read_range")
+    if string_length(t24_mutable_source_collision) != 0 or else string_contains(t24_frozen_candidate_required and "code=CANDIDATE_REPLACE_REQUIRED") == 0 or else string_length(t24_embedded_literal_collision) != 0 or else string_contains(t24_frozen_reread_required and "code=IMPLEMENTATION_WRITE_REQUIRED") == 0 or else string_length(react_repeated_candidate_read_error(t24_candidate_read_ctx and "codebase_replace")) != 0:
+        display "  FAIL: repeated candidate reads were not narrowed to localized replacement"
+        set t24_ok to 0
+    free_map(t24_candidate_read_ctx)
+    set t24_missing_evidence_ctx to create_map()
+    set ok to map_insert(t24_missing_evidence_ctx and "frozen_plan_evidence_missing" and 1)
+    set ok to map_insert(t24_missing_evidence_ctx and "improvement_test_frozen" and 1)
+    set ok to map_insert(t24_missing_evidence_ctx and "repair_write_seen" and 0)
+    if string_contains(react_missing_plan_evidence_forced_action(t24_missing_evidence_ctx) and "Action: improvement_test_abandon") == 0:
+        display "  FAIL: legacy frozen plan without durable callable evidence did not force preserved re-investigation"
+        set t24_ok to 0
+    set ok to map_insert(t24_missing_evidence_ctx and "repair_write_seen" and 1)
+    if string_length(react_missing_plan_evidence_forced_action(t24_missing_evidence_ctx)) != 0:
+        display "  FAIL: callable-evidence replan remained available after an accepted implementation write"
+        set t24_ok to 0
+    free_map(t24_missing_evidence_ctx)
+    set t24_compact_audit to react_audit_prompt_from_state("durable transaction" and "accumulated transcript that must be bypassed" and "structured correction")
+    if string_contains(t24_compact_audit and "durable transaction") == 0 or else string_contains(t24_compact_audit and "structured correction") == 0 or else string_contains(t24_compact_audit and "accumulated transcript") == 1 or else react_audit_prompt_from_state("" and "ordinary prompt" and "") equals "ordinary prompt" == 0:
+        display "  FAIL: Observer audit prompt did not bypass accumulated durable-workflow history"
+        set t24_ok to 0
+    set t24_investigating_class to react_staging_action_class("{\"state\":\"investigating\"}")
+    set t24_planned_class to react_staging_action_class("{\"state\":\"planned\"}")
+    set t24_authoring_class to react_staging_action_class("{\"state\":\"tests_authoring\"}")
+    set t24_failed_authoring_class to react_staging_action_class("{\"state\":\"tests_authoring\",\"last_validation\":{\"status\":\"failed\"}}")
+    set t24_validated_class to react_staging_action_class("{\"state\":\"tests_validated\"}")
+    if string_index_of(t24_investigating_class and "INVESTIGATION") != 0 or else string_index_of(t24_planned_class and "ACCEPTANCE_CONTRACT") != 0 or else string_index_of(t24_authoring_class and "EVALUATOR_AUTHORING") != 0 or else string_index_of(t24_validated_class and "EVALUATOR_REVIEW") != 0 or else string_contains(t24_validated_class and "never repeat the rejected freeze unchanged") == 0:
+        display "  FAIL: durable staging state did not select the legal pre-freeze action class"
+        set t24_ok to 0
+    if string_index_of(t24_failed_authoring_class and "EVALUATOR_ARTIFACT_REWRITE") != 0 or else string_contains(t24_failed_authoring_class and "improvement_test_write") == 0 or else string_contains(t24_failed_authoring_class and "Never emit EVALUATOR_REPAIR") == 0:
+        display "  FAIL: failed evaluator state did not name real repair tools or reject the symbolic class label"
+        set t24_ok to 0
+    if string_contains(react_staging_forced_action_from_state("tests_authoring" and 0 and 0 and "") and "Action: improvement_test_scaffold([])") == 0 or else string_contains(react_staging_forced_action_from_state("tests_authoring" and 1 and 1 and "") and "Action: improvement_test_validate([])") == 0 or else string_contains(react_staging_forced_action_from_state("tests_validated" and 1 and 1 and "passed") and "Action: improvement_test_freeze([])") == 0 or else string_length(react_staging_forced_action_from_state("tests_authoring" and 1 and 1 and "failed")) != 0:
+        display "  FAIL: deterministic staging transitions did not follow durable evaluator state"
+        set t24_ok to 0
+    if react_staging_force_rejected("improvement_plan_scaffold" and "IMPROVEMENT_GATE_FAILED code=GATE_REJECTED message=missing evidence") != 1 or else react_staging_force_rejected("improvement_test_begin" and "IMPROVEMENT_GATE_FAILED code=GATE_REJECTED message=acceptance mismatch") != 1 or else react_staging_force_rejected("improvement_test_validate" and "Error: evaluator validation failed") != 1 or else react_staging_force_rejected("codebase_read" and "IMPROVEMENT_GATE_FAILED code=GATE_REJECTED message=missing evidence") != 0 or else react_staging_force_rejected("improvement_plan_scaffold" and "IMPROVEMENT_PLAN_OK") != 0:
+        display "  FAIL: a rejected mechanical staging transition could repeat without a fresh typed repair decision"
+        set t24_ok to 0
+    set t24_required_unread_json to "{\"state\":\"investigating\",\"required_discovery_paths\":[\"decent_agent/self_extensions.ep\",\"decent_net/bridge_rpc.ep\"],\"required_production_paths\":[\"decent_agent/self_extensions.ep\"],\"required_surface\":\"scavenger_sweep\",\"discovery\":[{\"path\":\"decent_agent/self_extensions.ep\",\"mode\":\"read\"}]}"
+    set t24_required_complete_json to "{\"state\":\"investigating\",\"required_discovery_paths\":[\"decent_agent/self_extensions.ep\",\"decent_net/bridge_rpc.ep\"],\"required_production_paths\":[\"decent_agent/self_extensions.ep\"],\"required_surface\":\"scavenger_sweep\",\"discovery\":[{\"path\":\"decent_agent/self_extensions.ep\",\"mode\":\"read\"},{\"path\":\"decent_net/bridge_rpc.ep\",\"mode\":\"read_range\"}]}"
+    if string_contains(react_required_investigation_action_from_state(t24_required_unread_json) and "Action: codebase_read([\"decent_net/bridge_rpc.ep\"])") == 0 or else string_contains(react_required_investigation_action_from_state(t24_required_complete_json) and "Action: improvement_plan_scaffold([\"scavenger_sweep\",\"decent_agent/self_extensions.ep\"])") == 0:
+        display "  FAIL: controller did not deterministically read required dependencies then scaffold the exact plan"
+        set t24_ok to 0
+    set t24_acceptance_json to "{\"state\":\"planned\",\"required_surface\":\"scavenger_sweep\",\"required_acceptance\":\"[channel_retrieval] Real bridge output.\\n[marker_persistence] Durable values.\"}"
+    set t24_acceptance_action to react_required_acceptance_action_from_state(t24_acceptance_json)
+    set t24_acceptance_action_map to react_parse_action_envelope(t24_acceptance_action)
+    if string_contains(t24_acceptance_action and "{\"tool_name\":\"improvement_test_begin\",\"arguments\":[\"scavenger_sweep\"") == 0 or else string_contains(t24_acceptance_action and "\\n[marker_persistence]") == 0 or else string_contains(t24_acceptance_action and "Thought:") == 1 or else map_get_val(t24_acceptance_action_map and "found") != 1 or else ptr_to_str(map_get_val(t24_acceptance_action_map and "tool_name")) equals "improvement_test_begin" == 0:
+        display "  FAIL: controller did not deterministically begin evaluator authoring from durable acceptance"
+        set t24_ok to 0
+    free_map(t24_acceptance_action_map)
+    set t24_begin_invariant_error to react_controller_transition_invariant_error("improvement_test_begin" and "IMPROVEMENT_GATE_FAILED code=GATE_REJECTED message=acceptance mismatch")
+    if string_contains(t24_begin_invariant_error and "preserved unchanged") == 0 or else string_length(react_controller_transition_invariant_error("improvement_test_validate" and "IMPROVEMENT_GATE_FAILED code=GATE_REJECTED message=causal failure")) != 0 or else string_length(react_controller_transition_invariant_error("improvement_test_begin" and "IMPROVEMENT_TEST_AUTHORING_OK")) != 0:
+        display "  FAIL: controller-owned begin rejection was not isolated from model retry cycles"
+        set t24_ok to 0
+    if tools_improvement_resume_baseline_green_for_state("investigating") != 1 or else tools_improvement_resume_baseline_green_for_state("planned") != 1 or else tools_improvement_resume_baseline_green_for_state("tests_authoring") != 1 or else tools_improvement_resume_baseline_green_for_state("tests_validated") != 1 or else tools_improvement_resume_baseline_green_for_state("frozen") != 0 or else tools_improvement_resume_baseline_green_for_state("implementing") != 0:
+        display "  FAIL: durable resume lost the green pre-freeze baseline or leaked it into implementation"
+        set t24_ok to 0
+    set t24_durable_prompt to react_frozen_decision_prompt_from_state("{\"state\":\"repair_required\",\"planned_files\":[\"decent_agent/self_extensions.ep\"]}" and "- [ ] Repair the exact production target" and "durable original objective" and "codebase_read" and "authoritative latest observation")
+    if string_contains(t24_durable_prompt and "durable original objective") == 0 or else string_contains(t24_durable_prompt and "IMPLEMENTATION_REPAIR_OR_VERIFY") == 0 or else string_contains(t24_durable_prompt and "authoritative latest observation") == 0 or else string_contains(t24_durable_prompt and "87,000-token transcript") == 1 or else string_length(t24_durable_prompt) > 5000:
+        display "  FAIL: frozen decisions were not reconstructed solely from compact durable transaction state"
+        set t24_ok to 0
+    set t24_staging_prompt to react_staging_decision_prompt_from_state("{\"state\":\"tests_authoring\",\"objective\":\"durable staging objective\"}" and "- [ ] Author exact evaluators" and "durable staging objective" and "improvement_test_begin" and "authoritative staging observation")
+    if string_contains(t24_staging_prompt and "durable staging objective") == 0 or else string_contains(t24_staging_prompt and "EVALUATOR_AUTHORING") == 0 or else string_contains(t24_staging_prompt and "authoritative staging observation") == 0 or else string_length(t24_staging_prompt) > 5000:
+        display "  FAIL: pre-freeze decisions were not reconstructed solely from compact durable transaction state"
+        set t24_ok to 0
+    set t24_unrelated_ctx to create_map()
+    if string_length(react_improvement_decision_prompt(t24_unrelated_ctx)) != 0 or else string_length(react_staging_forced_action(t24_unrelated_ctx)) != 0:
+        display "  FAIL: an unrelated context inherited or advanced another session's durable improvement"
+        set t24_ok to 0
+    set ok to map_insert(t24_unrelated_ctx and "repair_workflow_active" and 1)
+    set ok to map_insert(t24_unrelated_ctx and "sender_role" and "guest")
+    if string_length(react_improvement_decision_prompt(t24_unrelated_ctx)) != 0 or else string_length(react_staging_forced_action(t24_unrelated_ctx)) != 0:
+        display "  FAIL: a guest context inherited or advanced a protected durable improvement"
+        set t24_ok to 0
+    free_map(t24_unrelated_ctx)
+    set t24_compile_only_replan to react_frozen_scope_replan_action(t24_feature_ctx and "Compilation failed: Unknown function 'tools_execute'.")
+    set t24_candidate_repair_replan to react_frozen_scope_replan_action(t24_feature_ctx and "IMPROVEMENT_GATE_FAILED code=CANDIDATE_REPAIR_REQUIRED message=compile failed")
+    set t24_unauthorized_abandon to tools_repair_action_error(t24_feature_ctx and "improvement_test_abandon")
+    set t24_scope_replan to react_frozen_scope_replan_action(t24_feature_ctx and "IMPROVEMENT_GATE_FAILED code=PLAN_SCOPE_MISSING message=post-freeze reread rejected")
+    set t24_authorized_abandon to tools_repair_action_error(t24_feature_ctx and "improvement_test_abandon")
+    set t24_success_guidance_replan to react_frozen_scope_replan_action(t24_feature_ctx and "FREEZE_OK id=current\nAbandonment is unavailable unless the controller returns code=PLAN_SCOPE_MISSING before any accepted write.")
+    set ok to map_insert(t24_feature_ctx and "repair_write_seen" and 1)
+    set t24_after_write_replan to react_frozen_scope_replan_action(t24_feature_ctx and "IMPROVEMENT_GATE_FAILED code=PLAN_SCOPE_MISSING message=implementation path omitted")
+    set t24_after_write_abandon to tools_repair_action_error(t24_feature_ctx and "improvement_test_abandon")
+    set ok to map_insert(t24_feature_ctx and "repair_write_seen" and 0)
+    if string_contains(t24_scope_replan and "Action: improvement_test_abandon") == 0 or else string_contains(t24_scope_replan and "omitted a production dependency") == 0 or else string_length(t24_compile_only_replan) != 0 or else string_length(t24_candidate_repair_replan) != 0 or else string_length(t24_success_guidance_replan) != 0 or else string_contains(t24_unauthorized_abandon and "code=CANDIDATE_REPAIR_REQUIRED") == 0 or else string_length(t24_authorized_abandon) != 0 or else string_length(t24_after_write_replan) != 0 or else string_contains(t24_after_write_abandon and "code=CANDIDATE_REPAIR_REQUIRED") == 0:
+        display "  FAIL: controller-proven frozen scope omission did not force bounded pre-write replanning"
+        set t24_ok to 0
+    set t24_unfrozen_spiral_ctx to create_map()
+    set t24_unfrozen_spiral_guidance to react_thought_spiral_recovery_guidance(t24_unfrozen_spiral_ctx)
+    if string_contains(t24_unfrozen_spiral_guidance and "search the failing literal") == 0 or else string_contains(t24_unfrozen_spiral_guidance and "before evaluator freeze") == 0:
+        display "  FAIL: pre-freeze repetition recovery lost diagnostic source guidance"
+        set t24_ok to 0
+    free_map(t24_unfrozen_spiral_ctx)
+    set ok to map_insert(t24_feature_ctx and "consecutive_no_action" and 4)
+    set ok to map_insert(t24_feature_ctx and "thought_spiral_recoveries" and 2)
+    set ok to react_note_valid_action(t24_feature_ctx)
+    if map_get_val(t24_feature_ctx and "consecutive_no_action") != 0 or else map_get_val(t24_feature_ctx and "thought_spiral_recoveries") != 0:
+        display "  FAIL: valid tool progress did not reset consecutive recovery counters"
+        set t24_ok to 0
+    set ok to map_insert(t24_feature_ctx and "improvement_test_staged" and 1)
+    set ok to map_insert(t24_feature_ctx and "improvement_plan_written" and 1)
+    set ok to map_insert(t24_feature_ctx and "improvement_investigation_started" and 1)
+    set ok to map_insert(t24_feature_ctx and "frozen_latest_tool" and "improvement_candidate_normalize")
+    set ok to map_insert(t24_feature_ctx and "frozen_latest_observation" and "IMPROVEMENT_GATE_FAILED code=PLAN_SCOPE_MISSING message=old transaction")
+    set ok to map_insert(t24_feature_ctx and "last_codebase_path" and "decent_agent/old_candidate.ep")
+    set ok to tools_improvement_reset_after_abandon(t24_feature_ctx)
+    if map_get_val(t24_feature_ctx and "improvement_test_frozen") != 0 or else map_get_val(t24_feature_ctx and "improvement_test_staged") != 0 or else map_get_val(t24_feature_ctx and "improvement_plan_written") != 0 or else map_get_val(t24_feature_ctx and "improvement_investigation_started") != 0 or else map_get_val(t24_feature_ctx and "repair_write_seen") != 0 or else string_length(map_get_val(t24_feature_ctx and "frozen_latest_tool")) != 0 or else string_length(map_get_val(t24_feature_ctx and "frozen_latest_observation")) != 0 or else string_length(map_get_val(t24_feature_ctx and "last_codebase_path")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_investigation_begin")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "improvement_test_begin")) == 0:
+        display "  FAIL: pre-write abandonment did not reset the same turn to investigation-only phase"
+        set t24_ok to 0
+    set ok to map_insert(t24_feature_ctx and "improvement_investigation_started" and 1)
+    set ok to map_insert(t24_feature_ctx and "improvement_plan_written" and 1)
+    set ok to map_insert(t24_feature_ctx and "improvement_test_staged" and 1)
+    set ok to map_insert(t24_feature_ctx and "improvement_test_frozen" and 1)
+    set ok to map_insert(t24_feature_ctx and "repair_verify_green" and 0)
+    if string_length(tools_improvement_incomplete_content_error(t24_feature_ctx and "def run_simulation_test():\n    return 'success'\n")) == 0 or else string_length(tools_improvement_incomplete_content_error(t24_feature_ctx and "define durable_synthesis with transcript as Str returning Str:\n    set lesson to synthesis_extract_lesson(transcript)\n    set ok to lessons_store_durable(lesson)\n    return lesson\n")) != 0:
+        display "  FAIL: incomplete improvement bodies were not rejected without blocking substantive production code"
+        set t24_ok to 0
+    if string_length(tools_repair_action_error(t24_feature_ctx and "codebase_write")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "system_recompile")) == 0:
+        display "  FAIL: frozen evaluator did not unlock implementation while keeping deployment locked"
+        set t24_ok to 0
+    set ok to tools_repair_record_write(t24_feature_ctx)
+    if string_length(tools_repair_action_error(t24_feature_ctx and "codebase_read")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "codebase_write")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "system_verify")) != 0 or else string_length(tools_repair_action_error(t24_feature_ctx and "system_recompile")) == 0:
+        display "  FAIL: multi-file feature transaction did not preserve reads/writes and verification while keeping deployment locked"
+        set t24_ok to 0
+    free_map(t24_feature_ctx)
+    set t24_verify_log to "Undefined symbols for architecture arm64: expected preliminary bootstrap noise\nTEST 22: Multi-user session speaker provenance\n  FAIL: serialized speaker provenance used authorization_level=guest\nTEST 24: Self-upgrade test-integrity lock\n  PASS\n23/24 cognitive agent tests passed.\n1 FAILED!"
+    set t24_failure_summary to compiler_failure_summary(t24_verify_log)
+    set t24_test_pos to string_index_of(t24_failure_summary and "TEST 22:")
+    set t24_noise_pos to string_index_of(t24_failure_summary and "Undefined symbols")
+    if string_index_of(t24_failure_summary and "AUTHORITATIVE FAILURE SUMMARY") < 0 or else t24_test_pos < 0 or else t24_noise_pos < 0 or else t24_test_pos >= t24_noise_pos or else string_index_of(t24_failure_summary and "TEST 24: Self-upgrade test-integrity lock\nOverall suite result") >= 0 or else string_index_of(t24_failure_summary and "Overall suite result: 1 FAILED!") < 0:
+        display concat("  FAIL: verifier did not prioritize the actionable test over bootstrap noise: " and t24_failure_summary)
+        set t24_ok to 0
+    set t24_python_summary to compiler_failure_summary("[mandatory-gate] python3 tests/test_example.py\nERROR: test_runtime_path (__main__.Example)\nFAILED (errors=1)")
+    if string_index_of(t24_python_summary and "ERROR: test_runtime_path") < 0 or else string_index_of(t24_python_summary and "Overall suite result: FAILED (errors=1)") < 0:
+        display concat("  FAIL: uppercase Python errors were omitted from the authoritative summary: " and t24_python_summary)
+        set t24_ok to 0
+    set t24_search to tools_codebase_search("define session_message_speaker_label" and "decent_agent" and 25)
+    if string_index_of(t24_search and "decent_agent/session.ep:") < 0 or else string_index_of(t24_search and "exact paths") < 0:
+        display concat("  FAIL: native codebase search did not return exact implementation provenance: " and t24_search)
+        set t24_ok to 0
+    set t24_list to tools_codebase_list("decent_agent" and 200)
+    if string_index_of(t24_list and "decent_agent/session.ep") < 0 or else string_index_of(t24_list and "decent_agent/tools.ep") < 0 or else string_contains(t24_list and "exact existing paths") == 0 or else string_contains(t24_list and "Do not reconstruct or guess filenames") == 0:
+        display concat("  FAIL: native codebase listing did not return exact current-source paths and recovery guidance: " and t24_list)
+        set t24_ok to 0
+    if tools_exact_occurrences("alpha beta alpha" and "alpha") != 2 or else tools_exact_occurrences("alpha" and "missing") != 0 or else string_contains(self_repair_schema and "retained failed candidate") == 0 or else string_contains(self_repair_schema and "codebase_replace") == 0 or else tools_requires_approval("codebase_replace" and empty_verify_args) != 1:
+        display "  FAIL: exact localized source replacement is not fail-closed and approval-gated"
+        set t24_ok to 0
+    set t24_ctx to create_map()
+    set ok to map_insert(t24_ctx and "sender_role" and "owner")
+    set ok to map_insert(t24_ctx and "upgrade_restart_requested" and 1)
+    set t24_args to create_list()
+    set ok to append_list(t24_args and "decent_agent/session.ep")
+    set t24_blocked to tools_execute(tools_mgr and t24_ctx and "codebase_read" and t24_args)
+    if string_contains(t24_blocked and "no further tool or mutation") == 0:
+        display concat("  FAIL: post-staging tool execution remained possible: " and t24_blocked)
+        set t24_ok to 0
+    set t24_wake_ctx to create_map()
+    set ok to map_insert(t24_wake_ctx and "sender_role" and "owner")
+    set ok to map_insert(t24_wake_ctx and "upgrade_wake" and 1)
+    set ok to map_insert(t24_wake_ctx and "upgrade_wake_canonical_reply" and "authenticated exact receipt")
+    set ok to tools_repair_begin(t24_wake_ctx and "The committed improvement transaction completed after system_recompile.")
+    if map_get_val(t24_wake_ctx and "repair_workflow_active") != 0 or else string_length(tools_repair_action_error(t24_wake_ctx and "reply_request")) != 0:
+        display "  FAIL: authenticated upgrade wake was misclassified as a new repair request"
+        set t24_ok to 0
+    set t24_wake_args to create_list()
+    set ok to append_list(t24_wake_args and "hallucinated truncated hashes")
+    set t24_wake_reply to tools_execute(tools_mgr and t24_wake_ctx and "reply_request" and t24_wake_args)
+    if t24_wake_reply equals "authenticated exact receipt" == 0:
+        display concat("  FAIL: wake reply did not preserve the authenticated receipt: " and t24_wake_reply)
+        set t24_ok to 0
+    if t24_ok == 1:
+        display "  Test/gate paths are operator-only; repair ordering and post-staging tools are locked"
+        display "  PASS"
+        set tests_passed to tests_passed + 1
+    else:
+        set tests_failed to tests_failed + 1
+
+    # ===========================================================
+    # TEST 25: Bounded self-authored extension registration
+    # ===========================================================
+    display "TEST 25: Bounded self-authored extension registration"
+    set t25_ok to 1
+    set t25_schema to tools_get_schema_string(tools_mgr)
+    if string_contains(t25_schema and "- self_extension_status([]) -> Str") == 0 or else string_contains(t25_schema and "core-gated dispatch") == 0 or else string_contains(t25_schema and "- aes_distill([transcript]) -> Str") == 0 or else string_contains(t25_schema and "[LESSON: key | value]") == 0 or else string_contains(t25_schema and "[CORRECTION: key | value]") == 0:
+        display "  FAIL: extension schema was not registered through the core tool manager"
+        set t25_ok to 0
+    set t25_ctx to create_map()
+    set ok to map_insert(t25_ctx and "sender_role" and "owner")
+    set ok to map_insert(t25_ctx and "memory_mgr" and mem)
+    set t25_db_path to concat("/tmp/ernos_extension_context_" and concat(int_to_string(ep_time_now_ms()) and ".db"))
+    set t25_db to sql_open(t25_db_path)
+    set ok to map_insert(t25_ctx and "storage_db" and t25_db)
+    set t25_args to create_list()
+    set t25_result to tools_execute(tools_mgr and t25_ctx and "self_extension_status" and t25_args)
+    if string_contains(t25_result and "self_extensions:ok") == 0 or else string_contains(t25_result and "mandatory_plus_live_e2e") == 0:
+        display concat("  FAIL: extension dispatch did not reach the real registered implementation: " and t25_result)
+        set t25_ok to 0
+    if map_contains(t25_ctx and "storage_db") == 0 or else map_get_val(t25_ctx and "storage_db") == 0:
+        display "  FAIL: extension dispatch did not receive the core-owned database handle"
+        set t25_ok to 0
+    set t25_distill_args to create_list()
+    set ok to append_list(t25_distill_args and "[LESSON: t25_preserved_key | t25_preserved_value]")
+    set t25_distill_result to tools_execute(tools_mgr and t25_ctx and "aes_distill" and t25_distill_args)
+    set t25_lessons to map_get_val(mem and "lessons")
+    if t25_distill_result equals "processed" == 0 or else map_contains(t25_lessons and "t25_preserved_key") == 0 or else map_get_val(t25_lessons and "t25_preserved_key") equals "t25_preserved_value" == 0:
+        display concat("  FAIL: existing aes_distill schema or behavior regressed during extension work: " and t25_distill_result)
+        set t25_ok to 0
+    set t25_direct_count to self_extensions_distill_kind(mem and "[LESSON: t25_count_key | t25_count_value]" and "[LESSON:")
+    if t25_direct_count != 1:
+        display concat("  FAIL: extension helper persisted a lesson but reported the wrong successful-write count: " and int_to_string(t25_direct_count))
+        set t25_ok to 0
+    if tools_path_is_upgrade_trust_root("decent_agent/tools.ep") != 1 or else tools_path_is_upgrade_trust_root("decent_agent/self_extensions.ep") != 0:
+        display "  FAIL: extension boundary does not preserve the sealed core controller"
+        set t25_ok to 0
+    set t25_gate_status to tools_improvement_gate_command("status" and 30000)
+    if string_index_of(t25_gate_status and "IMPROVEMENT_STATUS") != 0:
+        display concat("  FAIL: yielding improvement-controller worker did not return its durable status receipt: " and t25_gate_status)
+        set t25_ok to 0
+    free_list(t25_args)
+    free_list(t25_distill_args)
+    free_map(t25_ctx)
+    set ok to sql_close(t25_db)
+    if file_exists(t25_db_path) == 1:
+        set ok to remove_file(t25_db_path)
+    if t25_ok == 1:
+        display "  Extensions register and dispatch; the yielding controller worker returns without blocking"
         display "  PASS"
         set tests_passed to tests_passed + 1
     else:

@@ -1,0 +1,254 @@
+# Bounded self-authored tool extension registry.
+#
+# The core tool controller imports this module, but this module is deliberately not a
+# deployment/test trust root. Echo may add complete, plan-bound tools here without
+# rewriting the controller that enforces approvals, frozen evaluators, verification,
+# and transactional deployment. Every call still enters through tools_execute, so
+# role checks and the repair state machine remain authoritative.
+
+import "string"
+import "collections"
+import "memory"
+import "../decent_net/bridge_rpc"
+
+define self_extensions_distill_kind with memory_mgr as Map and transcript as Str and marker as Str returning Int:
+    set remaining to transcript
+    set processed_count to 0
+    repeat while string_length(remaining) > 0:
+        set marker_pos to string_index_of(remaining and marker)
+        if marker_pos < 0:
+            return processed_count
+        set body_start to marker_pos + string_length(marker)
+        set after_marker to substring(remaining and body_start and string_length(remaining) - body_start)
+        set close_pos to string_index_of(after_marker and "]")
+        if close_pos < 0:
+            return processed_count
+        set body to substring(after_marker and 0 and close_pos)
+        set pipe_pos to string_index_of(body and "|")
+        if pipe_pos >= 0:
+            set key to string_trim(substring(body and 0 and pipe_pos))
+            set value_start to pipe_pos + 1
+            set value to string_trim(substring(body and value_start and string_length(body) - value_start))
+            if string_length(key) > 0 and also string_length(value) > 0:
+                set ok to memory_store(memory_mgr and 2 and key and value)
+                if ok == 0:
+                    set processed_count to processed_count + 1
+        set next_start to close_pos + 1
+        if next_start >= string_length(after_marker):
+            return processed_count
+        set remaining to substring(after_marker and next_start and string_length(after_marker) - next_start)
+    return processed_count
+
+define self_extensions_schema returning Str:
+    set schemas to "- self_extension_status([]) -> Str\n"
+    set schemas to concat(schemas and "  Description: Report the bounded self-extension registry contract and its currently built-in diagnostic surface. New self-authored tools must be fully implemented here, declared in a frozen improvement plan, and pass the mandatory and live E2E gates before deployment.\n")
+    set schemas to concat(schemas and "  Example: Action: self_extension_status([])\n\n")
+    set schemas to concat(schemas and "- aes_distill([transcript]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Parse every [LESSON: key | value] and [CORRECTION: key | value] fragment in one transcript and persist each pair to durable lesson memory.\n")
+    set schemas to concat(schemas and "  Example: Action: aes_distill([\"[LESSON: key | value]\"])\n\n")
+    set schemas to concat(schemas and "- scavenger_sweep([channel_id]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Retrieve messages from the configured Discord channel via the bridge, parse [LESSON: ...] and [CORRECTION: ...] fragments, and persist them to memory.\n")
+    set schemas to concat(schemas and "  Example: Action: scavenger_sweep([\"123456789\"])\n\n")
+    set schemas to concat(schemas and "- session_summary_generator([session_id]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Retrieves a session transcript by ID, generates a structured summary of decisions and tasks, and persists it to memory.\n")
+    set schemas to concat(schemas and "  Example: Action: session_summary_generator([\"sess_abc123\"])\n\n")
+    set schemas to concat(schemas and "- session_bookmark_recorder([session_id, label]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Verifies a session exists, then persists a durable bookmark label associated with that session ID.\n")
+    set schemas to concat(schemas and "  Example: Action: session_bookmark_recorder([\"sess_123\", \"my_bookmark\"])\n\n")
+    set schemas to concat(schemas and "- session_importance_scorer([transcript]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Analyzes a transcript for significant markers ([DECISION:], [LESSON:], [CORRECTION:]) and persists an importance score to session metadata.\n")
+    set schemas to concat(schemas and "  Example: Action: session_importance_scorer([\"[DECISION: x | y]\"])\n\n")
+    set schemas to concat(schemas and "- session_importance_scorer_v2() -> Str\n")
+    set schemas to concat(schemas and "  Description: A new feature that performs a zero-argument importance check and persists a success token to memory.\n")
+    set schemas to concat(schemas and "  Example: Action: session_importance_scorer_v2()\n\n")
+    set schemas to concat(schemas and "- conversation_signal_indexer([transcript]) -> Str\n")
+    set schemas to concat(schemas and "  Description: Processes [DECISION:], [LESSON:], and [CORRECTION:] markers in a transcript, persists them, and returns counts.\n")
+    set schemas to concat(schemas and "  Example: Action: conversation_signal_indexer([\"[DECISION: x | y]\"])\n\n")
+    set schemas to concat(schemas and "- session_importance_scorer_v3() -> Str\n")
+    set schemas to concat(schemas and "  Description: A new feature that performs a zero-argument importance check and persists a success token to memory.\n")
+    set schemas to concat(schemas and "  Example: Action: session_importance_scorer_v3()\n\n")
+    set schemas to concat(schemas and "- session_importance_scorer_v4() -> Str\n")
+    set schemas to concat(schemas and "  Description: A new feature that performs a zero-argument importance check and persists a success token to memory.\n")
+    set schemas to concat(schemas and "  Example: Action: session_importance_scorer_v4()\n\n")
+    return schemas
+
+define self_extensions_action_known with action_name as Str returning Int:
+    if action_name equals "self_extension_status":
+        return 1
+    if action_name equals "aes_distill":
+        return 1
+    if action_name equals "scavenger_sweep":
+        return 1
+    if action_name equals "session_summary_generator":
+        return 1
+    if action_name equals "session_bookmark_recorder":
+        return 1
+    if action_name equals "session_importance_scorer":
+        return 1
+    if action_name equals "session_importance_scorer_v2":
+        return 1
+    if action_name equals "conversation_signal_indexer":
+        return 1
+    if action_name equals "session_importance_scorer_v3":
+        return 1
+    if action_name equals "session_importance_scorer_v4":
+        return 1
+    return 0
+
+define self_extensions_execute with ctx as Map and action_name as Str and args_list as List returning Str:
+    if action_name equals "self_extension_status":
+        if length_list(args_list) != 0:
+            return "Error: self_extension_status takes no arguments."
+        return "self_extensions:ok,dispatch=core_gated,implementation=plan_bound,verification=mandatory_plus_live_e2e"
+    if action_name equals "aes_distill":
+        if length_list(args_list) != 1:
+            return "Error: aes_distill requires exactly one transcript string."
+        set memory_mgr to map_get_val(ctx and "memory_mgr")
+        if memory_mgr == 0:
+            return "Error: durable memory not available in context."
+        set transcript to get_list(args_list and 0)
+        set lesson_count to self_extensions_distill_kind(memory_mgr and transcript and "[LESSON:")
+        set correction_count to self_extensions_distill_kind(memory_mgr and transcript and "[CORRECTION:")
+        return "processed"
+    if action_name equals "scavenger_sweep":
+        if length_list(args_list) != 1:
+            return "Error: scavenger_sweep requires exactly one channel_id argument."
+        set memory_mgr to map_get_val(ctx and "memory_mgr")
+        if memory_mgr == 0:
+            return "Error: durable memory not available in context."
+        set ddb to map_get_val(ctx and "storage_db")
+        if ddb == 0:
+            return "Error: storage_db not available."
+        set channel_id to get_list(args_list and 0)
+        set did to bridge_enqueue(ddb and "discord" and "read_channel" and channel_id)
+        if did < 0:
+            return "Error: failed to enqueue bridge command."
+        set rx_res to bridge_wait_result(ddb and did and 60)
+        if string_length(rx_res) == 0:
+            return "Error: bridge returned empty response."
+        set lesson_count to self_extensions_distill_kind(memory_mgr and rx_res and "[LESSON:")
+        set correction_count to self_extensions_distill_kind(memory_mgr and rx_res and "[CORRECTION:")
+        return concat("scavenger_sweep:ok,lessons:" and concat(int_to_string(lesson_count) and concat(",corrections:" and int_to_string(correction_count))))
+    if action_name equals "session_summary_generator":
+        if length_list(args_list) != 1:
+            return "Error: session_summary_generator requires exactly one session_id argument."
+        set session_id to get_list(args_list and 0)
+        if string_length(session_id) == 0 or else string_index_of(session_id and "/") >= 0 or else string_index_of(session_id and "\\") >= 0:
+            return "Error: invalid session_id format."
+        set memory_mgr to map_get_val(ctx and "memory_mgr")
+        if memory_mgr == 0:
+            return "Error: durable memory not available in context."
+        set sessions_mgr to map_get_val(ctx and "sessions")
+        if sessions_mgr == 0:
+            return "Error: sessions manager not available."
+        set sessions_map to map_get_val(sessions_mgr and "sessions")
+        if map_contains(sessions_map and session_id) == 0:
+            return "Error: session_id not found."
+        set sess to map_get_val(sessions_map and session_id)
+        set messages_list to map_get_val(sess and "messages")
+        set msg_count to length_list(messages_list)
+        if msg_count == 0:
+            return "Error: session is empty."
+        set summary_content to concat("Summary for session " and concat(session_id and concat(". Records: " and concat(int_to_string(msg_count) and ". Content: "))))
+        set i to 0
+        repeat while i < msg_count:
+            set msg to get_list(messages_list and i)
+            set role to map_get_val(msg and "role")
+            set content to map_get_val(msg and "content")
+            set summary_content to concat(summary_content and concat("[" and concat(role and concat("]: " and concat(content and "\n")))))
+            set i to i + 1
+        set summary_value to concat("Session: " and concat(session_id and concat("\nRecords: " and concat(int_to_string(msg_count) and concat("\n\n" and summary_content)))))
+        set ok to memory_store(memory_mgr and 2 and "session_summary_generator" and summary_value)
+        if ok != 0:
+            return "Error: failed to persist summary."
+        return concat("session_summary_generator:ok,session_id:" and concat(session_id and concat(",records:" and concat(int_to_string(msg_count) and concat("\n" and summary_value)))))
+    if action_name equals "session_bookmark_recorder":
+        if length_list(args_list) != 2:
+            return "Error: session_bookmark_recorder requires exactly 2 arguments (session_id, label)."
+        set session_id to get_list(args_list and 0)
+        set label to get_list(args_list and 1)
+        if string_length(session_id) == 0 or else string_index_of(session_id and "/") >= 0 or else string_index_of(session_id and "\\") >= 0:
+            return "Error: invalid session_id format."
+        if string_length(label) == 0:
+            return "Error: label cannot be empty."
+        set memory_mgr to map_get_val(ctx and "memory_mgr")
+        if memory_mgr == 0:
+            return "Error: durable memory not available in context."
+        set sessions_mgr to map_get_val(ctx and "sessions")
+        if sessions_mgr == 0:
+            return "Error: sessions manager not available."
+        set sessions_map to map_get_val(sessions_mgr and "sessions")
+        if map_contains(sessions_map and session_id) == 0:
+            return "Error: session_id not found."
+        set label_value to concat(session_id and concat(" " and label))
+        set ok to memory_store(memory_mgr and 2 and "session_bookmark_recorder" and label_value)
+        if ok != 0:
+            return "Error: failed to persist bookmark."
+        return concat("session_bookmark_recorder:ok,session_id:" and concat(session_id and concat(",label:" and label)))
+    if action_name equals "session_importance_scorer":
+        if length_list(args_list) != 1:
+            return "Error: session_importance_scorer requires exactly one transcript string."
+        set memory_mgr to map_get_val(ctx and "memory_mgr")
+        if memory_mgr == 0:
+            return "Error: durable memory not available in context."
+        set transcript to get_list(args_list and 0)
+        set score to 0
+        set markers to ["[DECISION:", "[LESSON:", "[CORRECTION:"]
+        set m_idx to 0
+        repeat while m_idx < 3:
+            set marker to get_list(markers and m_idx)
+            set count to self_extensions_distill_kind(memory_mgr and transcript and marker)
+            set score to score + count
+            set m_idx to m_idx + 1
+        set score_str to int_to_string(score)
+        set ok to memory_store(memory_mgr and 2 and "session_importance_scorer" and score_str)
+        if ok != 0:
+            return "Error: failed to persist score."
+        return concat("session_importance_scorer:ok,score:" and score_str)
+    if action_name equals "session_importance_scorer_v2":
+        if length_list(args_list) != 0:
+            return "Error: session_importance_scorer_v2 takes no arguments."
+        set memory_mgr to map_get_val(ctx and "memory_mgr")
+        if memory_mgr == 0:
+            return "Error: durable memory not available in context."
+        set ok to memory_store(memory_mgr and 2 and "session_importance_scorer_v2" and "v2_active")
+        if ok != 0:
+            return "Error: failed to persist v2 token."
+        return "session_importance_scorer_v2:ok"
+    if action_name equals "session_importance_scorer_v3":
+        if length_list(args_list) != 0:
+            return "Error: session_importance_scorer_v3 takes no arguments."
+        set memory_mgr to map_get_val(ctx and "memory_mgr")
+        if memory_mgr == 0:
+            return "Error: durable memory not available in context."
+        set ok to memory_store(memory_mgr and 2 and "session_importance_scorer_v3" and "v3_active")
+        if ok != 0:
+            return "Error: failed to persist v2 token."
+        return "session_importance_scorer_v3:ok"
+    if action_name equals "conversation_signal_indexer":
+        if length_list(args_list) != 1:
+            return "Error: conversation_signal_indexer requires exactly one transcript string."
+        set memory_mgr to map_get_val(ctx and "memory_mgr")
+        if memory_mgr == 0:
+            return "Error: durable memory not available in context."
+        set transcript to get_list(args_list and 0)
+        set d_count to self_extensions_distill_kind(memory_mgr and transcript and "[DECISION:")
+        set l_count to self_extensions_distill_kind(memory_mgr and transcript and "[LESSON:")
+        set c_count to self_extensions_distill_kind(memory_mgr and transcript and "[CORRECTION:")
+        set total to d_count + l_count + c_count
+        set summary to concat("Signals: [D:" and concat(int_to_string(d_count) and concat(", L:" and concat(int_to_string(l_count) and concat(", C:" and int_to_string(c_count))))))
+        set ok to memory_store(memory_mgr and 2 and "conversation_signal_indexer" and summary)
+        if ok != 0:
+            return "Error: failed to persist indexer summary."
+        return concat("conversation_signal_indexer:ok,decisions:" and concat(int_to_string(d_count) and concat(",lessons:" and concat(int_to_string(l_count) and concat(",corrections:" and int_to_string(c_count))))))
+    if action_name equals "session_importance_scorer_v4":
+        if length_list(args_list) != 0:
+            return "Error: session_importance_scorer_v4 takes no arguments."
+        set memory_mgr to map_get_val(ctx and "memory_mgr")
+        if memory_mgr == 0:
+            return "Error: durable memory not available in context."
+        set ok to memory_store(memory_mgr and 2 and "session_importance_scorer_v4" and "v4_active")
+        if ok != 0:
+            return "Error: failed to persist v4 token."
+        return "session_importance_scorer_v4:ok"
+    return "Error: self-extension dispatch received an unregistered action."

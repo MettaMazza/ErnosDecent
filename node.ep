@@ -147,7 +147,7 @@ define node_finish_turn with tctx as Map and sessions_mgr as Map and memory as M
     set resp to ""
     set unattended to 0
     if map_contains(tctx and "platform") == 1:
-        if map_get_val(tctx and "platform") equals "scheduler":
+        if map_get_val(tctx and "platform") equals "scheduler" or else map_get_val(tctx and "platform") equals "upgrade_wake":
             set unattended to 1
     if map_contains(tctx and "was_cancelled") == 1:
         set ok to map_delete(tctx and "was_cancelled")
@@ -243,6 +243,21 @@ define node_publish_final_fallback with sid as Str and turn_tag as Str and paylo
         return 1
     return 0
 
+define node_restart_after_staged_upgrade with tctx as Map and stays_open as Int returning Int:
+    if stays_open == 1:
+        return 0
+    if map_contains(tctx and "upgrade_restart_requested") == 0:
+        return 0
+    set ok to map_delete(tctx and "upgrade_restart_requested")
+    if file_exists("config/upgrades/pending.env") == 0:
+        log_error("upgrade" and "Restart was requested without a pending transactional receipt; continuing the current executable.")
+        return 1
+    # The terminal reply, session state, memory, continuity ingestion, and trace rows
+    # are all durable before this function is called. Only run_node.sh consumes 75.
+    log_info("upgrade" and "Final reply persisted; handing the staged candidate to the runtime supervisor.")
+    exit_program(75)
+    return 0
+
 # A detached foreground turn. Straight-line call to react_run (an awaiting PLAIN
 # function) from an async define is the proven-safe shape (orchestrator_spawn_worker
 # does exactly this); no awaits in loops here.
@@ -261,21 +276,28 @@ async define node_run_turn with model as Map and memory as Map and tools as Map 
     # Deliver final_reply first. Semantic extraction has already happened inside the
     # existing capable-model reply audit, so persistence adds no further LLM call.
     set stays_open to node_finish_turn(tctx and sessions_mgr and memory and sid and agent_resp)
-    if stays_open == 0 and also was_cancelled == 0:
+    set is_system_wake to 0
+    if map_contains(tctx and "upgrade_wake") == 1:
+        set is_system_wake to 1
+    if stays_open == 0 and also was_cancelled == 0 and also is_system_wake == 0:
         set continuity_role to ""
         if map_contains(tctx and "sender_role") == 1:
             set continuity_role to map_get_val(tctx and "sender_role")
-        # Never learn the owner's private relationship model from an external guest.
-        if continuity_role equals "guest" == 0:
-            set continuity_source to "local"
-            if map_contains(tctx and "platform") == 1:
-                set requested_source to map_get_val(tctx and "platform")
-                if string_length(requested_source) > 0:
-                    set continuity_source to requested_source
-            set continuity_persona to prompt_persona_current_name()
-            set ok to continuity_ingest_turn(storage_get_db() and continuity_persona and sid and continuity_source and prompt and agent_resp and continuity_json)
+        # Every speaker advances the chronology of the shared current session. Guests
+        # cannot write host relationship/project/long-term memories.
+        set allow_durable_continuity to 1
+        if continuity_role equals "guest":
+            set allow_durable_continuity to 0
+        set continuity_source to "local"
+        if map_contains(tctx and "platform") == 1:
+            set requested_source to map_get_val(tctx and "platform")
+            if string_length(requested_source) > 0:
+                set continuity_source to requested_source
+        set continuity_persona to prompt_persona_current_name()
+        set ok to continuity_ingest_turn(storage_get_db() and continuity_persona and sid and continuity_source and prompt and agent_resp and continuity_json and allow_durable_continuity)
         if map_contains(tctx and "continuity_user_text") == 1:
             set ok to map_delete(tctx and "continuity_user_text")
+    set restart_rc to node_restart_after_staged_upgrade(tctx and stays_open)
     return 0
 
 # A detached resume after approve/deny (kind 0) or clarification answers (kind 1).
@@ -299,17 +321,286 @@ async define node_resume_turn with model as Map and memory as Map and tools as M
         set continuity_role to ""
         if map_contains(tctx and "sender_role") == 1:
             set continuity_role to map_get_val(tctx and "sender_role")
-        if continuity_role equals "guest" == 0:
-            set continuity_source to "local"
-            if map_contains(tctx and "platform") == 1:
-                set requested_source to map_get_val(tctx and "platform")
-                if string_length(requested_source) > 0:
-                    set continuity_source to requested_source
-            set continuity_persona to prompt_persona_current_name()
-            set ok to continuity_ingest_turn(storage_get_db() and continuity_persona and sid and continuity_source and continuity_user_text and agent_resp and continuity_json)
+        set allow_durable_continuity to 1
+        if continuity_role equals "guest":
+            set allow_durable_continuity to 0
+        set continuity_source to "local"
+        if map_contains(tctx and "platform") == 1:
+            set requested_source to map_get_val(tctx and "platform")
+            if string_length(requested_source) > 0:
+                set continuity_source to requested_source
+        set continuity_persona to prompt_persona_current_name()
+        set ok to continuity_ingest_turn(storage_get_db() and continuity_persona and sid and continuity_source and continuity_user_text and agent_resp and continuity_json and allow_durable_continuity)
         if map_contains(tctx and "continuity_user_text") == 1:
             set ok to map_delete(tctx and "continuity_user_text")
+    set restart_rc to node_restart_after_staged_upgrade(tctx and stays_open)
     return 0
+
+# Recover the exact originating session from the immutable protected-change manifest.
+# Upgrade wake turns are system lifecycle events, never synthetic user messages.
+define node_upgrade_wake_session with change_id as Str returning Str:
+    if string_length(change_id) != 64:
+        return ""
+    set ec to string_replace(change_id and "'" and "''")
+    set rows to sql_query(storage_get_db() and concat("SELECT manifest FROM rights_changes WHERE change_id='" and concat(ec and "' AND category='system_recompile' LIMIT 1;")))
+    if length_list(rows) == 0:
+        return ""
+    set row to get_list(rows and 0)
+    set manifest to ptr_to_str(get_list(row and 0))
+    set root to json_parse(manifest)
+    if root == 0:
+        return ""
+    set session_node to get_json_object_value(root and "session_id")
+    if session_node == 0:
+        return ""
+    return get_json_value(session_node)
+
+define node_upgrade_wake_write with payload as Str returning Int:
+    set wake_path to "config/upgrades/wake.env"
+    set temp_path to concat(wake_path and concat(".tmp." and int_to_string(ep_time_now_ms())))
+    if write_file(temp_path and payload) == 0:
+        return 1
+    if read_file(temp_path) equals payload == 0:
+        set removed_bad_temp to remove_file(temp_path)
+        return 1
+    if fs_move_file(temp_path and wake_path) == 0:
+        set removed_unmoved_temp to remove_file(temp_path)
+        return 1
+    if read_file(wake_path) equals payload == 0:
+        return 1
+    return 0
+
+define node_upgrade_wake_create with reconcile_result as Str returning Str:
+    if file_exists("config/upgrades/outcome.env") == 0 or else file_exists("config/upgrades/pending.env") == 0:
+        return "error_missing_transaction_receipt"
+    set outcome to read_file("config/upgrades/outcome.env")
+    set pending to read_file("config/upgrades/pending.env")
+    set change_id to rights_marker_value(outcome and "change_id")
+    set candidate_hash to rights_marker_value(outcome and "candidate_hash")
+    set rollback_hash to rights_marker_value(outcome and "rollback_hash")
+    set active_hash to rights_marker_value(outcome and "active_hash")
+    set outcome_status to rights_marker_value(outcome and "status")
+    set detail to rights_marker_value(outcome and "detail")
+    set gate_hash to rights_marker_value(pending and "gate_manifest_hash")
+    set session_id to node_upgrade_wake_session(change_id)
+    set improvement_id to ""
+    set improvement_name to ""
+    set improvement_e2e_hash to ""
+    set improvement_live_hash to ""
+    set improvement_live_status to "none"
+    set improvement_failure_hash to ""
+    set improvement_failure_source_hash to ""
+    set improvement_failure_fingerprint to ""
+    set improvement_failure_attempt to "0"
+    if file_exists("config/improvements/active.json") == 1:
+        set improvement_root to json_parse(read_file("config/improvements/active.json"))
+        if improvement_root == 0:
+            return "error_malformed_improvement_receipt"
+        set improvement_state_node to get_json_object_value(improvement_root and "state")
+        set improvement_id_node to get_json_object_value(improvement_root and "id")
+        set improvement_name_node to get_json_object_value(improvement_root and "name")
+        set improvement_e2e_node to get_json_object_value(improvement_root and "e2e_hash")
+        if improvement_state_node == 0 or else improvement_id_node == 0 or else improvement_name_node == 0 or else improvement_e2e_node == 0:
+            return "error_incomplete_improvement_receipt"
+        set improvement_live_status to get_json_value(improvement_state_node)
+        set improvement_id to get_json_value(improvement_id_node)
+        set improvement_name to get_json_value(improvement_name_node)
+        set improvement_e2e_hash to get_json_value(improvement_e2e_node)
+        if string_length(improvement_id) != 64 or else string_length(improvement_e2e_hash) != 64:
+            return "error_unverified_improvement_receipt"
+        if outcome_status equals "applied":
+            set improvement_live_node to get_json_object_value(improvement_root and "live_output_hash")
+            if improvement_live_node == 0:
+                return "error_incomplete_improvement_receipt"
+            set improvement_live_hash to get_json_value(improvement_live_node)
+            if improvement_live_status equals "live_passed" == 0 or else string_length(improvement_live_hash) != 64:
+                return "error_unverified_improvement_receipt"
+        else:
+            set improvement_failure_node to get_json_object_value(improvement_root and "live_failure_hash")
+            set improvement_failure_source_node to get_json_object_value(improvement_root and "live_failure_source_hash")
+            set improvement_failure_fingerprint_node to get_json_object_value(improvement_root and "live_failure_fingerprint")
+            set improvement_failure_attempt_node to get_json_object_value(improvement_root and "live_failure_attempt")
+            if improvement_failure_node == 0 or else improvement_failure_source_node == 0 or else improvement_failure_fingerprint_node == 0 or else improvement_failure_attempt_node == 0:
+                return "error_incomplete_improvement_failure_receipt"
+            set improvement_failure_hash to get_json_value(improvement_failure_node)
+            set improvement_failure_source_hash to get_json_value(improvement_failure_source_node)
+            set improvement_failure_fingerprint to get_json_value(improvement_failure_fingerprint_node)
+            # JSON numeric values are returned as integers, not string pointers.
+            # Passing the live-failure attempt directly into concat dereferences that
+            # integer as a pointer during rollback reconciliation and crashes the
+            # restored node before it can schedule Echo's recursive repair wake.
+            set improvement_failure_attempt to int_to_string(get_json_value(improvement_failure_attempt_node))
+            if improvement_live_status equals "repair_required" == 0 or else string_length(improvement_failure_hash) != 64 or else string_length(improvement_failure_source_hash) != 64 or else string_length(improvement_failure_fingerprint) != 64:
+                return "error_unverified_improvement_failure_receipt"
+    if string_length(change_id) != 64 or else string_length(candidate_hash) != 64 or else string_length(rollback_hash) != 64 or else string_length(active_hash) != 64 or else string_length(gate_hash) != 64 or else string_length(session_id) == 0:
+        return "error_malformed_transaction_receipt"
+    if outcome_status equals "applied" == 0 and also outcome_status equals "failed" == 0:
+        return "error_invalid_outcome_status"
+    set turn_id to concat("upgrade_wake_" and keys_random_hex(24))
+    set payload to "version=1\nstate=pending\n"
+    set payload to concat(payload and concat("change_id=" and concat(change_id and "\n")))
+    set payload to concat(payload and concat("session_id=" and concat(session_id and "\n")))
+    set payload to concat(payload and concat("turn_id=" and concat(turn_id and "\n")))
+    set payload to concat(payload and concat("outcome_status=" and concat(outcome_status and "\n")))
+    set payload to concat(payload and concat("candidate_hash=" and concat(candidate_hash and "\n")))
+    set payload to concat(payload and concat("rollback_hash=" and concat(rollback_hash and "\n")))
+    set payload to concat(payload and concat("active_hash=" and concat(active_hash and "\n")))
+    set payload to concat(payload and concat("gate_manifest_hash=" and concat(gate_hash and "\n")))
+    set payload to concat(payload and concat("detail=" and concat(detail and "\n")))
+    set payload to concat(payload and concat("reconcile_result=" and concat(reconcile_result and "\n")))
+    set payload to concat(payload and concat("improvement_id=" and concat(improvement_id and "\n")))
+    set payload to concat(payload and concat("improvement_name=" and concat(improvement_name and "\n")))
+    set payload to concat(payload and concat("improvement_e2e_hash=" and concat(improvement_e2e_hash and "\n")))
+    set payload to concat(payload and concat("improvement_live_hash=" and concat(improvement_live_hash and "\n")))
+    set payload to concat(payload and concat("improvement_live_status=" and concat(improvement_live_status and "\n")))
+    set payload to concat(payload and concat("improvement_failure_hash=" and concat(improvement_failure_hash and "\n")))
+    set payload to concat(payload and concat("improvement_failure_source_hash=" and concat(improvement_failure_source_hash and "\n")))
+    set payload to concat(payload and concat("improvement_failure_fingerprint=" and concat(improvement_failure_fingerprint and "\n")))
+    set payload to concat(payload and concat("improvement_failure_attempt=" and concat(improvement_failure_attempt and "\n")))
+    if node_upgrade_wake_write(payload) != 0:
+        return "error_durable_wake_receipt_failed"
+    return "created"
+
+define node_upgrade_wake_dispatch with model as Map and memory as Map and tools as Map and shared_ctx as Map returning Str:
+    set wake_path to "config/upgrades/wake.env"
+    if file_exists(wake_path) == 0:
+        return "none"
+    set wake to read_file(wake_path)
+    if rights_marker_value(wake and "version") equals "1" == 0 or else rights_marker_value(wake and "state") equals "pending" == 0:
+        return "error_malformed_wake_receipt"
+    set change_id to rights_marker_value(wake and "change_id")
+    set session_id to rights_marker_value(wake and "session_id")
+    set turn_id to rights_marker_value(wake and "turn_id")
+    set outcome_status to rights_marker_value(wake and "outcome_status")
+    set candidate_hash to rights_marker_value(wake and "candidate_hash")
+    set rollback_hash to rights_marker_value(wake and "rollback_hash")
+    set active_hash to rights_marker_value(wake and "active_hash")
+    set gate_hash to rights_marker_value(wake and "gate_manifest_hash")
+    set detail to rights_marker_value(wake and "detail")
+    set reconcile_result to rights_marker_value(wake and "reconcile_result")
+    set improvement_id to rights_marker_value(wake and "improvement_id")
+    set improvement_name to rights_marker_value(wake and "improvement_name")
+    set improvement_e2e_hash to rights_marker_value(wake and "improvement_e2e_hash")
+    set improvement_live_hash to rights_marker_value(wake and "improvement_live_hash")
+    set improvement_live_status to rights_marker_value(wake and "improvement_live_status")
+    set improvement_failure_hash to rights_marker_value(wake and "improvement_failure_hash")
+    set improvement_failure_source_hash to rights_marker_value(wake and "improvement_failure_source_hash")
+    set improvement_failure_fingerprint to rights_marker_value(wake and "improvement_failure_fingerprint")
+    set improvement_failure_attempt to rights_marker_value(wake and "improvement_failure_attempt")
+    if string_length(change_id) != 64 or else string_length(session_id) == 0 or else string_index_of(turn_id and "upgrade_wake_") != 0 or else string_length(candidate_hash) != 64 or else string_length(rollback_hash) != 64 or else string_length(active_hash) != 64 or else string_length(gate_hash) != 64:
+        return "error_malformed_wake_receipt"
+
+    # A terminal row proves the wake report already completed. Leave an unsent row for
+    # the surface delivery owner; remove the receipt only after it is marked delivered.
+    set es to string_replace(session_id and "'" and "''")
+    set eprefix to string_replace(concat("turn:" and concat(turn_id and ",*")) and "'" and "''")
+    set prior to sql_query(storage_get_db() and concat("SELECT sent FROM trace_events WHERE session_id='" and concat(es and concat("' AND event_type='final_reply' AND content GLOB '" and concat(eprefix and "' ORDER BY id DESC LIMIT 1;")))))
+    if length_list(prior) > 0:
+        set prior_row to get_list(prior and 0)
+        if ptr_to_str(get_list(prior_row and 0)) equals "1":
+            set removed_delivered to remove_file(wake_path)
+            if removed_delivered == 0:
+                return "error_delivered_wake_receipt_cleanup_failed"
+            return "already_delivered"
+        return "awaiting_surface_delivery"
+
+    set sessions_mgr to map_get_val(shared_ctx and "sessions")
+    set sessions_map to map_get_val(sessions_mgr and "sessions")
+    if map_contains(sessions_map and session_id) == 0:
+        return "error_originating_session_missing"
+    if map_contains(shared_ctx and "active_turns") == 0:
+        set ok to map_insert(shared_ctx and "active_turns" and create_map())
+    if map_contains(shared_ctx and "turn_ctxs") == 0:
+        set ok to map_insert(shared_ctx and "turn_ctxs" and create_map())
+    set active_turns to map_get_val(shared_ctx and "active_turns")
+    set turn_ctxs to map_get_val(shared_ctx and "turn_ctxs")
+    if map_contains(active_turns and session_id) == 1:
+        return "error_originating_session_busy"
+
+    set active_sess to map_get_val(sessions_map and session_id)
+    set selected_model to ""
+    if map_contains(active_sess and "model") == 1:
+        set selected_model to map_get_val(active_sess and "model")
+    set ok to map_insert(shared_ctx and "model" and cast_borrow_to_map(model))
+    set ok to map_insert(shared_ctx and "memory_mgr" and cast_borrow_to_map(memory))
+    set ok to map_insert(shared_ctx and "tools_mgr" and cast_borrow_to_map(tools))
+    if map_contains(shared_ctx and "session_auto_approve") == 0:
+        set ok to map_insert(shared_ctx and "session_auto_approve" and create_map())
+    set tctx to _orch_clone_map(cast_borrow_to_map(shared_ctx))
+    set ok to map_delete(tctx and "pending_action")
+    set ok to map_delete(tctx and "pending_clarification")
+    set ok to map_delete(tctx and "tool_approved")
+    set ok to map_delete(tctx and "last_reasoning")
+    set ok to map_insert(tctx and "sender_username" and "ernosdecent_runtime")
+    set ok to map_insert(tctx and "sender_role" and "owner")
+    set ok to map_insert(tctx and "actor_id" and "ernosdecent:upgrade-supervisor")
+    set ok to map_insert(tctx and "actor_username" and "ernosdecent_runtime")
+    set ok to map_insert(tctx and "actor_global_name" and "ErnosDecent Runtime Supervisor")
+    set ok to map_insert(tctx and "actor_display_name" and "ErnosDecent Runtime Supervisor")
+    set ok to map_insert(tctx and "actor_type" and "system")
+    set ok to map_insert(tctx and "actor_is_host" and "no")
+    set ok to map_insert(tctx and "host_name" and "")
+    set ok to map_insert(tctx and "platform" and "upgrade_wake")
+    set ok to map_insert(tctx and "selected_model" and selected_model)
+    set ok to map_insert(tctx and "mode" and "")
+    set ok to map_insert(tctx and "session_id" and session_id)
+    set ok to map_insert(tctx and "turn_id" and turn_id)
+    set recovery_wake to 0
+    if outcome_status equals "failed" and also improvement_live_status equals "repair_required":
+        set recovery_wake to 1
+        set ok to map_insert(tctx and "improvement_recovery_wake" and 1)
+    else:
+        set ok to map_insert(tctx and "upgrade_wake" and 1)
+
+    # Echo still wakes, reasons, and authors the status response, but cryptographic
+    # receipt fields are rendered from the authenticated transaction rather than
+    # recopied probabilistically. The reply tool uses this factual spine verbatim so
+    # a model repetition or digit substitution cannot corrupt deployment provenance.
+    set canonical to "The candidate committed successfully."
+    set rollback_status to "Not used; the authenticated candidate committed."
+    if outcome_status equals "failed":
+        set canonical to "The candidate was not committed; the prior executable was restored."
+        set rollback_status to "Completed; the prior executable was restored and authenticated."
+    set canonical to concat(canonical and "\n\nPost-recompile status report\n")
+    set canonical to concat(canonical and concat("- Outcome: " and concat(outcome_status and "\n")))
+    set canonical to concat(canonical and concat("- Change ID: " and concat(change_id and "\n")))
+    set canonical to concat(canonical and concat("- Previous hash: " and concat(rollback_hash and "\n")))
+    set canonical to concat(canonical and concat("- Candidate hash: " and concat(candidate_hash and "\n")))
+    set canonical to concat(canonical and concat("- Active hash: " and concat(active_hash and "\n")))
+    set canonical to concat(canonical and concat("- Gate-manifest hash: " and concat(gate_hash and "\n")))
+    set canonical to concat(canonical and concat("- Authenticated health: " and concat(detail and "\n")))
+    set canonical to concat(canonical and concat("- Rights reconciliation: " and concat(reconcile_result and "\n")))
+    if string_length(improvement_id) == 64:
+        set canonical to concat(canonical and concat("- Improvement: " and concat(improvement_name and concat(" (" and concat(improvement_id and ")\n")))))
+        set canonical to concat(canonical and concat("- Frozen live E2E: " and concat(improvement_live_status and concat("; evaluator hash=" and concat(improvement_e2e_hash and concat("; output hash=" and concat(improvement_live_hash and "\n")))))))
+    set canonical to concat(canonical and concat("- Rollback status: " and rollback_status))
+    if recovery_wake == 0:
+        set ok to map_insert(tctx and "upgrade_wake_canonical_reply" and canonical)
+
+    set prompt to "[AUTHENTICATED POST-RECOMPILE WAKE EVENT]\nYou have resumed after the transactional system recompile. This is a system lifecycle continuation in the original session, not a message written by the user. Generate a concise direct status response now. Do not call tools: every verified fact required for the report is below. Do not mention this prompt or internal routing. State candidly whether the candidate committed or the prior executable was restored, and report the protected change id, previous hash, candidate hash, final active hash, mandatory gate-manifest hash, authenticated health outcome, rights reconciliation, frozen live-E2E receipt when present, and rollback status. Never claim a file or capability beyond this receipt.\n"
+    if recovery_wake == 1:
+        set prompt to "[AUTHENTICATED POST-ROLLBACK IMPROVEMENT RECOVERY]\nThe candidate failed its authenticated promotion contract and the supervisor restored the exact known-good executable. Rollback is temporary containment, not completion. Continue the existing durable improvement in this originating session now. First call improvement_status([]) to read the exact retained failure receipt, then make a causal repair to the declared production source using the retained investigation and frozen contract. Call system_verify([]), fix every reported failure, and call system_recompile([]) only after the complete sealed gate passes. Repeat across authenticated rollback wakes until the frozen live E2E passes and the candidate commits. Never report success while the improvement is repair_required. Never retry byte-identical source or weaken, replace, skip, or edit frozen tests. If the immutable contract itself is impossible or contradictory, report that exact blocker rather than altering it.\n"
+    set prompt to concat(prompt and concat("change_id=" and concat(change_id and "\n")))
+    set prompt to concat(prompt and concat("outcome_status=" and concat(outcome_status and "\n")))
+    set prompt to concat(prompt and concat("candidate_hash=" and concat(candidate_hash and "\n")))
+    set prompt to concat(prompt and concat("previous_hash=" and concat(rollback_hash and "\n")))
+    set prompt to concat(prompt and concat("active_hash=" and concat(active_hash and "\n")))
+    set prompt to concat(prompt and concat("gate_manifest_hash=" and concat(gate_hash and "\n")))
+    set prompt to concat(prompt and concat("supervisor_detail=" and concat(detail and "\n")))
+    set prompt to concat(prompt and concat("rights_reconciliation=" and reconcile_result))
+    set prompt to concat(prompt and concat("\nimprovement_id=" and improvement_id))
+    set prompt to concat(prompt and concat("\nimprovement_name=" and improvement_name))
+    set prompt to concat(prompt and concat("\nimprovement_e2e_hash=" and improvement_e2e_hash))
+    set prompt to concat(prompt and concat("\nimprovement_live_hash=" and improvement_live_hash))
+    set prompt to concat(prompt and concat("\nimprovement_live_status=" and improvement_live_status))
+    set prompt to concat(prompt and concat("\nimprovement_failure_hash=" and improvement_failure_hash))
+    set prompt to concat(prompt and concat("\nimprovement_failure_source_hash=" and improvement_failure_source_hash))
+    set prompt to concat(prompt and concat("\nimprovement_failure_fingerprint=" and improvement_failure_fingerprint))
+    set prompt to concat(prompt and concat("\nimprovement_failure_attempt=" and improvement_failure_attempt))
+    set ok to map_insert(active_turns and session_id and 1)
+    set ok to map_insert(turn_ctxs and session_id and tctx)
+    set wake_fut to node_run_turn(cast_borrow_to_map(model) and cast_borrow_to_map(memory) and cast_borrow_to_map(tools) and tctx and sessions_mgr and session_id and prompt)
+    return concat("scheduled,session:" and concat(session_id and concat(",turn:" and turn_id)))
 
 # ── Phase A2: the IPC ACCEPT is itself a TASK CHAIN ─────────────────────────────
 # Why a chain and not a loop in main: a task's step is ATOMIC on the single scheduler
@@ -699,6 +990,24 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                 set ok to ep_net_close(client_fd)
                 log_info("node" and "Daemon restarting on authenticated request.")
                 exit_program(75)
+            else if cmd_upper equals "UPGRADE RECONCILE":
+                # Only the authenticated run_node.sh supervisor sends this after the
+                # replacement or rollback process passes STATUS. The node validates
+                # every receipt hash and atomically commits the rights ledger itself.
+                # Once committed, persist and dispatch an exactly-correlated lifecycle
+                # wake turn in the originating session. The receipt survives crashes;
+                # startup recovery below re-dispatches only when no terminal row exists.
+                set resp to rights_reconcile_upgrade(storage_get_db())
+                if string_index_of(resp and "upgrade:committed,") == 0 or else string_index_of(resp and "upgrade:rolled_back,") == 0:
+                    set wake_created to node_upgrade_wake_create(resp)
+                    set wake_status to wake_created
+                    if wake_created equals "created":
+                        set wake_status to node_upgrade_wake_dispatch(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx))
+                    if string_index_of(wake_status and "error_") == 0:
+                        log_error("upgrade" and concat("Post-recompile wake handoff failed: " and wake_status))
+                    else:
+                        log_info("upgrade" and concat("Post-recompile wake handoff: " and wake_status))
+                    set resp to concat(resp and concat(",wake_status:" and wake_status))
             else if cmd_upper equals "HEALTH":
                 set health_ipc_port to map_get_val(agent_ctx and "ipc_port")
                 set health_report to run_health_check(dht_node and raft_node and health_ipc_port and identity and relay_node and msg_store and ledger and name_reg and agent_ctx and bft_node)
@@ -863,7 +1172,59 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             set resp to f"msg:queued_local,text:{msg_body}"
                                         free_map(send_result)
                                     else:
-                                        if string_contains(cmd_upper and "AI INFER ") == 1:
+                                        if string_index_of(cmd_upper and "AI EVAL_TOOL ") == 0:
+                                            # Authenticated, transaction-bound evaluator seam. It bypasses
+                                            # model selection, not authorization: only the exact planned
+                                            # surface is callable and approval-gated tools remain unavailable.
+                                            set eval_wire to substring(cmd and 13 and string_length(cmd) - 13)
+                                            set eval_sep to string_index_of(eval_wire and " ")
+                                            if eval_sep <= 0:
+                                                set resp to "eval_tool:error,reason:bad_args,expected:AI EVAL_TOOL <planned_surface> <base64-json-array>"
+                                            else:
+                                                set eval_name to substring(eval_wire and 0 and eval_sep)
+                                                set eval_args_b64 to substring(eval_wire and eval_sep + 1 and string_length(eval_wire) - eval_sep - 1)
+                                                if tools_improvement_eval_surface_allowed(eval_name) == 0:
+                                                    set resp to concat("eval_tool:error,reason:not_current_planned_surface,name:" and eval_name)
+                                                else:
+                                                    set eval_args_text to rag_base64_decode(eval_args_b64)
+                                                    set eval_args_node to json_parse(eval_args_text)
+                                                    if eval_args_node == 0 or else get_json_type(eval_args_node) != 3:
+                                                        set resp to "eval_tool:error,reason:args_must_be_base64_json_array"
+                                                    else:
+                                                        set eval_args to create_list()
+                                                        set eval_items to get_json_value(eval_args_node)
+                                                        set eval_i to 0
+                                                        repeat while eval_i < length_list(eval_items):
+                                                            set eval_item to get_list(eval_items and eval_i)
+                                                            if get_json_type(eval_item) == 1:
+                                                                set ok to append_list(eval_args and int_to_string(get_json_value(eval_item)))
+                                                            else:
+                                                                set ok to append_list(eval_args and get_json_value(eval_item))
+                                                            set eval_i to eval_i + 1
+                                                        if tools_requires_approval(eval_name and eval_args) == 1:
+                                                            set resp to concat("eval_tool:error,reason:approval_required,name:" and eval_name)
+                                                        else:
+                                                            set eval_ctx to create_map()
+                                                            set ok to map_insert(eval_ctx and "sender_role" and "owner")
+                                                            set ok to map_insert(eval_ctx and "platform" and "improvement_evaluator")
+                                                            set ok to map_insert(eval_ctx and "session_id" and "improvement_evaluator")
+                                                            set ok to map_insert(eval_ctx and "memory" and cast_borrow_to_map(agent_memory))
+                                                            set ok to map_insert(eval_ctx and "memory_mgr" and cast_borrow_to_map(agent_memory))
+                                                            # The authenticated evaluator must exercise the same
+                                                            # live service context as an ordinary tool turn. Session-
+                                                            # aware extensions otherwise receive an artificial context
+                                                            # with no session manager and can never pass a genuine live
+                                                            # replacement test, even though the production turn path has
+                                                            # that manager available.
+                                                            set eval_sessions to map_get_val(agent_ctx and "sessions")
+                                                            set ok to map_insert(eval_ctx and "sessions" and cast_borrow_to_map(eval_sessions))
+                                                            set eval_result to tools_execute(cast_borrow_to_map(agent_tools) and eval_ctx and eval_name and eval_args)
+                                                            set eval_save_rc to memory_serialize(cast_borrow_to_map(agent_memory) and "config/agent_memory.json")
+                                                            if eval_save_rc != 0:
+                                                                set resp to "eval_tool:error,reason:memory_persistence_failed"
+                                                            else:
+                                                                set resp to concat("eval_tool:ok,name:" and concat(eval_name and concat(",result_b64:" and base64_encode(eval_result))))
+                                        else if string_contains(cmd_upper and "AI INFER ") == 1:
                                             set ai_prompt to substring(cmd and 9 and string_length(cmd) - 9)
                                             display f"[AI] INFER received ({string_length(ai_prompt)} chars) — entering agent."
                                             set selected_session_id to ""
@@ -872,6 +1233,18 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                             set selected_system_prompt to ""
                                             set sender_username to ""
                                             set sender_role to ""
+                                            set actor_id to ""
+                                            set actor_username to ""
+                                            set actor_global_name to ""
+                                            set actor_display_name to ""
+                                            set actor_type to ""
+                                            set actor_is_host to ""
+                                            set host_name to ""
+                                            set guild_id to ""
+                                            set guild_name to ""
+                                            set channel_name to ""
+                                            set thread_id to ""
+                                            set thread_name to ""
                                             set in_memory_context to ""
                                             set visual_context to ""
                                             set image_path to ""
@@ -964,6 +1337,126 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                         if skip_len < string_length(ai_prompt):
                                                             set next_char to get_character(ai_prompt and skip_len)
                                                             if next_char == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[ACTOR_ID:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 10:
+                                                        set actor_id to substring(ai_prompt and 10 and end_idx - 10)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[ACTOR_USERNAME:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 16:
+                                                        set actor_username to substring(ai_prompt and 16 and end_idx - 16)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[ACTOR_GLOBAL:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 14:
+                                                        set actor_global_name to substring(ai_prompt and 14 and end_idx - 14)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[ACTOR_DISPLAY:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 15:
+                                                        set actor_display_name to substring(ai_prompt and 15 and end_idx - 15)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[ACTOR_TYPE:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 12:
+                                                        set actor_type to substring(ai_prompt and 12 and end_idx - 12)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[ACTOR_IS_HOST:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 15:
+                                                        set actor_is_host to substring(ai_prompt and 15 and end_idx - 15)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[HOST_NAME:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 11:
+                                                        set host_name to substring(ai_prompt and 11 and end_idx - 11)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[GUILD_ID:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 10:
+                                                        set guild_id to substring(ai_prompt and 10 and end_idx - 10)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[GUILD_NAME:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 12:
+                                                        set guild_name to substring(ai_prompt and 12 and end_idx - 12)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[CHANNEL_NAME:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 14:
+                                                        set channel_name to substring(ai_prompt and 14 and end_idx - 14)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[THREAD_ID:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 11:
+                                                        set thread_id to substring(ai_prompt and 11 and end_idx - 11)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
+                                                                set skip_len to skip_len + 1
+                                                        set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
+                                                        set found_opt to 1
+                                                else if string_index_of(ai_prompt and "[THREAD_NAME:") == 0:
+                                                    set end_idx to string_index_of(ai_prompt and "]")
+                                                    if end_idx > 13:
+                                                        set thread_name to substring(ai_prompt and 13 and end_idx - 13)
+                                                        set skip_len to end_idx + 1
+                                                        if skip_len < string_length(ai_prompt):
+                                                            if get_character(ai_prompt and skip_len) == 32:
                                                                 set skip_len to skip_len + 1
                                                         set ai_prompt to substring(ai_prompt and skip_len and string_length(ai_prompt) - skip_len)
                                                         set found_opt to 1
@@ -1115,10 +1608,6 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                     else:
                                                         set resp to "error:whisper_write_failed"
                                             else:
-                                                # Persist the user message exactly once, only when this request is
-                                                # accepted as a turn. Busy callers retry the same payload.
-                                                if active_sess != 0:
-                                                    set ok to session_add_message(active_sess and "user" and ai_prompt)
                                                 # Shared refs sub-agent delegation needs, kept on the SHARED ctx
                                                 # (clone below copies them). Also ensure session_auto_approve
                                                 # exists so all turn clones share ONE toggle map.
@@ -1143,6 +1632,18 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set ok to map_delete(tctx and "last_reasoning")
                                                 set ok to map_insert(tctx and "sender_username" and sender_username)
                                                 set ok to map_insert(tctx and "sender_role" and sender_role)
+                                                set ok to map_insert(tctx and "actor_id" and actor_id)
+                                                set ok to map_insert(tctx and "actor_username" and actor_username)
+                                                set ok to map_insert(tctx and "actor_global_name" and actor_global_name)
+                                                set ok to map_insert(tctx and "actor_display_name" and actor_display_name)
+                                                set ok to map_insert(tctx and "actor_type" and actor_type)
+                                                set ok to map_insert(tctx and "actor_is_host" and actor_is_host)
+                                                set ok to map_insert(tctx and "host_name" and host_name)
+                                                set ok to map_insert(tctx and "guild_id" and guild_id)
+                                                set ok to map_insert(tctx and "guild_name" and guild_name)
+                                                set ok to map_insert(tctx and "channel_name" and channel_name)
+                                                set ok to map_insert(tctx and "thread_id" and thread_id)
+                                                set ok to map_insert(tctx and "thread_name" and thread_name)
                                                 set ok to map_insert(tctx and "in_memory_context" and in_memory_context)
                                                 set ok to map_insert(tctx and "visual_context" and visual_context)
                                                 set ok to map_insert(tctx and "image_path" and image_path)
@@ -1152,6 +1653,11 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set ok to map_insert(tctx and "selected_model" and selected_model)
                                                 set ok to map_insert(tctx and "mode" and selected_mode)
                                                 set ok to map_insert(tctx and "session_id" and turn_sid)
+                                                # Persist the accepted message with its complete authenticated
+                                                # speaker/surface provenance. Historical turns must never inherit
+                                                # the identity attached to whichever account happens to speak next.
+                                                if active_sess != 0:
+                                                    set ok to session_add_message_with_context(active_sess and "user" and ai_prompt and tctx)
                                                 # Preserve the accepted, tag-free user request on the private turn
                                                 # context. Artifact creation records use this as their durable WHY;
                                                 # reconstructing intent later from filenames or summaries is lossy.
@@ -3137,6 +3643,19 @@ define main:
         set ok to map_insert(runtime_services and "rights" and 1)
         log_info("node" and concat("Echo rights charter v" and concat(RIGHTS_CHARTER_VERSION and " active and ledger verified.")))
         display concat("[+] Echo rights charter v" and concat(RIGHTS_CHARTER_VERSION and " ACTIVE (personhood/consent/disclosure/recovery ledger verified)."))
+
+    # A wake receipt is written before a reconciled upgrade returns to the supervisor.
+    # If the process died after that durable write but before Echo's report completed,
+    # resume it now. An existing terminal row suppresses duplicate inference and remains
+    # available for the platform delivery owner to claim exactly once.
+    if file_exists("config/upgrades/wake.env") == 1:
+        set recovered_wake to node_upgrade_wake_dispatch(cast_borrow_to_map(agent_model) and cast_borrow_to_map(agent_memory) and cast_borrow_to_map(agent_tools) and cast_borrow_to_map(agent_ctx))
+        if string_index_of(recovered_wake and "error_") == 0:
+            log_error("upgrade" and concat("Durable post-recompile wake recovery failed: " and recovered_wake))
+            display concat("[UPGRADE] Wake recovery failed visibly: " and recovered_wake)
+        else:
+            log_info("upgrade" and concat("Durable post-recompile wake recovery: " and recovered_wake))
+            display concat("[UPGRADE] Wake recovery: " and recovered_wake)
 
     # Changelog subsystem (monthly file rotation)
     set ok to changelog_init()

@@ -364,9 +364,21 @@ if [ "$1" = "test" ] || [ "$1" = "--test" ]; then
         exit 1
     fi
     
+    rm -f decent_agent/test_agent_compiled.c
+    TEST_COMPILER_LOG=$(mktemp "${TMPDIR:-/tmp}/ernos-test-compiler.XXXXXX")
     set +e
-    $ERNOS decent_agent/test_agent.ep 2>&1
+    $ERNOS decent_agent/test_agent.ep >"$TEST_COMPILER_LOG" 2>&1
     set -e
+    if [ ! -f decent_agent/test_agent_compiled.c ]; then
+        cat "$TEST_COMPILER_LOG"
+        rm -f "$TEST_COMPILER_LOG"
+        echo "[-] Cognitive-agent compiler did not emit C; refusing a stale test binary."
+        exit 1
+    fi
+    # ErnosPlain's preliminary link is expected to fail until the runtime helpers
+    # below are injected. HIVE/Apis reports only actionable test/build failures;
+    # suppress this successful bootstrap stage so an agent cannot misdiagnose it.
+    rm -f "$TEST_COMPILER_LOG"
 
     # Step 1b: Patch conflicting mutex declarations and inject cast_borrow_to_map, cast_map_to_int and ep_net_send_raw
     python3 -c "
@@ -516,13 +528,18 @@ print('Patched conflicting mutex declarations, test blocking barriers, and SQLit
     
     echo ""
     echo "[*] Building GitDec Host Election Test Suite..."
+    rm -f decent_net/test_host_election_compiled.c
+    HOST_COMPILER_LOG=$(mktemp "${TMPDIR:-/tmp}/ernos-host-compiler.XXXXXX")
     set +e
-    $ERNOS decent_net/test_host_election.ep 2>&1
+    $ERNOS decent_net/test_host_election.ep >"$HOST_COMPILER_LOG" 2>&1
     set -e
     if [ ! -f decent_net/test_host_election_compiled.c ]; then
+        cat "$HOST_COMPILER_LOG"
+        rm -f "$HOST_COMPILER_LOG"
         echo "[-] Host-election compiler did not emit C; refusing a stale test binary."
         exit 1
     fi
+    rm -f "$HOST_COMPILER_LOG"
     clang decent_net/test_host_election_compiled.c decent_net/network_runtime.c -o ./decent_net/test_host_election $CFLAGS 2>&1
     if [ "$OS" = "Darwin" ]; then
         codesign --force -s - ./decent_net/test_host_election 2>/dev/null || true
@@ -556,26 +573,79 @@ echo "[*] Using compiler: $ERNOS"
 
 # Step 0: Compile frontend app.ep to app.js
 echo "[*] Compiling frontend app.ep to app.js..."
-$ERNOS emit decent_web/app.ep --js -o decent_web/app.js
-
-# Step 1: Compile ErnosPlain -> C (the compiler's own link step is expected to
-# fail because it doesn't know about the injected runtime functions; we patch and
-# relink below). BUT we must FAIL LOUD if the type-checker aborted and no fresh C
-# was emitted -- otherwise build.sh silently relinks a STALE node_compiled.c and
-# ships a binary that doesn't match the source.
-set +e
-ERNOS_OUT=$($ERNOS node.ep 2>&1)
-set -e
-echo "$ERNOS_OUT" | tail -6
-# Fail loud if the compiler aborted before emitting fresh C. Cover BOTH classes that
-# leave a stale node_compiled.c behind: type errors AND codegen/safety errors (e.g.
-# "Code Generation Error", "Safety Error", "Compilation failed"). The latter do NOT
-# contain "type error", so a grep for only that would silently relink the stale C.
-if echo "$ERNOS_OUT" | grep -qE "type error\(s\) found|Code Generation Error|Safety Error|Compilation failed|Compiler Error"; then
-    echo "[-] BUILD FAILED: 'ernos node.ep' aborted (type or codegen/safety error) and did NOT emit fresh C."
-    echo "[-] Refusing to relink the stale node_compiled.c. Fix the error reported above first."
+APP_TEMP=$(mktemp "decent_web/app.js.build.XXXXXX")
+if ! $ERNOS emit decent_web/app.ep --js -o "$APP_TEMP"; then
+    rm -f "$APP_TEMP"
+    echo "[-] Frontend JavaScript emission failed."
     exit 1
 fi
+# The compiler currently emits function-local `let` names from an unordered set, so
+# declaration order can vary even when app.ep is byte-identical. Compare a normalized
+# view before publishing: declaration-only shuffles leave the tracked app.js untouched,
+# while any executable/source change still replaces it atomically.
+if [ -f decent_web/app.js ] && python3 - "$APP_TEMP" decent_web/app.js <<'PY'
+import re
+import sys
+
+def normalized(path):
+    lines = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            match = re.match(r"^(\s*)let ([A-Za-z0-9_, ]+);(\s*)$", line.rstrip("\n"))
+            if match:
+                names = sorted(name.strip() for name in match.group(2).split(","))
+                line = f"{match.group(1)}let {', '.join(names)};{match.group(3)}\n"
+            lines.append(line)
+    return "".join(lines)
+
+sys.exit(0 if normalized(sys.argv[1]) == normalized(sys.argv[2]) else 1)
+PY
+then
+    rm -f "$APP_TEMP"
+    echo "[*] Frontend output is semantically unchanged; retained stable app.js bytes."
+else
+    mv -f "$APP_TEMP" decent_web/app.js
+    echo "[+] Frontend output updated atomically: decent_web/app.js"
+fi
+
+# Step 1: Generate the compiler's complete C runtime in an isolated symlink view.
+# `ernos node.ep` performs a preliminary link before our required helpers are injected.
+# Running that compiler pass in the repository deleted ./node even when the final build
+# targeted ERNOS_NODE_OUTPUT. The isolated directory preserves normal relative imports
+# while confining the compiler's preliminary binary/C outputs away from the live tree.
+SOURCE_ROOT=$(pwd -P)
+COMPILE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ernos-node-compile.XXXXXX")
+cleanup_compile_dir() {
+    case "$COMPILE_DIR" in
+        "${TMPDIR:-/tmp}"/ernos-node-compile.*) rm -rf "$COMPILE_DIR" ;;
+        *) echo "[-] Refusing unsafe compiler scratch cleanup path: $COMPILE_DIR" >&2 ;;
+    esac
+}
+trap cleanup_compile_dir EXIT INT TERM
+for source_entry in "$SOURCE_ROOT"/*; do
+    source_name=$(basename "$source_entry")
+    case "$source_name" in
+        node|node_compiled.c) continue ;;
+    esac
+    ln -s "$source_entry" "$COMPILE_DIR/$source_name"
+done
+
+set +e
+ERNOS_OUT=$(cd "$COMPILE_DIR" && "$ERNOS" node.ep 2>&1)
+ERNOS_RC=$?
+set -e
+echo "$ERNOS_OUT" | tail -6
+if echo "$ERNOS_OUT" | grep -qE "type error\(s\) found|Code Generation Error|Safety Error|Compiler Error"; then
+    echo "[-] BUILD FAILED: ErnosPlain compilation aborted before emitting fresh complete C."
+    exit 1
+fi
+if [ ! -f "$COMPILE_DIR/node_compiled.c" ]; then
+    echo "[-] BUILD FAILED: compiler returned $ERNOS_RC without fresh complete node_compiled.c."
+    exit 1
+fi
+mv -f "$COMPILE_DIR/node_compiled.c" node_compiled.c
+cleanup_compile_dir
+trap - EXIT INT TERM
 
 # Step 2: Patch SIGPIPE ignore into the C runtime
 # The ErnosPlain compiler's signal handler catches SIGFPE/SIGSEGV/SIGABRT
@@ -1475,13 +1545,32 @@ case "$OS" in
         ;;
 esac
 
-echo "[*] Compiling with: clang node_compiled.c $SD_SHIM_SRC -o ./node $CFLAGS $SD_CFLAGS"
-clang node_compiled.c $SD_SHIM_SRC -o ./node $CFLAGS $SD_CFLAGS 2>&1
+NODE_OUTPUT="${ERNOS_NODE_OUTPUT:-./node}"
+case "$NODE_OUTPUT" in
+    *$'\n'*|'')
+        echo "[-] Invalid ERNOS_NODE_OUTPUT path."
+        exit 1
+        ;;
+esac
+NODE_OUTPUT_DIR=$(dirname "$NODE_OUTPUT")
+mkdir -p "$NODE_OUTPUT_DIR"
+NODE_TEMP=$(mktemp "${NODE_OUTPUT}.tmp.XXXXXX")
+cleanup_node_temp() {
+    rm -f "$NODE_TEMP"
+}
+trap cleanup_node_temp EXIT INT TERM
+
+echo "[*] Compiling with: clang node_compiled.c $SD_SHIM_SRC -o $NODE_TEMP $CFLAGS $SD_CFLAGS"
+clang node_compiled.c $SD_SHIM_SRC -o "$NODE_TEMP" $CFLAGS $SD_CFLAGS 2>&1
 
 # Step 4: Sign the binary (macOS requirement for notarization)
 if [ "$OS" = "Darwin" ]; then
-    codesign --force -s - ./node 2>/dev/null || true
+    codesign --force -s - "$NODE_TEMP" 2>/dev/null || true
 fi
 
-echo "[+] Build complete: ./node"
+chmod 755 "$NODE_TEMP"
+mv -f "$NODE_TEMP" "$NODE_OUTPUT"
+trap - EXIT INT TERM
+
+echo "[+] Build complete: $NODE_OUTPUT"
 echo "[+] Platform: $OS $ARCH"

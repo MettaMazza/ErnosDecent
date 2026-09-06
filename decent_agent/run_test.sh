@@ -20,11 +20,14 @@ import sys
 f = sys.argv[1] + "_compiled.c"
 c = open(f).read()
 c = c.replace('long long ep_mutex_lock(long long);', '').replace('long long ep_mutex_unlock(long long);', '')
+with open('decent_agent/rights_hash_runtime.c.inc', 'r', encoding='utf-8') as handle:
+    rights_hash_runtime = handle.read()
 inj = '''
 long long cast_borrow_to_map(long long b){return b;}
 long long cast_map_to_int(long long m){return m;}
 long long ep_net_send_raw(long long fd,long long buf,long long count){if(count<=0||buf==0)return 0;const char*p=(const char*)buf;long long t=0;while(t<count){ssize_t n=send((int)fd,p+t,(size_t)(count-t),0);if(n<=0)break;t+=n;}return t;}
 '''
+inj += '\n' + rights_hash_runtime + '\n'
 pat = 'long long ep_net_send(long long fd, const char* data) {'
 first = c.find(pat); second = c.find(pat, first + 1)
 if second > 0:   c = c[:second] + inj + c[second:]
@@ -38,7 +41,7 @@ CFLAGS_COMMON="-O2 -lpthread -DEP_HAS_SQLITE -lsqlite3 -Wno-int-conversion -Wno-
 case "$(uname -s)" in
   Darwin)
     if [ -d /opt/homebrew/lib ]; then
-      clang "${T}_compiled.c" -o "./${T}" $CFLAGS_COMMON -L/opt/homebrew/lib -lsodium -L/opt/homebrew/opt/openssl/lib -lcrypto
+      clang "${T}_compiled.c" -o "./${T}" $CFLAGS_COMMON -I/opt/homebrew/opt/openssl/include -L/opt/homebrew/lib -lsodium -L/opt/homebrew/opt/openssl/lib -lcrypto
     else
       clang "${T}_compiled.c" -o "./${T}" $CFLAGS_COMMON -L/usr/local/lib -lsodium -L/usr/local/opt/openssl/lib -lcrypto
     fi

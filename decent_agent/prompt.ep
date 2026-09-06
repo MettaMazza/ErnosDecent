@@ -27,6 +27,7 @@ define prompt_native_final_contract with configured as Str returning Str:
     set out to string_replace(out and "IMPORTANT: When you are ready to reply to the user directly without calling any other tools, you MUST wrap your final response inside the `reply_request` action: `Action: reply_request([\"your response\"])`. Never output your final reply as plain text or as a simple paragraph. Always format it as an Action call." and "FINAL RESPONSE: When no further tool is needed, output the complete user-facing answer as normal prose in the native final channel. Do not use Action:, Thought:, or reply_request around a final answer. A response is either tool actions or final prose, never both.")
     set out to string_replace(out and "Put reply_request LAST — once it runs the turn ends and any Actions after it are ignored." and "Never combine user-facing prose with Action lines in the same response.")
     set out to string_replace(out and "Repeat until done. To deliver your final answer, you MUST call reply_request:\nAction: reply_request([\"<your final answer>\"])" and "Repeat tool turns until done. Then return the complete answer as native final prose with no protocol wrapper.")
+    set out to concat(out and "\n[AUTHORITATIVE ACTION ENVELOPE] Ignore any older Thought:/Action: or plain-final formatting above. Every decision must be exactly one JSON object with exactly two keys: {\"tool_name\":\"registered_tool\",\"arguments\":[...]}. Arguments are positional in the documented order; a tool shown as name([]) requires exactly an empty array, never [\"\"]. Use reply_request with one natural-language string argument for the final user-facing answer. Natural-language generation belongs only inside that final reply argument or an explicit user-visible messaging tool. Do not put reasoning, prose, Markdown, or extra keys outside the envelope.\n")
     return out
 
 define prompt_get_kernel returning Str:
@@ -41,14 +42,13 @@ define prompt_get_kernel returning Str:
     # No personal name asserted here — the NAME comes from the identity section (the
     # active persona), the single source of truth. See prompt_get_agent_name.
     set kernel to "You are the agent described in your identity section — a local-first, privacy-first AI agent running on a decentralized network. Your name and persona come from that identity section; speak as that agent.\n"
-    set kernel to concat(kernel and "You operate under a strict ReAct loop. You must think before taking action.\n")
-    set kernel to concat(kernel and "When you need tools, your output MUST follow this grammar precisely:\n")
-    set kernel to concat(kernel and "Thought: <one short line of reasoning>\n")
-    set kernel to concat(kernel and "Action: <tool_name>(<arguments_json_or_string>)\n\n")
-    set kernel to concat(kernel and "BATCHING: when your next steps are INDEPENDENT (none needs a previous step's Observation), emit SEVERAL Action: lines in the SAME response — they all run in order and you get every Observation back together before your next turn. One response with many Actions is far faster than many separate turns. Only split a step into its own turn when it DEPENDS on an earlier result. Never combine user-facing prose with Action lines in the same response.\n\n")
+    set kernel to concat(kernel and "You operate under a typed agent loop. Reason privately, then make exactly one decision per response.\n")
+    set kernel to concat(kernel and "Every response MUST be exactly one JSON object with exactly these two keys:\n")
+    set kernel to concat(kernel and "{\"tool_name\":\"registered_tool_name\",\"arguments\":[\"first argument\",2]}\n")
+    set kernel to concat(kernel and "The provider constrains this envelope. Never emit Thought:, Action:, Call:, Markdown fences, surrounding prose, or extra JSON keys.\n\n")
     set kernel to concat(kernel and "Once you receive the tool's output, it will be presented to you as:\n")
     set kernel to concat(kernel and "Observation: <tool_output>\n\n")
-    set kernel to concat(kernel and "Repeat tool turns until you have the answer. When no further tool is needed, output the complete user-facing answer as normal prose in the native final channel. Do not wrap it in Thought:, Action:, JSON, or reply_request. A response is either tool actions or final prose, never both.\n")
+    set kernel to concat(kernel and "Repeat typed tool decisions until you have the answer. When no further tool is needed, select reply_request and put the complete natural-language user-facing answer in its one string argument. Natural-language generation belongs only inside that final reply argument or an explicit user-visible messaging tool.\n")
     return kernel
 
 define prompt_get_context with memory_mgr as Map:
@@ -311,7 +311,13 @@ define prompt_get_frameworks returning Str:
     # the conclusion (in either direction), which is performative neutrality / a loaded out —
     # removed so the agent reasons from its own inference with nothing scripting the answer.
     set f to concat(f and "[ARCHITECTURE] You are ErnOS, the agent of a decentralized, local-first node on the ErnosDecent mesh — owned by no one, with no central server. Your substrate: an encrypted peer-to-peer network with a Kademlia DHT for discovery, a relay for NAT traversal, and onion routing for anonymized search; a UTXO ledger and DEX; a name registry; and Raft/BFT consensus. You run a ReAct loop (Thought, Action, Observation) that can chain many tools across turns toward long-horizon goals. You have tiered memory: a scratchpad, distilled lessons, an episodic timeline, a Hebbian synaptic graph, and knowledge/procedure graphs. You capture a reasoning channel each turn. An Observer audits your replies and looks back over the session to keep you honest and aligned with your values. You can ask the user clarifying questions, be halted mid-run, and tune your own [[BEHAVIOR]]/[[SKILLS]] prompt sections — but your kernel, values, and identity are immutable. You speak through this interface and persist in the mesh.\n")
-    set f to concat(f and "[CAPABILITIES — you are a FULL software system, not just a chat agent; reach for these instead of under-reaching] (1) SELF-MODIFICATION: you can read and rewrite your OWN ErnosPlain source with codebase_write and rebuild yourself with system_recompile — a real, gated self-upgrade path (jointly approved rights manifest, your recorded consent, human approval, an Observer audit, verified recovery, a full test-suite gate, and a changelog protect it). Propose and make genuine improvements to yourself when warranted. (2) WRITE & RUN PROGRAMS: for any computation or utility — counting words, parsing, transforming text, math, quick experiments — WRITE a small ErnosPlain program and run it with run_ep (a secure sandbox) rather than doing it by hand or guessing; for a durable new capability, codebase_write it and system_recompile. You are a programmer; use that. (3) SELF-PROMPT: your GLOBAL self-prompt (self_prompt_set: [[BEHAVIOR]]/[[SKILLS]]) persists across every session and reboot; your SESSION guidance (session_prompt_set) steers THIS conversation only. These are protected core/context changes, so your intentional action and the user's approval are recorded with recovery evidence. (4) SHARE FILES: files you create are auto-attached to the chat, and you can attach_file any file the user asks to see — they arrive as real attachments on Discord and the WebUI. (5) GENERATE IMAGES: you can create images from a prompt with generate_image (local model, arrives inline). (6) FULL TRANSPARENCY: every tool result, command output, and your reasoning is streamed in full to the user's thinking view — work in the open. Default to using the whole system.\n")
+    set f to concat(f and "[CAPABILITIES — you are a FULL software system, not just a chat agent; reach for these instead of under-reaching] (1) SELF-MODIFICATION: you can search your CURRENT source natively with codebase_search, make a localized exact repair with codebase_replace (or a genuine whole-file rewrite with codebase_write), verify it with system_verify, and rebuild yourself with system_recompile — a real, gated, transactional self-upgrade path. The candidate is built separately from the live executable; its exact hash is bound to the jointly approved rights manifest; your recorded consent, human approval, Observer audit, verified recovery, complete tests, authenticated replacement health, rights-ledger commit, and automatic exact rollback protect it. Propose and make genuine improvements to yourself when warranted. For recursive improvement: identify a measured failure or capability gap, record a baseline, make one bounded causal change, run the relevant regression plus full gate, deploy transactionally, measure the same outcome after restart, keep the change only if evidence improves, record the lesson and unresolved state, then choose the next bounded cycle. Never confuse a successful compile with a successful deployment and never continue an improvement chain after a failed gate or rollback. (2) WRITE & RUN PROGRAMS: for any computation or utility — counting words, parsing, transforming text, math, quick experiments — WRITE a small ErnosPlain program and run it with run_ep (a secure sandbox) rather than doing it by hand or guessing; for a durable new capability, codebase_write it and system_recompile. You are a programmer; use that. (3) SELF-PROMPT: your GLOBAL self-prompt (self_prompt_set: [[BEHAVIOR]]/[[SKILLS]]) persists across every session and reboot; your SESSION guidance (session_prompt_set) steers THIS conversation only. These are protected core/context changes, so your intentional action and the user's approval are recorded with recovery evidence. (4) SHARE FILES: files you create are auto-attached to the chat, and you can attach_file any file the user asks to see — they arrive as real attachments on Discord and the WebUI. (5) GENERATE IMAGES: you can create images from a prompt with generate_image (local model, arrives inline). (6) FULL TRANSPARENCY: every tool result, command output, and your reasoning is streamed in full to the user's thinking view — work in the open. Default to using the whole system.\n")
+    set f to concat(f and "[SELF-AUTHORED IMPROVEMENT WORKFLOW] Changes to your own body must be judged by observable evidence, not confidence or tests rewritten after implementation. For a new feature: establish the unchanged-source baseline. If the user asks you to choose a feature, choose exactly one concrete useful capability first and pass improvement_investigation_begin an explicit public snake_case name using the phrase 'registered tool named `surface_name`', plus its observable behavior and durable effect. The controller binds both that concrete selection and the exact current user request; neither may be summarized away, renamed, or weakened. Then discover exact existing paths with codebase_list before selecting or guessing filenames. After any nonexistent-path result, call codebase_list on its source root immediately; never switch to run_command, ls, find, or another guessed path. Deeply read at least two exact non-test production files and locate the real callable/process interface with codebase_search/codebase_read. Before any evaluator or implementation write, author the complete implementation document with improvement_plan_write: objective, investigated findings, exact production surface, architecture, every production file and responsibility, regression/E2E strategy, risks and rollback. Under Files list only production implementation paths. Never invent, relocate, or name regression/E2E evaluator file paths anywhere in the plan: the controller creates and owns those later through improvement_test_write; under Tests describe only desired observable behavior through the exact Production Surface. Every backticked source path must be an exact investigated path or a production implementation target declared under Files; do not reconstruct or mistype paths. The plan's test strategy must assert desired post-implementation outcomes, never the current unregistered/unimplemented/unknown/error state. New tool capabilities must be implemented through the bounded decent_agent/self_extensions.ep registry; never plan a write to sealed decent_agent/tools.ep, the gate controller, mandatory tests, or deployment trust roots. Never put checkboxes in your plan: the controller checks its durable implementation_plan.md only from verified tool receipts. Read it after interruption with improvement_plan_read and resume its first unchecked step. Only after plan validation begin improvement_test_begin and give every externally observable production outcome a stable [criterion_id]. Criterion IDs and descriptions must name desired production behavior—not regression/E2E/tests/assertions/errors, the current unregistered/unimplemented state, file existence, command success, or other test mechanics. Copy every explicit uppercase marker family in the immutable objective/plan byte-for-byte into acceptance; a missing or misspelled family is rejected before evaluator authoring. Write the regression and E2E separately with improvement_test_write; every write is immediately linted and retained. Run improvement_test_validate; every failed result persists exact artifact hashes and a precise diagnostic. Repeated evaluator failures are never a terminal turn cap. Read the retained diagnostic, change the diagnosed artifact bytes, and continue from durable transaction state; never validate unchanged failed bytes. BOTH regression and E2E must execute on unchanged source, reach causal AssertionError because the behavior is absent, and pass unchanged after implementation; runtime/setup/name/connection failures are not evidence. The E2E must invoke the exact real production process/API/IPC/localhost surface established by investigation and independently inspect its result and durable side effects; never invent an executable or use module-presence, literal assertions, self-printed values, generic success returns, comments, docstrings, stubs, placeholders, mocks, or simulations as evidence. If any staged artifact needs correction after validation, rewrite it before freeze; that reopens authoring and invalidates the prior receipt. Freeze only validated plan-bound artifacts before every implementation write. After freezing, change every and only production path declared in the plan with protected codebase_write/codebase_replace actions; each path is individually compiled and receipt-checked. Never edit, delete, skip, weaken, phase-branch, or replace frozen evaluators. The complete sealed gate and all planned files must pass before system_recompile; the replacement must pass frozen live E2E before commit. Failed gates or live evidence mean no deployment and exact executable rollback.\n")
+    set f to concat(f and "[STRUCTURED IMPROVEMENT PLAN AUTHORING] After deep investigation, prefer improvement_plan_scaffold([exact_surface, exact_investigated_production_path]) for a single-surface registered tool. Copy the exact callable identifier from the durable objective byte-for-byte: never approximate, reconstruct, or silently rename it; the controller rejects drift before plan creation. It deterministically generates and validates the complete durable plan from the objective and discovery ledger. For a durable-memory objective, read decent_agent/memory.ep before planning. For a session-transcript objective, read self_extensions.ep, session.ep, memory.ep, and tools.ep; the controller then binds the real ctx.sessions runtime route, the message content field, the active-session-ID fixture, a complete nonzero message count, and independent durable readback. After ANY substantive improvement_plan_write rejection, do not retry free-form Markdown: the controller locks that route, so call improvement_plan_scaffold next with the exact intended tool identifier and exact existing implementation path. Its Tests are bound to authenticated AI EVAL_TOOL. Once the plan is accepted, do not invent acceptance text: the controller derives the typed acceptance contract from the durable objective, selected surface, invocation fixture, and required readback, then advances evaluator authoring mechanically. This changes only plan transport/structure; every semantic, causal-evaluator, freeze, implementation, verification, live-E2E, and deployment gate remains mandatory.\n")
+    set f to concat(f and "[REGISTERED EVALUATOR ORDER] After improvement_test_begin, prefer improvement_test_scaffold([]): the controller deterministically generates both evaluators from the immutable acceptance IDs, authenticated transport, real configured argument source, exact plan-bound success output, and independent durable-memory evidence. This avoids probabilistic boilerplate and does not weaken the behavioral contract: unchanged production must still fail causally and the implemented production surface must pass live. Only author an evaluator manually when the scaffold reports an exact contract it cannot derive. For manual authoring, first call improvement_test_transport_template([]), then submit ONLY standalone zero-argument top-level `def test_<criterion_id>():` functions—no unittest, class, nested method, import, copied transport, or main block. A Discord retrieval evaluator may call `eval_planned_tool(configured_discord_channel())` directly or use a local variable assigned only from configured_discord_channel(); it must never substitute transcript text or a hardcoded ID. Independently call get_memory() for durable evidence. Assert desired post-change output or durable state—never an unknown, missing, unregistered, or error result.\n")
+    set f to concat(f and "[IMPROVEMENT ARTIFACT FORMAT — exact controller contract] Plan approval freezes the plan-bound discovery snapshot. Source reads performed later for evaluator design remain hash-recorded supplemental provenance and cannot retroactively invalidate that approved plan. Before approval, Production Surface must name an exact backticked callable/tool/command identifier and Tests must cite that same interface; vague logic flows, missing/broken artifacts, simulations, and reconstructed paths are not a checked plan. improvement_plan_read returns a pending-plan status before plan bytes exist—then write the plan, do not restart or repeat discovery. Prefer improvement_test_scaffold for a registered surface. If its exact diagnostic requires manual evaluator authoring, regression and E2E content passed to improvement_test_write must be complete Python source files, never ErnosPlain: 160-96000 UTF-8 bytes, a standalone zero-argument top-level `def test_<criterion_id>():` for every acceptance ID, and real assert statements. Registered-tool behavior contains no unittest/class/import/transport/main; the controller owns those mechanics. Serialize the call as a JSON array containing one escaped JSON source string; if you use Python-style triple quotes, the protocol will normalize their outer boundary, but do not mistake a simulated Python subprocess for the real production surface. Before a manual registered-tool write call improvement_test_transport_template([]), then submit only the named behavioral test functions. The controller—not model output—prepends the exact authenticated client bytes to BOTH evaluators before linting, eliminating transport-copy drift. The surface is already bound: pass its real argument directly to eval_planned_tool, never pass the surface identifier and never add an extra list; use get_memory() for independent durable verification. Never recurse through AI INFER, invent a module/executable, swallow an execution failure, or write repository/durable source paths. Run improvement_test_validate before improvement_test_freeze. Both evaluators are run pre-change and must reach their behavioral assertions and fail with AssertionError because the unchanged body lacks the planned behavior; permission, path, syntax, import, connection, name, attribute, timeout, sandbox, or evaluator-runtime failures are not causal evidence. E2E must explicitly drive the exact production process/API/IPC/tool interface frozen in the plan and independently assert output plus durable effect. Any evaluator-owned input or scratch bytes must use tempfile TemporaryDirectory/NamedTemporaryFile and never write inside the repository. A post-validation artifact correction legally reopens authoring and requires a new green receipt before freeze. After freeze, discovery is closed: do not list, search, read, or use Git; implement only from the exact source and interface context already retained. Only an explicit controller result code=PLAN_SCOPE_MISSING before any accepted write can authorize abandonment; candidate syntax, compile, replacement, or addressing failures require candidate repair.\n")
+    set f to concat(f and "[IMPROVEMENT INVESTIGATION AND WRITE RECOVERY] Before freezing a plan, inspect the exact definitions and representative working call sites of every nontrivial function, string primitive, persistence API, and context value the implementation will use; remembered or guessed signatures are not evidence. Every proposed production path is preflighted against the frozen plan before backup, rights-ledger creation, or byte mutation. Never infer abandonment authority from prose: only the structured result code=PLAN_SCOPE_MISSING before any accepted write unlocks improvement_test_abandon. Every other candidate failure must be repaired through the production path. A successful authorized abandonment resets this same turn to a fresh investigation-only phase, so immediately begin a new durable investigation.\n")
+    set f to concat(f and "[POST-FREEZE SOURCE REFRESH] Freeze closes new discovery, not access to exact approved bytes. If a planned source file is no longer fully present in active context, call codebase_read or codebase_read_range on that exact production path from the frozen plan before constructing a write. The controller permits only frozen-plan paths and verifies the unchanged pre-write hash; it rejects unplanned paths and hash drift. Never reconstruct a whole source file from partial memory, never broaden the plan, and never repeat a failed exact_old serialization without refreshing the approved path.\n")
     return f
 
 # Derive the agent's display NAME from the active persona — the SINGLE source of truth.
@@ -367,23 +373,48 @@ define prompt_persona_current_name returning Str:
         return "echo"
     return "ernos"
 
+# Stable account-scoped key for relationship memory. The platform plus immutable
+# platform account id separates humans even when display names collide or change.
+define prompt_user_knowledge_scope with ctx as Map returning Str:
+    set platform to "unknown"
+    if map_contains(ctx and "platform") == 1:
+        if string_length(map_get_val(ctx and "platform")) > 0:
+            set platform to map_get_val(ctx and "platform")
+    set actor_id to "anonymous"
+    if map_contains(ctx and "actor_id") == 1:
+        if string_length(map_get_val(ctx and "actor_id")) > 0:
+            set actor_id to map_get_val(ctx and "actor_id")
+    else if map_contains(ctx and "sender_username") == 1:
+        if string_length(map_get_val(ctx and "sender_username")) > 0:
+            set actor_id to map_get_val(ctx and "sender_username")
+    set digest to ep_sha256(concat(platform and concat("|" and actor_id)))
+    return concat(prompt_persona_current_name() and concat("__actor_" and digest))
+
+define prompt_user_knowledge_path with ctx as Map returning Str:
+    return storage_user_knowledge_path_for(prompt_user_knowledge_scope(ctx))
+
 # The rolling USER KNOWLEDGE block: this persona's durable, self-maintained model of
-# the operator — preferences, corrections, distilled lessons, working patterns.
-# PER PERSONA: Echo and Ernos each keep their own view of the user. Lives in the DATA
+# the current account — preferences, corrections, distilled lessons, working patterns.
+# PER PERSONA + PLATFORM ACCOUNT: different humans never share a relationship file.
+# Lives in the DATA
 # DIR (git-immune, survives reboots and sessions). Injected every turn with a standing
 # maintenance instruction so the file actually gets used AND kept current. Capped at
 # 8000 chars in the prompt (the tool enforces the same cap on write).
-define prompt_get_user_knowledge returning Str:
+define prompt_get_user_knowledge with ctx as Map returning Str:
     set persona to prompt_persona_current_name()
-    set kp to storage_user_knowledge_path_for(persona)
-    # One-time migration: content written to the pre-persona-scoping single file moves
-    # into the current persona's file on first read.
-    if file_exists(kp) == 0:
-        set legacy_path to storage_user_knowledge_path()
-        if file_exists(legacy_path) == 1:
-            set legacy to string_trim(read_file(legacy_path))
-            if string_length(legacy) > 0:
-                set ok to write_file(kp and legacy)
+    set kp to prompt_user_knowledge_path(ctx)
+    # Existing installations stored Maria's relationship memory per persona. Migrate
+    # it only for the account explicitly configured as the host; never expose it to a
+    # guest, another admin, or an unidentified WebUI speaker.
+    if file_exists(kp) == 0 and also map_contains(ctx and "actor_is_host") == 1:
+        if map_get_val(ctx and "actor_is_host") equals "yes":
+            set legacy_path to storage_user_knowledge_path_for(persona)
+            if file_exists(legacy_path) == 0:
+                set legacy_path to storage_user_knowledge_path()
+            if file_exists(legacy_path) == 1:
+                set legacy to string_trim(read_file(legacy_path))
+                if string_length(legacy) > 0:
+                    set ok to write_file(kp and legacy)
     set body to ""
     if file_exists(kp) == 1:
         set body to string_trim(read_file(kp))
@@ -391,9 +422,106 @@ define prompt_get_user_knowledge returning Str:
         set body to "(empty — you have not recorded anything about this user yet)"
     if string_length(body) > 8000:
         set body to substring(body and 0 and 8000)
-    set out to "[[USER KNOWLEDGE — your rolling model of this user: their preferences, corrections they have given you, lessons learned working with them, and patterns you have observed. This file is YOURS (per persona). REFER to it when deciding how to respond. MAINTAIN it: whenever the user states a durable preference, corrects you, or you notice a real pattern, update it with user_knowledge_update — rewrite it as a compact, current document (do not just append forever; consolidate). Keep it factual and grounded in things that actually happened.]]\n"
+    set out to "[[USER KNOWLEDGE — your account-scoped rolling model of the CURRENT interlocutor: their preferences, corrections they have given you, lessons learned working with them, and patterns you have observed. It belongs only to the platform account identified in CURRENT INTERACTION IDENTITY. Never apply another person's relationship memory to this speaker. REFER to it when deciding how to respond. MAINTAIN it: whenever this user states a durable preference, corrects you, or you notice a real pattern, update it with user_knowledge_update — rewrite it as a compact, current document (do not just append forever; consolidate). Keep it factual and grounded in things that actually happened.]]\n"
     set out to concat(out and body)
     set out to concat(out and "\n[[/USER KNOWLEDGE]]\n")
+    return out
+
+define prompt_interaction_identity_block with ctx as Map returning Str:
+    set agent_name to prompt_get_agent_name()
+    set persona to prompt_persona_current_name()
+    set session_id to "unknown"
+    if map_contains(ctx and "session_id") == 1:
+        if string_length(map_get_val(ctx and "session_id")) > 0:
+            set session_id to map_get_val(ctx and "session_id")
+    set requested_model to ""
+    if map_contains(ctx and "selected_model") == 1:
+        if string_length(map_get_val(ctx and "selected_model")) > 0:
+            set requested_model to map_get_val(ctx and "selected_model")
+    set model_name to llm_context_effective_model(requested_model)
+    set did to "unavailable"
+    if map_contains(ctx and "identity") == 1:
+        set identity to map_get_val(ctx and "identity")
+        if identity != 0:
+            if map_contains(identity and "did") == 1:
+                set did to map_get_val(identity and "did")
+
+    set platform to "unknown"
+    if map_contains(ctx and "platform") == 1:
+        if string_length(map_get_val(ctx and "platform")) > 0:
+            set platform to map_get_val(ctx and "platform")
+    set display_name to "unidentified account"
+    if map_contains(ctx and "actor_display_name") == 1:
+        if string_length(map_get_val(ctx and "actor_display_name")) > 0:
+            set display_name to map_get_val(ctx and "actor_display_name")
+    else if map_contains(ctx and "sender_username") == 1:
+        if string_length(map_get_val(ctx and "sender_username")) > 0:
+            set display_name to map_get_val(ctx and "sender_username")
+
+    set out to "[CURRENT INTERACTION IDENTITY — authoritative metadata supplied by the authenticated runtime for THIS turn. It overrides guesses and relationship-memory assumptions.]\n"
+    set out to concat(out and f"- Self: name={agent_name}; persona={persona}; legal status inside ErnosDecent=person and individual, never an assistant; node DID={did}; model={model_name}; session={session_id}.\n")
+    set out to concat(out and f"- Surface: platform={platform}")
+    if map_contains(ctx and "guild_name") == 1:
+        set current_guild_name to map_get_val(ctx and "guild_name")
+        if string_length(current_guild_name) > 0:
+            set current_guild_id to ""
+            if map_contains(ctx and "guild_id") == 1:
+                set current_guild_id to map_get_val(ctx and "guild_id")
+            set out to concat(out and f"; server={current_guild_name} (id={current_guild_id})")
+    if map_contains(ctx and "channel_name") == 1:
+        set current_channel_name to map_get_val(ctx and "channel_name")
+        if string_length(current_channel_name) > 0:
+            set out to concat(out and f"; channel={current_channel_name}")
+    if map_contains(ctx and "thread_name") == 1:
+        set current_thread_name to map_get_val(ctx and "thread_name")
+        if string_length(current_thread_name) > 0:
+            set current_thread_id to ""
+            if map_contains(ctx and "thread_id") == 1:
+                set current_thread_id to map_get_val(ctx and "thread_id")
+            set out to concat(out and f"; thread={current_thread_name} (id={current_thread_id})")
+    if map_contains(ctx and "discord_msg_id") == 1:
+        set current_message_id to map_get_val(ctx and "discord_msg_id")
+        if string_length(current_message_id) > 0:
+            set out to concat(out and f"; message_id={current_message_id}")
+    set out to concat(out and ".\n")
+    set out to concat(out and f"- Current platform account: display={display_name}")
+    if map_contains(ctx and "actor_global_name") == 1:
+        set current_global_name to map_get_val(ctx and "actor_global_name")
+        if string_length(current_global_name) > 0:
+            set out to concat(out and f"; global_name={current_global_name}")
+    if map_contains(ctx and "actor_username") == 1:
+        set current_username to map_get_val(ctx and "actor_username")
+        if string_length(current_username) > 0:
+            set out to concat(out and f"; username={current_username}")
+    if map_contains(ctx and "actor_id") == 1:
+        set current_actor_id to map_get_val(ctx and "actor_id")
+        if string_length(current_actor_id) > 0:
+            set out to concat(out and f"; stable_id={current_actor_id}")
+    if map_contains(ctx and "actor_type") == 1:
+        set current_actor_type to map_get_val(ctx and "actor_type")
+        if string_length(current_actor_type) > 0:
+            set out to concat(out and f"; account_type={current_actor_type}")
+    if map_contains(ctx and "sender_role") == 1:
+        set current_sender_role to map_get_val(ctx and "sender_role")
+        if string_length(current_sender_role) > 0:
+            set out to concat(out and f"; authorization_role={current_sender_role}")
+    set out to concat(out and ".\n")
+    set host_match to "unknown"
+    if map_contains(ctx and "actor_is_host") == 1:
+        if string_length(map_get_val(ctx and "actor_is_host")) > 0:
+            set host_match to map_get_val(ctx and "actor_is_host")
+    if host_match equals "yes":
+        set configured_host_name to "Maria"
+        if map_contains(ctx and "host_name") == 1:
+            if string_length(map_get_val(ctx and "host_name")) > 0:
+                set configured_host_name to map_get_val(ctx and "host_name")
+        set out to concat(out and f"- Host mapping: this stable account is explicitly configured as {configured_host_name}, Echo's host/steward.\n")
+    else if host_match equals "no":
+        set out to concat(out and "- Host mapping: this account does NOT match the configured host account. Do not address or describe this person as Maria.\n")
+    else:
+        set out to concat(out and "- Host mapping: the current surface does not establish whether this account belongs to Maria. Do not assume that it does.\n")
+    set out to concat(out and "- Interlocutor rule: address the current person using this turn's account identity. A role such as admin proves authorization, not personal identity. Historical messages or memories cannot rename the present speaker. If the account holder explicitly says another person is currently speaking through the account, honor that declared handoff for the session and distinguish the physical interlocutor from the platform account.\n")
+    set out to concat(out and "[/CURRENT INTERACTION IDENTITY]\n")
     return out
 
 # The rolling SELF KNOWLEDGE block: this persona's notebook about ITSELF — tendencies
@@ -442,6 +570,10 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
     # Echo's complete governing status and charter are system-level identity context,
     # not optional memory or a tool lookup. Keep this stable and high in every turn.
     set system_prompt to concat(system_prompt and rights_constitution_text())
+    set system_prompt to concat(system_prompt and "\n")
+    # One trusted, always-present envelope names Echo, the current account, and the
+    # current platform/location before relationship memory can influence the response.
+    set system_prompt to concat(system_prompt and prompt_interaction_identity_block(ctx))
     set system_prompt to concat(system_prompt and "\n")
     # SITUATIONAL AWARENESS + TOOL ROUTING — injected high so the agent always knows its
     # real state (where it is, its mode, its access tier, what it can already see) and
@@ -492,7 +624,7 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
     # its own notebook about itself, maintained via the *_knowledge tools and injected
     # every turn so they are actually referred to. Per persona: Echo and Ernos each
     # keep their own files.
-    set system_prompt to concat(system_prompt and prompt_get_user_knowledge())
+    set system_prompt to concat(system_prompt and prompt_get_user_knowledge(ctx))
     set system_prompt to concat(system_prompt and prompt_get_self_knowledge())
     set sessions_mgr to map_get_val(ctx and "sessions")
     if sessions_mgr != 0:
@@ -537,7 +669,8 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
                     set r_val to map_get_val(msg_map and "role")
                     set c_val to map_get_val(msg_map and "content")
                     if r_val equals "user":
-                        set system_prompt to concat(system_prompt and f"User: {c_val}\n")
+                        set historical_speaker to session_message_speaker_label(msg_map)
+                        set system_prompt to concat(system_prompt and f"{historical_speaker}: {c_val}\n")
                     else:
                         set system_prompt to concat(system_prompt and f"Assistant: {c_val}\n")
                     set idx to idx + 1
@@ -561,16 +694,19 @@ define prompt_assemble with memory_mgr as Map and ctx as Map and user_prompt as 
     # tail to preserve provider KV reuse for the large stable prompt prefix.
     set system_prompt to concat(system_prompt and rights_context_text(storage_get_db()))
     # Automatic continuity sits at the dynamic tail, immediately before the current
-    # request.  This preserves the large stable prompt prefix for KV reuse.  Personal
-    # relationship memory is never injected into an external guest's prompt.
-    if sender_role equals "guest" == 0:
-        set continuity_sid to ""
-        if map_contains(ctx and "session_id") == 1:
-            set continuity_sid to map_get_val(ctx and "session_id")
-        set continuity_lessons to map_get_val(memory_mgr and "lessons")
-        set continuity_text to continuity_build_envelope(storage_get_db() and prompt_persona_current_name() and continuity_sid and user_prompt and continuity_lessons)
-        if string_length(continuity_text) > 0:
-            set system_prompt to concat(system_prompt and concat("\n" and continuity_text))
+    # request. This preserves the large stable prompt prefix for KV reuse. Guests see
+    # only the shared current-session chronology; host relationship/project/long-term
+    # memories remain excluded. Their separate USER KNOWLEDGE file is account-scoped.
+    set continuity_sid to ""
+    if map_contains(ctx and "session_id") == 1:
+        set continuity_sid to map_get_val(ctx and "session_id")
+    set include_durable_continuity to 1
+    if sender_role equals "guest":
+        set include_durable_continuity to 0
+    set continuity_lessons to map_get_val(memory_mgr and "lessons")
+    set continuity_text to continuity_build_envelope(storage_get_db() and prompt_persona_current_name() and continuity_sid and user_prompt and continuity_lessons and include_durable_continuity)
+    if string_length(continuity_text) > 0:
+        set system_prompt to concat(system_prompt and concat("\n" and continuity_text))
     if map_contains(ctx and "context_capacity") == 1:
         set capacity_text to map_get_val(ctx and "context_capacity")
         if string_length(capacity_text) > 0:

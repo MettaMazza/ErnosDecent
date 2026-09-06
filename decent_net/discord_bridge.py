@@ -85,7 +85,15 @@ def _parse_ids(raw):
             out.add(int(part))
     return out
 
-ADMIN_IDS = _parse_ids(discord_cfg.get('admin_id', '1299810741984956449'))
+_raw_admin_ids = discord_cfg.get('admin_id', '1299810741984956449')
+ADMIN_IDS = _parse_ids(_raw_admin_ids)
+_configured_host_ids = _parse_ids(discord_cfg.get('host_id', ''))
+# A dedicated host_id is authoritative. Existing single-owner installations predate
+# that key and conventionally put the host first in admin_id. Preserve that explicit
+# legacy ordering while keeping every later admin distinct from the host.
+_legacy_host_ids = _parse_ids(str(_raw_admin_ids).split(',', 1)[0])
+HOST_IDS = _configured_host_ids or _legacy_host_ids
+HOST_NAME = str(discord_cfg.get('host_name', 'Maria')).strip() or 'Maria'
 try:
     ADMIN_ROLE_ID = int(str(discord_cfg.get('admin_role_id', '1501167171844444190')).strip())
 except (TypeError, ValueError):
@@ -101,6 +109,54 @@ def is_admin_author(author):
             if getattr(r, 'id', None) == ADMIN_ROLE_ID:
                 return True
     return False
+
+def _identity_tag_value(value):
+    """Keep trusted metadata inside one line-delimited IPC tag."""
+    return str(value or '').replace('[', '(').replace(']', ')').replace('\r', ' ').replace('\n', ' ')
+
+def build_discord_interaction_tags(author, message):
+    """Return the complete trusted account and Discord location envelope for a turn."""
+    if author is None:
+        return ""
+
+    actor_id = str(getattr(author, 'id', '') or '')
+    username = _identity_tag_value(getattr(author, 'name', ''))
+    global_name = _identity_tag_value(getattr(author, 'global_name', ''))
+    display_name = _identity_tag_value(getattr(author, 'display_name', '') or global_name or username)
+    role = 'admin' if is_admin_author(author) else 'guest'
+    is_host = 'yes' if getattr(author, 'id', None) in HOST_IDS else 'no'
+    account_type = 'bot' if bool(getattr(author, 'bot', False)) else 'human'
+
+    fields = [
+        ('SENDER', display_name),
+        ('ROLE', role),
+        ('ACTOR_ID', actor_id),
+        ('ACTOR_USERNAME', username),
+        ('ACTOR_GLOBAL', global_name),
+        ('ACTOR_DISPLAY', display_name),
+        ('ACTOR_TYPE', account_type),
+        ('ACTOR_IS_HOST', is_host),
+    ]
+    if is_host == 'yes':
+        fields.append(('HOST_NAME', _identity_tag_value(HOST_NAME)))
+
+    if message is not None:
+        guild = getattr(message, 'guild', None)
+        channel = getattr(message, 'channel', None)
+        parent = getattr(channel, 'parent', None)
+        is_thread = getattr(channel, 'parent_id', None) is not None
+        fields.extend([
+            ('GUILD_ID', getattr(guild, 'id', '') if guild is not None else ''),
+            ('GUILD_NAME', _identity_tag_value(getattr(guild, 'name', '')) if guild is not None else ''),
+            ('CHANNEL_NAME', _identity_tag_value(getattr(parent if is_thread else channel, 'name', '')) if channel is not None else ''),
+        ])
+        if is_thread:
+            fields.extend([
+                ('THREAD_ID', getattr(channel, 'id', '')),
+                ('THREAD_NAME', _identity_tag_value(getattr(channel, 'name', ''))),
+            ])
+
+    return ''.join(f'[{key}:{_identity_tag_value(value)}] ' for key, value in fields if str(value or ''))
 
 if not enabled or not token or not channel_id_str:
     print("[Discord Bridge] Discord connection is not enabled or missing details. Exiting.", flush=True)
@@ -714,10 +770,7 @@ async def query_daemon_ipc(prompt, author=None, message=None, image_path=None,
         tags = ""
         if reserved_session:
             tags = f"[SESSION:{reserved_session}] "
-        if author is not None:
-            username = str(author.display_name).replace('[', '(').replace(']', ')')
-            role = "admin" if is_admin_author(author) else "guest"
-            tags += f"[SENDER:{username}] [ROLE:{role}] "
+        tags += build_discord_interaction_tags(author, message)
         # Current message coordinates → the agent can react([emoji]) to THIS message with no ids.
         if message is not None:
             try:
@@ -797,6 +850,63 @@ def _consume_final_reply_fallback(session_id, turn_tag):
         return None
 
 
+def _claim_final_reply_trace(session_id, turn_tag):
+    """Atomically claim one terminal reply correlated to this exact turn."""
+    prefix = f"turn:{turn_tag}," if turn_tag else None
+    conn = None
+    try:
+        conn = sqlite3.connect(get_db_path(), timeout=15)
+        conn.execute("PRAGMA busy_timeout=15000")
+        cur = conn.cursor()
+        if prefix:
+            cur.execute(
+                "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 AND content LIKE ? ORDER BY id LIMIT 1",
+                (session_id, prefix + "%"),
+            )
+        else:
+            cur.execute(
+                "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1",
+                (session_id,),
+            )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cur.execute("UPDATE trace_events SET sent=1 WHERE id=? AND sent=0", (row[0],))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return None
+        conn.commit()
+        content = row[1]
+        if prefix and content.startswith(prefix):
+            content = content[len(prefix):]
+        return content
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _trace_turn_is_active(session_id, turn_tag):
+    """Return true only while the node records this exact correlated turn as live."""
+    if not session_id or not turn_tag:
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(get_db_path(), timeout=15)
+        conn.execute("PRAGMA busy_timeout=15000")
+        row = conn.execute(
+            "SELECT 1 FROM trace_active_turns WHERE session_id=? AND turn_id=? LIMIT 1",
+            (session_id, turn_tag),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 async def wait_final_reply(session_id, timeout_s=1800, turn_tag=None):
     """Phase A3: poll the session's `final_reply` trace row (direct SQLite — the same
     proven cross-process pattern as the trace/commands pollers). Returns the legacy
@@ -807,42 +917,20 @@ async def wait_final_reply(session_id, timeout_s=1800, turn_tag=None):
     scheduler-job turn in the SAME session could land its final_reply first and be
     delivered as the user's answer — the tick bug: Maria's 'Hello' was 'answered' by an
     orphaned diagnostic job's reply while her real reply rotted unsent."""
-    import time as _t
-    start = _t.time()
-    prefix = f"turn:{turn_tag}," if turn_tag else None
-    while _t.time() - start < timeout_s:
+    # ``timeout_s`` remains in the public signature for compatibility with older
+    # callers and tests, but it is not a turn-completion deadline. A detached turn is
+    # durable work: transport polling may retry forever, while only a correlated final
+    # reply, structured terminal failure, explicit cancellation, or session-ending
+    # action may conclude it.
+    while True:
         fallback = _consume_final_reply_fallback(session_id, turn_tag)
         if fallback is not None:
             print(f"[DELIVERY] Recovered terminal reply from durable fallback for turn={turn_tag}", flush=True)
             return fallback
-        try:
-            conn = sqlite3.connect(get_db_path(), timeout=15)
-            conn.execute("PRAGMA busy_timeout=15000")
-            cur = conn.cursor()
-            if prefix:
-                cur.execute(
-                    "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 AND content LIKE ? ORDER BY id LIMIT 1",
-                    (session_id, prefix + "%"),
-                )
-            else:
-                cur.execute(
-                    "SELECT id, content FROM trace_events WHERE session_id=? AND event_type='final_reply' AND sent=0 ORDER BY id LIMIT 1",
-                    (session_id,),
-                )
-            row = cur.fetchone()
-            if row:
-                cur.execute("UPDATE trace_events SET sent=1 WHERE id=?", (row[0],))
-                conn.commit()
-                conn.close()
-                content = row[1]
-                if prefix and content.startswith(prefix):
-                    content = content[len(prefix):]
-                return content
-            conn.close()
-        except Exception:
-            pass
+        claimed = _claim_final_reply_trace(session_id, turn_tag)
+        if claimed is not None:
+            return claimed
         await asyncio.sleep(0.5)
-    return "error:turn_timeout"
 
 
 async def resolve_ai_response(resp, session_id):
@@ -1185,7 +1273,7 @@ async def session_side_channel_loop():
                 conn = sqlite3.connect(get_db_path())
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT id, event_type, content FROM trace_events WHERE session_id=? AND sent=0 AND event_type IN ('mid_message','attachment','image_progress','subagent_spawn','subagent_complete','subagent_approval') ORDER BY id LIMIT 30",
+                    "SELECT id, event_type, content FROM trace_events WHERE session_id=? AND sent=0 AND (event_type IN ('mid_message','attachment','image_progress','subagent_spawn','subagent_complete','subagent_approval') OR (event_type='final_reply' AND content GLOB 'turn:upgrade_wake_*')) ORDER BY id LIMIT 30",
                     (sid,),
                 )
                 rows = cur.fetchall()
@@ -1206,6 +1294,14 @@ async def session_side_channel_loop():
                             await post_image_progress(ch, content)
                         elif etype in ('subagent_spawn', 'subagent_complete', 'subagent_approval'):
                             await handle_subagent_event(ch, etype, content)
+                        elif etype == 'final_reply':
+                            wake_text = extract_upgrade_wake_response(content)
+                            if wake_text is None:
+                                continue
+                            if not await post_upgrade_wake_reply(ch, wake_text, rid):
+                                # Leave the durable row unclaimed; the next poll retries
+                                # it with the same stable Discord nonce.
+                                continue
                     except Exception as e:
                         print(f"[Discord Bridge] side-channel deliver error ({etype}): {e}", flush=True)
                     try:
@@ -1237,6 +1333,40 @@ async def post_mid_message(channel, content, session_id=None):
             await channel.send(body[i:i + 1990])
         except Exception as e:
             print(f"[Discord Bridge] mid_message chunk send error: {e}", flush=True)
+
+
+async def post_upgrade_wake_reply(channel, content, event_id):
+    """Deliver an autonomous recompile report as a normal speakable response.
+
+    False leaves the SQLite row unclaimed. Stable per-event/per-chunk nonces make
+    ambiguous Discord retries idempotent instead of duplicating the report.
+    """
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', content or '').strip()
+    if not text:
+        text = "The post-recompile status response contained no visible text. This is a bug."
+    chunks = [text[index:index + 2000] for index in range(0, len(text), 2000)]
+    nonce_base = ''.join(ch for ch in str(event_id) if ch.isdigit())[-20:] or str(int(time.time() * 1000))
+    for index, chunk in enumerate(chunks):
+        is_last = index == len(chunks) - 1
+        for attempt in range(1, 5):
+            try:
+                await channel.send(
+                    chunk,
+                    view=SpeakView(text) if is_last else None,
+                    nonce=f"{nonce_base}{index:02d}",
+                )
+                break
+            except Exception as exc:
+                if attempt == 4:
+                    print(
+                        f"[UPGRADE WAKE] Discord delivery failed after retries: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    return False
+                await asyncio.sleep(2 ** (attempt - 1))
+    print(f"[UPGRADE WAKE] Delivered autonomous status event={event_id}", flush=True)
+    return True
 
 
 # Defence-in-depth: even though the node refuses secret paths before queueing an
@@ -1362,6 +1492,23 @@ def extract_ai_ok_response(resp):
     marker = "|||RESPONSE|||"
     idx = resp.find(marker)
     return resp[idx + len(marker):] if idx >= 0 else resp
+
+
+def extract_upgrade_wake_response(content):
+    """Extract only an authenticated, specially correlated upgrade-wake reply."""
+    prefix = "turn:upgrade_wake_"
+    if not content or not content.startswith(prefix):
+        return None
+    separator = content.find(",")
+    if separator < len(prefix):
+        return None
+    payload = content[separator + 1:]
+    if payload.startswith("ai:ok"):
+        answer = extract_ai_ok_response(payload).strip()
+        return answer or "The post-recompile status response was empty. This is a delivery bug."
+    if payload.startswith("ai:cancelled,response:"):
+        return "🛑 " + payload[len("ai:cancelled,response:"):]
+    return "Post-recompile status generation did not complete normally: " + payload
 
 class ApprovalView(discord.ui.View):
     def __init__(self, author, timeout=None):
@@ -2300,32 +2447,124 @@ class StopView(discord.ui.View):
 class SpeakView(discord.ui.View):
     """A 🔊 button attached to AI replies. On click, asks the node to synthesise
     the message audio (Kokoro, voice bm_fable @1.15x via the `TTS SPEAK` IPC verb)
-    and uploads the resulting WAV as a Discord attachment. Anyone in the channel
-    may play it — reading a message aloud is a read-only action."""
+    exactly once and uploads the resulting WAV as a Discord attachment. A later
+    click removes that attachment message; the following click uploads the cached
+    WAV again without synthesising it again. Anyone in the channel may use it —
+    reading a message aloud is a read-only action."""
     def __init__(self, text, timeout=None):
         super().__init__(timeout=timeout)
         self.text = text
+        self._state_lock = asyncio.Lock()
+        self._busy = False
+        self._audio_path = None
+        self._delivered_message = None
+
+    async def _render_button(self, interaction, button, state):
+        if state == "busy":
+            button.label = "Generating…"
+            button.emoji = "⏳"
+            button.disabled = True
+        elif state == "delivered":
+            button.label = "Remove voice"
+            button.emoji = "🔇"
+            button.disabled = False
+        elif state == "cached":
+            button.label = "Replay voice"
+            button.emoji = "🔊"
+            button.disabled = False
+        else:
+            button.label = "Speak"
+            button.emoji = "🔊"
+            button.disabled = False
+        try:
+            await interaction.message.edit(view=self)
+        except Exception as exc:
+            print(
+                f"[TTS] Could not refresh Speak button state {state}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    @staticmethod
+    def _response_path(resp):
+        for part in (resp or "").split(","):
+            if part.startswith("path:"):
+                return part[len("path:"):].strip()
+        return None
+
+    async def _upload_cached_audio(self, interaction, path):
+        return await interaction.followup.send(
+            file=discord.File(path, filename="ernos_voice.wav"),
+            wait=True,
+        )
 
     @discord.ui.button(label="Speak", emoji="🔊", style=discord.ButtonStyle.secondary)
     async def speak(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        # Collapse newlines so the text rides cleanly in the single-line IPC command.
-        speak_text = (self.text or "").replace("\r", " ").replace("\n", " ").strip()
-        if not speak_text:
-            await interaction.followup.send("Nothing to speak.", ephemeral=True)
+
+        already_busy = False
+        async with self._state_lock:
+            if self._busy:
+                already_busy = True
+                delivered = None
+                cached_path = None
+            else:
+                self._busy = True
+                delivered = self._delivered_message
+                cached_path = self._audio_path
+
+        if already_busy:
+            await interaction.followup.send(
+                "⏳ This reply's voice request is already in progress.",
+                ephemeral=True,
+            )
             return
-        resp = await send_daemon_ipc("TTS SPEAK " + speak_text)
-        path = None
-        for part in resp.split(","):
-            if part.startswith("path:"):
-                path = part[len("path:"):].strip()
-        if not path or not os.path.exists(path):
-            await interaction.followup.send(f"🔇 TTS failed: {resp}", ephemeral=True)
-            return
+
+        await self._render_button(interaction, button, "busy")
         try:
-            await interaction.followup.send(file=discord.File(path, filename="ernos_voice.wav"))
-        except Exception as e:
-            await interaction.followup.send(f"🔇 Failed to upload audio: {e}", ephemeral=True)
+            if delivered is not None:
+                try:
+                    await delivered.delete()
+                except discord.NotFound:
+                    print("[TTS] Delivered voice was already deleted.", flush=True)
+                async with self._state_lock:
+                    self._delivered_message = None
+                await self._render_button(interaction, button, "cached")
+                return
+
+            path = cached_path
+            if not path or not os.path.isfile(path):
+                # Collapse newlines so the text rides cleanly in the single-line IPC command.
+                speak_text = (self.text or "").replace("\r", " ").replace("\n", " ").strip()
+                if not speak_text:
+                    await interaction.followup.send("Nothing to speak.", ephemeral=True)
+                    await self._render_button(interaction, button, "ready")
+                    return
+                resp = await send_daemon_ipc("TTS SPEAK " + speak_text)
+                path = self._response_path(resp)
+                if not path or not os.path.isfile(path):
+                    await interaction.followup.send(f"🔇 TTS failed: {resp}", ephemeral=True)
+                    await self._render_button(interaction, button, "ready")
+                    return
+                async with self._state_lock:
+                    self._audio_path = path
+
+            sent = await self._upload_cached_audio(interaction, path)
+            if sent is None:
+                raise RuntimeError("Discord did not acknowledge the uploaded voice message")
+            async with self._state_lock:
+                self._delivered_message = sent
+            await self._render_button(interaction, button, "delivered")
+        except Exception as exc:
+            await interaction.followup.send(
+                f"🔇 Voice delivery failed: {type(exc).__name__}: {exc}",
+                ephemeral=True,
+            )
+            state = "cached" if self._audio_path and os.path.isfile(self._audio_path) else "ready"
+            await self._render_button(interaction, button, state)
+        finally:
+            async with self._state_lock:
+                self._busy = False
 
 async def _handle_approval_bg(message, resp, reply_msg, trace_ctx,
                               session_id, busy_token):
@@ -2611,7 +2850,12 @@ async def _exec_bridge_command(action, args):
             if ch is None:
                 return f"error: channel {args} not found"
             msgs = []
-            async for m in ch.history(limit=20):
+            # Registered retrieval improvements are durable contracts, so their
+            # source evidence cannot silently fall outside an arbitrary 20-message
+            # window as an active channel grows. Discord paginates this bounded read;
+            # 200 retains a finite response while covering the verified production
+            # marker horizon used by the live scavenger contract.
+            async for m in ch.history(limit=200):
                 msgs.append(f"{m.author.display_name}: {m.content}")
             msgs.reverse()
             return "\n".join(msgs) if msgs else "(no recent messages)"
