@@ -1273,6 +1273,11 @@ define react_verified_deploy_forced_action with ctx as Map returning Str:
 # The first source verification in repair/feature work is a controller transition,
 # not a planning choice. Selecting it here also prevents an explicitly recognized
 # request from spending a model turn trying a later phase before the baseline exists.
+define react_improvement_confirmation_forced_action with ctx as Map returning Str:
+    if map_contains(ctx and "improvement_confirmation_required") == 0 or else map_get_val(ctx and "improvement_confirmation_required") != 1:
+        return ""
+    return "Thought: The current message may be requesting a protected self-improvement transaction, but a mention is not authorization. I will ask one explicit follow-up before any verification or implementation.\nAction: request_clarification([\"Are you trying to trigger the protected self-improvement workflow now?||Yes, trigger self-improvement||No, continue the conversation\"])"
+
 define react_initial_repair_baseline_forced_action with ctx as Map returning Str:
     if map_contains(ctx and "repair_workflow_active") == 0 or else map_get_val(ctx and "repair_workflow_active") != 1:
         return ""
@@ -1920,6 +1925,11 @@ define react_run_loop with model as Map and memory_mgr as Map and tools_mgr as M
 
         # Controller-owned deployment transition. This is inserted before inference
         # and still traverses normal parsing, approval, Observer audit and execution.
+        if string_length(override_output) == 0:
+            set forced_improvement_confirmation to react_improvement_confirmation_forced_action(ctx)
+            if string_length(forced_improvement_confirmation) > 0:
+                set override_output to forced_improvement_confirmation
+                display "[ReAct] Explicit self-improvement confirmation selected by controller; no inference call."
         if string_length(override_output) == 0:
             set forced_pending_investigation to react_pending_investigation_forced_action(ctx)
             if string_length(forced_pending_investigation) > 0:
@@ -2986,6 +2996,13 @@ define react_resume_approved with model as Map and memory_mgr as Map and tools_m
         # F2: distinguish a USER decision from a policy gate. The user actively chose
         # not to run this — acknowledge it, do not retry, and ask what they want instead.
         set tool_result to f"[USER DECLINED] The user chose not to run '{tool_name}'. This was the user's decision, not a system error or your own limitation. Acknowledge their choice, do NOT retry the same action, and ask what they would like to do instead."
+        # A denial revokes this turn's inferred/confirmed improvement authority. Keep
+        # any already-durable transaction evidence on disk, but release every local
+        # forced-action flag so the same system_verify/recompile card cannot recur.
+        if map_contains(ctx and "repair_workflow_active") == 1:
+            if map_get_val(ctx and "repair_workflow_active") == 1:
+                set ok to tools_improvement_clear_turn_state(ctx)
+                set tool_result to concat(tool_result and " The protected self-improvement rail for this turn is cleared; continue as ordinary conversation.")
     
     # Store event in Tier 3 Timeline
     set ok to memory_store(memory_mgr and 3 and f"Action: {tool_name}" and f"Result: {tool_result}")
@@ -3060,7 +3077,22 @@ define react_resume_clarify with model as Map and memory_mgr as Map and tools_mg
     set ok to map_delete(ctx and "pending_clarification")
 
     set obs to ""
-    if answers equals "__USE_CURRENT__":
+    set improvement_confirmation to 0
+    if map_contains(ctx and "improvement_confirmation_required") == 1:
+        if map_get_val(ctx and "improvement_confirmation_required") == 1:
+            set improvement_confirmation to 1
+    if improvement_confirmation == 1:
+        if tools_improvement_confirmation_answer_is_yes(answers) == 1:
+            set confirmed to tools_improvement_confirm_pending(ctx)
+            if confirmed == 1:
+                set obs to "The user explicitly confirmed that this exact pending request should trigger the protected self-improvement workflow. Begin with the controller-required unchanged-source verification."
+            else:
+                set obs to "The self-improvement confirmation could not be bound to a pending request. Continue the conversation without verification, implementation, or source changes."
+                set ok to tools_improvement_clear_turn_state(ctx)
+        else:
+            set ok to tools_improvement_clear_turn_state(ctx)
+            set obs to "The user did not authorize self-improvement. Treat their original message and this answer as ordinary conversation. Do not verify, edit, recompile, deploy, or ask the same trigger question again in this turn."
+    else if answers equals "__USE_CURRENT__":
         set ok to map_insert(ctx and "clarify_done" and 1)
         set obs to "The user chose to proceed with the information already available. Do NOT ask for more clarification; complete the task now with your best understanding."
     else:
@@ -3142,7 +3174,8 @@ define react_run with model as Map and memory_mgr as Map and tools_mgr as Map an
     # cannot halt this fresh one on turn 1 (the EPOCH needs no clearing — runs capture
     # the current value at start, so old bumps are already behind them).
     set ok to ep_cancel_set(0)
-    set sanitized_user_prompt to prompt_sanitize_input(user_prompt)
+    set literal_user_prompt to tools_literal_current_user_message(ctx and user_prompt)
+    set sanitized_user_prompt to prompt_sanitize_input(literal_user_prompt)
     set ok to map_insert(ctx and "repair_original_request" and sanitized_user_prompt)
     set ok to tools_repair_begin(ctx and sanitized_user_prompt)
     # Trigger Hebbian learning on prompt concepts

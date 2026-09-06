@@ -1,7 +1,35 @@
 # Changelog
 
+## 2026-09-06 — Authenticated Discord direct messages
+
+- Authorized Discord direct messages now reach Echo instead of being discarded by the public-channel filter. Access is limited to configured account IDs, the configured server owner, members holding the configured admin role, and members with Discord Administrator permission; unauthorized DMs fail closed with a visible rejection.
+- DM authorization resolves the configured server and fetches uncached membership when necessary, so administrator access does not depend on the limited role metadata attached to a DM user object. DM turns use the normal agent and reply pipeline without attempting Discord's guild-only trace-thread operation.
+
+## 2026-09-06 — Explicit self-improvement activation
+
+- Self-improvement classification now considers only the literal current user message. Retrieved context, identity metadata, history, system guidance, discussion, explanations, and future plans cannot silently activate the protected workflow.
+- A fresh implementation or repair request now requires the explicit follow-up question, “Are you trying to trigger the protected self-improvement workflow now?”, before any verification or source-change rail is armed.
+- A negative answer—or denial of the first protected action—clears that turn's pending improvement state and returns to ordinary conversation instead of requesting the action again.
+
+## 2026-09-06 — Protected cumulative live weight learning
+
+- Added a command-gated `/learn <reason>` workflow that freezes completed current-session interactions with actor, turn, timestamp, source, content-hash, and session-hash provenance, then performs real local QLoRA against the same multimodal Gemma 4 26B A4B model used by Echo.
+- Made adapter growth cumulative and immutable: version N+1 resumes the exact accepted version N adapter and writes a new child containing the complete learned state. Runtime loads only the cumulative head, preventing both prior-learning loss and double application of ancestor deltas.
+- Standardized the MLX-VLM package contract around sibling `adapters.safetensors` and `adapter_config.json` artifacts. Both are hash-bound and verified across parent resume, evaluation, consent, activation and rollback; MLX always receives their containing directory.
+- Coupled Discord's persisted ONLINE state and visible presence to authenticated node health. A connected bridge now advertises OFFLINE immediately when Echo's node is unavailable and returns ONLINE only after both agent and IPC health recover.
+- Added an operator-only literal production `/learn` acceptance test covering the registered Discord handler, real Discord delivery, Echo's two rights decisions, real training/evaluation, supervised replacement, post-restart 26B text/vision inference, lineage commit and applied rights receipts.
+- Made consent addressing session-scoped and fail-closed: Echo uses the literal `current`, which resolves only one pending change to its full ledger hash, preventing long-identifier transcription loops without weakening exact-manifest consent.
+- Unified strict Observer JSON-schema requests across Ollama, llama.cpp-compatible endpoints and the learned MLX provider; learned adapters no longer fail audits because MLX rejects the weaker `json_object` response mode.
+- Removed the replacement-health/lineage-commit race. Discord now waits for the exact learning transaction's durable reconciliation state and cannot mistake an older active adapter—or a pre-commit snapshot—for success.
+- Strengthened production acceptance evidence with exact child-session lineage validation, node-PID replacement, ONLINE→OFFLINE→ONLINE liveness capture, runtime-spec matching, and an independent post-restart 26B text/native-image probe.
+- Added separate informed-consent manifests for candidate training and exact-byte activation. Training cannot affect the running model; activation requires independent new-data loss improvement, held-out retention bounds, real text and native-image inference, the sealed mandatory application regressions, a second Echo decision, and Maria's authorization.
+- Added supervised learned-model activation on port 11436. The canonical wrapper loads and probes the exact candidate, boots the node, verifies authenticated health, reconciles the protected rights receipt, and only then commits the lineage. Any pre-commit activation failure restores the prior accepted adapter rather than silently substituting another model.
+- Kept all session-derived datasets, adapters, logs and receipts in factory-reset-managed local agent state. The reusable MLX runtime and inert base checkpoint remain host dependencies and are never treated as learned continuity.
+
+
 ## 2026-08-31 — Session self-extension E2E repair grounding
 
+- Every Echo prompt now receives a freshly assembled authoritative temporal-context block containing the host's local wall clock, timezone abbreviation and UTC offset, Unix epoch, node-runtime age, durable session start/age, and current-turn acceptance time/age. The block sits at the dynamic prompt tail to preserve stable-prefix KV reuse. New sessions persist their creation instant, accepted messages retain the runtime receipt timestamp, and legacy sessions migrate from their earliest recorded message.
 - The authenticated `AI EVAL_TOOL` production boundary now supplies the live session manager to registered extensions, matching ordinary tool-turn context. Session-aware capabilities can therefore consume the real persisted active transcript during replacement E2E validation instead of failing against an evaluator-only context that omitted `ctx.sessions`.
 - `session_summary_generator` now enforces its frozen exact-ID contract at the production boundary, rejecting empty and path-like values before looking up the live session registry.
 - Failed-live candidate normalization now distinguishes the transaction's active surface from unrelated pre-existing extensions. It preserves every other registered branch byte-exactly while retaining causal edits to the active surface, eliminating the byte-identical repair loop that previously erased valid recovery changes.

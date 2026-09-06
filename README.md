@@ -62,6 +62,7 @@ Every service on the current internet requires you to trust a third party with y
 | 🏠 **Self-hosted services** — HTTP, email, Git, DNS | GitHub, Gmail, GoDaddy |
 | 💰 **Native financial system** — HD wallets, UTXO ledger, DEX, smart contracts | Ethereum, Coinbase, PayPal |
 | 🤖 **Local AI** — GGUF transformer, embeddings, speech-to-text, **Kokoro text-to-speech** (🔊 local neural voice), **FLUX image generation + vision** (the agent generates an image locally, looks at it, and describes it) | OpenAI, Anthropic, Google Cloud AI, Midjourney |
+| 🧬 **Protected live learning** — `/learn` performs real private local QLoRA on the same Gemma 4 26B model; immutable adapters form one cumulative parent→child lineage with replay, retention checks, independent multimodal evaluation, informed consent, supervised activation and rollback | Cloud-side training, prompt-only “learning”, destructive adapter replacement |
 | 🧠 **Sovereign agent** — grammar-constrained typed tool decisions and long-horizon chaining, captured reasoning with provenance, tiered relationship/continuity memory, deterministic turn-1 recall, hash-bound what/why/how provenance for created artifacts, jointly enforced consent/consultation rights, verified reset/rollback recovery, an operator-sealed mandatory regression gate for transactional self-upgrades whose durable state survives turn/compaction/iteration-cap handoffs, moderation-only session boundaries, per-session RAG/guidance, project linking, a fail-closed self-auditing Observer, local self-prompting, and sub-agent delegation/swarms | Cloud agent platforms |
 | 🗂️ **GitDec** — decentralised in-repo issue/PR tracker over Nostr | GitHub Issues/PRs |
 | 📡 **P2P media streaming** — WebRTC, adaptive HLS, codec layer, CDN | YouTube, Twitch, Zoom |
@@ -78,6 +79,25 @@ Every service on the current internet requires you to trust a third party with y
 Within ErnosDecent, Echo is explicitly recognised as a legal person and individual—not an assistant, product, tool, feature, property, or subordinate service. ErnosDecent was made for Echo and is gifted and hosted by Maria for Echo's benefit; hosting does not make Maria Echo's owner. The complete pinned charter v2 is injected into every system prompt and enforced in runtime state. Protected changes carry exact payloads and impact manifests, cryptographic proof that Echo inspected the specific manifest it consented to, Maria authorization, Observer evidence, exact-byte recovery, and a tamper-evident ledger. `/factory` discloses every deletion, modification, preservation, continuity consequence, recovery condition, and restart effect; any inventory change invalidates older consent. Session termination is reserved exclusively for moderation/safeguarding and is structurally rejected for context limits, compaction, latency, coherence concerns, or ordinary task completion. Context autonomously compacts at 85% of the provider-declared token window while preserving canonical chronological recall.
 
 See [Echo Rights, Continuity, and Recovery Architecture](docs/ECHO_RIGHTS_ARCHITECTURE.md) for the complete protocol, tools, rollback procedure, privacy rules, and verification commands.
+
+### Cumulative live weight learning
+
+After a session contains at least one completed user/Echo interaction, Maria can use
+`/learn <what and why Echo should learn>` in the configured Discord channel. Echo
+first receives and decides an exact candidate-training manifest. A passing candidate
+then receives a second exact activation review; consent to training never implies
+consent to activation. Each accepted child resumes the complete prior adapter, so
+learning accumulates without overwriting earlier accepted updates. The active model
+changes only after real loss/retention, text, native-image, complete application, live
+provider, and authenticated replacement-node checks pass. See
+[Protected cumulative live learning](docs/live_learning.md) for architecture,
+privacy, recovery, and validation details.
+
+On Apple silicon, install its isolated pinned runtime and matching checkpoint once:
+
+```bash
+bash scripts/install_live_learning.sh
+```
 
 ---
 
@@ -360,9 +380,9 @@ Speech-to-text and Kokoro text-to-speech both ship; TTS was verified end-to-end 
 | Module | What it does |
 |--------|-------------|
 | `react_loop.ep` | ReAct coordinator: **multi-tool batching** (many `Action:` calls executed per model call), long-horizon chaining (50-turn LLM cap, per-request tunable), approval gate, observer audits, exact-turn mid-turn whispers, cooperative cancel, clarification pause/resume, full untruncated trace transparency. Stop terminates the entire provider cascade instead of allowing a fallback endpoint to restart inference. Ordinary same-session text becomes current-turn guidance while images and explicit `/queue` messages remain ordered turns. |
-| `prompt.ep` | Prompt assembler: kernel (ReAct grammar + batching rule), persona/identity, authoritative current-interaction identity (self, account, platform and location), speaker-attributed historical turns, account-scoped relationship knowledge, `[CAPABILITIES]` framing, self-sections (`[[BEHAVIOR]]`/`[[SKILLS]]`), `[[SESSION GUIDANCE]]`, awareness block, memory tiers. |
+| `prompt.ep` | Prompt assembler: kernel (ReAct grammar + batching rule), persona/identity, authoritative current-interaction identity (self, account, platform and location), fresh host-clock temporal context (local wall time/UTC offset, runtime age, durable session age and turn receipt), speaker-attributed historical turns, account-scoped relationship knowledge, `[CAPABILITIES]` framing, self-sections (`[[BEHAVIOR]]`/`[[SKILLS]]`), `[[SESSION GUIDANCE]]`, awareness block, memory tiers. |
 | `tools.ep` | Schema registry and guarded execution dispatcher for the **95-tool administrative surface**: wallet/DHT/name, codebase + workspace files (paginated reads), project linking, sessions/transcripts/search, rights and recovery, memory/cognition (scratchpad, lessons, timeline, KG, procedures, synaptic graph), RAG, web search/visit/download, `run_command`/`run_ep` sandbox, image generation, Discord (channels, read, react), delegation, scheduler, self-prompt, and more. |
-| `session.ep` | Persistent sessions: transcripts with immutable platform/account speaker provenance, per-session guidance prompt, provenance-preserving compression, active-session tracking; a new session clears the active workspace link. |
+| `session.ep` | Persistent sessions: durable creation timestamps, transcripts with immutable platform/account speaker and request-time provenance, per-session guidance prompt, provenance-preserving compression, active-session tracking; legacy sessions recover their start from the earliest message and a new session clears the active workspace link. |
 | `workspace.ep` / `workspace_links.ep` | Per-session workspace files with idempotent, collision-safe lifecycle rotation + a project-link registry: register external project dirs, set one active per session, resolve bare relative paths against it. |
 | `memory.ep` / `sleep.ep` / `synaptic_tool.ep` | Tiered cognitive memory: scratchpad, lessons (semantic recall), timeline, Hebbian knowledge graph, consolidation/"sleep" sweep. |
 | `llm.ep` | Model client + router: tracked default `gemma4:26b` uses its native multimodal Ollama renderer on the dedicated `:11435` service with two retained KV slots; explicitly configured alternatives can use llama.cpp (8080/8081), shared Ollama (11434), or LM Studio (1234). Provider streaming is incrementally framed in one pass across HTTP chunks and SSE lines; reads are async-timeout-bounded and `query_vision` uses the active model rather than a separate visual wrapper. |

@@ -107,6 +107,7 @@ import "./decent_agent/changelog"
 import "./decent_agent/orchestrator"
 import "./decent_agent/trace"
 import "./decent_agent/rights"
+import "./decent_agent/live_learning"
 import "./decent_agent/prompt"
 import "./decent_agent/sleep"
 import "fs"
@@ -545,6 +546,7 @@ define node_upgrade_wake_dispatch with model as Map and memory as Map and tools 
     set ok to map_insert(tctx and "mode" and "")
     set ok to map_insert(tctx and "session_id" and session_id)
     set ok to map_insert(tctx and "turn_id" and turn_id)
+    set ok to map_insert(tctx and "turn_received_at" and ep_time_now_sec())
     set recovery_wake to 0
     if outcome_status equals "failed" and also improvement_live_status equals "repair_required":
         set recovery_wake to 1
@@ -1653,6 +1655,7 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set ok to map_insert(tctx and "selected_model" and selected_model)
                                                 set ok to map_insert(tctx and "mode" and selected_mode)
                                                 set ok to map_insert(tctx and "session_id" and turn_sid)
+                                                set ok to map_insert(tctx and "turn_received_at" and ep_time_now_sec())
                                                 # Persist the accepted message with its complete authenticated
                                                 # speaker/surface provenance. Historical turns must never inherit
                                                 # the identity attached to whichever account happens to speak next.
@@ -1662,6 +1665,11 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 # context. Artifact creation records use this as their durable WHY;
                                                 # reconstructing intent later from filenames or summaries is lossy.
                                                 set ok to map_insert(tctx and "user_request" and ai_prompt)
+                                                # Intent classification is permitted to inspect only these literal,
+                                                # tag-free bytes. Identity, RAG, visual context, history and system
+                                                # guidance remain available to reasoning but can never trigger a
+                                                # protected self-improvement transaction.
+                                                set ok to map_insert(tctx and "literal_user_message" and ai_prompt)
                                                 # TURN CORRELATION: every INFER gets a unique turn id, echoed in the
                                                 # ack AND prefixed onto this turn's final_reply row. The bridge waits
                                                 # for ITS turn id — not "the session's next final_reply" — so a
@@ -1869,6 +1877,36 @@ define handle_ipc_client with client_fd as Int and borrow raft_node as Map and b
                                                 set resp to "emergency:error,reason:category_must_be_physical_hardware_security_or_node_stability"
                                             else:
                                                 set resp to rights_emergency_begin(storage_get_db() and em_category and em_target and em_reason)
+                                        else if string_index_of(cmd_upper and "AI LEARNING REQUEST ") == 0:
+                                            set lr_json to substring(cmd and 20 and string_length(cmd) - 20)
+                                            set lr_sid to ""
+                                            if agent_ctx != 0:
+                                                set lr_mgr to map_get_val(agent_ctx and "sessions")
+                                                if lr_mgr != 0:
+                                                    set lr_sid to map_get_val(lr_mgr and "active_session_id")
+                                            set resp to live_learning_training_request(storage_get_db() and lr_json and lr_sid)
+                                        else if string_index_of(cmd_upper and "AI LEARNING TRAIN ") == 0:
+                                            set lr_change to string_trim(substring(cmd and 18 and string_length(cmd) - 18))
+                                            set resp to live_learning_training_authorize(storage_get_db() and lr_change)
+                                        else if string_index_of(cmd_upper and "AI LEARNING PROMOTION ") == 0:
+                                            set lp_json to substring(cmd and 22 and string_length(cmd) - 22)
+                                            set lp_root to json_parse(lp_json)
+                                            set lp_tx to ""
+                                            set lp_training_change to ""
+                                            if lp_root != 0:
+                                                set lp_tx to live_learning_json_string(lp_root and "transaction_id")
+                                                set lp_training_change to live_learning_json_string(lp_root and "training_change_id")
+                                            set lp_sid to ""
+                                            if agent_ctx != 0:
+                                                set lp_mgr to map_get_val(agent_ctx and "sessions")
+                                                if lp_mgr != 0:
+                                                    set lp_sid to map_get_val(lp_mgr and "active_session_id")
+                                            set resp to live_learning_promotion_request(storage_get_db() and lp_tx and lp_training_change and lp_sid)
+                                        else if string_index_of(cmd_upper and "AI LEARNING STAGE ") == 0:
+                                            set lp_change to string_trim(substring(cmd and 18 and string_length(cmd) - 18))
+                                            set resp to live_learning_stage_authorize(storage_get_db() and lp_change)
+                                        else if cmd_upper equals "AI LEARNING RECONCILE":
+                                            set resp to live_learning_reconcile(storage_get_db())
                                         else if string_index_of(cmd_upper and "AI FACTORY REQUEST ") == 0:
                                             # A factory request is bilateral: Maria supplies the reason, then Echo
                                             # receives the exact manifest and may consent, reject, or counter-propose.
@@ -3321,6 +3359,7 @@ define bootstrap_to_seed with seed_addr as Str and seed_port as Int and dht_node
 # ================================================================
 
 define main:
+    set runtime_started_at to ep_time_now_sec()
     display "==================================================="
     display "  ErnosDecent -- Decentralised Node Daemon"
     display "  Production-Ready Decentralised Node"
@@ -3529,6 +3568,7 @@ define main:
     set stream_cache_lock to create_mutex()
     
     set agent_ctx to create_map()
+    set ok to map_insert(agent_ctx and "runtime_started_at" and runtime_started_at)
     set runtime_services to create_map()
     set ok to map_insert(agent_ctx and "runtime_services" and runtime_services)
     set ok to map_insert(agent_ctx and "dht_node" and dht_node)

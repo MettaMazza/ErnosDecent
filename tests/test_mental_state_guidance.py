@@ -71,6 +71,11 @@ class MentalStateGuidanceRegressionTest(unittest.TestCase):
         self.assertIn("rejecting reasoning-only output", llm)
         self.assertIn('max_tokens\\": 1024', llm)
         self.assertIn("llm_observer_response_schema", llm)
+        split_start = llm.index("define try_chat_completion_split")
+        split_end = llm.index("define llm_system_identity", split_start)
+        split_source = llm[split_start:split_end]
+        self.assertNotIn('{\\"type\\": \\"json_object\\"}', split_source)
+        self.assertEqual(split_source.count("llm_observer_response_schema(capture_continuity)"), 2)
         self.assertIn('reasoning_effort\\": \\"none', llm)
         self.assertIn("llm_observer_reason_codes", llm)
         self.assertIn('mental_state_downgrade\\",\\"posthoc_trace_grounding', llm)

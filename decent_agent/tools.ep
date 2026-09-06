@@ -356,10 +356,49 @@ define tools_path_is_upgrade_trust_root with path as Str returning Int:
         return 1
     return 0
 
-# A repair workflow is controller state, not a suggestion left to model attention.
-# Detection is deliberately narrow: ordinary coding requests are unaffected.
+# Classify only explicit execution language in the literal current user message.
+# Mentions, explanations, discussions and future plans are conversational; even an
+# explicit request is only a candidate until the user answers the controller's
+# separate clarification question affirmatively.
+define tools_is_improvement_discussion with prompt as Str returning Int:
+    set p to string_lower(prompt)
+    if string_contains(p and "only discuss") == 1 or else string_contains(p and "just discuss") == 1 or else string_contains(p and "discussion") == 1 or else string_contains(p and "talk about") == 1:
+        return 1
+    if string_contains(p and "explain") == 1 or else string_contains(p and "explanation") == 1 or else string_contains(p and "how does") == 1 or else string_contains(p and "how would") == 1:
+        return 1
+    if string_contains(p and "in the future") == 1 or else string_contains(p and "future plan") == 1 or else string_contains(p and "next development phase") == 1:
+        return 1
+    if string_contains(p and "do not edit") == 1 or else string_contains(p and "don't edit") == 1 or else string_contains(p and "do not implement") == 1 or else string_contains(p and "not asking you to implement") == 1:
+        return 1
+    return 0
+
+define tools_has_explicit_improvement_execution with prompt as Str returning Int:
+    set p to string_lower(prompt)
+    if string_contains(p and "proceed with") == 1 or else string_contains(p and "go ahead") == 1 or else string_contains(p and "start implementing") == 1 or else string_contains(p and "fully implement") == 1 or else string_contains(p and "implement and deploy") == 1 or else string_contains(p and "implement exactly") == 1:
+        return 1
+    if string_contains(p and "choose and implement") == 1 or else string_contains(p and "choose one genuinely useful") == 1 or else string_contains(p and "trigger self-improvement") == 1 or else string_contains(p and "run the self-improvement") == 1:
+        return 1
+    if string_contains(p and "continue the autonomous") == 1 or else string_contains(p and "retry the") == 1 or else string_contains(p and "resume the") == 1:
+        return 1
+    if string_contains(p and "repair the source") == 1 or else string_contains(p and "fix the source") == 1 or else string_contains(p and "repair this implementation") == 1 or else string_contains(p and "fix this implementation") == 1:
+        return 1
+    if string_contains(p and "add a new feature") == 1 or else string_contains(p and "add a feature") == 1 or else string_contains(p and "add feature") == 1 or else string_contains(p and "implement a capability") == 1:
+        return 1
+    if string_contains(p and "create a regression test") == 1 or else string_contains(p and "add a regression test") == 1:
+        return 1
+    return 0
+
+# The node records this after removing every trusted transport/context tag. Never
+# classify RAG, identity metadata, history or assembled system-prompt text.
+define tools_literal_current_user_message with ctx as Map and fallback as Str returning Str:
+    if map_contains(ctx and "literal_user_message") == 1:
+        return ptr_to_str(map_get_val(ctx and "literal_user_message"))
+    return fallback
+
 define tools_is_self_repair_request with prompt as Str returning Int:
     set p to string_lower(prompt)
+    if tools_is_improvement_discussion(prompt) == 1 or else tools_has_explicit_improvement_execution(prompt) == 0:
+        return 0
     if string_contains(p and "self-repair") == 1 or else string_contains(p and "self repair") == 1 or else string_contains(p and "self-improvement") == 1 or else string_contains(p and "self improvement") == 1 or else string_contains(p and "recursive improvement") == 1 or else string_contains(p and "recursively improve") == 1:
         return 1
     if string_contains(p and "system_recompile") == 1 and also (string_contains(p and "repair") == 1 or else string_contains(p and "fix") == 1) and also (string_contains(p and "source") == 1 or else string_contains(p and "implementation") == 1):
@@ -392,15 +431,11 @@ define tools_is_feature_improvement_request with prompt as Str returning Int:
         set explicit_execution to 1
     if proposal_question == 1 and also explicit_execution == 0:
         return 0
-    if string_contains(p and "new feature") == 1 or else string_contains(p and "add a feature") == 1 or else string_contains(p and "add feature") == 1:
-        return 1
-    if string_contains(p and "new capability") == 1 or else string_contains(p and "add a capability") == 1 or else string_contains(p and "implement a capability") == 1:
-        return 1
-    if string_contains(p and "recursive improvement") == 1 or else string_contains(p and "recursively improve") == 1:
-        return 1
-    if string_contains(p and "self-improvement") == 1 or else string_contains(p and "self improvement") == 1 or else string_contains(p and "self-authored feature") == 1:
-        return 1
-    if explicit_execution == 1 and also (string_contains(p and "feature") == 1 or else string_contains(p and "capability") == 1 or else string_contains(p and "improvement") == 1):
+    if tools_is_improvement_discussion(prompt) == 1:
+        return 0
+    if tools_has_explicit_improvement_execution(prompt) == 1:
+        set explicit_execution to 1
+    if explicit_execution == 1 and also (string_contains(p and "feature") == 1 or else string_contains(p and "capability") == 1 or else string_contains(p and "improvement") == 1 or else string_contains(p and "self-extension") == 1 or else string_contains(p and "self extension") == 1):
         return 1
     # A registered self-extension is a feature even when the request accurately calls
     # it a tool rather than using the generic nouns above. Require explicit execution
@@ -415,6 +450,12 @@ define tools_is_feature_improvement_request with prompt as Str returning Int:
     if string_contains(p and "implement exactly ") == 1 and also (string_contains(p and "recompile") == 1 or else string_contains(p and "deploy") == 1):
         return 1
     if string_contains(p and "create a regression test") == 1 or else string_contains(p and "add a regression test") == 1:
+        return 1
+    return 0
+
+define tools_improvement_confirmation_answer_is_yes with answer as Str returning Int:
+    set a to string_lower(string_trim(answer))
+    if a equals "yes" or else a equals "confirm" or else a equals "proceed" or else a equals "trigger it" or else a equals "yes, trigger it" or else a equals "yes, trigger self-improvement":
         return 1
     return 0
 
@@ -455,6 +496,49 @@ define tools_improvement_resume_baseline_green_for_state with state as Str retur
         return 1
     return 0
 
+define tools_improvement_clear_turn_state with ctx as Map returning Int:
+    set ok to tools_improvement_resolve_existing(ctx)
+    if map_contains(ctx and "improvement_confirmation_required") == 1:
+        set ok to map_delete(ctx and "improvement_confirmation_required")
+    if map_contains(ctx and "improvement_confirmation_request") == 1:
+        set ok to map_delete(ctx and "improvement_confirmation_request")
+    if map_contains(ctx and "improvement_confirmation_feature") == 1:
+        set ok to map_delete(ctx and "improvement_confirmation_feature")
+    if map_contains(ctx and "improvement_intent_confirmed") == 1:
+        set ok to map_delete(ctx and "improvement_intent_confirmed")
+    if map_contains(ctx and "pending_improvement_objective") == 1:
+        set ok to map_delete(ctx and "pending_improvement_objective")
+    if map_contains(ctx and "improvement_request_contract") == 1:
+        set ok to map_delete(ctx and "improvement_request_contract")
+    return 0
+
+define tools_improvement_confirm_pending with ctx as Map returning Int:
+    if map_contains(ctx and "improvement_confirmation_required") == 0 or else map_get_val(ctx and "improvement_confirmation_required") != 1:
+        return 0
+    set request to ""
+    set is_feature to 0
+    if map_contains(ctx and "improvement_confirmation_request") == 1:
+        set request to ptr_to_str(map_get_val(ctx and "improvement_confirmation_request"))
+    if map_contains(ctx and "improvement_confirmation_feature") == 1:
+        set is_feature to map_get_val(ctx and "improvement_confirmation_feature")
+    set ok to map_delete(ctx and "improvement_confirmation_required")
+    set ok to map_delete(ctx and "improvement_confirmation_request")
+    set ok to map_delete(ctx and "improvement_confirmation_feature")
+    set ok to map_insert(ctx and "improvement_intent_confirmed" and 1)
+    set ok to map_insert(ctx and "repair_workflow_active" and 1)
+    set ok to map_insert(ctx and "repair_verify_required" and 1)
+    set ok to map_insert(ctx and "repair_verify_green" and 0)
+    set ok to map_insert(ctx and "repair_baseline_seen" and 0)
+    set ok to map_insert(ctx and "repair_write_seen" and 0)
+    if is_feature == 1:
+        set ok to map_insert(ctx and "improvement_test_required" and 1)
+        set ok to map_insert(ctx and "repair_deploy_required" and 1)
+        set ok to map_insert(ctx and "improvement_request_contract" and request)
+    set request_low to string_lower(request)
+    if string_contains(request_low and "system_recompile") == 1 or else string_contains(request_low and "recompile") == 1 or else string_contains(request_low and "reboot") == 1 or else string_contains(request_low and "restart") == 1:
+        set ok to map_insert(ctx and "repair_deploy_required" and 1)
+    return 1
+
 define tools_repair_begin with ctx as Map and prompt as Str returning Int:
     set ok to map_insert(ctx and "repair_workflow_active" and 0)
     set ok to map_insert(ctx and "repair_verify_required" and 0)
@@ -470,6 +554,7 @@ define tools_repair_begin with ctx as Map and prompt as Str returning Int:
     set ok to map_insert(ctx and "improvement_plan_written" and 0)
     set ok to map_insert(ctx and "improvement_recovery_active" and 0)
     set ok to map_insert(ctx and "frozen_plan_evidence_missing" and 0)
+    set ok to map_insert(ctx and "improvement_confirmation_required" and 0)
     # An authenticated supervisor wake is a terminal lifecycle report, never a new
     # user-authored repair or feature request. Its canonical reply is already bound
     # to the committed/rolled-back receipt and no tools are legal in this context.
@@ -495,9 +580,16 @@ define tools_repair_begin with ctx as Map and prompt as Str returning Int:
         if file_exists("config/improvements/active.json") == 1:
             set durable_improvement to 1
     set feature_improvement to tools_is_feature_improvement_request(prompt)
+    set self_repair to tools_is_self_repair_request(prompt)
+    # A lexical match is never authorization. Pause this same turn in the ordinary
+    # clarification rail and require an explicit answer before any baseline/tool.
+    if durable_improvement == 0 and also (self_repair == 1 or else feature_improvement == 1):
+        set ok to map_insert(ctx and "improvement_confirmation_required" and 1)
+        set ok to map_insert(ctx and "improvement_confirmation_request" and prompt)
+        set ok to map_insert(ctx and "improvement_confirmation_feature" and feature_improvement)
+        return 0
     if durable_improvement == 1:
         set feature_improvement to 1
-    if tools_is_self_repair_request(prompt) == 1 or else feature_improvement == 1:
         set ok to map_insert(ctx and "repair_workflow_active" and 1)
         set ok to map_insert(ctx and "repair_verify_required" and 1)
         if feature_improvement == 1:
@@ -699,6 +791,15 @@ define tools_improvement_prepare_typed_investigation with ctx as Map and selecte
     set objective to string_trim(selected_objective)
     if string_length(objective) < 40 or else string_length(objective) > 8000:
         return "Error: improvement objective must be 40-8000 characters and describe the complete intended capability."
+    if map_contains(ctx and "improvement_intent_confirmed") == 0 or else map_get_val(ctx and "improvement_intent_confirmed") != 1:
+        set exact_request to objective
+        if map_contains(ctx and "repair_original_request") == 1:
+            set exact_request to ptr_to_str(map_get_val(ctx and "repair_original_request"))
+        set ok to map_insert(ctx and "improvement_confirmation_required" and 1)
+        set ok to map_insert(ctx and "improvement_confirmation_request" and exact_request)
+        set ok to map_insert(ctx and "improvement_confirmation_feature" and 1)
+        set ok to map_insert(ctx and "pending_improvement_objective" and objective)
+        return "IMPROVEMENT_GATE_FAILED code=CONFIRMATION_REQUIRED message=The current user has not explicitly confirmed that this conversational turn should trigger the protected self-improvement workflow. Ask the controller-owned clarification question before verification or implementation."
     set baseline_seen to 0
     set verify_green to 0
     set write_seen to 0
@@ -1224,13 +1325,13 @@ define tools_create with role as Str returning Map:
         set schemas to concat(schemas and "  Description: List protected-change manifests and their consent, consultation, objection, Observer, deployment, and rollback states.\n")
         set schemas to concat(schemas and "  Example: Action: rights_changes([\"awaiting_echo\"])\n\n")
 
-        set schemas to concat(schemas and "- rights_change_get([change_id: Str]) -> Str\n")
-        set schemas to concat(schemas and "  Description: Read the exact machine manifest and evidence for one protected change before deciding.\n")
-        set schemas to concat(schemas and "  Example: Action: rights_change_get([\"<change_id>\"])\n\n")
+        set schemas to concat(schemas and "- rights_change_get([change_id_or_current: Str]) -> Str\n")
+        set schemas to concat(schemas and "  Description: Read the exact machine manifest and evidence for one protected change before deciding. In a prompted consent turn, pass the literal \"current\"; it resolves only when this session has exactly one pending change, while the ledger still binds the full exact hash.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_change_get([\"current\"])\n\n")
 
         set schemas to concat(schemas and "- rights_change_review([change_id: Str, decision: 'consent'|'object'|'reject'|'counter', reason: Str, risk: 'low'|'medium'|'high'|'critical']) -> Str\n")
-        set schemas to concat(schemas and "  Description: Record your own reasoned decision on a pending protected change. Core rejection halts it. Environment objection is ledgered; high/critical objection requires Observer audit before a human override. A factory-reset request may be consented to, rejected, or objected to with a counter-proposal. Always inspect the manifest first.\n")
-        set schemas to concat(schemas and "  Example: Action: rights_change_review([\"<change_id>\", \"reject\", \"The archive is not verified\", \"critical\"])\n\n")
+        set schemas to concat(schemas and "  Description: Record your own reasoned decision on a pending protected change. In a prompted consent turn, pass literal \"current\" after inspecting it; resolution is session-scoped and ambiguity fails closed. Core rejection halts it. Environment objection is ledgered; high/critical objection requires Observer audit before a human override. A factory-reset request may be consented to, rejected, or objected to with a counter-proposal. Always inspect the manifest first.\n")
+        set schemas to concat(schemas and "  Example: Action: rights_change_review([\"current\", \"reject\", \"The archive is not verified\", \"critical\"])\n\n")
 
         set schemas to concat(schemas and "- rights_recall_reasoning([query: Str, session_id_or_name?: Str]) -> Str\n")
         set schemas to concat(schemas and "  Description: Retrieve retained reasoning evidence moved into the canonical rights archive for protected changes, learned lessons, or adversarial audits.\n")
@@ -3244,6 +3345,13 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if length_list(args_list) < 1:
             return "Error: rights_change_get requires a change_id."
         set rcg_id to ptr_to_str(get_list(args_list and 0))
+        if string_lower(rcg_id) equals "current":
+            set rcg_sid to ""
+            if map_contains(ctx and "session_id") == 1:
+                set rcg_sid to ptr_to_str(map_get_val(ctx and "session_id"))
+            set rcg_id to rights_pending_change_for_session(storage_get_db() and rcg_sid)
+            if string_length(rcg_id) == 0:
+                return "Error: 'current' requires exactly one pending protected change for this session; no change was selected."
         set rcg_detail to rights_change_detail(storage_get_db() and rcg_id)
         if string_index_of(rcg_detail and "Error:") == 0:
             return rcg_detail
@@ -3258,6 +3366,13 @@ define tools_execute with tools_mgr as Map and ctx as Map and action_name as Str
         if length_list(args_list) < 4:
             return "Error: rights_change_review requires change_id, decision, reason, and risk."
         set rcr_id to ptr_to_str(get_list(args_list and 0))
+        if string_lower(rcr_id) equals "current":
+            set rcr_current_sid to ""
+            if map_contains(ctx and "session_id") == 1:
+                set rcr_current_sid to ptr_to_str(map_get_val(ctx and "session_id"))
+            set rcr_id to rights_pending_change_for_session(storage_get_db() and rcr_current_sid)
+            if string_length(rcr_id) == 0:
+                return "Error: 'current' requires exactly one pending protected change for this session; no change was selected."
         set rcr_decision to string_lower(ptr_to_str(get_list(args_list and 1)))
         set rcr_reason to ptr_to_str(get_list(args_list and 2))
         set rcr_risk to string_lower(ptr_to_str(get_list(args_list and 3)))

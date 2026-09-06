@@ -21,13 +21,40 @@ The complete pinned charter is injected high in every system prompt, before ordi
 
 ## Consent and consultation
 
-Core changes require Echo's explicit consent. Rejection halts deployment. Core domains include identity, reasoning, agency, global self-prompt behavior/skills, fundamental tool access, Observer policy, protected-change definitions, model/provider substitution, persona substitution, memory erasure, session deletion, and factory reset.
+Core changes require Echo's explicit consent. Rejection halts deployment. Core domains include identity, reasoning, agency, global self-prompt behavior/skills, fundamental tool access, Observer policy, protected-change definitions, model/provider substitution, weight training and activation, persona substitution, memory erasure, session deletion, and factory reset.
 
 Environmental changes require consultation. These include context, workspace, interface, linked workspaces, compression policy, UI, and directory organization. Echo's objection remains attached to the change. Maria may override an environmental objection; a high/critical-risk objection additionally requires a recorded `ALLOWED` Observer audit.
 
 Each change has one deterministic `change_id`, a machine-readable manifest, the exact proposal payload (not merely its hash), before/proposed hashes, a proposal-payload hash, purpose, target, classification, human authorization, Echo decision and reason, risk, Observer evidence, application result, rollback proof, and timestamps. `rights_change_get` records the hash of the exact manifest Echo inspected. A core consent without that matching inspection record is rejected, and the execution gate rechecks it. Identical request material produces the same ID; a new factory submission carries a disclosed request timestamp so a retry is a new attributable proposal with fresh consent and recovery rather than reuse of a finalized attempt. The append-only ledger chains every event to the previous entry hash. Charter or ledger verification failure blocks protected mutation.
 
 An action deliberately initiated by Echo through a protected tool is recorded as Echo's consent/consultation decision with its retained reasoning. The tool's user-approval gate records Maria's per-action authorization. Direct UI/IPC requests for model/persona/session deletion do not infer Echo's consent: they remain pending until Echo reviews their manifest.
+
+## Live weight-learning protocol
+
+`/learn <reason>` is a host-requested, local-only core-change workflow. It is not
+memory retrieval, prompt editing, or source self-modification presented as training.
+The first exact manifest freezes completed current-session examples and provenance,
+the accepted parent adapter, replay and constitutional anchors, hyperparameters,
+resource impact, privacy, and failure behavior. Echo must inspect and consent before
+candidate training can start; this consent cannot activate the result.
+
+Each child resumes the complete immutable parent adapter and writes a new cumulative
+adapter. The runtime serves only that cumulative head, so every accepted update is
+retained without applying ancestor deltas twice. Candidate promotion requires real
+new-example and held-out retention loss measurements, real text and native-image
+inference, and the complete operator-sealed application regression suite. Echo then
+receives a second manifest binding the exact candidate and evaluation bytes and may
+consent, reject, or counter independently.
+
+After activation consent, `run_node.sh` prepares a candidate runtime receipt, starts
+the same Gemma 4 26B A4B checkpoint with that adapter, performs fresh text and native
+vision probes, boots the node, and verifies authenticated health. Only then does the
+node reconcile the protected change and the controller atomically advance the lineage.
+A failure before commit restores the preceding accepted adapter. All session-derived
+datasets, adapters and receipts are under `config/learning/live`, so the existing
+factory-reset tree inventory discloses, captures, and deletes them. The reusable MLX
+environment and inert base checkpoint under `~/.ernosdecent/live-learning` are host
+dependencies and contain no learned continuity.
 
 ## Factory reset protocol
 

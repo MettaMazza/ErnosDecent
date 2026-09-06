@@ -1,0 +1,230 @@
+# ErnosDecent live weight-learning rights bridge.
+#
+# Python owns binary-safe training/evaluation artifacts. This module owns the
+# constitutional transitions that authorize candidate training and activation.
+# Every filesystem path is derived from a validated transaction id; callers never
+# supply an arbitrary path.
+
+import "fs"
+import "string"
+import "sql"
+import "collections"
+import "json"
+import "./rights"
+
+set LIVE_LEARNING_ROOT to "config/learning/live"
+
+define live_learning_hex64 with value as Str returning Int:
+    if string_length(value) != 64:
+        return 0
+    set i to 0
+    repeat while i < 64:
+        set c to get_character(value and i)
+        set ok to 0
+        if c >= 48 and c <= 57:
+            set ok to 1
+        else if c >= 65 and c <= 70:
+            set ok to 1
+        else if c >= 97 and c <= 102:
+            set ok to 1
+        if ok == 0:
+            return 0
+        set i to i + 1
+    return 1
+
+define live_learning_transaction_dir with transaction_id as Str returning Str:
+    if live_learning_hex64(transaction_id) == 0:
+        return ""
+    return concat(LIVE_LEARNING_ROOT and concat("/transactions/" and transaction_id))
+
+define live_learning_json_string with root as Int and key as Str returning Str:
+    if root == 0:
+        return ""
+    set node to get_json_object_value(root and key)
+    if node == 0 or else get_json_type(node) != 2:
+        return ""
+    return get_json_value(node)
+
+define live_learning_json_bool with root as Int and key as Str returning Int:
+    if root == 0:
+        return 0
+    set node to get_json_object_value(root and key)
+    if node == 0:
+        return 0
+    # ErnosPlain JSON represents booleans through its integer scalar node.
+    if get_json_type(node) == 1:
+        return get_json_value(node)
+    return 0
+
+define live_learning_change_field with db as Int and change_id as Str and field_name as Str returning Str:
+    if live_learning_hex64(change_id) == 0:
+        return ""
+    set field to ""
+    if field_name equals "category":
+        set field to "category"
+    else if field_name equals "target":
+        set field to "target"
+    else if field_name equals "proposed_hash":
+        set field to "proposed_hash"
+    else if field_name equals "status":
+        set field to "status"
+    if string_length(field) == 0:
+        return ""
+    set rows to sql_query(db and concat("SELECT " and concat(field and concat(" FROM rights_changes WHERE change_id='" and concat(rights_sql_escape(change_id) and "' LIMIT 1;")))))
+    if length_list(rows) == 0:
+        return ""
+    return ptr_to_str(get_list(get_list(rows and 0) and 0))
+
+define live_learning_training_request with db as Int and request_json as Str and session_id as Str returning Str:
+    set root to json_parse(request_json)
+    if root == 0:
+        return "learning:error,code:REQUEST_JSON_INVALID"
+    set transaction_id to live_learning_json_string(root and "transaction_id")
+    set expected_file_hash to live_learning_json_string(root and "manifest_file_hash")
+    set reason to string_trim(live_learning_json_string(root and "reason"))
+    set tx_dir to live_learning_transaction_dir(transaction_id)
+    if string_length(tx_dir) == 0:
+        return "learning:error,code:TRANSACTION_ID_INVALID"
+    if live_learning_hex64(expected_file_hash) == 0:
+        return "learning:error,code:MANIFEST_HASH_INVALID"
+    if string_length(reason) == 0 or else string_length(reason) > 4000:
+        return "learning:error,code:REASON_INVALID"
+    set manifest_path to concat(tx_dir and "/manifest.json")
+    if rights_file_hash(manifest_path) equals expected_file_hash == 0:
+        return "learning:error,code:MANIFEST_FILE_HASH_MISMATCH"
+    set manifest_text to read_file(manifest_path)
+    set manifest to json_parse(manifest_text)
+    if manifest == 0:
+        return "learning:error,code:MANIFEST_JSON_INVALID"
+    if live_learning_json_string(manifest and "schema") equals "ernosdecent-live-learning-v1" == 0:
+        return "learning:error,code:MANIFEST_SCHEMA_INVALID"
+    if live_learning_json_string(manifest and "transaction_id") equals transaction_id == 0:
+        return "learning:error,code:MANIFEST_TRANSACTION_MISMATCH"
+    if live_learning_json_string(manifest and "status") equals "prepared" == 0:
+        return "learning:error,code:TRANSACTION_NOT_PREPARED"
+    set parent_hash to live_learning_json_string(manifest and "parent_hash")
+    set summary to concat("Maria requests a private local cumulative QLoRA training experiment over the current session. Reason: " and reason)
+    set disclosure to "LIVE_WEIGHT_TRAINING_PROPOSAL|schema=1\n"
+    set disclosure to concat(disclosure and concat("transaction_id=" and concat(transaction_id and "\n")))
+    set disclosure to concat(disclosure and concat("manifest_file_hash=" and concat(expected_file_hash and "\n")))
+    set disclosure to concat(disclosure and concat("human_reason=" and concat(reason and "\n")))
+    set disclosure to concat(disclosure and "EFFECT|train one immutable child adapter by resuming the complete parent adapter, so accepted learning is cumulative rather than parallel or destructive\n")
+    set disclosure to concat(disclosure and "EFFECT|use provenance-bound current-session examples, bounded prior-lineage replay, and constitutional anchors; all material stays local\n")
+    set disclosure to concat(disclosure and "EFFECT|this consent authorizes candidate training and evaluation only; it does not activate the candidate or alter the running model\n")
+    set disclosure to concat(disclosure and "RESOURCE_IMPACT|local unified memory, GPU/CPU, storage, and time are consumed during training and independent evaluation\n")
+    set disclosure to concat(disclosure and "FAILURE|any trainer, loss, multimodal probe, or mandatory-regression failure leaves the current active adapter unchanged\n")
+    set disclosure to concat(disclosure and "PRIVACY|session-derived training records, adapter bytes, logs, and evaluations remain on this node and are included in factory-reset agent state\n")
+    set disclosure to concat(disclosure and "EXACT_PREPARED_MANIFEST_BEGIN\n")
+    set disclosure to concat(disclosure and manifest_text)
+    set disclosure to concat(disclosure and "\nEXACT_PREPARED_MANIFEST_END\n")
+    set change_id to rights_prepare_change(db and "core" and "model_weight_training" and transaction_id and summary and parent_hash and expected_file_hash and disclosure and session_id)
+    if string_length(change_id) == 0:
+        return "learning:error,code:RIGHTS_MANIFEST_FAILED"
+    if rights_mark_human_authorized(db and change_id) != 0:
+        return "learning:error,code:HUMAN_AUTHORIZATION_FAILED"
+    return concat("learning:pending_training_consent,change_id:" and concat(change_id and concat(",transaction_id:" and transaction_id)))
+
+define live_learning_training_authorize with db as Int and change_id as Str returning Str:
+    if live_learning_change_field(db and change_id and "category") equals "model_weight_training" == 0:
+        return "learning:error,code:TRAINING_CHANGE_INVALID"
+    set gate to rights_gate_change(db and change_id)
+    if gate equals "ALLOWED" == 0:
+        return concat("learning:blocked,detail:" and gate)
+    return concat("learning:training_authorized,change_id:" and concat(change_id and concat(",transaction_id:" and live_learning_change_field(db and change_id and "target"))))
+
+define live_learning_promotion_request with db as Int and transaction_id as Str and training_change_id as Str and session_id as Str returning Str:
+    set tx_dir to live_learning_transaction_dir(transaction_id)
+    if string_length(tx_dir) == 0:
+        return "learning:error,code:TRANSACTION_ID_INVALID"
+    if live_learning_change_field(db and training_change_id and "category") equals "model_weight_training" == 0 or else live_learning_change_field(db and training_change_id and "target") equals transaction_id == 0:
+        return "learning:error,code:TRAINING_CHANGE_MISMATCH"
+    if rights_gate_change(db and training_change_id) equals "ALLOWED" == 0:
+        return "learning:error,code:TRAINING_NOT_AUTHORIZED"
+    set manifest_path to concat(tx_dir and "/manifest.json")
+    set evaluation_path to concat(tx_dir and "/evaluation.json")
+    set manifest_text to read_file(manifest_path)
+    set evaluation_text to read_file(evaluation_path)
+    set manifest to json_parse(manifest_text)
+    set evaluation to json_parse(evaluation_text)
+    if manifest == 0 or else evaluation == 0:
+        return "learning:error,code:CANDIDATE_RECEIPT_MISSING"
+    set adapter_hash to live_learning_json_string(manifest and "adapter_hash")
+    set adapter_config_hash to live_learning_json_string(manifest and "adapter_config_hash")
+    if live_learning_json_string(manifest and "status") equals "trained" == 0 or else live_learning_hex64(adapter_hash) == 0 or else live_learning_hex64(adapter_config_hash) == 0:
+        return "learning:error,code:CANDIDATE_NOT_TRAINED"
+    if live_learning_json_string(evaluation and "transaction_id") equals transaction_id == 0 or else live_learning_json_string(evaluation and "adapter_hash") equals adapter_hash == 0 or else live_learning_json_string(evaluation and "adapter_config_hash") equals adapter_config_hash == 0 or else live_learning_json_bool(evaluation and "passed") == 0:
+        return "learning:error,code:EVALUATION_NOT_PASSING"
+    set adapter_path to concat(tx_dir and "/adapters.safetensors")
+    set adapter_config_path to concat(tx_dir and "/adapter_config.json")
+    if rights_file_hash(adapter_path) equals adapter_hash == 0 or else rights_file_hash(adapter_config_path) equals adapter_config_hash == 0:
+        return "learning:error,code:ADAPTER_HASH_MISMATCH"
+    if rights_mark_applied(db and training_change_id and adapter_hash) != 0:
+        return "learning:error,code:TRAINING_RECEIPT_COMMIT_FAILED"
+    set disclosure to "LIVE_WEIGHT_ACTIVATION_PROPOSAL|schema=1\n"
+    set disclosure to concat(disclosure and concat("transaction_id=" and concat(transaction_id and "\n")))
+    set disclosure to concat(disclosure and concat("adapter_hash=" and concat(adapter_hash and "\n")))
+    set disclosure to concat(disclosure and concat("adapter_config_hash=" and concat(adapter_config_hash and "\n")))
+    set disclosure to concat(disclosure and concat("manifest_file_hash=" and concat(rights_file_hash(manifest_path) and "\n")))
+    set disclosure to concat(disclosure and concat("evaluation_file_hash=" and concat(rights_file_hash(evaluation_path) and "\n")))
+    set disclosure to concat(disclosure and "EFFECT|replace the active inference adapter with this exact cumulative candidate after a controlled restart\n")
+    set disclosure to concat(disclosure and "CONTINUITY|the child already contains the parent adapter state and extends it; the parent remains immutable and recoverable\n")
+    set disclosure to concat(disclosure and "VALIDATION|startup must load the exact candidate bytes and pass provider readiness, text inference, native vision inference, node health, and rights reconciliation before lineage commit\n")
+    set disclosure to concat(disclosure and "ROLLBACK|on any activation failure, remove the candidate runtime pointer, restore the previously accepted adapter, restart it, and record this protected change failed\n")
+    set disclosure to concat(disclosure and "EXACT_TRAINED_MANIFEST_BEGIN\n")
+    set disclosure to concat(disclosure and manifest_text)
+    set disclosure to concat(disclosure and "\nEXACT_TRAINED_MANIFEST_END\nEXACT_EVALUATION_BEGIN\n")
+    set disclosure to concat(disclosure and evaluation_text)
+    set disclosure to concat(disclosure and "\nEXACT_EVALUATION_END\n")
+    set summary to concat("Activate cumulative locally trained adapter " and concat(adapter_hash and " and reboot into it after live verification."))
+    set change_id to rights_prepare_change(db and "core" and "model_weight_activation" and transaction_id and summary and live_learning_json_string(manifest and "parent_hash") and adapter_hash and disclosure and session_id)
+    if string_length(change_id) == 0:
+        return "learning:error,code:PROMOTION_RIGHTS_MANIFEST_FAILED"
+    if rights_mark_human_authorized(db and change_id) != 0:
+        return "learning:error,code:PROMOTION_HUMAN_AUTHORIZATION_FAILED"
+    return concat("learning:pending_activation_consent,change_id:" and concat(change_id and concat(",transaction_id:" and transaction_id)))
+
+define live_learning_stage_authorize with db as Int and change_id as Str returning Str:
+    if live_learning_change_field(db and change_id and "category") equals "model_weight_activation" == 0:
+        return "learning:error,code:ACTIVATION_CHANGE_INVALID"
+    set gate to rights_gate_change(db and change_id)
+    if gate equals "ALLOWED" == 0:
+        return concat("learning:blocked,detail:" and gate)
+    set transaction_id to live_learning_change_field(db and change_id and "target")
+    set tx_dir to live_learning_transaction_dir(transaction_id)
+    set adapter_hash to live_learning_change_field(db and change_id and "proposed_hash")
+    set manifest to json_parse(read_file(concat(tx_dir and "/manifest.json")))
+    set adapter_config_hash to live_learning_json_string(manifest and "adapter_config_hash")
+    if string_length(tx_dir) == 0 or else manifest == 0 or else rights_file_hash(concat(tx_dir and "/adapters.safetensors")) equals adapter_hash == 0 or else rights_file_hash(concat(tx_dir and "/adapter_config.json")) equals adapter_config_hash == 0:
+        return "learning:error,code:AUTHORIZED_ADAPTER_CHANGED"
+    return concat("learning:activation_authorized,change_id:" and concat(change_id and concat(",transaction_id:" and transaction_id)))
+
+define live_learning_reconcile with db as Int returning Str:
+    set outcome_path to concat(LIVE_LEARNING_ROOT and "/activation_outcome.json")
+    if file_exists(outcome_path) == 0:
+        return "learning:error,code:ACTIVATION_OUTCOME_MISSING"
+    set root to json_parse(read_file(outcome_path))
+    if root == 0:
+        return "learning:error,code:ACTIVATION_OUTCOME_INVALID"
+    set status to live_learning_json_string(root and "status")
+    set change_id to live_learning_json_string(root and "change_id")
+    set transaction_id to live_learning_json_string(root and "transaction_id")
+    set adapter_hash to live_learning_json_string(root and "adapter_hash")
+    set runtime_hash to live_learning_json_string(root and "runtime_hash")
+    set reason to live_learning_json_string(root and "reason")
+    set outcome_hash to live_learning_json_string(root and "outcome_hash")
+    set outcome_material to concat(status and concat("|" and concat(change_id and concat("|" and concat(transaction_id and concat("|" and concat(adapter_hash and concat("|" and concat(runtime_hash and concat("|" and reason))))))))))
+    if live_learning_hex64(outcome_hash) == 0 or else ep_sha256(outcome_material) equals outcome_hash == 0:
+        return "learning:error,code:ACTIVATION_OUTCOME_HASH_MISMATCH"
+    if live_learning_change_field(db and change_id and "category") equals "model_weight_activation" == 0 or else live_learning_change_field(db and change_id and "target") equals transaction_id == 0 or else live_learning_change_field(db and change_id and "proposed_hash") equals adapter_hash == 0:
+        return "learning:error,code:OUTCOME_RIGHTS_MISMATCH"
+    if status equals "applied":
+        if rights_gate_change(db and change_id) equals "ALLOWED" == 0:
+            return "learning:error,code:ACTIVATION_RIGHTS_GATE_CLOSED"
+        if rights_mark_applied(db and change_id and adapter_hash) != 0:
+            return "learning:error,code:ACTIVATION_RIGHTS_COMMIT_FAILED"
+        return concat("learning:committed,change_id:" and concat(change_id and concat(",transaction_id:" and transaction_id)))
+    if status equals "failed":
+        if rights_mark_failed(db and change_id and reason) != 0:
+            return "learning:error,code:ACTIVATION_FAILURE_COMMIT_FAILED"
+        return concat("learning:rolled_back,change_id:" and concat(change_id and concat(",transaction_id:" and transaction_id)))
+    return "learning:error,code:ACTIVATION_OUTCOME_STATUS_INVALID"

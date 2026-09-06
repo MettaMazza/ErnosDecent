@@ -726,6 +726,21 @@ define rights_change_detail with db as Int and change_id as Str returning Str:
     set out to concat(out and concat("; disclosure=" and ptr_to_str(get_list(row and 11))))
     return out
 
+# Resolve the literal model-facing reference "current" only when this exact session
+# has one unambiguous pending protected change.  The database still returns and binds
+# the complete 256-bit change id; ambiguity fails closed instead of guessing.
+define rights_pending_change_for_session with db as Int and session_id as Str returning Str:
+    if string_length(session_id) == 0:
+        return ""
+    set escaped_session to rights_sql_escape(session_id)
+    set query to "SELECT change_id FROM rights_changes WHERE status='awaiting_echo' AND manifest LIKE '%\"session_id\":\""
+    set query to concat(query and escaped_session)
+    set query to concat(query and "\"%' ORDER BY proposed_at DESC,change_id DESC LIMIT 2;")
+    set rows to sql_query(db and query)
+    if length_list(rows) != 1:
+        return ""
+    return ptr_to_str(get_list(get_list(rows and 0) and 0))
+
 define rights_list_changes with db as Int and status_filter as Str returning Str:
     if rights_charter_valid(db) == 0:
         return "Error: rights charter or ledger verification failed."

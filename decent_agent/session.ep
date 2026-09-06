@@ -56,10 +56,36 @@ define session_create_new with id as Str and title as Str and model as Str and s
     set ok to map_insert(sess and "title" and title)
     set ok to map_insert(sess and "model" and model)
     set ok to map_insert(sess and "system_prompt" and system_prompt)
+    set ok to map_insert(sess and "created_at" and int_to_string(ep_time_now_sec()))
     set ok to map_insert(sess and "messages" and create_list())
     set ok to map_insert(sess and "compressed_sessions" and create_list())
     set ok to map_insert(sess and "next_turn_id" and "1")
     return sess
+
+# Return a durable session creation instant. Sessions created before this field was
+# introduced are migrated from their earliest trustworthy message timestamp; an
+# empty legacy session begins at the migration instant rather than inventing history.
+define session_created_at with sess as Map returning Int:
+    if map_contains(sess and "created_at") == 1:
+        set stored to string_to_int(ptr_to_str(map_get_val(sess and "created_at")))
+        if stored > 0:
+            return stored
+    set earliest to 0
+    if map_contains(sess and "messages") == 1:
+        set messages_list to map_get_val(sess and "messages")
+        set i to 0
+        repeat while i < length_list(messages_list):
+            set msg_map to get_list(messages_list and i)
+            if map_contains(msg_map and "created_at") == 1:
+                set candidate to string_to_int(ptr_to_str(map_get_val(msg_map and "created_at")))
+                if candidate > 0:
+                    if earliest == 0 or else candidate < earliest:
+                        set earliest to candidate
+            set i to i + 1
+    if earliest == 0:
+        set earliest to ep_time_now_sec()
+    set ok to map_insert(sess and "created_at" and int_to_string(earliest))
+    return earliest
 
 # ---- Add message helper ----
 define session_add_message with sess as Map and role as Str and content as Str returning Int:
@@ -123,7 +149,16 @@ define session_add_message_with_context with sess as Map and role as Str and con
     if count <= 0:
         return 1
     set msg_map to get_list(messages_list and count - 1)
-    return session_copy_actor_provenance(msg_map and ctx)
+    set provenance_rc to session_copy_actor_provenance(msg_map and ctx)
+    if provenance_rc != 0:
+        return provenance_rc
+    # Bind the persisted message to the runtime's request-acceptance instant rather
+    # than a later prompt/tool timestamp. Only the trusted turn context can supply it.
+    if map_contains(ctx and "turn_received_at") == 1:
+        set received_at to map_get_val(ctx and "turn_received_at")
+        if received_at > 0:
+            set ok to map_insert(msg_map and "created_at" and int_to_string(received_at))
+    return 0
 
 define session_actor_json_fields with msg_map as Map and separator as Str and indent as Str returning Str:
     set out to ""
@@ -214,6 +249,7 @@ define session_serialize with sess as Map and path as Str returning Int:
     set next_turn_val to "1"
     if map_contains(sess and "next_turn_id") == 1:
         set next_turn_val to ptr_to_str(map_get_val(sess and "next_turn_id"))
+    set created_val to int_to_string(session_created_at(sess))
     
     set summary_val to ""
     if map_contains(sess and "compression_summary") == 1:
@@ -227,6 +263,7 @@ define session_serialize with sess as Map and path as Str returning Int:
     set json_str to concat(json_str and f"  \"title\": \"{session_json_escape(title_val)}\",\n")
     set json_str to concat(json_str and f"  \"model\": \"{session_json_escape(model_val)}\",\n")
     set json_str to concat(json_str and f"  \"system_prompt\": \"{session_json_escape(system_val)}\",\n")
+    set json_str to concat(json_str and f"  \"created_at\": \"{session_json_escape(created_val)}\",\n")
     set json_str to concat(json_str and f"  \"compression_summary\": \"{session_json_escape(summary_val)}\",\n")
     set json_str to concat(json_str and f"  \"session_guidance\": \"{session_json_escape(guidance_val)}\",\n")
     set json_str to concat(json_str and f"  \"next_turn_id\": \"{session_json_escape(next_turn_val)}\",\n")
@@ -302,6 +339,7 @@ define session_deserialize_json with content as Str returning Map:
     set title_node to get_json_object_value(root and "title")
     set model_node to get_json_object_value(root and "model")
     set system_node to get_json_object_value(root and "system_prompt")
+    set session_created_node to get_json_object_value(root and "created_at")
     set messages_node to get_json_object_value(root and "messages")
     set comp_node to get_json_object_value(root and "compressed_sessions")
     set summary_node to get_json_object_value(root and "compression_summary")
@@ -317,6 +355,8 @@ define session_deserialize_json with content as Str returning Map:
         set ok to map_insert(sess and "model" and get_json_value(model_node))
     if system_node != 0:
         set ok to map_insert(sess and "system_prompt" and get_json_value(system_node))
+    if session_created_node != 0:
+        set ok to map_insert(sess and "created_at" and get_json_value(session_created_node))
     if summary_node != 0:
         set ok to map_insert(sess and "compression_summary" and get_json_value(summary_node))
     if guidance_node != 0:
@@ -367,6 +407,9 @@ define session_deserialize_json with content as Str returning Map:
             set ok to append_list(msg_list and msg_map)
             set i to i + 1
     set ok to map_insert(sess and "messages" and msg_list)
+    # Complete the backward-compatible migration only after messages are loaded, so
+    # their earliest timestamp can recover the real start of a legacy session.
+    set migrated_created_at to session_created_at(sess)
     set comp_list to create_list()
     if comp_node != 0:
         set raw_list to get_json_value(comp_node)

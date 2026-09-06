@@ -81,13 +81,17 @@ bash -n build.sh
 bash -n upgrade.sh
 bash -n run_node.sh
 bash -n scripts/run_mandatory_regressions.sh
-python3 -m py_compile decent_net/discord_bridge.py decent_net/discord_manager.py
+python3 -m py_compile decent_net/discord_bridge.py decent_net/discord_manager.py \
+    scripts/live_learning.py scripts/live_learning_loss.py \
+    scripts/live_learning_probe.py scripts/live_learning_tokens.py \
+    scripts/patch_mlx_vlm_gemma4.py
 ernos check decent_agent/compiler_tool.ep
 ernos check decent_agent/llm.ep
 ernos check decent_agent/tools.ep
 ernos check decent_agent/self_extensions.ep
 ernos check decent_agent/react_loop.ep
 ernos check decent_agent/rights.ep
+ernos check decent_agent/live_learning.ep
 ernos check decent_agent/session.ep
 ernos check decent_agent/prompt.ep
 ernos check decent_store/continuity.ep
@@ -98,14 +102,18 @@ echo "[mandatory-gate] running native cognitive and host-election suites."
 bash build.sh test
 echo "[mandatory-gate] bash decent_agent/run_test.sh decent_agent/test_rights.ep"
 bash decent_agent/run_test.sh decent_agent/test_rights.ep
+echo "[mandatory-gate] bash decent_agent/run_test.sh decent_agent/test_live_learning_rights.ep"
+bash decent_agent/run_test.sh decent_agent/test_live_learning_rights.ep
 
 PYTHON_SUITES=(
     tests/test_discord_manager_readiness.py
+    tests/test_discord_node_liveness.py
     tests/test_discord_tts_toggle.py
     tests/test_final_reply_fallback.py
     tests/test_improvement_eval_context.py
     tests/test_improvement_test_gate.py
     tests/test_interaction_identity.py
+    tests/test_live_learning.py
     tests/test_mental_state_guidance.py
     tests/test_self_upgrade_transaction.py
     tests/test_turn_queue_and_visual_memory.py

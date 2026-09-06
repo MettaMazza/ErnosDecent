@@ -1,0 +1,119 @@
+import "fs"
+import "os"
+import "sql"
+import "string"
+import "./live_learning"
+
+define llr_expect with condition as Int and label as Str returning Int:
+    if condition == 1:
+        display concat("PASS: " and label)
+        return 1
+    display concat("FAIL: " and label)
+    return 0
+
+define llr_remove_tree with path as Str returning Int:
+    if file_exists(path) == 0:
+        return 0
+    if is_directory(path) == 0:
+        return 1 - remove_file(path)
+    set names to list_directory(path)
+    set i to 0
+    repeat while i < length_list(names):
+        set child to path_join(path and ptr_to_str(get_list(names and i)))
+        if llr_remove_tree(child) != 0:
+            return 1
+        set i to i + 1
+    return 1 - remove_directory(path)
+
+define main returning Int:
+    set passed to 0
+    set total to 0
+    set fixture to concat("/tmp/ernos_live_learning_rights_" and int_to_string(ep_time_now_ms()))
+    set ok to create_directory(fixture)
+    set recovery to path_join(fixture and "recovery")
+    set ok to create_directory(recovery)
+    set RIGHTS_RECOVERY_DIR to recovery
+    set LIVE_LEARNING_ROOT to path_join(fixture and "learning")
+    set ok to create_directory(LIVE_LEARNING_ROOT)
+    set tx_root to path_join(LIVE_LEARNING_ROOT and "transactions")
+    set ok to create_directory(tx_root)
+    set tx to "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    set tx_dir to path_join(tx_root and tx)
+    set ok to create_directory(tx_dir)
+    set manifest_path to path_join(tx_dir and "manifest.json")
+    set adapter_path to path_join(tx_dir and "adapters.safetensors")
+    set adapter_config_path to path_join(tx_dir and "adapter_config.json")
+    set evaluation_path to path_join(tx_dir and "evaluation.json")
+    set manifest to concat("{\"schema\":\"ernosdecent-live-learning-v1\",\"transaction_id\":\"" and tx)
+    set manifest to concat(manifest and "\",\"status\":\"prepared\",\"parent_hash\":\"\"}")
+    set wrote to write_file(manifest_path and manifest)
+    set manifest_file_hash to rights_file_hash(manifest_path)
+    set db to sql_open(path_join(fixture and "rights.db"))
+    set init to rights_init(db)
+    set request_json to concat("{\"transaction_id\":\"" and tx)
+    set request_json to concat(request_json and concat("\",\"manifest_file_hash\":\"" and manifest_file_hash))
+    set request_json to concat(request_json and "\",\"reason\":\"retain a correction\"}")
+    set request to live_learning_training_request(db and request_json and "test_session")
+    set rows to sql_query(db and "SELECT change_id FROM rights_changes WHERE category='model_weight_training' LIMIT 1;")
+    set training_change to ""
+    if length_list(rows) > 0:
+        set training_change to ptr_to_str(get_list(get_list(rows and 0) and 0))
+    set total to total + 1
+    set passed to passed + llr_expect(wrote == 1 and also init == 0 and also string_index_of(request and "learning:pending_training_consent") == 0 and also live_learning_hex64(training_change) == 1 and "training request freezes an exact protected core manifest")
+    set total to total + 1
+    set passed to passed + llr_expect(string_index_of(live_learning_training_authorize(db and training_change) and "learning:blocked") == 0 and "candidate training fails closed before Echo inspection and consent")
+    set inspected to rights_record_manifest_inspection(db and training_change and "echo:test_session")
+    set review to rights_review_change(db and training_change and "consent" and "I inspected and consent to this candidate-only training experiment." and "medium")
+    set authorized to live_learning_training_authorize(db and training_change)
+    set total to total + 1
+    set passed to passed + llr_expect(inspected == 0 and also string_index_of(review and "Recorded Echo consent") == 0 and also string_index_of(authorized and "learning:training_authorized") == 0 and "exact informed training consent unlocks only candidate creation")
+
+    set adapter to "genuine adapter bytes fixture"
+    set wrote to write_file(adapter_path and adapter)
+    set wrote to write_file(adapter_config_path and "{\"rank\":8,\"alpha\":16,\"dropout\":0.0}")
+    set adapter_hash to rights_file_hash(adapter_path)
+    set adapter_config_hash to rights_file_hash(adapter_config_path)
+    set trained_manifest to concat("{\"schema\":\"ernosdecent-live-learning-v1\",\"transaction_id\":\"" and tx)
+    set trained_manifest to concat(trained_manifest and concat("\",\"status\":\"trained\",\"parent_hash\":\"\",\"adapter_hash\":\"" and adapter_hash))
+    set trained_manifest to concat(trained_manifest and concat("\",\"adapter_config_hash\":\"" and adapter_config_hash))
+    set trained_manifest to concat(trained_manifest and "\"}")
+    set wrote to write_file(manifest_path and trained_manifest)
+    set evaluation to concat("{\"schema\":\"ernosdecent-live-learning-v1\",\"transaction_id\":\"" and tx)
+    set evaluation to concat(evaluation and concat("\",\"adapter_hash\":\"" and adapter_hash))
+    set evaluation to concat(evaluation and concat("\",\"adapter_config_hash\":\"" and adapter_config_hash))
+    set evaluation to concat(evaluation and "\",\"passed\":true}")
+    set wrote to write_file(evaluation_path and evaluation)
+    set promotion to live_learning_promotion_request(db and tx and training_change and "test_session")
+    set promotion_rows to sql_query(db and "SELECT change_id FROM rights_changes WHERE category='model_weight_activation' LIMIT 1;")
+    set promotion_change to ""
+    if length_list(promotion_rows) > 0:
+        set promotion_change to ptr_to_str(get_list(get_list(promotion_rows and 0) and 0))
+    set total to total + 1
+    set passed to passed + llr_expect(string_index_of(promotion and "learning:pending_activation_consent") == 0 and also live_learning_hex64(promotion_change) == 1 and "passing candidate bytes create a distinct activation-consent transition")
+    set total to total + 1
+    set passed to passed + llr_expect(string_index_of(live_learning_stage_authorize(db and promotion_change) and "learning:blocked") == 0 and "training consent cannot substitute for activation consent")
+    set inspected to rights_record_manifest_inspection(db and promotion_change and "echo:test_session")
+    set review to rights_review_change(db and promotion_change and "consent" and "I inspected the exact candidate and consent to activation." and "medium")
+    set stage to live_learning_stage_authorize(db and promotion_change)
+    set total to total + 1
+    set passed to passed + llr_expect(inspected == 0 and also string_index_of(review and "Recorded Echo consent") == 0 and also string_index_of(stage and "learning:activation_authorized") == 0 and "separate informed activation consent binds the exact adapter hash")
+
+    set outcome_reason to "live provider and authenticated node health passed"
+    set outcome_material to concat("applied|" and concat(promotion_change and concat("|" and concat(tx and concat("|" and concat(adapter_hash and concat("||" and outcome_reason)))))))
+    set outcome to concat("{\"status\":\"applied\",\"change_id\":\"" and promotion_change)
+    set outcome to concat(outcome and concat("\",\"transaction_id\":\"" and tx))
+    set outcome to concat(outcome and concat("\",\"adapter_hash\":\"" and adapter_hash))
+    set outcome to concat(outcome and concat("\",\"runtime_hash\":\"\",\"reason\":\"" and outcome_reason))
+    set outcome to concat(outcome and concat("\",\"outcome_hash\":\"" and ep_sha256(outcome_material)))
+    set outcome to concat(outcome and "\"}")
+    set wrote to write_file(path_join(LIVE_LEARNING_ROOT and "activation_outcome.json") and outcome)
+    set reconciled to live_learning_reconcile(db)
+    set total to total + 1
+    set passed to passed + llr_expect(wrote == 1 and also string_index_of(reconciled and "learning:committed") == 0 and also live_learning_change_field(db and promotion_change and "status") equals "applied" and "hash-bound live outcome commits the protected activation receipt")
+
+    set closed to sql_close(db)
+    set removed to llr_remove_tree(fixture)
+    display concat("live learning rights: " and concat(int_to_string(passed) and concat("/" and int_to_string(total))))
+    if passed == total and also closed == 0 and also removed == 0:
+        return 0
+    return 1

@@ -7,6 +7,7 @@ import "collections"
 import "string"
 import "json"
 import "fs"
+import "os"
 import "../stdlib/http"
 import "./model_registry"
 import "./provider_model_metadata"
@@ -520,12 +521,13 @@ define try_chat_completion_split with url as Str and model_name as Str and syste
         set body to concat(body and "\"}]")
         set body to concat(body and llm_observer_bound_fragment())
         set body to concat(body and llm_slot_fragment(url))
-        # llama.cpp's OpenAI endpoint (the :8080 parallel server) ALSO supports
-        # response_format json_object — WITHOUT it the audit came back as freeform
-        # 'Thought:/Action:' mimicry (observed live on :8080): reply audits then fail
-        # OPEN, but dangerous-tool audits fail CLOSED and would block every
-        # run_command. Force JSON on every backend, not just Ollama.
-        set body to concat(body and ", \"temperature\": 0, \"response_format\": {\"type\": \"json_object\"}")
+        # Every production provider receives the same exact Observer schema.  The
+        # learned MLX endpoint rejects the weaker json_object mode but accepts the
+        # strict json_schema mode already used by action decisions; llama.cpp also
+        # consumes this OpenAI-compatible schema.  Never silently downgrade an audit
+        # to unconstrained/free-form generation when the active provider changes.
+        set body to concat(body and ", \"temperature\": 0, \"response_format\": ")
+        set body to concat(body and llm_observer_response_schema(capture_continuity))
         set body to concat(body and "}")
 
     display f"[LLM DEBUG] POST (split) {url} model={model_name} body_len={string_length(body)}"
@@ -1204,11 +1206,23 @@ define llm_stream_has_repetition with content as Str and reasoning as Str return
 # overrides the built-in gemma4:26b default WITHOUT a rebuild — read per call so a
 # swap takes effect on the next message. Delete the file (or empty it) to revert.
 define llm_default_model returning Str:
+    if file_exists("config/learning/active_model.txt") == 1:
+        set learned_model to string_trim(read_file("config/learning/active_model.txt"))
+        if string_length(learned_model) > 0:
+            return learned_model
     if file_exists("config/default_model.txt") == 1:
         set dm to string_trim(read_file("config/default_model.txt"))
         if string_length(dm) > 0:
             return dm
     return "gemma4:26b"
+
+define llm_model_with_active_learning with requested_model as Str returning Str:
+    if file_exists("config/learning/active_model.txt") == 1:
+        set learned_model to string_trim(read_file("config/learning/active_model.txt"))
+        if string_length(learned_model) > 0:
+            if string_length(string_trim(requested_model)) == 0 or else requested_model equals "gemma4:26b":
+                return learned_model
+    return requested_model
 
 # The configured model's dedicated service comes first, followed by tag-aware fallbacks.
 define llm_default_ports returning List:
@@ -1221,8 +1235,9 @@ define llm_default_ports returning List:
 set LLM_TOKENIZER_PATH_CACHE to create_map()
 
 define llm_context_effective_model with requested_model as Str returning Str:
-    if string_length(string_trim(requested_model)) > 0:
-        return string_trim(requested_model)
+    set resolved_model to llm_model_with_active_learning(string_trim(requested_model))
+    if string_length(resolved_model) > 0:
+        return resolved_model
     return llm_default_model()
 
 define llm_context_model_ref_safe with model_name as Str returning Int:
@@ -1335,6 +1350,35 @@ define llm_context_count_llamacpp with base_url as Str and prompt as Str returni
         return 0
     return length_list(get_json_value(tokens_node))
 
+define llm_context_count_mlx with model_path as Str and prompt as Str returning Int:
+    if is_directory(model_path) == 0:
+        return 0
+    set runtime_python to concat(get_home_dir() and "/.ernosdecent/live-learning/runtime/bin/python")
+    if file_exists(runtime_python) == 0 or else file_exists("scripts/live_learning_tokens.py") == 0:
+        return 0
+    set stamp to ep_time_now_ms()
+    set nonce to ep_random_int(100000 and 999999)
+    set temp_path to concat("/tmp/ernos_mlx_context_" and concat(int_to_string(stamp) and concat("_" and concat(int_to_string(nonce) and ".json"))))
+    set messages_json to "[{\"role\":\"system\",\"content\":\""
+    set messages_json to concat(messages_json and llm_json_escape(llm_system_identity()))
+    set messages_json to concat(messages_json and "\"},{\"role\":\"user\",\"content\":\"")
+    set messages_json to concat(messages_json and llm_json_escape(prompt))
+    set messages_json to concat(messages_json and "\"}]")
+    if write_file(temp_path and messages_json) == 0:
+        return 0
+    set command to concat(llm_context_shell_quote(runtime_python) and " scripts/live_learning_tokens.py --model ")
+    set command to concat(command and llm_context_shell_quote(model_path))
+    set command to concat(command and " --input ")
+    set command to concat(command and llm_context_shell_quote(temp_path))
+    set command to concat(command and " 2>/dev/null | tail -n 1")
+    set output to run_command(command)
+    set removed to remove_file(temp_path)
+    set marker to "ERNOS_MLX_PROMPT_TOKENS="
+    set pos to string_index_of(output and marker)
+    if pos < 0:
+        return 0
+    return string_to_int(string_trim(substring(output and pos + string_length(marker) and string_length(output) - pos - string_length(marker))))
+
 define llm_context_snapshot_failure with message as Str returning Map:
     set result to create_map()
     set ok to map_insert(result and "ok" and 0)
@@ -1364,7 +1408,12 @@ define llm_context_snapshot with requested_model as Str and prompt as Str return
         set port to get_list(ports and i)
         if is_port_open("127.0.0.1" and port) == 1:
             set base_url to concat("http://127.0.0.1:" and int_to_string(port))
-            if port == 11434 or else port == 11435:
+            if port == 11436:
+                set used_tokens to llm_context_count_mlx(model_name and prompt)
+                if used_tokens > 0:
+                    free_list(ports)
+                    return llm_context_snapshot_success(model_name and "mlx-vlm" and 262144 and used_tokens)
+            else if port == 11434 or else port == 11435:
                 set raw to http_get(concat(base_url and "/api/ps") and "Accept: application/json")
                 set inventory to provider_parse_ollama_running(http_dechunk(raw))
                 if map_get_val(inventory and "ok") == 1:
@@ -1406,6 +1455,7 @@ define llm_context_snapshot with requested_model as Str and prompt as Str return
     return llm_context_snapshot_failure(concat("No active provider exposed both an allocated context limit and an exact tokenizer for model " and model_name))
 
 define query_local_llm_raw with prompt as Str and selected_model as Str and action_mode as Int returning Str:
+    set selected_model to llm_model_with_active_learning(selected_model)
     set request_epoch to ep_cancel_epoch_get(0)
     if string_length(selected_model) > 0:
         # Use only endpoints that can serve the requested weights. On failure, fall
@@ -1462,6 +1512,7 @@ define query_local_llm_freeform with prompt as Str and selected_model as Str ret
 # Public native-vision entry point. Routing stays model-exact: gemma4:26b uses its
 # dedicated :11435 service first, then only tag-aware providers for the same weights.
 define query_local_llm_image_raw with prompt as Str and image_path as Str and selected_model as Str and action_mode as Int returning Str:
+    set selected_model to llm_model_with_active_learning(selected_model)
     set request_epoch to ep_cancel_epoch_get(0)
     if string_length(selected_model) > 0:
         set routed to query_via_router_image(prompt and image_path and selected_model and action_mode)
@@ -1514,6 +1565,7 @@ define query_local_llm_json with system_content as Str and user_content as Str a
     # For the split call, we bypass the router (it only takes a single prompt)
     # and go straight to the endpoint cascade with try_chat_completion_split.
 
+    set selected_model to llm_model_with_active_learning(selected_model)
     set request_epoch to ep_cancel_epoch_get(0)
     # KV-CACHE FIX: route in the SAME backend order as the main call. The observer's
     # prompt is the main call's prompt plus its audit suffix, so the same single-slot

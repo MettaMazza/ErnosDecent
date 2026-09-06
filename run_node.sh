@@ -15,6 +15,8 @@ mkdir -p "$(dirname "$LOG")"
 LOCK_DIR="${HOME}/.ernosdecent/node-runtime.lock"
 LOCK_PID="${LOCK_DIR}/pid"
 CURRENT_NODE_PID=""
+LEARNING_PROVIDER_PID=""
+LEARNING_PROVIDER_ADAPTER_HASH=""
 
 # Atomic single-instance guard. The lock belongs to this wrapper, which owns the node
 # pipeline for its whole lifetime. A stale lock is removed only after its recorded PID
@@ -35,6 +37,9 @@ echo "$$" > "$LOCK_PID"
 cleanup_runtime_lock() {
   if [ -n "$CURRENT_NODE_PID" ] && kill -0 "$CURRENT_NODE_PID" 2>/dev/null; then
     kill -TERM "$CURRENT_NODE_PID" 2>/dev/null || true
+  fi
+  if [ -n "$LEARNING_PROVIDER_PID" ] && kill -0 "$LEARNING_PROVIDER_PID" 2>/dev/null; then
+    kill -TERM "$LEARNING_PROVIDER_PID" 2>/dev/null || true
   fi
   rm -f "$LOCK_PID"
   rmdir "$LOCK_DIR" 2>/dev/null || true
@@ -216,12 +221,111 @@ stop_current_node() {
   CURRENT_NODE_PID=""
 }
 
+stop_learning_provider() {
+  local attempt
+  if [ -z "$LEARNING_PROVIDER_PID" ] || ! kill -0 "$LEARNING_PROVIDER_PID" 2>/dev/null; then
+    LEARNING_PROVIDER_PID=""
+    LEARNING_PROVIDER_ADAPTER_HASH=""
+    return 0
+  fi
+  kill -TERM "$LEARNING_PROVIDER_PID" 2>/dev/null || true
+  for attempt in $(seq 1 50); do
+    if ! kill -0 "$LEARNING_PROVIDER_PID" 2>/dev/null; then
+      wait "$LEARNING_PROVIDER_PID" 2>/dev/null || true
+      LEARNING_PROVIDER_PID=""
+      LEARNING_PROVIDER_ADAPTER_HASH=""
+      return 0
+    fi
+    sleep 0.2
+  done
+  kill -KILL "$LEARNING_PROVIDER_PID" 2>/dev/null || true
+  wait "$LEARNING_PROVIDER_PID" 2>/dev/null || true
+  LEARNING_PROVIDER_PID=""
+  LEARNING_PROVIDER_ADAPTER_HASH=""
+}
+
+learning_runtime_spec() {
+  python3 scripts/live_learning.py runtime-spec 2>/dev/null
+}
+
+start_learning_provider() {
+  local spec status model adapter adapter_load adapter_hash port runtime_python
+  if [ ! -f "config/learning/live/runtime_active.json" ]; then
+    stop_learning_provider
+    return 0
+  fi
+  spec=$(learning_runtime_spec) || return 1
+  status=$(printf '%s' "$spec" | jq -r '.status // empty') || return 1
+  model=$(printf '%s' "$spec" | jq -r '.model_path // empty') || return 1
+  adapter=$(printf '%s' "$spec" | jq -r '.adapter_path // empty') || return 1
+  adapter_load=$(printf '%s' "$spec" | jq -r '.adapter_load_path // empty') || return 1
+  adapter_hash=$(printf '%s' "$spec" | jq -r '.adapter_hash // empty') || return 1
+  port=$(printf '%s' "$spec" | jq -r '.provider_port // empty') || return 1
+  runtime_python="${HOME}/.ernosdecent/live-learning/runtime/bin/python"
+  [ "$status" = "active" ] || [ "$status" = "candidate" ] || return 1
+  [ -x "$runtime_python" ] && [ -d "$model" ] && [ -f "$adapter" ] && [ -d "$adapter_load" ] || return 1
+  if [ -n "$LEARNING_PROVIDER_PID" ] && kill -0 "$LEARNING_PROVIDER_PID" 2>/dev/null && [ "$LEARNING_PROVIDER_ADAPTER_HASH" = "$adapter_hash" ]; then
+    return 0
+  fi
+  stop_learning_provider
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "[run_node] learned-model port :$port is occupied by an unowned process; refusing ambiguous activation." >&2
+    return 1
+  fi
+  echo "[run_node] loading cumulative Gemma 4 adapter ${adapter_hash:0:12} on :$port"
+  "$runtime_python" -m mlx_vlm.server \
+    --host 127.0.0.1 --port "$port" --model "$model" --adapter-path "$adapter_load" \
+    --max-kv-size 262144 --max-tokens 8192 \
+    > "${HOME}/.ernosdecent/mlx-vlm-learned.log" 2>&1 &
+  LEARNING_PROVIDER_PID=$!
+  LEARNING_PROVIDER_ADAPTER_HASH="$adapter_hash"
+  # Startup has no artificial transaction deadline: a large local model may take
+  # as long as the host requires. Process exit is a definitive failure; successful
+  # HTTP inference is the definitive readiness condition.
+  while kill -0 "$LEARNING_PROVIDER_PID" 2>/dev/null; do
+    if curl -fsS -m 2 "http://127.0.0.1:${port}/docs" >/dev/null 2>&1; then
+      if "$runtime_python" scripts/live_learning_probe.py \
+        --model "$model" --adapter "$adapter" --port "$port" --existing-server \
+        --output "config/learning/live/runtime-probe.json" \
+        --server-log "${HOME}/.ernosdecent/mlx-vlm-learned.log" \
+        > "${HOME}/.ernosdecent/mlx-vlm-runtime-probe.log" 2>&1; then
+        echo "[run_node] cumulative learned-model provider passed live text and native-image inference readiness."
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  wait "$LEARNING_PROVIDER_PID" 2>/dev/null || true
+  LEARNING_PROVIDER_PID=""
+  LEARNING_PROVIDER_ADAPTER_HASH=""
+  return 1
+}
+
 upgrade_outcome_status() {
   sed -n 's/^status=//p' config/upgrades/outcome.env 2>/dev/null | head -n 1
 }
 
 PRESERVE_DISCORD_BRIDGE=0
 while true; do
+  LEARNING_PENDING=0
+  if [ -f "config/learning/live/pending_activation.json" ]; then
+    LEARNING_PENDING=1
+    if ! python3 scripts/live_learning.py prepare-runtime >/dev/null; then
+      echo "[run_node] pending learned adapter failed receipt verification; refusing activation." >&2
+      exit 1
+    fi
+  fi
+  if ! start_learning_provider; then
+    if [ "$LEARNING_PENDING" -eq 1 ]; then
+      echo "[run_node] candidate learned adapter failed live provider validation; restoring prior accepted runtime." >&2
+      python3 scripts/live_learning.py write-outcome --status failed --reason learned_provider_live_validation_failed >/dev/null || exit 1
+      python3 scripts/live_learning.py abort-pending --reason learned_provider_live_validation_failed >/dev/null || exit 1
+      start_learning_provider || exit 1
+    else
+      echo "[run_node] accepted learned-model provider failed to start; refusing silent model substitution." >&2
+      exit 1
+    fi
+  fi
   UPGRADE_PENDING=0
   if [ -f "config/upgrades/pending.env" ]; then
     UPGRADE_PENDING=1
@@ -237,6 +341,43 @@ while true; do
   fi
 
   launch_node_process
+
+  if [ "$LEARNING_PENDING" -eq 1 ]; then
+    if ! wait_for_node_health; then
+      stop_current_node
+      stop_learning_provider
+      python3 scripts/live_learning.py write-outcome --status failed --reason candidate_node_failed_authenticated_health >/dev/null || exit 1
+      python3 scripts/live_learning.py abort-pending --reason candidate_node_failed_authenticated_health >/dev/null || exit 1
+      start_learning_provider || exit 1
+      PRESERVE_DISCORD_BRIDGE=1
+      launch_node_process
+      wait_for_node_health || exit 1
+      RECONCILE_RESPONSE=$(ipc_cmd 5 "AI LEARNING RECONCILE" || true)
+      if ! echo "$RECONCILE_RESPONSE" | grep -q '^learning:rolled_back,'; then
+        echo "[run_node] learned-adapter failure could not be reconciled: ${RECONCILE_RESPONSE:-no response}" >&2
+        stop_current_node
+        exit 1
+      fi
+      rm -f "config/learning/live/activation_outcome.json"
+      LEARNING_PENDING=0
+    else
+      python3 scripts/live_learning.py write-outcome --status applied --reason exact_candidate_provider_and_node_health_passed >/dev/null || exit 1
+      RECONCILE_RESPONSE=$(ipc_cmd 5 "AI LEARNING RECONCILE" || true)
+      if ! echo "$RECONCILE_RESPONSE" | grep -q '^learning:committed,'; then
+        echo "[run_node] learned-adapter rights reconciliation failed: ${RECONCILE_RESPONSE:-no response}" >&2
+        stop_current_node
+        exit 1
+      fi
+      python3 scripts/live_learning.py commit-pending >/dev/null || {
+        echo "[run_node] learned-adapter lineage commit failed after rights reconciliation; transaction retained for exact recovery." >&2
+        stop_current_node
+        exit 1
+      }
+      rm -f "config/learning/live/activation_outcome.json"
+      echo "[run_node] cumulative learned adapter activation committed."
+      LEARNING_PENDING=0
+    fi
+  fi
 
   if [ "$UPGRADE_PENDING" -eq 1 ]; then
     if ! wait_for_node_health; then

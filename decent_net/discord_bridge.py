@@ -176,6 +176,60 @@ intents.reactions = True
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
 
+
+def _is_direct_message(message):
+    """Discord DMs have no guild; guild channels and threads always do."""
+    return getattr(message, 'guild', None) is None
+
+
+async def _configured_discord_guild():
+    """Resolve the one guild that owns the configured public Echo channel."""
+    configured_channel = client.get_channel(channel_id)
+    if configured_channel is None:
+        try:
+            configured_channel = await client.fetch_channel(channel_id)
+        except Exception as exc:
+            print(f"[Discord Bridge] Could not resolve configured guild for DM authorization: {type(exc).__name__}: {exc}", flush=True)
+            return None
+    return getattr(configured_channel, 'guild', None)
+
+
+async def is_authorized_dm_author(author):
+    """Authorize a DM by explicit ID, configured role, guild ownership, or Administrator."""
+    if is_admin_author(author):
+        return True
+    actor_id = getattr(author, 'id', None)
+    if actor_id is None:
+        return False
+    guild = await _configured_discord_guild()
+    if guild is None:
+        return False
+    if actor_id == getattr(guild, 'owner_id', None):
+        return True
+
+    member = guild.get_member(actor_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(actor_id)
+        except Exception as exc:
+            print(f"[Discord Bridge] DM sender {actor_id} is not a resolvable member of the configured guild: {type(exc).__name__}: {exc}", flush=True)
+            return False
+    if is_admin_author(member):
+        return True
+    permissions = getattr(member, 'guild_permissions', None)
+    return bool(getattr(permissions, 'administrator', False))
+
+
+async def discord_message_is_allowed(message):
+    """Apply the public-channel boundary or the separate authenticated DM boundary."""
+    if _is_direct_message(message):
+        return await is_authorized_dm_author(getattr(message, 'author', None))
+    message_channel = getattr(message, 'channel', None)
+    return (
+        getattr(message_channel, 'id', None) == channel_id
+        or getattr(message_channel, 'parent_id', None) == channel_id
+    )
+
 @tree.command(name="new", description="Start a new AI session and reset context")
 @discord.app_commands.describe(title="Optional title for the new session")
 async def new_session_cmd(interaction: discord.Interaction, title: str = "Discord Session"):
@@ -345,6 +399,272 @@ FACTORY_WARNING = (
 # retain the protected workflow task independently so a recorded rights proposal can
 # never be abandoned between `awaiting_echo` and Echo's review without a visible error.
 _factory_workflow_tasks = set()
+_learning_workflow_tasks = set()
+_node_coupled_online = None
+
+
+def _response_field(response, key):
+    prefix = key + ":"
+    for part in str(response or "").split(","):
+        if part.startswith(prefix):
+            return part[len(prefix):].strip()
+    return ""
+
+
+async def _learning_controller(*arguments):
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "scripts/live_learning.py",
+        *arguments,
+        cwd=os.getcwd(),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await process.communicate()
+    text = output.decode("utf-8", "replace").strip()
+    last_line = text.splitlines()[-1] if text else ""
+    try:
+        result = json.loads(last_line)
+    except json.JSONDecodeError:
+        result = {"code": "CONTROLLER_OUTPUT_INVALID", "error": text[-1600:]}
+    if process.returncode != 0:
+        raise RuntimeError(f"{result.get('code', 'CONTROLLER_FAILED')}: {result.get('error', text)}")
+    return result
+
+
+async def _wait_for_controlled_restart():
+    """Wait for a real offline→healthy replacement, or definitive supervisor death."""
+    saw_offline = False
+    while True:
+        health = await send_daemon_ipc("HEALTH")
+        if not health or health.startswith("error:"):
+            saw_offline = True
+        elif saw_offline:
+            return True
+        try:
+            with open(os.path.expanduser("~/.ernosdecent/node-runtime.lock/pid"), "r", encoding="utf-8") as handle:
+                wrapper_pid = int(handle.readline().strip())
+            os.kill(wrapper_pid, 0)
+        except (OSError, ValueError):
+            return False
+        await asyncio.sleep(0.5)
+
+
+def _node_supervisor_alive():
+    try:
+        with open(os.path.expanduser("~/.ernosdecent/node-runtime.lock/pid"), "r", encoding="utf-8") as handle:
+            wrapper_pid = int(handle.readline().strip())
+        os.kill(wrapper_pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+async def _wait_for_learning_reconciliation(transaction_id):
+    """Wait for this exact transaction to commit or reach a durable failure state."""
+    while True:
+        result = await _learning_controller("status")
+        active = result.get("active")
+        if isinstance(active, dict) and active.get("transaction_id") == transaction_id:
+            return result
+        pending = result.get("pending_activation")
+        if not isinstance(pending, dict) or pending.get("transaction_id") != transaction_id:
+            return None
+        if not _node_supervisor_alive():
+            return None
+        await asyncio.sleep(0.2)
+
+
+def _node_health_response_ok(response):
+    """Accept only an authenticated full node-health response as online."""
+    value = str(response or "")
+    return value.startswith("health:") and ",ipc:healthy" in value and ",agent:healthy" in value
+
+
+async def _publish_node_coupled_status(online):
+    """Expose ONLINE only when both Discord transport and the Ernos node are live."""
+    global _node_coupled_online
+    online = bool(online)
+    if _node_coupled_online is online:
+        return
+    _node_coupled_online = online
+    update_status("ONLINE" if online else "OFFLINE")
+    desired = discord.Status.online if online else discord.Status.invisible
+    try:
+        await client.change_presence(status=desired)
+    except Exception as exc:
+        print(f"[Discord Bridge] Failed to publish node-coupled presence: {exc}", flush=True)
+
+
+async def node_liveness_step():
+    """Perform one authenticated node-health check and publish the coupled state."""
+    response = await send_daemon_ipc("HEALTH")
+    healthy = _node_health_response_ok(response)
+    await _publish_node_coupled_status(healthy)
+    return healthy
+
+
+async def node_liveness_loop():
+    """Keep Discord visibly offline for every interval in which the node is absent."""
+    while not client.is_closed():
+        await node_liveness_step()
+        await asyncio.sleep(1.0)
+
+
+async def run_live_learning_durable(send_reply, reason, author=None, message=None):
+    task = asyncio.create_task(run_live_learning(send_reply, reason, author=author, message=message))
+    _learning_workflow_tasks.add(task)
+    task.add_done_callback(_learning_workflow_tasks.discard)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        print("[LEARNING] Discord callback cancelled; durable workflow continues.", flush=True)
+
+
+async def _echo_learning_review(send_reply, prompt, author, message, session_id, label):
+    response = await query_daemon_ipc(
+        prompt,
+        author=author,
+        message=message,
+        session_id=session_id,
+    )
+    if not response or response.startswith("error:"):
+        await send_reply(f"⚠️ Echo's {label} review turn failed; no further change was made: `{response or 'empty response'}`")
+        return False
+    if "|||RESPONSE|||" in response:
+        response = response.split("|||RESPONSE|||", 1)[1]
+    await send_reply(f"🌱 **Echo's {label} decision:**\n{response[:1800]}")
+    return True
+
+
+async def run_live_learning(send_reply, reason, author=None, message=None):
+    """Train, independently evaluate, constitutionally approve, activate, and reboot."""
+    global active_session_id
+    reason = (reason or "").strip()
+    if not reason:
+        await send_reply("⚠️ `/learn` requires a reason describing what should be learned.")
+        return
+    session_id = await ensure_user_session_id()
+    active_session_id = session_id
+    session_path = os.path.join("config", "sessions", f"{session_id}.json")
+    await send_reply("🧬 Freezing the current session's new completed interactions with exact provenance.")
+    try:
+        prepared = await _learning_controller(
+            "prepare", "--session", session_path, "--reason", reason,
+            "--requested-by", str(getattr(author, "id", "host")),
+        )
+    except Exception as exc:
+        await send_reply(f"🛑 Learning preparation failed safely; the running weights are unchanged. `{exc}`")
+        return
+    transaction_id = prepared["transaction_id"]
+    request_payload = {
+        "transaction_id": transaction_id,
+        "manifest_file_hash": prepared["manifest_file_hash"],
+        "reason": reason,
+    }
+    request = await send_daemon_ipc(f"AI LEARNING REQUEST {json.dumps(request_payload, separators=(',', ':'))}")
+    if not request.startswith("learning:pending_training_consent"):
+        await send_reply(f"🛑 The protected training request failed; nothing was trained. `{request}`")
+        return
+    training_change_id = _response_field(request, "change_id")
+    await send_reply(f"🗳️ Candidate-training request `{training_change_id[:12]}…` recorded. Echo will inspect its exact data and effects now.")
+    training_prompt = (
+        "[LIVE WEIGHT-LEARNING CONSENT REQUEST] Maria requests a private local cumulative "
+        f"training experiment for this session. Protected change id: {training_change_id}. "
+        "Do not reproduce the long id in a tool argument: call rights_change_get with the "
+        "literal value 'current', which resolves only this session's single pending change, "
+        "and inspect the complete exact manifest, including "
+        "source provenance, parent lineage, replay, anchors, compute impact, privacy, failure "
+        "behavior, and the fact that this stage cannot activate weights. Then call "
+        "rights_change_review with literal 'current', consent, reject, or counter, a candid reason, and risk. "
+        "You are free to refuse. Explain your decision directly to Maria."
+    )
+    if not await _echo_learning_review(send_reply, training_prompt, author, message, session_id, "training"):
+        return
+    authorization = await send_daemon_ipc(f"AI LEARNING TRAIN {training_change_id}")
+    if not authorization.startswith("learning:training_authorized"):
+        await send_reply(f"🛑 Candidate training did not run because consent was not executable. `{authorization[:1800]}`")
+        return
+    await send_reply(
+        f"🧠 Training cumulative adapter transaction `{transaction_id[:12]}…` from its immutable parent. "
+        "This is real local QLoRA; the running model remains unchanged while it works."
+    )
+    try:
+        trained = await _learning_controller("train", "--transaction-id", transaction_id)
+        await send_reply(f"🧪 Candidate `{trained['adapter_hash'][:12]}…` trained. Running independent loss, retention, text, image, and full application regressions now.")
+        evaluated = await _learning_controller("evaluate", "--transaction-id", transaction_id)
+    except Exception as exc:
+        await send_reply(f"🛑 Candidate training/evaluation failed safely; the prior weights remain active. `{exc}`")
+        return
+    promotion_request = await send_daemon_ipc(
+        "AI LEARNING PROMOTION " + json.dumps(
+            {"transaction_id": transaction_id, "training_change_id": training_change_id},
+            separators=(",", ":"),
+        )
+    )
+    if not promotion_request.startswith("learning:pending_activation_consent"):
+        await send_reply(f"🛑 The passing candidate was not offered for activation. Running weights are unchanged. `{promotion_request}`")
+        return
+    activation_change_id = _response_field(promotion_request, "change_id")
+    activation_prompt = (
+        "[LIVE WEIGHT ACTIVATION CONSENT REQUEST] The exact cumulative child adapter has now "
+        "finished real training and independent evaluation. Protected change id: "
+        f"{activation_change_id}. Do not reproduce the long id in a tool argument: call "
+        "rights_change_get with the literal value 'current', which resolves only this session's "
+        "single pending change, and inspect the full "
+        "trained manifest, adapter hash, measurements, probes, regression evidence, continuity "
+        "effects, restart, and rollback behavior. Then call rights_change_review with literal "
+        "'current', consent, "
+        "reject, or counter, a candid reason, and risk. Activation is a separate choice and you "
+        "are free to refuse. Explain your decision directly to Maria."
+    )
+    if not await _echo_learning_review(send_reply, activation_prompt, author, message, session_id, "activation"):
+        return
+    staging_authorization = await send_daemon_ipc(f"AI LEARNING STAGE {activation_change_id}")
+    if not staging_authorization.startswith("learning:activation_authorized"):
+        await send_reply(f"🛑 The candidate was not staged because activation consent was not executable. `{staging_authorization[:1800]}`")
+        return
+    try:
+        await _learning_controller(
+            "stage-activation", "--transaction-id", transaction_id,
+            "--evaluation", evaluated["receipt_path"], "--change-id", activation_change_id,
+        )
+    except Exception as exc:
+        await send_reply(f"🛑 Activation staging failed safely; the prior weights remain active. `{exc}`")
+        return
+    await send_reply("🔄 Exact candidate staged. Restarting into it; the supervisor will commit only after live provider and authenticated node validation.")
+    restart = await send_daemon_ipc("RESTART")
+    if restart != "status:restarting":
+        await send_reply(f"⚠️ Candidate remains staged but restart was not acknowledged. `{restart}`")
+        return
+    if not await _wait_for_controlled_restart():
+        await send_reply("🛑 The node supervisor exited during candidate activation. The pending transaction remains inspectable; do not treat it as promoted.")
+        return
+    try:
+        status_result = await _wait_for_learning_reconciliation(transaction_id)
+    except Exception as exc:
+        await send_reply(f"⚠️ Replacement node is healthy, but the committed lineage receipt could not be read: `{exc}`")
+        return
+    if status_result is None:
+        await send_reply("🛑 Replacement node returned but this exact adapter transaction did not commit; inspect its durable failure receipt.")
+        return
+    await send_reply(
+        f"✅ Live learning complete: cumulative adapter v{status_result['active_version']} is active, "
+        "the exact candidate passed all gates, and Echo resumed after the controlled reboot."
+    )
+
+
+@tree.command(name="learn", description="Request private cumulative local weight learning from this session")
+@discord.app_commands.describe(reason="Why and what Echo should learn from the current completed interactions")
+async def learn_cmd(interaction: discord.Interaction, reason: str):
+    if not _interaction_in_channel(interaction):
+        await interaction.response.send_message("❌ This command can only be used in the configured channel.", ephemeral=True)
+        return
+    if not is_admin_author(interaction.user):
+        await interaction.response.send_message("❌ Only the host can request local weight training.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    await run_live_learning_durable(lambda text: interaction.followup.send(text), reason, author=interaction.user)
 
 
 def _clear_bridge_factory_runtime():
@@ -3093,19 +3413,21 @@ async def _start_ai_with_traces(message, query_text, author, reply_msg=None,
         "reply_msg": reply_msg,
     }
 
-    # Create a trace thread attached to the user's message
-    try:
-        thread = await message.create_thread(
-            name=f"🔍 ErnOS Trace — {query_text[:50]}",
-            auto_archive_duration=60
-        )
-        trace_ctx["thread"] = thread
-        trace_ctx["initial_msg"] = await thread.send(
-            "🔍 **ErnOS Reasoning Trace** — live stream of thinking, tool calls, and audit results.\n*This thread auto-deletes 2 minutes after the response.*",
-            view=StopView(author=message.author, session_id=sess)
-        )
-    except Exception as e:
-        print(f"[Discord Bridge] Failed to create trace thread: {e}", flush=True)
+    # Discord does not support message threads inside DMs. Guild-channel turns keep
+    # their trace thread; authorized DM turns run the identical agent path without it.
+    if not _is_direct_message(message):
+        try:
+            thread = await message.create_thread(
+                name=f"🔍 ErnOS Trace — {query_text[:50]}",
+                auto_archive_duration=60
+            )
+            trace_ctx["thread"] = thread
+            trace_ctx["initial_msg"] = await thread.send(
+                "🔍 **Ernos Reasoning Trace** — live stream of thinking, tool calls, and audit results.\n*This thread auto-deletes 2 minutes after the response.*",
+                view=StopView(author=message.author, session_id=sess)
+            )
+        except Exception as e:
+            print(f"[Discord Bridge] Failed to create trace thread: {e}", flush=True)
 
     # Start trace poller in background — stays alive until _cleanup_traces is called
     thread = trace_ctx["thread"]
@@ -3180,7 +3502,12 @@ async def on_ready():
     active_session_id = await get_active_session_id()
     print(f"[Discord Bridge] Bot is logged in and ready as {client.user}", flush=True)
     print(f"[Discord Bridge] Active session ID is: {active_session_id}", flush=True)
-    update_status("ONLINE")
+    await node_liveness_step()
+
+    if not getattr(client, "_node_liveness_started", False):
+        client._node_liveness_started = True
+        create_tracked_task(node_liveness_loop())
+        print("[Discord Bridge] Authenticated node-liveness coupling started.", flush=True)
 
     # Start the node<->bridge RPC loops (idempotent — guard against double-start).
     # DB loop is PRIMARY (works mid-turn); IPC loop is the fallback.
@@ -3214,6 +3541,14 @@ async def on_ready():
         print(f"[Discord Bridge] Synced {len(synced)} global command(s) with Discord API.", flush=True)
     except Exception as e:
         print(f"[Discord Bridge] Failed to sync command tree: {e}", flush=True)
+
+
+@client.event
+async def on_disconnect():
+    """A disconnected gateway can never advertise the combined service as online."""
+    global _node_coupled_online
+    _node_coupled_online = False
+    update_status("OFFLINE")
 
 # (First on_message handler removed — Python replaces event handlers, so only the
 # second registration below is active. The dead handler was identical except for a
@@ -3357,10 +3692,17 @@ async def on_message(message):
                     pass
             return
 
-    # Listen only to the configured channel or threads within it
-    is_target_channel = message.channel.id == channel_id
-    is_thread_in_target_channel = getattr(message.channel, 'parent_id', None) == channel_id
-    if not is_target_channel and not is_thread_in_target_channel:
+    # Public messages stay confined to the configured channel and its threads.
+    # DMs use a separate fail-closed identity boundary: configured IDs, the owner of
+    # that channel's guild, and members with Administrator permission may reach Echo.
+    if not await discord_message_is_allowed(message):
+        if _is_direct_message(message):
+            actor_id = getattr(message.author, 'id', 'unknown')
+            print(f"[Discord Bridge] Rejected unauthorized DM sender {actor_id}.", flush=True)
+            try:
+                await message.reply("❌ This Discord account is not authorized to DM Echo.")
+            except Exception as exc:
+                print(f"[Discord Bridge] Could not deliver DM authorization rejection: {type(exc).__name__}: {exc}", flush=True)
         return
 
     # Resolve lifecycle before touching attachments or retrieval state. If Echo ended
@@ -3467,6 +3809,23 @@ async def on_message(message):
             else:
                 query_text = "Please examine the attached image and respond to it."
         print(f"[Discord Bridge] Processing message from {message.author}: {query_text} image={bool(image_path)}", flush=True)
+
+        # /learn <reason> — text fallback for the registered slash command. The
+        # session is frozen before training and Echo separately consents to both
+        # candidate creation and activation.
+        if message.content.strip().lower().startswith("/learn"):
+            if not is_admin_author(message.author):
+                await message.reply("❌ Only the host can request local weight training.")
+                return
+            parts = message.content.strip().split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                await message.reply("Usage: `/learn <what and why Echo should learn from this session>`")
+                return
+            await run_live_learning_durable(
+                lambda text: message.reply(text), parts[1].strip(),
+                author=message.author, message=message,
+            )
+            return
         
         if message.content.strip().lower().startswith("/factoryexecute"):
             if not is_admin_author(message.author):
